@@ -74,8 +74,6 @@ impl SolanaGrpcAdapter {
 
 #[async_trait::async_trait]
 impl ChainIngestor for SolanaGrpcAdapter {
-    // Note: This function now STREAMs data and prints it, rather than returning a static Vec.
-    // In a real app, you might pass a callback or a channel sender here.
     async fn fetch_history(&self, wallet: &str, _limit: usize) -> anyhow::Result<Vec<TaxEvent>> {
         println!("Connecting to Yellowstone gRPC at {}...", self.endpoint);
 
@@ -119,10 +117,10 @@ impl ChainIngestor for SolanaGrpcAdapter {
                                 let events = self.parse_grpc_tx(tx_update, wallet);
                                 for event in events {
                                     println!("Found Tax Event: {:?} {} {}", event.event_type, event.amount_change, event.asset_address);
-                                    // In a real app, you'd send this to your DB channel here
+                                    // Send to db here
                                 }
                             },
-                            _ => {} // Ignore heartbeats/slots/etc
+                            _ => {}
                         }
                     }
                 }
