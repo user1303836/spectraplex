@@ -1,0 +1,9 @@
+[dependencies]
+core = { path = "../core" }
+adapters = { path = "../adapters" }
+clap = "4.5.53"
+tokio = "1.48.0"
+csv = "1.2"
+serde = "1.0"
+anyhow = "1.0"
+dotenv = "0.15"

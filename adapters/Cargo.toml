@@ -1,0 +1,11 @@
+[dependencies]
+core = { path = "../core" }
+yellowstone-grpc-client = "10.2.0" # Check latest version
+yellowstone-grpc-proto = "10.1.1"
+solana-sdk = "3.0.0"
+solana-transaction-status = "3.1.4"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+anyhow = "1.0"
+async-trait = "0.1"
+log = "0.4"
