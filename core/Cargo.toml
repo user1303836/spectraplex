@@ -1,0 +1,13 @@
+[package]
+name = "spectraplex-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+async-trait = "0.1"
+anyhow = "1.0"
+serde_json = "1.0.145"
+uuid = { version = "1.19.0", features = ["v4", "serde"] }
+chrono = { version = "0.4.42", features = ["serde"] }
+bigdecimal = { version = "0.4.9", features = ["serde"] }

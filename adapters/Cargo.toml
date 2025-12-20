@@ -1,11 +1,23 @@
+[package]
+name = "spectraplex-adapters"
+version = "0.1.0"
+edition = "2021"
+
 [dependencies]
-core = { path = "../core" }
-yellowstone-grpc-client = "10.2.0" # Check latest version
+spectraplex-core = { path = "../core" }
+yellowstone-grpc-client = "10.2.0"
 yellowstone-grpc-proto = "10.1.1"
 solana-sdk = "3.0.0"
-solana-transaction-status = "3.1.4"
+solana-transaction-status = "3.0.0"
+solana-client = "3.0.0"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 anyhow = "1.0"
 async-trait = "0.1"
 log = "0.4"
+bs58 = "0.5"
+uuid = { version = "1.19.0", features = ["v4", "serde"] }
+serde_json = "1.0"
+sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "chrono", "json", "bigdecimal"] }
+chrono = { version = "0.4.42", features = ["serde"] }
+bigdecimal = "0.4.9"

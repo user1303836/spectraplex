@@ -1,35 +1,49 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use bigdecimal::BigDecimal;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Chain {
     Solana,
     Hyperliquid,
     Ethereum,
 }
 
-pub enum EventType {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EntryType {
     Trade,
-    TransferIn,
-    TransferOut,
-    Income,
     Fee,
+    Transfer,
+    Staking,
+    Income,
 }
 
-pub struct TaxEvent {
-    pub chain: Chain,
+// Bronze Layer: Raw Immutable Data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Transaction {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub wallet_address: String, // The wallet we are tracking
+    pub timestamp: i64,
     pub tx_hash: String,
-    pub block_time: i64,
-    pub event_type: EventType,
+    pub chain: Chain,
+    pub raw_metadata: serde_json::Value,
+}
 
+// Silver Layer: Normalized Financial Data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub transaction_id: Uuid,
+    pub user_id: Uuid,
+    pub wallet_address: String,
     pub asset_symbol: String,
-    pub asset_address: String, // Mint address or Contract address
-    pub amount_change: f64, // Positive = Received, Negative = Sent
-    
-    // Fees are always relevant for tax cost-basis
-    pub fee_paid: f64, 
-    pub fee_asset: String,
+    pub amount: BigDecimal, 
+    pub entry_type: EntryType,
+    pub fiat_value: Option<BigDecimal>,
 }
 
 #[async_trait::async_trait]
 pub trait ChainIngestor {
-    async fn fetch_history(&self, wallet: &str, limit: usize) -> anyhow::Result<Vec<TaxEvent>>;
+    async fn fetch_history(&self, wallet: &str, limit: usize) -> anyhow::Result<Vec<Transaction>>;
 }
