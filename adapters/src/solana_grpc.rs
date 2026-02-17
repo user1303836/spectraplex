@@ -485,7 +485,11 @@ fn build_raw_metadata(
             "rewards": [],
             "status": status
         },
-        "block_time": 0i64
+        // Yellowstone gRPC transaction updates don't include block_time;
+        // it's a block-level attribute. Use current time as approximation
+        // for real-time streaming. For historical accuracy, callers should
+        // enrich timestamps from block data.
+        "block_time": chrono::Utc::now().timestamp()
     }))
 }
 

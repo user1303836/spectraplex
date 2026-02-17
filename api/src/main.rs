@@ -41,6 +41,13 @@ impl AppError {
             message: msg.into(),
         }
     }
+
+    fn bad_request(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: msg.into(),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -165,10 +172,27 @@ fn clamp_offset(offset: Option<i64>) -> i64 {
     offset.unwrap_or(0).max(0)
 }
 
+/// Basic wallet address validation. Rejects obviously invalid inputs.
+fn validate_wallet(wallet: &str) -> Result<(), AppError> {
+    if wallet.is_empty() || wallet.len() > 128 {
+        return Err(AppError::bad_request("Invalid wallet address length"));
+    }
+    if !wallet
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == 'x')
+    {
+        return Err(AppError::bad_request(
+            "Wallet address contains invalid characters",
+        ));
+    }
+    Ok(())
+}
+
 async fn trigger_ingest(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<IngestRequest>,
 ) -> Result<Json<JobStatus>, AppError> {
+    validate_wallet(&payload.wallet)?;
     let job_id = Uuid::new_v4();
     let job = JobStatus {
         id: job_id,
@@ -251,6 +275,7 @@ async fn trigger_normalize(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<NormalizeRequest>,
 ) -> Result<Json<JobStatus>, AppError> {
+    validate_wallet(&payload.wallet)?;
     let job_id = Uuid::new_v4();
     let job = JobStatus {
         id: job_id,
@@ -347,6 +372,7 @@ async fn get_transactions(
     Path(wallet): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<Transaction>>, AppError> {
+    validate_wallet(&wallet)?;
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
     let repo = Repository::new(state.pool.clone());
@@ -362,6 +388,7 @@ async fn get_ledger(
     Path(wallet): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<LedgerEntry>>, AppError> {
+    validate_wallet(&wallet)?;
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
     let repo = Repository::new(state.pool.clone());
