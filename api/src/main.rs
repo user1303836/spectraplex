@@ -14,9 +14,9 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-// App State to share DB Pool
 struct AppState {
     pool: PgPool,
+    solana_rpc_url: String,
 }
 
 #[tokio::main]
@@ -25,12 +25,18 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let solana_rpc_url = std::env::var("SOLANA_RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(&database_url)
         .await?;
 
-    let shared_state = Arc::new(AppState { pool });
+    let shared_state = Arc::new(AppState {
+        pool,
+        solana_rpc_url,
+    });
 
     let app = Router::new()
         .route("/health", get(health_check))
@@ -52,20 +58,16 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
-// Request Models
 #[derive(Deserialize)]
 struct IngestRequest {
     _chain: String,
     wallet: String,
-    rpc_url: String,
 }
 
 #[derive(Deserialize)]
 struct NormalizeRequest {
     wallet: String,
 }
-
-// Handlers
 
 async fn trigger_ingest(
     State(state): State<Arc<AppState>>,
@@ -83,7 +85,7 @@ async fn trigger_ingest(
                 })?
         }
         _ => {
-            let adapter = SolanaAdapter::new(&payload.rpc_url);
+            let adapter = SolanaAdapter::new(&state.solana_rpc_url);
             adapter
                 .fetch_history(&payload.wallet, 50)
                 .await
