@@ -1,6 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -19,6 +20,35 @@ use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use uuid::Uuid;
+
+struct AppError {
+    status: StatusCode,
+    message: String,
+}
+
+impl AppError {
+    fn internal(e: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: e.to_string(),
+        }
+    }
+
+    fn not_found(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: msg.into(),
+        }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        error!(status = %self.status, error = %self.message);
+        let body = serde_json::json!({ "error": self.message });
+        (self.status, Json(body)).into_response()
+    }
+}
 
 struct AppState {
     pool: sqlx::PgPool,
@@ -46,7 +76,7 @@ pub enum JobState {
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
-    let config = AppConfig::load().expect("Failed to load config");
+    let config = AppConfig::load()?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -120,7 +150,7 @@ fn clamp_offset(offset: Option<i64>) -> i64 {
 async fn trigger_ingest(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<IngestRequest>,
-) -> Result<Json<JobStatus>, StatusCode> {
+) -> Result<Json<JobStatus>, AppError> {
     let job_id = Uuid::new_v4();
     let job = JobStatus {
         id: job_id,
@@ -193,7 +223,7 @@ async fn trigger_ingest(
 async fn trigger_normalize(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<NormalizeRequest>,
-) -> Result<Json<JobStatus>, StatusCode> {
+) -> Result<Json<JobStatus>, AppError> {
     let job_id = Uuid::new_v4();
     let job = JobStatus {
         id: job_id,
@@ -268,11 +298,11 @@ async fn trigger_normalize(
 async fn get_job_status(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<Uuid>,
-) -> Result<Json<JobStatus>, StatusCode> {
+) -> Result<Json<JobStatus>, AppError> {
     let jobs = state.jobs.read().await;
     match jobs.get(&job_id) {
         Some(status) => Ok(Json(status.clone())),
-        None => Err(StatusCode::NOT_FOUND),
+        None => Err(AppError::not_found(format!("Job {} not found", job_id))),
     }
 }
 
@@ -280,17 +310,14 @@ async fn get_transactions(
     State(state): State<Arc<AppState>>,
     Path(wallet): Path<String>,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<Vec<Transaction>>, StatusCode> {
+) -> Result<Json<Vec<Transaction>>, AppError> {
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
     let repo = Repository::new(state.pool.clone());
     let txs = repo
         .get_transactions_by_wallet_paginated(&wallet, limit, offset)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to fetch transactions");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .map_err(AppError::internal)?;
     Ok(Json(txs))
 }
 
@@ -298,16 +325,13 @@ async fn get_ledger(
     State(state): State<Arc<AppState>>,
     Path(wallet): Path<String>,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<Vec<LedgerEntry>>, StatusCode> {
+) -> Result<Json<Vec<LedgerEntry>>, AppError> {
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
     let repo = Repository::new(state.pool.clone());
     let entries = repo
         .get_ledger_entries_by_wallet_paginated(&wallet, limit, offset)
         .await
-        .map_err(|e| {
-            error!(error = %e, "Failed to fetch ledger entries");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .map_err(AppError::internal)?;
     Ok(Json(entries))
 }
