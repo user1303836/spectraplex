@@ -5,7 +5,10 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use spectraplex_adapters::{repo::Repository, solana::SolanaAdapter, solana_parser};
+use spectraplex_adapters::{
+    hyperliquid::HyperliquidAdapter, hyperliquid_parser, repo::Repository, solana::SolanaAdapter,
+    solana_parser,
+};
 use spectraplex_core::models::{ChainIngestor, LedgerEntry, Transaction};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::net::SocketAddr;
@@ -68,18 +71,28 @@ async fn trigger_ingest(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<IngestRequest>,
 ) -> Result<Json<String>, StatusCode> {
-    // In a real system, this should spawn a background task or push to a queue (e.g. Redis/bullmq)
-    // For prototype, we'll just run it inline (blocking the request until done - not ideal for prod but ok for demo)
-
-    let adapter = SolanaAdapter::new(&payload.rpc_url);
-    // Hardcoded limit for API safety
-    let events = adapter
-        .fetch_history(&payload.wallet, 50)
-        .await
-        .map_err(|e| {
-            eprintln!("Ingest Error: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let events: Vec<Transaction> = match payload._chain.as_str() {
+        "hyperliquid" => {
+            let adapter = HyperliquidAdapter::new();
+            adapter
+                .fetch_history(&payload.wallet, 50)
+                .await
+                .map_err(|e| {
+                    eprintln!("Ingest Error: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
+        }
+        _ => {
+            let adapter = SolanaAdapter::new(&payload.rpc_url);
+            adapter
+                .fetch_history(&payload.wallet, 50)
+                .await
+                .map_err(|e| {
+                    eprintln!("Ingest Error: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
+        }
+    };
 
     let repo = Repository::new(state.pool.clone());
     repo.save_transactions(&events).await.map_err(|e| {
@@ -107,6 +120,9 @@ async fn trigger_normalize(
         let entries = match tx.chain {
             spectraplex_core::models::Chain::Solana => {
                 solana_parser::parse_solana_transaction(&tx).unwrap_or_default()
+            }
+            spectraplex_core::models::Chain::Hyperliquid => {
+                hyperliquid_parser::parse_hyperliquid_transaction(&tx).unwrap_or_default()
             }
             _ => vec![],
         };

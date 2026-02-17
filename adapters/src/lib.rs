@@ -1,3 +1,6 @@
+pub mod hyperliquid;
+pub mod hyperliquid_parser;
+pub mod hyperliquid_ws;
 pub mod repo;
 pub mod solana;
 pub mod solana_grpc;
