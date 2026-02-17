@@ -1,12 +1,16 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
+use alloy::consensus::Transaction as TransactionTrait;
 use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::{Filter, Log};
 use governor::{Quota, RateLimiter};
 use serde_json::json;
 use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
+use tracing::warn;
 use uuid::Uuid;
 
 /// Maximum block range per eth_getLogs request.
@@ -120,6 +124,60 @@ impl ChainIngestor for EvmAdapter {
 
         let logs = self.fetch_logs(address, from_block, latest_block).await?;
 
+        // Collect unique tx hashes so we can fetch receipts/transactions once per hash
+        let mut seen_tx_hashes: HashMap<String, (serde_json::Value, serde_json::Value)> =
+            HashMap::new();
+
+        for log in &logs {
+            let tx_hash_b256 = match log.transaction_hash {
+                Some(h) => h,
+                None => continue,
+            };
+            let tx_hash = format!("{tx_hash_b256:#x}");
+
+            if seen_tx_hashes.contains_key(&tx_hash) {
+                continue;
+            }
+
+            // Fetch transaction details (value, from, to) and receipt (gas_used, effective_gas_price)
+            let mut tx_fields = json!({});
+            let mut receipt_fields = json!({});
+
+            self.rate_limiter.until_ready().await;
+            match self.provider.get_transaction_by_hash(tx_hash_b256).await {
+                Ok(Some(full_tx)) => {
+                    let value = full_tx.inner.value();
+                    let from = full_tx.inner.signer();
+                    let to = full_tx.inner.to().map(|a| format!("{a:#x}"));
+                    tx_fields = json!({
+                        "value": format!("{value:#x}"),
+                        "from": format!("{from:#x}"),
+                        "to": to,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(tx_hash = %tx_hash, error = %e, "Failed to fetch transaction");
+                }
+            }
+
+            self.rate_limiter.until_ready().await;
+            match self.provider.get_transaction_receipt(tx_hash_b256).await {
+                Ok(Some(receipt)) => {
+                    receipt_fields = json!({
+                        "gas_used": format!("{:#x}", receipt.gas_used),
+                        "effective_gas_price": format!("{:#x}", receipt.effective_gas_price),
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(tx_hash = %tx_hash, error = %e, "Failed to fetch receipt");
+                }
+            }
+
+            seen_tx_hashes.insert(tx_hash, (tx_fields, receipt_fields));
+        }
+
         let mut transactions = Vec::new();
 
         for log in &logs {
@@ -130,7 +188,7 @@ impl ChainIngestor for EvmAdapter {
 
             let block_timestamp = log.block_timestamp.unwrap_or(0);
 
-            let raw_metadata = json!({
+            let mut raw_metadata = json!({
                 "log_index": log.log_index,
                 "block_number": log.block_number,
                 "block_hash": log.block_hash.map(|h| format!("{h:#x}")),
@@ -139,6 +197,18 @@ impl ChainIngestor for EvmAdapter {
                 "topics": log.topics().iter().map(|t| format!("{t:#x}")).collect::<Vec<_>>(),
                 "data": format!("0x{}", alloy::hex::encode(log.data().data.as_ref())),
             });
+
+            // Merge transaction and receipt fields into raw_metadata
+            if let Some((tx_fields, receipt_fields)) = seen_tx_hashes.get(&tx_hash) {
+                if let Some(obj) = raw_metadata.as_object_mut() {
+                    if let Some(tx_obj) = tx_fields.as_object() {
+                        obj.extend(tx_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    }
+                    if let Some(rx_obj) = receipt_fields.as_object() {
+                        obj.extend(rx_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    }
+                }
+            }
 
             transactions.push(Transaction {
                 id: Uuid::new_v4(),
