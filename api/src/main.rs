@@ -92,6 +92,7 @@ async fn health_check() -> &'static str {
 struct IngestRequest {
     _chain: String,
     wallet: String,
+    user_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +134,7 @@ async fn trigger_ingest(
     let wallet = payload.wallet.clone();
     let chain = payload._chain.clone();
     let limit = state.config.ingest_limit;
+    let user_id = payload.user_id.unwrap_or_else(Uuid::new_v4);
 
     tokio::spawn(async move {
         {
@@ -146,11 +148,11 @@ async fn trigger_ingest(
             let events: Vec<Transaction> = match chain.as_str() {
                 "hyperliquid" => {
                     let adapter = HyperliquidAdapter::new();
-                    adapter.fetch_history(&wallet, limit).await?
+                    adapter.fetch_history(&wallet, limit, user_id).await?
                 }
                 _ => {
                     let adapter = SolanaAdapter::new(&state_clone.config.solana_rpc_url);
-                    adapter.fetch_history(&wallet, limit).await?
+                    adapter.fetch_history(&wallet, limit, user_id).await?
                 }
             };
             let repo = Repository::new(state_clone.pool.clone());
