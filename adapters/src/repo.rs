@@ -1,4 +1,4 @@
-use spectraplex_core::models::{LedgerEntry, Transaction};
+use spectraplex_core::models::{Chain, IndexerCheckpoint, LedgerEntry, Transaction};
 use sqlx::{postgres::PgPool, Row};
 
 pub struct Repository {
@@ -152,5 +152,73 @@ impl Repository {
             });
         }
         Ok(entries)
+    }
+
+    pub async fn get_checkpoint(
+        &self,
+        chain: &str,
+        wallet: &str,
+    ) -> anyhow::Result<Option<IndexerCheckpoint>> {
+        let row = sqlx::query(
+            r#"
+            SELECT chain::text, wallet_address, last_signature, last_slot, last_timestamp
+            FROM indexer_checkpoints
+            WHERE chain = $1::chain_enum AND wallet_address = $2
+            "#,
+        )
+        .bind(chain)
+        .bind(wallet)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => {
+                let chain_str: String = row.try_get("chain")?;
+                let chain = match chain_str.as_str() {
+                    "solana" => Chain::Solana,
+                    "hyperliquid" => Chain::Hyperliquid,
+                    "ethereum" => Chain::Ethereum,
+                    _ => return Err(anyhow::anyhow!("Unknown chain: {}", chain_str)),
+                };
+                Ok(Some(IndexerCheckpoint {
+                    chain,
+                    wallet_address: row.try_get("wallet_address")?,
+                    last_signature: row.try_get("last_signature")?,
+                    last_slot: row.try_get("last_slot")?,
+                    last_timestamp: row.try_get("last_timestamp")?,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn save_checkpoint(&self, checkpoint: &IndexerCheckpoint) -> anyhow::Result<()> {
+        let chain_str = match checkpoint.chain {
+            Chain::Solana => "solana",
+            Chain::Hyperliquid => "hyperliquid",
+            Chain::Ethereum => "ethereum",
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO indexer_checkpoints (chain, wallet_address, last_signature, last_slot, last_timestamp, updated_at)
+            VALUES ($1::chain_enum, $2, $3, $4, $5, NOW())
+            ON CONFLICT (chain, wallet_address)
+            DO UPDATE SET
+                last_signature = EXCLUDED.last_signature,
+                last_slot = EXCLUDED.last_slot,
+                last_timestamp = EXCLUDED.last_timestamp,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(chain_str)
+        .bind(&checkpoint.wallet_address)
+        .bind(&checkpoint.last_signature)
+        .bind(checkpoint.last_slot)
+        .bind(checkpoint.last_timestamp)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 }

@@ -4,52 +4,82 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use spectraplex_adapters::{
     hyperliquid::HyperliquidAdapter, hyperliquid_parser, repo::Repository, solana::SolanaAdapter,
     solana_parser,
 };
+use spectraplex_core::config::AppConfig;
 use spectraplex_core::models::{ChainIngestor, LedgerEntry, Transaction};
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::RwLock;
+use tower_http::trace::TraceLayer;
+use tracing::{error, info};
+use uuid::Uuid;
 
 struct AppState {
-    pool: PgPool,
-    solana_rpc_url: String,
+    pool: sqlx::PgPool,
+    config: AppConfig,
+    jobs: RwLock<HashMap<Uuid, JobStatus>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobStatus {
+    pub id: Uuid,
+    pub state: JobState,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    Pending,
+    Running,
+    Completed,
+    Failed,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
-    tracing_subscriber::fmt::init();
 
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let solana_rpc_url = std::env::var("SOLANA_RPC_URL")
-        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    let config = AppConfig::load().expect("Failed to load config");
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| config.log_level.clone().into()),
+        )
+        .init();
 
     let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&database_url)
+        .max_connections(config.pool_size)
+        .connect(&config.database_url)
         .await?;
 
     let shared_state = Arc::new(AppState {
         pool,
-        solana_rpc_url,
+        config: config.clone(),
+        jobs: RwLock::new(HashMap::new()),
     });
 
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/v1/ingest", post(trigger_ingest))
         .route("/v1/normalize", post(trigger_normalize))
-        .route("/v1/transactions/:wallet", get(get_transactions))
-        .route("/v1/ledger/:wallet", get(get_ledger))
+        .route("/v1/jobs/{job_id}", get(get_job_status))
+        .route("/v1/transactions/{wallet}", get(get_transactions))
+        .route("/v1/ledger/{wallet}", get(get_ledger))
+        .layer(TraceLayer::new_for_http())
         .with_state(shared_state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    println!("Listening on {}", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
+    info!("Listening on {}", addr);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
@@ -72,73 +102,153 @@ struct NormalizeRequest {
 async fn trigger_ingest(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<IngestRequest>,
-) -> Result<Json<String>, StatusCode> {
-    let events: Vec<Transaction> = match payload._chain.as_str() {
-        "hyperliquid" => {
-            let adapter = HyperliquidAdapter::new();
-            adapter
-                .fetch_history(&payload.wallet, 50)
-                .await
-                .map_err(|e| {
-                    eprintln!("Ingest Error: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?
-        }
-        _ => {
-            let adapter = SolanaAdapter::new(&state.solana_rpc_url);
-            adapter
-                .fetch_history(&payload.wallet, 50)
-                .await
-                .map_err(|e| {
-                    eprintln!("Ingest Error: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?
-        }
+) -> Result<Json<JobStatus>, StatusCode> {
+    let job_id = Uuid::new_v4();
+    let job = JobStatus {
+        id: job_id,
+        state: JobState::Pending,
+        message: None,
     };
 
-    let repo = Repository::new(state.pool.clone());
-    repo.save_transactions(&events).await.map_err(|e| {
-        eprintln!("DB Error: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    state.jobs.write().await.insert(job_id, job.clone());
 
-    Ok(Json(format!("Ingested {} transactions", events.len())))
+    let state_clone = Arc::clone(&state);
+    let wallet = payload.wallet.clone();
+    let chain = payload._chain.clone();
+    let limit = state.config.ingest_limit;
+
+    tokio::spawn(async move {
+        {
+            let mut jobs = state_clone.jobs.write().await;
+            if let Some(j) = jobs.get_mut(&job_id) {
+                j.state = JobState::Running;
+            }
+        }
+
+        let result = async {
+            let events: Vec<Transaction> = match chain.as_str() {
+                "hyperliquid" => {
+                    let adapter = HyperliquidAdapter::new();
+                    adapter.fetch_history(&wallet, limit).await?
+                }
+                _ => {
+                    let adapter = SolanaAdapter::new(&state_clone.config.solana_rpc_url);
+                    adapter.fetch_history(&wallet, limit).await?
+                }
+            };
+            let repo = Repository::new(state_clone.pool.clone());
+            repo.save_transactions(&events).await?;
+            Ok::<usize, anyhow::Error>(events.len())
+        }
+        .await;
+
+        let mut jobs = state_clone.jobs.write().await;
+        if let Some(j) = jobs.get_mut(&job_id) {
+            match result {
+                Ok(count) => {
+                    info!(job_id = %job_id, count, "Ingestion completed");
+                    j.state = JobState::Completed;
+                    j.message = Some(format!("Ingested {} transactions", count));
+                }
+                Err(e) => {
+                    error!(job_id = %job_id, error = %e, "Ingestion failed");
+                    j.state = JobState::Failed;
+                    j.message = Some(e.to_string());
+                }
+            }
+        }
+    });
+
+    info!(job_id = %job_id, "Ingestion job queued");
+    Ok(Json(JobStatus {
+        id: job_id,
+        state: JobState::Pending,
+        message: Some("Job queued".to_string()),
+    }))
 }
 
 async fn trigger_normalize(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<NormalizeRequest>,
-) -> Result<Json<String>, StatusCode> {
-    let repo = Repository::new(state.pool.clone());
+) -> Result<Json<JobStatus>, StatusCode> {
+    let job_id = Uuid::new_v4();
+    let job = JobStatus {
+        id: job_id,
+        state: JobState::Pending,
+        message: None,
+    };
 
-    let txs = repo
-        .get_transactions_by_wallet(&payload.wallet)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state.jobs.write().await.insert(job_id, job.clone());
 
-    let mut all_entries = Vec::new();
+    let state_clone = Arc::clone(&state);
+    let wallet = payload.wallet.clone();
 
-    for tx in txs {
-        let entries = match tx.chain {
-            spectraplex_core::models::Chain::Solana => {
-                solana_parser::parse_solana_transaction(&tx).unwrap_or_default()
+    tokio::spawn(async move {
+        {
+            let mut jobs = state_clone.jobs.write().await;
+            if let Some(j) = jobs.get_mut(&job_id) {
+                j.state = JobState::Running;
             }
-            spectraplex_core::models::Chain::Hyperliquid => {
-                hyperliquid_parser::parse_hyperliquid_transaction(&tx).unwrap_or_default()
+        }
+
+        let result = async {
+            let repo = Repository::new(state_clone.pool.clone());
+            let txs = repo.get_transactions_by_wallet(&wallet).await?;
+
+            let mut all_entries = Vec::new();
+            for tx in txs {
+                let entries = match tx.chain {
+                    spectraplex_core::models::Chain::Solana => {
+                        solana_parser::parse_solana_transaction(&tx).unwrap_or_default()
+                    }
+                    spectraplex_core::models::Chain::Hyperliquid => {
+                        hyperliquid_parser::parse_hyperliquid_transaction(&tx).unwrap_or_default()
+                    }
+                    _ => vec![],
+                };
+                all_entries.extend(entries);
             }
-            _ => vec![],
-        };
-        all_entries.extend(entries);
+
+            let count = all_entries.len();
+            repo.save_ledger_entries(&all_entries).await?;
+            Ok::<usize, anyhow::Error>(count)
+        }
+        .await;
+
+        let mut jobs = state_clone.jobs.write().await;
+        if let Some(j) = jobs.get_mut(&job_id) {
+            match result {
+                Ok(count) => {
+                    info!(job_id = %job_id, count, "Normalization completed");
+                    j.state = JobState::Completed;
+                    j.message = Some(format!("Normalized {} ledger entries", count));
+                }
+                Err(e) => {
+                    error!(job_id = %job_id, error = %e, "Normalization failed");
+                    j.state = JobState::Failed;
+                    j.message = Some(e.to_string());
+                }
+            }
+        }
+    });
+
+    info!(job_id = %job_id, "Normalization job queued");
+    Ok(Json(JobStatus {
+        id: job_id,
+        state: JobState::Pending,
+        message: Some("Job queued".to_string()),
+    }))
+}
+
+async fn get_job_status(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<Uuid>,
+) -> Result<Json<JobStatus>, StatusCode> {
+    let jobs = state.jobs.read().await;
+    match jobs.get(&job_id) {
+        Some(status) => Ok(Json(status.clone())),
+        None => Err(StatusCode::NOT_FOUND),
     }
-
-    repo.save_ledger_entries(&all_entries)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Json(format!(
-        "Normalized {} ledger entries",
-        all_entries.len()
-    )))
 }
 
 async fn get_transactions(
@@ -149,7 +259,10 @@ async fn get_transactions(
     let txs = repo
         .get_transactions_by_wallet(&wallet)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            error!(error = %e, "Failed to fetch transactions");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     Ok(Json(txs))
 }
 
@@ -161,6 +274,9 @@ async fn get_ledger(
     let entries = repo
         .get_ledger_entries_by_wallet(&wallet)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            error!(error = %e, "Failed to fetch ledger entries");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     Ok(Json(entries))
 }

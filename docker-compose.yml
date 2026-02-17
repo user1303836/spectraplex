@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: spectraplex
+      POSTGRES_PASSWORD: spectraplex
+      POSTGRES_DB: spectraplex
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spectraplex"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://spectraplex:spectraplex@postgres:5432/spectraplex
+      SPECTRAPLEX_PORT: "3000"
+      SPECTRAPLEX_HOST: "0.0.0.0"
+      SPECTRAPLEX_LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["spectraplex-api"]
+
+volumes:
+  pgdata:
