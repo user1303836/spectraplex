@@ -16,6 +16,7 @@ use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
@@ -53,7 +54,24 @@ impl IntoResponse for AppError {
 struct AppState {
     pool: sqlx::PgPool,
     config: AppConfig,
-    jobs: RwLock<HashMap<Uuid, JobStatus>>,
+    jobs: RwLock<HashMap<Uuid, JobEntry>>,
+}
+
+/// Wraps a JobStatus with a timestamp for TTL-based cleanup.
+struct JobEntry {
+    status: JobStatus,
+    finished_at: Option<Instant>,
+}
+
+const JOB_TTL_SECS: u64 = 3600; // 1 hour
+
+impl AppState {
+    /// Remove completed/failed jobs older than JOB_TTL_SECS.
+    async fn prune_stale_jobs(&self) {
+        let mut jobs = self.jobs.write().await;
+        let cutoff = Instant::now() - std::time::Duration::from_secs(JOB_TTL_SECS);
+        jobs.retain(|_, entry| entry.finished_at.is_none_or(|finished| finished > cutoff));
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(shared_state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
+    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     info!("Listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -158,7 +176,13 @@ async fn trigger_ingest(
         message: None,
     };
 
-    state.jobs.write().await.insert(job_id, job.clone());
+    state.jobs.write().await.insert(
+        job_id,
+        JobEntry {
+            status: job.clone(),
+            finished_at: None,
+        },
+    );
 
     let state_clone = Arc::clone(&state);
     let wallet = payload.wallet.clone();
@@ -169,8 +193,8 @@ async fn trigger_ingest(
     tokio::spawn(async move {
         {
             let mut jobs = state_clone.jobs.write().await;
-            if let Some(j) = jobs.get_mut(&job_id) {
-                j.state = JobState::Running;
+            if let Some(entry) = jobs.get_mut(&job_id) {
+                entry.status.state = JobState::Running;
             }
         }
 
@@ -196,20 +220,23 @@ async fn trigger_ingest(
         .await;
 
         let mut jobs = state_clone.jobs.write().await;
-        if let Some(j) = jobs.get_mut(&job_id) {
+        if let Some(entry) = jobs.get_mut(&job_id) {
             match result {
                 Ok(count) => {
                     info!(job_id = %job_id, count, "Ingestion completed");
-                    j.state = JobState::Completed;
-                    j.message = Some(format!("Ingested {} transactions", count));
+                    entry.status.state = JobState::Completed;
+                    entry.status.message = Some(format!("Ingested {} transactions", count));
                 }
                 Err(e) => {
                     error!(job_id = %job_id, error = %e, "Ingestion failed");
-                    j.state = JobState::Failed;
-                    j.message = Some(e.to_string());
+                    entry.status.state = JobState::Failed;
+                    entry.status.message = Some(e.to_string());
                 }
             }
+            entry.finished_at = Some(Instant::now());
         }
+
+        state_clone.prune_stale_jobs().await;
     });
 
     info!(job_id = %job_id, "Ingestion job queued");
@@ -231,7 +258,13 @@ async fn trigger_normalize(
         message: None,
     };
 
-    state.jobs.write().await.insert(job_id, job.clone());
+    state.jobs.write().await.insert(
+        job_id,
+        JobEntry {
+            status: job.clone(),
+            finished_at: None,
+        },
+    );
 
     let state_clone = Arc::clone(&state);
     let wallet = payload.wallet.clone();
@@ -239,8 +272,8 @@ async fn trigger_normalize(
     tokio::spawn(async move {
         {
             let mut jobs = state_clone.jobs.write().await;
-            if let Some(j) = jobs.get_mut(&job_id) {
-                j.state = JobState::Running;
+            if let Some(entry) = jobs.get_mut(&job_id) {
+                entry.status.state = JobState::Running;
             }
         }
 
@@ -271,20 +304,23 @@ async fn trigger_normalize(
         .await;
 
         let mut jobs = state_clone.jobs.write().await;
-        if let Some(j) = jobs.get_mut(&job_id) {
+        if let Some(entry) = jobs.get_mut(&job_id) {
             match result {
                 Ok(count) => {
                     info!(job_id = %job_id, count, "Normalization completed");
-                    j.state = JobState::Completed;
-                    j.message = Some(format!("Normalized {} ledger entries", count));
+                    entry.status.state = JobState::Completed;
+                    entry.status.message = Some(format!("Normalized {} ledger entries", count));
                 }
                 Err(e) => {
                     error!(job_id = %job_id, error = %e, "Normalization failed");
-                    j.state = JobState::Failed;
-                    j.message = Some(e.to_string());
+                    entry.status.state = JobState::Failed;
+                    entry.status.message = Some(e.to_string());
                 }
             }
+            entry.finished_at = Some(Instant::now());
         }
+
+        state_clone.prune_stale_jobs().await;
     });
 
     info!(job_id = %job_id, "Normalization job queued");
@@ -301,7 +337,7 @@ async fn get_job_status(
 ) -> Result<Json<JobStatus>, AppError> {
     let jobs = state.jobs.read().await;
     match jobs.get(&job_id) {
-        Some(status) => Ok(Json(status.clone())),
+        Some(entry) => Ok(Json(entry.status.clone())),
         None => Err(AppError::not_found(format!("Job {} not found", job_id))),
     }
 }

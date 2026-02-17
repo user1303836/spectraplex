@@ -7105,6 +7105,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tokio-tungstenite 0.24.0",
+ "tracing",
  "uuid",
  "yellowstone-grpc-client",
  "yellowstone-grpc-proto",

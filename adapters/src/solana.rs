@@ -1,10 +1,10 @@
-use serde_json::json;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use solana_transaction_status::UiTransactionEncoding;
 use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
 use std::str::FromStr;
 use std::sync::Arc;
+use tracing::warn;
 use uuid::Uuid;
 
 pub struct SolanaAdapter {
@@ -41,7 +41,17 @@ impl ChainIngestor for SolanaAdapter {
 
                 match client.get_transaction(&sig, UiTransactionEncoding::Json) {
                     Ok(tx) => {
-                        let raw_metadata = serde_json::to_value(&tx).unwrap_or(json!({}));
+                        let raw_metadata = match serde_json::to_value(&tx) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!(
+                                    tx_hash = %sig_info.signature,
+                                    error = %e,
+                                    "Failed to serialize transaction metadata, using empty object"
+                                );
+                                serde_json::Value::Object(Default::default())
+                            }
+                        };
 
                         transactions.push(Transaction {
                             id: Uuid::new_v4(),
@@ -54,7 +64,11 @@ impl ChainIngestor for SolanaAdapter {
                         });
                     }
                     Err(e) => {
-                        eprintln!("Failed to fetch tx {}: {}", sig_info.signature, e);
+                        warn!(
+                            tx_hash = %sig_info.signature,
+                            error = %e,
+                            "Failed to fetch transaction, skipping"
+                        );
                     }
                 }
             }

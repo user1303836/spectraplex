@@ -153,36 +153,26 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Normalize { input, output } => {
-            let transactions = if let Some(p) = pool.clone() {
-                let input_str = input.to_string_lossy();
-                if input_str.starts_with("db:") {
-                    let wallet = input_str.strip_prefix("db:").unwrap();
-                    info!(wallet = %wallet, "Fetching transactions from DB");
-                    let repo = Repository::new(p);
-                    repo.get_transactions_by_wallet(wallet).await?
-                } else {
-                    info!(path = ?input, "Reading raw data from file");
-                    let file = File::open(&input)?;
-                    let reader = BufReader::new(file);
-                    let mut txs = Vec::new();
-                    for line in reader.lines() {
-                        let line = line?;
-                        let tx: Transaction = serde_json::from_str(&line)?;
-                        txs.push(tx);
-                    }
-                    txs
-                }
+            let input_str = input.to_string_lossy();
+            let transactions = if input_str.starts_with("db:") {
+                let wallet = input_str.strip_prefix("db:").unwrap();
+                let p = pool
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("--db-url is required for db: input"))?;
+                info!(wallet = %wallet, "Fetching transactions from DB");
+                let repo = Repository::new(p);
+                repo.get_transactions_by_wallet(wallet).await?
             } else {
                 info!(path = ?input, "Reading raw data from file");
                 let file = File::open(&input)?;
                 let reader = BufReader::new(file);
-                let mut txs = Vec::new();
-                for line in reader.lines() {
-                    let line = line?;
-                    let tx: Transaction = serde_json::from_str(&line)?;
-                    txs.push(tx);
-                }
-                txs
+                reader
+                    .lines()
+                    .map(|line| {
+                        let line = line?;
+                        Ok(serde_json::from_str(&line)?)
+                    })
+                    .collect::<anyhow::Result<Vec<Transaction>>>()?
             };
 
             let mut all_entries = Vec::new();
@@ -198,10 +188,6 @@ async fn main() -> anyhow::Result<()> {
                     }
                     spectraplex_core::models::Chain::Ethereum => {
                         evm_parser::parse_evm_transaction(&tx)?
-                    }
-                    _ => {
-                        warn!(chain = ?tx.chain, "Skipping unsupported chain for normalization");
-                        vec![]
                     }
                 };
                 all_entries.extend(entries);
