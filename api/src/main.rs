@@ -59,7 +59,7 @@ impl IntoResponse for AppError {
 }
 
 struct AppState {
-    pool: sqlx::PgPool,
+    repo: Repository,
     config: AppConfig,
     jobs: RwLock<HashMap<Uuid, JobEntry>>,
 }
@@ -116,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let shared_state = Arc::new(AppState {
-        pool,
+        repo: Repository::new(pool),
         config: config.clone(),
         jobs: RwLock::new(HashMap::new()),
     });
@@ -237,8 +237,7 @@ async fn trigger_ingest(
                     adapter.fetch_history(&wallet, limit, user_id).await?
                 }
             };
-            let repo = Repository::new(state_clone.pool.clone());
-            repo.save_transactions(&events).await?;
+            state_clone.repo.save_transactions(&events).await?;
             Ok::<usize, anyhow::Error>(events.len())
         }
         .await;
@@ -303,8 +302,7 @@ async fn trigger_normalize(
         }
 
         let result = async {
-            let repo = Repository::new(state_clone.pool.clone());
-            let txs = repo.get_transactions_by_wallet(&wallet).await?;
+            let txs = state_clone.repo.get_transactions_by_wallet(&wallet).await?;
 
             let mut all_entries = Vec::new();
             for tx in txs {
@@ -323,7 +321,7 @@ async fn trigger_normalize(
             }
 
             let count = all_entries.len();
-            repo.save_ledger_entries(&all_entries).await?;
+            state_clone.repo.save_ledger_entries(&all_entries).await?;
             Ok::<usize, anyhow::Error>(count)
         }
         .await;
@@ -375,8 +373,8 @@ async fn get_transactions(
     validate_wallet(&wallet)?;
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
-    let repo = Repository::new(state.pool.clone());
-    let txs = repo
+    let txs = state
+        .repo
         .get_transactions_by_wallet_paginated(&wallet, limit, offset)
         .await
         .map_err(AppError::internal)?;
@@ -391,8 +389,8 @@ async fn get_ledger(
     validate_wallet(&wallet)?;
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
-    let repo = Repository::new(state.pool.clone());
-    let entries = repo
+    let entries = state
+        .repo
         .get_ledger_entries_by_wallet_paginated(&wallet, limit, offset)
         .await
         .map_err(AppError::internal)?;

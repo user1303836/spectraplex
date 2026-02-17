@@ -275,7 +275,8 @@ fn test_spl_token_transfer() {
     let entries = solana_parser::parse_solana_transaction(&tx).expect("Parser failed");
 
     // Wallet is not fee payer (index 1), no SOL change for wallet, but has SPL token change
-    let token_entries: Vec<_> = entries.iter().filter(|e| e.asset_symbol == mint).collect();
+    // USDC mint resolves to "USDC" symbol
+    let token_entries: Vec<_> = entries.iter().filter(|e| e.asset_symbol == "USDC").collect();
     assert_eq!(token_entries.len(), 1, "Should have one SPL token entry");
     assert_eq!(token_entries[0].amount, bd("50.5"));
     assert!(matches!(token_entries[0].entry_type, EntryType::Transfer));
@@ -344,7 +345,8 @@ fn test_spl_token_send() {
     let tx = make_tx(wallet, meta);
     let entries = solana_parser::parse_solana_transaction(&tx).expect("Parser failed");
 
-    let token_entries: Vec<_> = entries.iter().filter(|e| e.asset_symbol == mint).collect();
+    // USDC mint resolves to "USDC" symbol
+    let token_entries: Vec<_> = entries.iter().filter(|e| e.asset_symbol == "USDC").collect();
     assert_eq!(token_entries.len(), 1);
     assert_eq!(token_entries[0].amount, bd("-75"));
 }
@@ -417,22 +419,28 @@ fn test_multi_asset_transaction() {
         .iter()
         .filter(|e| matches!(e.entry_type, EntryType::Fee))
         .collect();
+    // Wrapped SOL mint resolves to "SOL" symbol, so all SOL-related transfer
+    // entries share the same asset_symbol. Filter by amount to distinguish.
     let sol_transfers: Vec<_> = entries
         .iter()
         .filter(|e| e.asset_symbol == "SOL" && matches!(e.entry_type, EntryType::Transfer))
         .collect();
-    let token_entries: Vec<_> = entries.iter().filter(|e| e.asset_symbol == mint).collect();
 
     assert_eq!(fee_entries.len(), 1, "One fee entry");
     assert_eq!(fee_entries[0].amount, bd("-0.00001"));
 
-    // SOL transfer: total change = 4_899_990_000 - 5_000_000_000 = -100_010_000
-    // Fee = 10_000 lamports. Transfer = -100_010_000 + 10_000 = -100_000_000 = -0.1 SOL
-    assert_eq!(sol_transfers.len(), 1, "One SOL transfer entry");
-    assert_eq!(sol_transfers[0].amount, bd("-0.1"));
-
-    assert_eq!(token_entries.len(), 1, "One SPL token entry");
-    assert_eq!(token_entries[0].amount, bd("1"));
+    // Should have 2 SOL transfer entries: native SOL (-0.1) + wrapped SOL SPL token (+1)
+    assert_eq!(sol_transfers.len(), 2, "Native SOL + wrapped SOL transfers");
+    let native_sol: Vec<_> = sol_transfers
+        .iter()
+        .filter(|e| e.amount == bd("-0.1"))
+        .collect();
+    let wrapped_sol: Vec<_> = sol_transfers
+        .iter()
+        .filter(|e| e.amount == bd("1"))
+        .collect();
+    assert_eq!(native_sol.len(), 1, "One native SOL transfer");
+    assert_eq!(wrapped_sol.len(), 1, "One wrapped SOL SPL transfer");
 }
 
 // -----------------------------------------------------------------------
