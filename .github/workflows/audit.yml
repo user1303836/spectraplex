@@ -1,0 +1,25 @@
+name: Security Audit
+
+on:
+  schedule:
+    - cron: "0 0 * * 1" # Every Monday at midnight UTC
+  pull_request:
+    paths:
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
