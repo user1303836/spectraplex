@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(about = "Spectraplex CLI", long_about = None)]
@@ -47,6 +48,10 @@ enum Commands {
 
         #[arg(long, default_value_t = 10)]
         limit: usize,
+
+        /// User ID to associate with ingested transactions. Auto-generates if not provided.
+        #[arg(long)]
+        user_id: Option<Uuid>,
     },
     /// Normalize Bronze data to Silver layer (Ledger Entries)
     Normalize {
@@ -95,24 +100,30 @@ async fn main() -> anyhow::Result<()> {
             grpc_url,
             x_token,
             limit,
+            user_id,
         } => {
+            let user_id = user_id.unwrap_or_else(|| {
+                let id = Uuid::new_v4();
+                info!(user_id = %id, "No --user-id provided, auto-generated");
+                id
+            });
             info!(wallet = %wallet, chain = %chain, "Starting ingestion");
 
             let events = match chain.as_str() {
                 "solana" => {
                     if let Some(endpoint) = grpc_url {
                         let adapter = SolanaGrpcAdapter::new(&endpoint, x_token);
-                        adapter.fetch_history(&wallet, limit).await?
+                        adapter.fetch_history(&wallet, limit, user_id).await?
                     } else if let Some(rpc_url) = rpc {
                         let adapter = SolanaAdapter::new(&rpc_url);
-                        adapter.fetch_history(&wallet, limit).await?
+                        adapter.fetch_history(&wallet, limit, user_id).await?
                     } else {
                         anyhow::bail!("Either --grpc-url or --rpc must be provided for Solana");
                     }
                 }
                 "hyperliquid" => {
                     let adapter = HyperliquidAdapter::new();
-                    adapter.fetch_history(&wallet, limit).await?
+                    adapter.fetch_history(&wallet, limit, user_id).await?
                 }
                 _ => {
                     warn!(chain = %chain, "Unsupported chain");

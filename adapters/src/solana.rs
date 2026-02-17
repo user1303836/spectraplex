@@ -21,7 +21,7 @@ impl SolanaAdapter {
 
 #[async_trait::async_trait]
 impl ChainIngestor for SolanaAdapter {
-    async fn fetch_history(&self, wallet: &str, limit: usize) -> anyhow::Result<Vec<Transaction>> {
+    async fn fetch_history(&self, wallet: &str, limit: usize, user_id: Uuid) -> anyhow::Result<Vec<Transaction>> {
         let client = self.client.clone();
         let wallet = wallet.to_string();
 
@@ -40,7 +40,7 @@ impl ChainIngestor for SolanaAdapter {
 
                         transactions.push(Transaction {
                             id: Uuid::new_v4(),
-                            user_id: Uuid::nil(), // Placeholder
+                            user_id,
                             wallet_address: wallet.to_string(),
                             timestamp: tx.block_time.unwrap_or(0),
                             tx_hash: sig_info.signature.clone(),

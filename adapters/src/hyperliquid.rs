@@ -158,7 +158,7 @@ impl HyperliquidAdapter {
 
 #[async_trait::async_trait]
 impl ChainIngestor for HyperliquidAdapter {
-    async fn fetch_history(&self, wallet: &str, limit: usize) -> anyhow::Result<Vec<Transaction>> {
+    async fn fetch_history(&self, wallet: &str, limit: usize, user_id: Uuid) -> anyhow::Result<Vec<Transaction>> {
         let mut transactions = Vec::new();
 
         // 1. Fetch fills (trades)
@@ -167,7 +167,7 @@ impl ChainIngestor for HyperliquidAdapter {
             let raw = serde_json::to_value(fill)?;
             transactions.push(Transaction {
                 id: Uuid::new_v4(),
-                user_id: Uuid::nil(),
+                user_id,
                 wallet_address: wallet.to_string(),
                 timestamp: (fill.time / 1000) as i64, // HL timestamps are in ms
                 tx_hash: fill.hash.clone(),
@@ -186,7 +186,7 @@ impl ChainIngestor for HyperliquidAdapter {
                 .unwrap_or_else(|| format!("funding-{}-{}", entry.coin, entry.time));
             transactions.push(Transaction {
                 id: Uuid::new_v4(),
-                user_id: Uuid::nil(),
+                user_id,
                 wallet_address: wallet.to_string(),
                 timestamp: (entry.time / 1000) as i64,
                 tx_hash: hash,
@@ -201,7 +201,7 @@ impl ChainIngestor for HyperliquidAdapter {
             let raw = serde_json::to_value(update)?;
             transactions.push(Transaction {
                 id: Uuid::new_v4(),
-                user_id: Uuid::nil(),
+                user_id,
                 wallet_address: wallet.to_string(),
                 timestamp: (update.time / 1000) as i64,
                 tx_hash: update.hash.clone(),
@@ -337,7 +337,7 @@ mod tests {
 
         let adapter = HyperliquidAdapter::with_base_url(&base_url);
         let txs = adapter
-            .fetch_history("0x1234567890abcdef1234567890abcdef12345678", 10)
+            .fetch_history("0x1234567890abcdef1234567890abcdef12345678", 10, Uuid::new_v4())
             .await
             .unwrap();
 
