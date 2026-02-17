@@ -21,7 +21,12 @@ impl SolanaAdapter {
 
 #[async_trait::async_trait]
 impl ChainIngestor for SolanaAdapter {
-    async fn fetch_history(&self, wallet: &str, limit: usize, user_id: Uuid) -> anyhow::Result<Vec<Transaction>> {
+    async fn fetch_history(
+        &self,
+        wallet: &str,
+        limit: usize,
+        user_id: Uuid,
+    ) -> anyhow::Result<Vec<Transaction>> {
         let client = self.client.clone();
         let wallet = wallet.to_string();
 

@@ -151,8 +151,7 @@ async fn trigger_ingest(
                     adapter.fetch_history(&wallet, limit, user_id).await?
                 }
                 "ethereum" => {
-                    let adapter =
-                        EvmAdapter::new(&state_clone.config.evm_rpc_url).await?;
+                    let adapter = EvmAdapter::new(&state_clone.config.evm_rpc_url).await?;
                     adapter.fetch_history(&wallet, limit, user_id).await?
                 }
                 _ => {
@@ -226,8 +225,7 @@ async fn trigger_normalize(
                         solana_parser::parse_solana_transaction(&tx).unwrap_or_default()
                     }
                     spectraplex_core::models::Chain::Hyperliquid => {
-                        hyperliquid_parser::parse_hyperliquid_transaction(&tx)
-                            .unwrap_or_default()
+                        hyperliquid_parser::parse_hyperliquid_transaction(&tx).unwrap_or_default()
                     }
                     spectraplex_core::models::Chain::Ethereum => {
                         evm_parser::parse_evm_transaction(&tx).unwrap_or_default()

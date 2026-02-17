@@ -39,6 +39,10 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
                     .unwrap_or("unknown")
                     .to_string();
 
+                let decimals = token_decimals(&token_address);
+                let symbol = token_symbol(&token_address);
+                let normalized = normalize_amount(amount_raw, decimals);
+
                 // Determine if this wallet sent or received
                 if from == wallet {
                     // Outgoing transfer
@@ -47,8 +51,8 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
                         transaction_id: tx.id,
                         user_id: tx.user_id,
                         wallet_address: tx.wallet_address.clone(),
-                        asset_symbol: token_address.clone(),
-                        amount: raw_to_decimal(amount_raw, true),
+                        asset_symbol: symbol.clone(),
+                        amount: negate(normalized.clone()),
                         entry_type: EntryType::Transfer,
                         fiat_value: None,
                     });
@@ -61,8 +65,8 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
                         transaction_id: tx.id,
                         user_id: tx.user_id,
                         wallet_address: tx.wallet_address.clone(),
-                        asset_symbol: token_address,
-                        amount: raw_to_decimal(amount_raw, false),
+                        asset_symbol: symbol,
+                        amount: normalized,
                         entry_type: EntryType::Transfer,
                         fiat_value: None,
                     });
@@ -177,16 +181,45 @@ fn wei_to_eth(wei: u128) -> BigDecimal {
     wei_bd / divisor
 }
 
-/// Convert a raw token amount to BigDecimal.
-/// If `negate_it` is true, the amount is negative (outgoing).
-fn raw_to_decimal(raw: u128, negate_it: bool) -> BigDecimal {
-    use bigdecimal::FromPrimitive;
-    let bd = BigDecimal::from_u128(raw).unwrap_or_default();
-    if negate_it {
-        -bd
-    } else {
-        bd
+/// Lookup the number of decimals for well-known ERC-20 tokens.
+/// Defaults to 18 for unknown tokens.
+fn token_decimals(contract_address: &str) -> u32 {
+    match contract_address.to_lowercase().as_str() {
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" => 6, // USDC
+        "0xdac17f958d2ee523a2206206994597c13d831ec7" => 6, // USDT
+        "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599" => 8, // WBTC
+        "0x6b175474e89094c44da98b954eedeac495271d0f" => 18, // DAI
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2" => 18, // WETH
+        "0x514910771af9ca656af840dff83e8264ecf986ca" => 18, // LINK
+        "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984" => 18, // UNI
+        "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce" => 18, // SHIB
+        _ => 18,
     }
+}
+
+/// Lookup a human-readable symbol for well-known ERC-20 tokens.
+/// Falls back to the contract address for unknown tokens.
+fn token_symbol(contract_address: &str) -> String {
+    match contract_address.to_lowercase().as_str() {
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" => "USDC".to_string(),
+        "0xdac17f958d2ee523a2206206994597c13d831ec7" => "USDT".to_string(),
+        "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599" => "WBTC".to_string(),
+        "0x6b175474e89094c44da98b954eedeac495271d0f" => "DAI".to_string(),
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2" => "WETH".to_string(),
+        "0x514910771af9ca656af840dff83e8264ecf986ca" => "LINK".to_string(),
+        "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984" => "UNI".to_string(),
+        "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce" => "SHIB".to_string(),
+        _ => contract_address.to_string(),
+    }
+}
+
+/// Normalize a raw token amount by dividing by 10^decimals.
+fn normalize_amount(raw: u128, decimals: u32) -> BigDecimal {
+    use bigdecimal::FromPrimitive;
+    let raw_bd = BigDecimal::from_u128(raw).unwrap_or_default();
+    let divisor =
+        BigDecimal::from_u128(10u128.pow(decimals)).unwrap_or_else(|| BigDecimal::from(1));
+    raw_bd / divisor
 }
 
 /// Negate a BigDecimal value.
@@ -238,10 +271,9 @@ mod tests {
         let entries = parse_evm_transaction(&tx).unwrap();
 
         assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].asset_symbol,
-            "0xdac17f958d2ee523a2206206994597c13d831ec7"
-        );
+        // USDT is a known token, so symbol should be resolved
+        assert_eq!(entries[0].asset_symbol, "USDT");
+        // 1e18 raw with 6 decimals = 1e12 normalized
         assert!(entries[0].amount > BigDecimal::from(0));
         assert!(matches!(entries[0].entry_type, EntryType::Transfer));
     }
@@ -330,5 +362,58 @@ mod tests {
         let tx = make_tx(metadata);
         let entries = parse_evm_transaction(&tx).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_token_decimals_known() {
+        assert_eq!(
+            token_decimals("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+            6
+        ); // USDC
+        assert_eq!(
+            token_decimals("0xdac17f958d2ee523a2206206994597c13d831ec7"),
+            6
+        ); // USDT
+        assert_eq!(
+            token_decimals("0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"),
+            8
+        ); // WBTC
+    }
+
+    #[test]
+    fn test_token_decimals_unknown_defaults_to_18() {
+        assert_eq!(
+            token_decimals("0x0000000000000000000000000000000000000001"),
+            18
+        );
+    }
+
+    #[test]
+    fn test_token_symbol_known() {
+        assert_eq!(
+            token_symbol("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+            "USDC"
+        );
+        assert_eq!(
+            token_symbol("0xdac17f958d2ee523a2206206994597c13d831ec7"),
+            "USDT"
+        );
+    }
+
+    #[test]
+    fn test_token_symbol_unknown_returns_address() {
+        let addr = "0x0000000000000000000000000000000000000001";
+        assert_eq!(token_symbol(addr), addr);
+    }
+
+    #[test]
+    fn test_normalize_amount() {
+        // 1_000_000 raw with 6 decimals = 1.0
+        let result = normalize_amount(1_000_000, 6);
+        assert_eq!(result, BigDecimal::from(1));
+
+        // 100_000_000 raw with 8 decimals = 1.0
+        let result = normalize_amount(100_000_000, 8);
+        assert_eq!(result, BigDecimal::from(1));
     }
 }
