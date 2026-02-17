@@ -4,16 +4,17 @@ use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use solana_transaction_status::UiTransactionEncoding;
 use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
 use std::str::FromStr;
+use std::sync::Arc;
 use uuid::Uuid;
 
 pub struct SolanaAdapter {
-    client: RpcClient,
+    client: Arc<RpcClient>,
 }
 
 impl SolanaAdapter {
     pub fn new(rpc_url: &str) -> Self {
         Self {
-            client: RpcClient::new(rpc_url.to_string()),
+            client: Arc::new(RpcClient::new(rpc_url.to_string())),
         }
     }
 }
@@ -21,42 +22,40 @@ impl SolanaAdapter {
 #[async_trait::async_trait]
 impl ChainIngestor for SolanaAdapter {
     async fn fetch_history(&self, wallet: &str, limit: usize) -> anyhow::Result<Vec<Transaction>> {
-        let pubkey = Pubkey::from_str(wallet)?;
-        // Fetch signatures (transaction history list)
-        let signatures = self.client.get_signatures_for_address(&pubkey)?;
+        let client = self.client.clone();
+        let wallet = wallet.to_string();
 
-        let mut transactions = Vec::new();
+        tokio::task::spawn_blocking(move || {
+            let pubkey = Pubkey::from_str(&wallet)?;
+            let signatures = client.get_signatures_for_address(&pubkey)?;
 
-        for sig_info in signatures.iter().take(limit) {
-            let sig = Signature::from_str(&sig_info.signature)?;
+            let mut transactions = Vec::new();
 
-            // Fetch full transaction details in JSON format
-            // We use UiTransactionEncoding::JsonParsed to get as much detail as possible,
-            // or Json for raw structure. "Json" is often safer for raw storage.
-            match self
-                .client
-                .get_transaction(&sig, UiTransactionEncoding::Json)
-            {
-                Ok(tx) => {
-                    // Serialize the entire response to a JSON Value
-                    let raw_metadata = serde_json::to_value(&tx).unwrap_or(json!({}));
+            for sig_info in signatures.iter().take(limit) {
+                let sig = Signature::from_str(&sig_info.signature)?;
 
-                    transactions.push(Transaction {
-                        id: Uuid::new_v4(),
-                        user_id: Uuid::nil(), // Placeholder
-                        wallet_address: wallet.to_string(),
-                        timestamp: tx.block_time.unwrap_or(0),
-                        tx_hash: sig_info.signature.clone(),
-                        chain: Chain::Solana,
-                        raw_metadata,
-                    });
-                }
-                Err(e) => {
-                    eprintln!("Failed to fetch tx {}: {}", sig_info.signature, e);
+                match client.get_transaction(&sig, UiTransactionEncoding::Json) {
+                    Ok(tx) => {
+                        let raw_metadata = serde_json::to_value(&tx).unwrap_or(json!({}));
+
+                        transactions.push(Transaction {
+                            id: Uuid::new_v4(),
+                            user_id: Uuid::nil(), // Placeholder
+                            wallet_address: wallet.to_string(),
+                            timestamp: tx.block_time.unwrap_or(0),
+                            tx_hash: sig_info.signature.clone(),
+                            chain: Chain::Solana,
+                            raw_metadata,
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to fetch tx {}: {}", sig_info.signature, e);
+                    }
                 }
             }
-        }
 
-        Ok(transactions)
+            Ok(transactions)
+        })
+        .await?
     }
 }
