@@ -11,7 +11,7 @@ Spectraplex is a multi-chain blockchain transaction indexer written in Rust. It 
 |-------|-----------|---------|---------------------|--------|
 | Solana | RPC + gRPC | SOL + SPL tokens | Yellowstone gRPC | Active |
 | Hyperliquid | REST + WebSocket | Planned | WebSocket | In progress |
-| Ethereum (EVM) | alloy | Planned | Planned | In progress |
+| Ethereum (EVM) | alloy (eth_getLogs) | ERC-20 transfers, ETH transfers, gas fees | Planned | Active |
 
 ## Architecture
 
@@ -38,7 +38,7 @@ Spectraplex is a multi-chain blockchain transaction indexer written in Rust. It 
           |  - SolanaAdapter (RPC)           |
           |  - SolanaGrpcAdapter (gRPC)      |
           |  - HyperliquidAdapter (planned)  |
-          |  - EvmAdapter (planned)          |
+          |  - EvmAdapter (alloy)            |
           +----------------------------------+
                          |
                          v
@@ -106,6 +106,16 @@ cargo run --release --bin spectraplex-cli -- ingest \
   --limit 10
 ```
 
+Fetch Ethereum (or any EVM chain) transactions for a wallet:
+
+```bash
+cargo run --release --bin spectraplex-cli -- ingest \
+  --chain ethereum \
+  --wallet <ETH_ADDRESS> \
+  --rpc https://eth-mainnet.g.alchemy.com/v2/<API_KEY> \
+  --limit 5
+```
+
 ### 5. Normalize to ledger entries
 
 From the database:
@@ -156,15 +166,15 @@ The CLI binary is `spectraplex-cli`. All commands accept a global `--db-url` fla
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
-| `-c, --chain` | Yes | -- | Blockchain name (`solana`) |
+| `-c, --chain` | Yes | -- | Blockchain name (`solana`, `ethereum`) |
 | `-w, --wallet` | Yes | -- | Wallet address to index |
 | `-o, --output` | No | `bronze_transactions.jsonl` | Output file (when no DB) |
-| `--rpc` | No* | -- | Solana RPC URL |
+| `--rpc` | No* | -- | RPC URL (Solana RPC or EVM JSON-RPC) |
 | `--grpc-url` | No* | -- | Yellowstone gRPC endpoint |
 | `--x-token` | No | -- | gRPC auth token |
 | `--limit` | No | `10` | Max transactions to fetch |
 
-*Either `--rpc` or `--grpc-url` is required for Solana.
+*`--rpc` is required for Solana (or `--grpc-url`) and Ethereum.
 
 ### `normalize` flags
 
@@ -256,12 +266,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ### Database schema
 
-The schema uses two main tables:
+The schema uses the following tables:
 
 - **`transactions`** -- Bronze layer. Stores raw blockchain data as JSONB. Indexed by wallet address and timestamp.
 - **`ledger_entries`** -- Silver layer. Normalized financial records. Indexed by wallet address and creation time.
+- **`blocks`** -- Stores block hashes per chain for reorg detection (EVM chains).
+- **`evm_logs`** -- Raw EVM event logs linked to transactions.
 
-Both tables use UUIDs as primary keys and support idempotent inserts (`ON CONFLICT DO NOTHING`).
+Both main tables use UUIDs as primary keys and support idempotent inserts (`ON CONFLICT DO NOTHING`).
 
 ## Tech Stack
 
@@ -273,6 +285,7 @@ Both tables use UUIDs as primary keys and support idempotent inserts (`ON CONFLI
 | API Framework | Axum 0.7 |
 | CLI Framework | Clap 4 (derive) |
 | Solana | solana-sdk 3.0, Yellowstone gRPC |
+| Ethereum (EVM) | alloy 1.x, governor (rate limiting) |
 | Serialization | serde / serde_json |
 | Precision Math | BigDecimal |
 
@@ -284,7 +297,7 @@ Both tables use UUIDs as primary keys and support idempotent inserts (`ON CONFLI
 - [x] CI/CD with GitHub Actions
 - [ ] Yellowstone gRPC real-time streaming
 - [ ] Hyperliquid adapter (REST + WebSocket)
-- [ ] EVM adapter (Ethereum and compatibles)
+- [x] EVM adapter (Ethereum and compatibles)
 - [ ] Improved entry type classification (trades, fees, staking)
 - [ ] Historical price lookups for fiat value
 - [ ] Docker Compose deployment
