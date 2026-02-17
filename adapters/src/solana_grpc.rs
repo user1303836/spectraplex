@@ -19,7 +19,7 @@ use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
 /// Default program IDs to monitor when none are specified.
 const DEFAULT_PROGRAM_IDS: &[&str] = &[
     "11111111111111111111111111111111",             // System Program
-    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // Token Program
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  // Token Program
     "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL", // Associated Token Program
 ];
 
@@ -38,10 +38,7 @@ impl Default for GrpcStreamConfig {
         Self {
             endpoint: String::new(),
             x_token: None,
-            program_ids: DEFAULT_PROGRAM_IDS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            program_ids: DEFAULT_PROGRAM_IDS.iter().map(|s| s.to_string()).collect(),
             commitment: CommitmentLevel::Confirmed,
             max_retries: 10,
             channel_capacity: 10_000,
@@ -164,10 +161,7 @@ impl SolanaGrpcAdapter {
     /// resuming from the last checkpointed slot.
     pub fn stream_transactions(
         &self,
-    ) -> (
-        mpsc::Receiver<Transaction>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> (mpsc::Receiver<Transaction>, tokio::task::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(self.config.channel_capacity);
         let config_endpoint = self.config.endpoint.clone();
         let config_x_token = self.config.x_token.clone();
@@ -194,7 +188,11 @@ impl SolanaGrpcAdapter {
             loop {
                 let from_slot = {
                     let last = checkpoint.get();
-                    if last > 0 { Some(last) } else { None }
+                    if last > 0 {
+                        Some(last)
+                    } else {
+                        None
+                    }
                 };
 
                 info!(
@@ -285,16 +283,16 @@ impl ChainIngestor for SolanaGrpcAdapter {
     ///
     /// The `wallet` parameter is used as the wallet_address on collected transactions.
     /// For real-time streaming, use `stream_transactions()` instead.
-    async fn fetch_history(
-        &self,
-        wallet: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<Transaction>> {
+    async fn fetch_history(&self, wallet: &str, limit: usize) -> anyhow::Result<Vec<Transaction>> {
         let mut client = self.connect_client().await?;
 
         let from_slot = {
             let last = self.checkpoint.get();
-            if last > 0 { Some(last) } else { None }
+            if last > 0 {
+                Some(last)
+            } else {
+                None
+            }
         };
         let request = self.build_subscribe_request(from_slot);
         let mut stream = client.subscribe_once(request).await?;
@@ -501,9 +499,7 @@ mod tests {
         post_balances: Vec<u64>,
         account_keys: Vec<Vec<u8>>,
     ) -> SubscribeUpdateTransactionInfo {
-        use yellowstone_grpc_proto::prelude::{
-            Message, MessageHeader, Transaction as ProtoTx,
-        };
+        use yellowstone_grpc_proto::prelude::{Message, MessageHeader, Transaction as ProtoTx};
 
         SubscribeUpdateTransactionInfo {
             signature: make_test_signature(),
@@ -583,7 +579,8 @@ mod tests {
 
     #[test]
     fn test_convert_grpc_transaction_with_token_balances() {
-        let mut tx_info = make_test_tx_info(vec![1_000_000_000], vec![999_000_000], vec![vec![1u8; 32]]);
+        let mut tx_info =
+            make_test_tx_info(vec![1_000_000_000], vec![999_000_000], vec![vec![1u8; 32]]);
 
         if let Some(meta) = tx_info.meta.as_mut() {
             meta.pre_token_balances = vec![TokenBalance {
@@ -619,7 +616,10 @@ mod tests {
         let meta = &transaction.raw_metadata["meta"];
 
         let pre_tok = &meta["preTokenBalances"];
-        assert_eq!(pre_tok[0]["mint"], "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+        assert_eq!(
+            pre_tok[0]["mint"],
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        );
         assert_eq!(pre_tok[0]["uiTokenAmount"]["uiAmount"], 100.0);
 
         let post_tok = &meta["postTokenBalances"];
@@ -636,19 +636,15 @@ mod tests {
 
         let transaction = result.unwrap();
         assert_eq!(transaction.raw_metadata["meta"]["fee"], 0);
-        assert_eq!(
-            transaction.raw_metadata["meta"]["preBalances"],
-            json!([])
-        );
+        assert_eq!(transaction.raw_metadata["meta"]["preBalances"], json!([]));
     }
 
     #[test]
     fn test_convert_grpc_transaction_failed_tx() {
         let mut tx_info = make_test_tx_info(vec![1000], vec![1000], vec![vec![0u8; 32]]);
         if let Some(meta) = tx_info.meta.as_mut() {
-            meta.err = Some(yellowstone_grpc_proto::prelude::TransactionError {
-                err: vec![1, 2, 3],
-            });
+            meta.err =
+                Some(yellowstone_grpc_proto::prelude::TransactionError { err: vec![1, 2, 3] });
         }
 
         let result = convert_grpc_transaction(&tx_info, 42);
@@ -692,16 +688,15 @@ mod tests {
         let request = adapter.build_subscribe_request(Some(12345));
 
         assert_eq!(request.from_slot, Some(12345));
-        assert_eq!(
-            request.commitment,
-            Some(CommitmentLevel::Confirmed as i32)
-        );
+        assert_eq!(request.commitment, Some(CommitmentLevel::Confirmed as i32));
     }
 
     #[test]
     fn test_build_subscribe_request_custom_programs() {
         let mut adapter = SolanaGrpcAdapter::new("http://localhost:10000", None);
-        adapter.set_program_ids(vec!["CustomProgram111111111111111111111111111111".to_string()]);
+        adapter.set_program_ids(vec![
+            "CustomProgram111111111111111111111111111111".to_string()
+        ]);
 
         let request = adapter.build_subscribe_request(None);
         let filter = &request.transactions["tx_filter"];
