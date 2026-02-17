@@ -29,7 +29,7 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
                     .get("data")
                     .and_then(|d| d.as_str())
                     .unwrap_or("0x0");
-                let amount_raw = hex_to_u128(data_hex);
+                let amount_bd = hex_to_bigdecimal(data_hex);
 
                 // The contract address is the token address
                 let token_address = tx
@@ -41,7 +41,7 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
 
                 let decimals = token_decimals(&token_address);
                 let symbol = token_symbol(&token_address);
-                let normalized = normalize_amount(amount_raw, decimals);
+                let normalized = normalize_bigdecimal(amount_bd, decimals);
 
                 // Determine if this wallet sent or received
                 if from == wallet {
@@ -164,7 +164,29 @@ fn topic_to_address(topic: &str) -> String {
     }
 }
 
+/// Parse a hex string (with optional 0x prefix) into BigDecimal.
+/// Handles full uint256 range without truncation.
+fn hex_to_bigdecimal(hex: &str) -> BigDecimal {
+    let stripped = hex.strip_prefix("0x").unwrap_or(hex);
+    if stripped.is_empty() {
+        return BigDecimal::from(0);
+    }
+    // Parse hex digits in chunks to build a BigDecimal without overflow
+    let mut result = BigDecimal::from(0);
+    let base = BigDecimal::from(16);
+    for ch in stripped.chars() {
+        let digit = match ch.to_ascii_lowercase() {
+            '0'..='9' => ch as u32 - '0' as u32,
+            'a'..='f' => ch as u32 - 'a' as u32 + 10,
+            _ => return BigDecimal::from(0),
+        };
+        result = result * &base + BigDecimal::from(digit);
+    }
+    result
+}
+
 /// Parse a hex string (with optional 0x prefix) into u128.
+/// Suitable for values known to fit in u128 (e.g., gas values).
 fn hex_to_u128(hex: &str) -> u128 {
     let stripped = hex.strip_prefix("0x").unwrap_or(hex);
     if stripped.is_empty() {
@@ -214,12 +236,12 @@ fn token_symbol(contract_address: &str) -> String {
 }
 
 /// Normalize a raw token amount by dividing by 10^decimals.
-fn normalize_amount(raw: u128, decimals: u32) -> BigDecimal {
-    use bigdecimal::FromPrimitive;
-    let raw_bd = BigDecimal::from_u128(raw).unwrap_or_default();
-    let divisor =
-        BigDecimal::from_u128(10u128.pow(decimals)).unwrap_or_else(|| BigDecimal::from(1));
-    raw_bd / divisor
+/// Normalize a BigDecimal raw amount by dividing by 10^decimals.
+fn normalize_bigdecimal(raw: BigDecimal, decimals: u32) -> BigDecimal {
+    use std::str::FromStr;
+    let divisor = BigDecimal::from_str(&format!("1{}", "0".repeat(decimals as usize)))
+        .unwrap_or_else(|_| BigDecimal::from(1));
+    raw / divisor
 }
 
 /// Negate a BigDecimal value.
@@ -407,13 +429,25 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_amount() {
+    fn test_normalize_bigdecimal() {
         // 1_000_000 raw with 6 decimals = 1.0
-        let result = normalize_amount(1_000_000, 6);
+        let result = normalize_bigdecimal(BigDecimal::from(1_000_000), 6);
         assert_eq!(result, BigDecimal::from(1));
 
         // 100_000_000 raw with 8 decimals = 1.0
-        let result = normalize_amount(100_000_000, 8);
+        let result = normalize_bigdecimal(BigDecimal::from(100_000_000), 8);
         assert_eq!(result, BigDecimal::from(1));
+    }
+
+    #[test]
+    fn test_hex_to_bigdecimal() {
+        // Small value
+        assert_eq!(hex_to_bigdecimal("0xff"), BigDecimal::from(255));
+        // u128 max = 0xffffffffffffffffffffffffffffffff
+        let u128_max = hex_to_bigdecimal("0xffffffffffffffffffffffffffffffff");
+        assert_eq!(u128_max, BigDecimal::from(u128::MAX));
+        // Value larger than u128 (u128::MAX + 1)
+        let over_u128 = hex_to_bigdecimal("0x100000000000000000000000000000000");
+        assert!(over_u128 > BigDecimal::from(u128::MAX));
     }
 }
