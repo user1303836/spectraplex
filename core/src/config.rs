@@ -13,6 +13,7 @@ pub struct AppConfig {
     pub log_level: String,
     pub ingest_limit: usize,
     pub solana_rpc_url: String,
+    pub evm_rpc_url: String,
 }
 
 impl Default for AppConfig {
@@ -25,6 +26,7 @@ impl Default for AppConfig {
             log_level: "info".to_string(),
             ingest_limit: 50,
             solana_rpc_url: "https://api.mainnet-beta.solana.com".to_string(),
+            evm_rpc_url: "https://eth.llamarpc.com".to_string(),
         }
     }
 }
@@ -35,7 +37,7 @@ impl AppConfig {
             .merge(Serialized::defaults(AppConfig::default()))
             .merge(Toml::file("spectraplex.toml"))
             .merge(Env::prefixed("SPECTRAPLEX_"))
-            .merge(Env::raw().only(&["DATABASE_URL", "SOLANA_RPC_URL"]))
+            .merge(Env::raw().only(&["DATABASE_URL", "SOLANA_RPC_URL", "EVM_RPC_URL"]))
             .extract()
             .map_err(Box::new)
     }
