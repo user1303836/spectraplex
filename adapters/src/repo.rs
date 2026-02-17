@@ -1,4 +1,4 @@
-use spectraplex_core::models::{Transaction, LedgerEntry};
+use spectraplex_core::models::{LedgerEntry, Transaction};
 use sqlx::{postgres::PgPool, Row};
 
 pub struct Repository {
@@ -48,7 +48,7 @@ impl Repository {
                 spectraplex_core::models::EntryType::Staking => "staking",
                 spectraplex_core::models::EntryType::Income => "income",
             };
-            
+
             sqlx::query(
                 r#"
                 INSERT INTO ledger_entries (id, transaction_id, user_id, wallet_address, asset_symbol, amount, entry_type, fiat_value)
@@ -69,15 +69,18 @@ impl Repository {
         }
         Ok(())
     }
-    
-    pub async fn get_transactions_by_wallet(&self, wallet: &str) -> anyhow::Result<Vec<Transaction>> {
+
+    pub async fn get_transactions_by_wallet(
+        &self,
+        wallet: &str,
+    ) -> anyhow::Result<Vec<Transaction>> {
         let rows = sqlx::query(
             r#"
             SELECT id, user_id, wallet_address, timestamp, tx_hash, chain::text, raw_metadata
             FROM transactions
             WHERE wallet_address = $1
             ORDER BY timestamp ASC
-            "#
+            "#,
         )
         .bind(wallet)
         .fetch_all(&self.pool)
@@ -92,7 +95,7 @@ impl Repository {
                 "ethereum" => spectraplex_core::models::Chain::Ethereum,
                 _ => return Err(anyhow::anyhow!("Unknown chain: {}", chain_str)),
             };
-            
+
             txs.push(Transaction {
                 id: row.try_get("id")?,
                 user_id: row.try_get("user_id")?,
@@ -106,7 +109,10 @@ impl Repository {
         Ok(txs)
     }
 
-    pub async fn get_ledger_entries_by_wallet(&self, wallet: &str) -> anyhow::Result<Vec<LedgerEntry>> {
+    pub async fn get_ledger_entries_by_wallet(
+        &self,
+        wallet: &str,
+    ) -> anyhow::Result<Vec<LedgerEntry>> {
         // Optimized: Query directly on indexed wallet_address column
         let rows = sqlx::query(
             r#"
@@ -116,7 +122,7 @@ impl Repository {
             FROM ledger_entries
             WHERE wallet_address = $1
             ORDER BY created_at ASC
-            "#
+            "#,
         )
         .bind(wallet)
         .fetch_all(&self.pool)

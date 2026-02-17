@@ -1,10 +1,10 @@
-use spectraplex_core::models::{Chain, Transaction, ChainIngestor};
+use serde_json::json;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use solana_transaction_status::UiTransactionEncoding;
+use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
 use std::str::FromStr;
 use uuid::Uuid;
-use serde_json::json;
 
 pub struct SolanaAdapter {
     client: RpcClient,
@@ -24,16 +24,19 @@ impl ChainIngestor for SolanaAdapter {
         let pubkey = Pubkey::from_str(wallet)?;
         // Fetch signatures (transaction history list)
         let signatures = self.client.get_signatures_for_address(&pubkey)?;
-        
+
         let mut transactions = Vec::new();
 
         for sig_info in signatures.iter().take(limit) {
             let sig = Signature::from_str(&sig_info.signature)?;
-            
+
             // Fetch full transaction details in JSON format
-            // We use UiTransactionEncoding::JsonParsed to get as much detail as possible, 
+            // We use UiTransactionEncoding::JsonParsed to get as much detail as possible,
             // or Json for raw structure. "Json" is often safer for raw storage.
-            match self.client.get_transaction(&sig, UiTransactionEncoding::Json) {
+            match self
+                .client
+                .get_transaction(&sig, UiTransactionEncoding::Json)
+            {
                 Ok(tx) => {
                     // Serialize the entire response to a JSON Value
                     let raw_metadata = serde_json::to_value(&tx).unwrap_or(json!({}));

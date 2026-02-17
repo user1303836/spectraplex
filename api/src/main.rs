@@ -70,13 +70,16 @@ async fn trigger_ingest(
 ) -> Result<Json<String>, StatusCode> {
     // In a real system, this should spawn a background task or push to a queue (e.g. Redis/bullmq)
     // For prototype, we'll just run it inline (blocking the request until done - not ideal for prod but ok for demo)
-    
+
     let adapter = SolanaAdapter::new(&payload.rpc_url);
     // Hardcoded limit for API safety
-    let events = adapter.fetch_history(&payload.wallet, 50).await.map_err(|e| {
-        eprintln!("Ingest Error: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let events = adapter
+        .fetch_history(&payload.wallet, 50)
+        .await
+        .map_err(|e| {
+            eprintln!("Ingest Error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let repo = Repository::new(state.pool.clone());
     repo.save_transactions(&events).await.map_err(|e| {
@@ -92,24 +95,32 @@ async fn trigger_normalize(
     Json(payload): Json<NormalizeRequest>,
 ) -> Result<Json<String>, StatusCode> {
     let repo = Repository::new(state.pool.clone());
-    
-    let txs = repo.get_transactions_by_wallet(&payload.wallet).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
+    let txs = repo
+        .get_transactions_by_wallet(&payload.wallet)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     let mut all_entries = Vec::new();
 
     for tx in txs {
         let entries = match tx.chain {
             spectraplex_core::models::Chain::Solana => {
                 solana_parser::parse_solana_transaction(&tx).unwrap_or_default()
-            },
-            _ => vec![]
+            }
+            _ => vec![],
         };
         all_entries.extend(entries);
     }
 
-    repo.save_ledger_entries(&all_entries).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    repo.save_ledger_entries(&all_entries)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(format!("Normalized {} ledger entries", all_entries.len())))
+    Ok(Json(format!(
+        "Normalized {} ledger entries",
+        all_entries.len()
+    )))
 }
 
 async fn get_transactions(
@@ -117,7 +128,10 @@ async fn get_transactions(
     Path(wallet): Path<String>,
 ) -> Result<Json<Vec<Transaction>>, StatusCode> {
     let repo = Repository::new(state.pool.clone());
-    let txs = repo.get_transactions_by_wallet(&wallet).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let txs = repo
+        .get_transactions_by_wallet(&wallet)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(txs))
 }
 
@@ -126,6 +140,9 @@ async fn get_ledger(
     Path(wallet): Path<String>,
 ) -> Result<Json<Vec<LedgerEntry>>, StatusCode> {
     let repo = Repository::new(state.pool.clone());
-    let entries = repo.get_ledger_entries_by_wallet(&wallet).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(entries)) 
+    let entries = repo
+        .get_ledger_entries_by_wallet(&wallet)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(entries))
 }

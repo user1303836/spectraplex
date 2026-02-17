@@ -1,6 +1,6 @@
+use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use bigdecimal::BigDecimal;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Chain {
@@ -38,7 +38,7 @@ pub struct LedgerEntry {
     pub user_id: Uuid,
     pub wallet_address: String,
     pub asset_symbol: String,
-    pub amount: BigDecimal, 
+    pub amount: BigDecimal,
     pub entry_type: EntryType,
     pub fiat_value: Option<BigDecimal>,
 }
