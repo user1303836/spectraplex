@@ -108,12 +108,13 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
 
                     if delta_raw != 0 {
                         let amount = token_raw_to_decimal(delta_raw, decimals);
+                        let symbol = spl_token_symbol(&mint);
                         entries.push(LedgerEntry {
                             id: Uuid::new_v4(),
                             transaction_id: tx.id,
                             user_id: tx.user_id,
                             wallet_address: tx.wallet_address.clone(),
-                            asset_symbol: mint,
+                            asset_symbol: symbol,
                             amount,
                             entry_type: EntryType::Transfer,
                             fiat_value: None,
@@ -146,4 +147,22 @@ fn token_raw_to_decimal(raw: i128, decimals: u32) -> BigDecimal {
     let raw_bd = BigDecimal::from_str(&format!("{}", raw)).unwrap();
     let divisor = BigDecimal::from_str(&format!("1{}", "0".repeat(decimals as usize))).unwrap();
     raw_bd / divisor
+}
+
+/// Lookup a human-readable symbol for well-known SPL tokens.
+/// Falls back to the mint address for unknown tokens.
+fn spl_token_symbol(mint: &str) -> String {
+    match mint {
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" => "USDC".to_string(),
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" => "USDT".to_string(),
+        "So11111111111111111111111111111111111111112" => "SOL".to_string(),
+        "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So" => "mSOL".to_string(),
+        "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs" => "WETH".to_string(),
+        "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263" => "BONK".to_string(),
+        "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN" => "JUP".to_string(),
+        "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj" => "stSOL".to_string(),
+        "RLBxxFkseAZ4RgJH3Sqn8jXxhmGoz9jWxDNJMh8pL7a" => "RLSOL".to_string(),
+        "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn" => "jitoSOL".to_string(),
+        _ => mint.to_string(),
+    }
 }
