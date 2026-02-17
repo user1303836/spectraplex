@@ -1,13 +1,13 @@
+use bigdecimal::{BigDecimal, FromPrimitive};
+use serde_json::json;
 use spectraplex_adapters::solana_parser;
 use spectraplex_core::models::{Chain, Transaction};
-use serde_json::json;
 use uuid::Uuid;
-use bigdecimal::{BigDecimal, FromPrimitive};
 
 #[test]
 fn test_parse_solana_native_transfer() {
     let wallet = "WalletAddress111111111111111111111111111111";
-    
+
     let full_tx_json = json!({
         "slot": 123456,
         "transaction": {
@@ -47,13 +47,17 @@ fn test_parse_solana_native_transfer() {
     };
 
     let entries = solana_parser::parse_solana_transaction(&tx).expect("Parser failed");
-    
-    assert_eq!(entries.len(), 1, "Should produce 1 entry for native SOL change");
-    
+
+    assert_eq!(
+        entries.len(),
+        1,
+        "Should produce 1 entry for native SOL change"
+    );
+
     let entry = &entries[0];
     assert_eq!(entry.wallet_address, wallet);
     assert_eq!(entry.asset_symbol, "SOL");
-    
+
     let expected_amount = BigDecimal::from_f64(-0.5).unwrap();
     assert_eq!(entry.amount, expected_amount);
 }

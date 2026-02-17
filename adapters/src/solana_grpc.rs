@@ -1,4 +1,4 @@
-use spectraplex_core::models::{Transaction, ChainIngestor};
+use spectraplex_core::models::{ChainIngestor, Transaction};
 
 pub struct SolanaGrpcAdapter {
     _endpoint: String,
@@ -16,7 +16,11 @@ impl SolanaGrpcAdapter {
 
 #[async_trait::async_trait]
 impl ChainIngestor for SolanaGrpcAdapter {
-    async fn fetch_history(&self, _wallet: &str, _limit: usize) -> anyhow::Result<Vec<Transaction>> {
+    async fn fetch_history(
+        &self,
+        _wallet: &str,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<Transaction>> {
         println!("gRPC Adapter: connect method needs verification. Returning empty.");
         // Stub to allow compilation.
         Ok(vec![])

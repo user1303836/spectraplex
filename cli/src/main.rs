@@ -1,10 +1,12 @@
 use clap::{Parser, Subcommand};
-use spectraplex_adapters::{solana::SolanaAdapter, solana_grpc::SolanaGrpcAdapter, solana_parser, repo::Repository};
+use spectraplex_adapters::{
+    repo::Repository, solana::SolanaAdapter, solana_grpc::SolanaGrpcAdapter, solana_parser,
+};
 use spectraplex_core::models::{ChainIngestor, Transaction};
-use std::path::PathBuf;
-use std::fs::File;
-use std::io::{Write, BufReader, BufRead};
 use sqlx::postgres::PgPoolOptions;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(about = "Spectraplex CLI", long_about = None)]
@@ -20,7 +22,7 @@ struct Cli {
 enum Commands {
     /// Initialize the database schema
     InitDb,
-    
+
     /// Ingest raw data from blockchain to Bronze layer (JSONL)
     Ingest {
         #[arg(short, long)]
@@ -31,7 +33,7 @@ enum Commands {
 
         #[arg(short, long, default_value = "bronze_transactions.jsonl")]
         output: PathBuf,
-        
+
         #[arg(long)]
         rpc: Option<String>,
 
@@ -40,7 +42,7 @@ enum Commands {
 
         #[arg(long)]
         x_token: Option<String>,
-        
+
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
@@ -51,7 +53,7 @@ enum Commands {
 
         #[arg(short, long, default_value = "silver_ledger.jsonl")]
         output: PathBuf,
-    }
+    },
 }
 
 #[tokio::main]
@@ -76,7 +78,15 @@ async fn main() -> anyhow::Result<()> {
                 println!("Error: --db-url is required for InitDb");
             }
         }
-        Commands::Ingest { chain, wallet, output, rpc, grpc_url, x_token, limit } => {
+        Commands::Ingest {
+            chain,
+            wallet,
+            output,
+            rpc,
+            grpc_url,
+            x_token,
+            limit,
+        } => {
             println!("Starting ingestion for {} on chain {}", wallet, chain);
 
             let events = match chain.as_str() {
@@ -114,7 +124,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Normalize { input, output } => {
             let transactions = if let Some(p) = pool.clone() {
-                
                 let input_str = input.to_string_lossy();
                 if input_str.starts_with("db:") {
                     let wallet = input_str.strip_prefix("db:").unwrap();
@@ -153,9 +162,12 @@ async fn main() -> anyhow::Result<()> {
                 let entries = match tx.chain {
                     spectraplex_core::models::Chain::Solana => {
                         solana_parser::parse_solana_transaction(&tx)?
-                    },
+                    }
                     _ => {
-                        println!("Skipping unsupported chain for normalization: {:?}", tx.chain);
+                        println!(
+                            "Skipping unsupported chain for normalization: {:?}",
+                            tx.chain
+                        );
                         vec![]
                     }
                 };
