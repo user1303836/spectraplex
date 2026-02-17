@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use spectraplex_adapters::{
-    hyperliquid::HyperliquidAdapter, hyperliquid_parser, repo::Repository, solana::SolanaAdapter,
-    solana_grpc::SolanaGrpcAdapter, solana_parser,
+    evm::EvmAdapter, evm_parser, hyperliquid::HyperliquidAdapter, hyperliquid_parser,
+    repo::Repository, solana::SolanaAdapter, solana_grpc::SolanaGrpcAdapter, solana_parser,
 };
 use spectraplex_core::models::{ChainIngestor, Transaction};
 use sqlx::postgres::PgPoolOptions;
@@ -125,6 +125,12 @@ async fn main() -> anyhow::Result<()> {
                     let adapter = HyperliquidAdapter::new();
                     adapter.fetch_history(&wallet, limit, user_id).await?
                 }
+                "ethereum" => {
+                    let rpc_url =
+                        rpc.ok_or_else(|| anyhow::anyhow!("--rpc is required for Ethereum"))?;
+                    let adapter = EvmAdapter::new(&rpc_url).await?;
+                    adapter.fetch_history(&wallet, limit, user_id).await?
+                }
                 _ => {
                     warn!(chain = %chain, "Unsupported chain");
                     return Ok(());
@@ -189,6 +195,9 @@ async fn main() -> anyhow::Result<()> {
                     }
                     spectraplex_core::models::Chain::Hyperliquid => {
                         hyperliquid_parser::parse_hyperliquid_transaction(&tx)?
+                    }
+                    spectraplex_core::models::Chain::Ethereum => {
+                        evm_parser::parse_evm_transaction(&tx)?
                     }
                     _ => {
                         warn!(chain = ?tx.chain, "Skipping unsupported chain for normalization");

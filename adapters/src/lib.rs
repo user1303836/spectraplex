@@ -1,3 +1,5 @@
+pub mod evm;
+pub mod evm_parser;
 pub mod hyperliquid;
 pub mod hyperliquid_parser;
 pub mod hyperliquid_ws;

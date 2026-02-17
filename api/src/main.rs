@@ -6,8 +6,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use spectraplex_adapters::{
-    hyperliquid::HyperliquidAdapter, hyperliquid_parser, repo::Repository, solana::SolanaAdapter,
-    solana_parser,
+    evm::EvmAdapter, evm_parser, hyperliquid::HyperliquidAdapter, hyperliquid_parser,
+    repo::Repository, solana::SolanaAdapter, solana_parser,
 };
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::models::{ChainIngestor, LedgerEntry, Transaction};
@@ -90,7 +90,7 @@ async fn health_check() -> &'static str {
 
 #[derive(Deserialize)]
 struct IngestRequest {
-    _chain: String,
+    chain: String,
     wallet: String,
     user_id: Option<Uuid>,
 }
@@ -132,7 +132,7 @@ async fn trigger_ingest(
 
     let state_clone = Arc::clone(&state);
     let wallet = payload.wallet.clone();
-    let chain = payload._chain.clone();
+    let chain = payload.chain.clone();
     let limit = state.config.ingest_limit;
     let user_id = payload.user_id.unwrap_or_else(Uuid::new_v4);
 
@@ -148,6 +148,10 @@ async fn trigger_ingest(
             let events: Vec<Transaction> = match chain.as_str() {
                 "hyperliquid" => {
                     let adapter = HyperliquidAdapter::new();
+                    adapter.fetch_history(&wallet, limit, user_id).await?
+                }
+                "ethereum" => {
+                    let adapter = EvmAdapter::new(&state_clone.config.evm_rpc_url).await?;
                     adapter.fetch_history(&wallet, limit, user_id).await?
                 }
                 _ => {
@@ -223,7 +227,9 @@ async fn trigger_normalize(
                     spectraplex_core::models::Chain::Hyperliquid => {
                         hyperliquid_parser::parse_hyperliquid_transaction(&tx).unwrap_or_default()
                     }
-                    _ => vec![],
+                    spectraplex_core::models::Chain::Ethereum => {
+                        evm_parser::parse_evm_transaction(&tx).unwrap_or_default()
+                    }
                 };
                 all_entries.extend(entries);
             }

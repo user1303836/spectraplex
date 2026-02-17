@@ -283,7 +283,12 @@ impl ChainIngestor for SolanaGrpcAdapter {
     ///
     /// The `wallet` parameter is used as the wallet_address on collected transactions.
     /// For real-time streaming, use `stream_transactions()` instead.
-    async fn fetch_history(&self, wallet: &str, limit: usize, user_id: Uuid) -> anyhow::Result<Vec<Transaction>> {
+    async fn fetch_history(
+        &self,
+        wallet: &str,
+        limit: usize,
+        user_id: Uuid,
+    ) -> anyhow::Result<Vec<Transaction>> {
         let mut client = self.connect_client().await?;
 
         let from_slot = {

@@ -54,5 +54,10 @@ pub struct IndexerCheckpoint {
 
 #[async_trait::async_trait]
 pub trait ChainIngestor {
-    async fn fetch_history(&self, wallet: &str, limit: usize, user_id: Uuid) -> anyhow::Result<Vec<Transaction>>;
+    async fn fetch_history(
+        &self,
+        wallet: &str,
+        limit: usize,
+        user_id: Uuid,
+    ) -> anyhow::Result<Vec<Transaction>>;
 }

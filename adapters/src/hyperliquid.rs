@@ -158,7 +158,12 @@ impl HyperliquidAdapter {
 
 #[async_trait::async_trait]
 impl ChainIngestor for HyperliquidAdapter {
-    async fn fetch_history(&self, wallet: &str, limit: usize, user_id: Uuid) -> anyhow::Result<Vec<Transaction>> {
+    async fn fetch_history(
+        &self,
+        wallet: &str,
+        limit: usize,
+        user_id: Uuid,
+    ) -> anyhow::Result<Vec<Transaction>> {
         let mut transactions = Vec::new();
 
         // 1. Fetch fills (trades)
@@ -337,7 +342,11 @@ mod tests {
 
         let adapter = HyperliquidAdapter::with_base_url(&base_url);
         let txs = adapter
-            .fetch_history("0x1234567890abcdef1234567890abcdef12345678", 10, Uuid::new_v4())
+            .fetch_history(
+                "0x1234567890abcdef1234567890abcdef12345678",
+                10,
+                Uuid::new_v4(),
+            )
             .await
             .unwrap();
 
