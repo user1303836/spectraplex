@@ -23,8 +23,8 @@ impl Repository {
                 r#"
                 INSERT INTO transactions (id, user_id, wallet_address, timestamp, tx_hash, chain, raw_metadata)
                 VALUES ($1, $2, $3, $4, $5, $6::chain_enum, $7)
-                ON CONFLICT (id) DO NOTHING
-                "#
+                ON CONFLICT (chain, tx_hash) DO NOTHING
+                "#,
             )
             .bind(tx.id)
             .bind(tx.user_id)
