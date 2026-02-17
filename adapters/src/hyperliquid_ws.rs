@@ -1,6 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::error;
 
 const HL_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 
@@ -95,7 +96,7 @@ impl HyperliquidWsClient {
                 }
                 Ok(Message::Close(_)) => break,
                 Err(e) => {
-                    eprintln!("WebSocket error: {}", e);
+                    error!(error = %e, "WebSocket error");
                     break;
                 }
                 _ => {}

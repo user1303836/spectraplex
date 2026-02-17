@@ -178,19 +178,23 @@ async fn main() -> anyhow::Result<()> {
             let mut all_entries = Vec::new();
 
             for tx in transactions {
-                // Use the parser to extract actual ledger entries
-                let entries = match tx.chain {
+                let result = match tx.chain {
                     spectraplex_core::models::Chain::Solana => {
-                        solana_parser::parse_solana_transaction(&tx)?
+                        solana_parser::parse_solana_transaction(&tx)
                     }
                     spectraplex_core::models::Chain::Hyperliquid => {
-                        hyperliquid_parser::parse_hyperliquid_transaction(&tx)?
+                        hyperliquid_parser::parse_hyperliquid_transaction(&tx)
                     }
                     spectraplex_core::models::Chain::Ethereum => {
-                        evm_parser::parse_evm_transaction(&tx)?
+                        evm_parser::parse_evm_transaction(&tx)
                     }
                 };
-                all_entries.extend(entries);
+                match result {
+                    Ok(entries) => all_entries.extend(entries),
+                    Err(e) => {
+                        warn!(tx_hash = %tx.tx_hash, error = %e, "Skipping unparseable transaction");
+                    }
+                }
             }
 
             if let Some(p) = pool {

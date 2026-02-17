@@ -276,7 +276,10 @@ fn test_spl_token_transfer() {
 
     // Wallet is not fee payer (index 1), no SOL change for wallet, but has SPL token change
     // USDC mint resolves to "USDC" symbol
-    let token_entries: Vec<_> = entries.iter().filter(|e| e.asset_symbol == "USDC").collect();
+    let token_entries: Vec<_> = entries
+        .iter()
+        .filter(|e| e.asset_symbol == "USDC")
+        .collect();
     assert_eq!(token_entries.len(), 1, "Should have one SPL token entry");
     assert_eq!(token_entries[0].amount, bd("50.5"));
     assert!(matches!(token_entries[0].entry_type, EntryType::Transfer));
@@ -346,7 +349,10 @@ fn test_spl_token_send() {
     let entries = solana_parser::parse_solana_transaction(&tx).expect("Parser failed");
 
     // USDC mint resolves to "USDC" symbol
-    let token_entries: Vec<_> = entries.iter().filter(|e| e.asset_symbol == "USDC").collect();
+    let token_entries: Vec<_> = entries
+        .iter()
+        .filter(|e| e.asset_symbol == "USDC")
+        .collect();
     assert_eq!(token_entries.len(), 1);
     assert_eq!(token_entries[0].amount, bd("-75"));
 }
