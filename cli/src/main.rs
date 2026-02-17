@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use spectraplex_adapters::{
-    hyperliquid::HyperliquidAdapter, hyperliquid_parser, repo::Repository,
-    solana::SolanaAdapter, solana_grpc::SolanaGrpcAdapter, solana_parser,
+    hyperliquid::HyperliquidAdapter, hyperliquid_parser, repo::Repository, solana::SolanaAdapter,
+    solana_grpc::SolanaGrpcAdapter, solana_parser,
 };
 use spectraplex_core::models::{ChainIngestor, Transaction};
 use sqlx::postgres::PgPoolOptions;

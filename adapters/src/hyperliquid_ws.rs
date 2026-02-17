@@ -54,11 +54,7 @@ impl HyperliquidWsClient {
     /// Subscribe to a user's fills, funding, and ledger updates.
     /// Calls `on_message` for each incoming WebSocket message.
     /// Returns when the connection is closed or an error occurs.
-    pub async fn subscribe_user<F>(
-        &self,
-        wallet: &str,
-        mut on_message: F,
-    ) -> anyhow::Result<()>
+    pub async fn subscribe_user<F>(&self, wallet: &str, mut on_message: F) -> anyhow::Result<()>
     where
         F: FnMut(WsMessage) + Send,
     {

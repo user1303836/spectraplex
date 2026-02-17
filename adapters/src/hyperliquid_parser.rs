@@ -7,9 +7,7 @@ use crate::hyperliquid::{HlFill, HlFundingEntry, HlLedgerUpdate};
 
 pub fn parse_hyperliquid_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry>> {
     let raw = &tx.raw_metadata;
-    let entry_type = raw["type"]
-        .as_str()
-        .unwrap_or("unknown");
+    let entry_type = raw["type"].as_str().unwrap_or("unknown");
 
     match entry_type {
         "fill" => parse_fill(tx, &raw["data"]),
@@ -36,11 +34,7 @@ fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<
     let fiat_value = &size * &price;
 
     // Determine sign based on side: B (buy) = positive, A/S (sell) = negative
-    let signed_size = if fill.side == "B" {
-        size
-    } else {
-        -size
-    };
+    let signed_size = if fill.side == "B" { size } else { -size };
 
     entries.push(LedgerEntry {
         id: Uuid::new_v4(),
@@ -91,10 +85,7 @@ fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<
     Ok(entries)
 }
 
-fn parse_funding(
-    tx: &Transaction,
-    data: &serde_json::Value,
-) -> anyhow::Result<Vec<LedgerEntry>> {
+fn parse_funding(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<LedgerEntry>> {
     let funding: HlFundingEntry = serde_json::from_value(data.clone())?;
     let amount = BigDecimal::from_str(&funding.usdc).unwrap_or_default();
 
@@ -122,9 +113,7 @@ fn parse_ledger_update(
 
     match delta_type {
         "deposit" => {
-            let usdc = delta["usdc"]
-                .as_str()
-                .unwrap_or("0");
+            let usdc = delta["usdc"].as_str().unwrap_or("0");
             let amount = BigDecimal::from_str(usdc).unwrap_or_default();
             Ok(vec![LedgerEntry {
                 id: Uuid::new_v4(),
@@ -138,9 +127,7 @@ fn parse_ledger_update(
             }])
         }
         "withdraw" => {
-            let usdc = delta["usdc"]
-                .as_str()
-                .unwrap_or("0");
+            let usdc = delta["usdc"].as_str().unwrap_or("0");
             let amount = BigDecimal::from_str(usdc).unwrap_or_default();
             Ok(vec![LedgerEntry {
                 id: Uuid::new_v4(),

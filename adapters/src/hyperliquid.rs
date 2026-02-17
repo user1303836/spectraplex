@@ -1,5 +1,5 @@
-use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
 use serde::{Deserialize, Serialize};
+use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
 use uuid::Uuid;
 
 const HL_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
@@ -101,12 +101,7 @@ impl HyperliquidAdapter {
             r#type: "userFills",
             user: wallet,
         };
-        let resp = self
-            .client
-            .post(&self.base_url)
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.client.post(&self.base_url).json(&body).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -126,12 +121,7 @@ impl HyperliquidAdapter {
             user: wallet,
             start_time,
         };
-        let resp = self
-            .client
-            .post(&self.base_url)
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.client.post(&self.base_url).json(&body).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -151,12 +141,7 @@ impl HyperliquidAdapter {
             user: wallet,
             start_time,
         };
-        let resp = self
-            .client
-            .post(&self.base_url)
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.client.post(&self.base_url).json(&body).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -173,11 +158,7 @@ impl HyperliquidAdapter {
 
 #[async_trait::async_trait]
 impl ChainIngestor for HyperliquidAdapter {
-    async fn fetch_history(
-        &self,
-        wallet: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<Transaction>> {
+    async fn fetch_history(&self, wallet: &str, limit: usize) -> anyhow::Result<Vec<Transaction>> {
         let mut transactions = Vec::new();
 
         // 1. Fetch fills (trades)
@@ -296,8 +277,7 @@ mod tests {
 
     #[test]
     fn test_deserialize_funding() {
-        let funding: Vec<HlFundingEntry> =
-            serde_json::from_str(sample_funding_json()).unwrap();
+        let funding: Vec<HlFundingEntry> = serde_json::from_str(sample_funding_json()).unwrap();
         assert_eq!(funding.len(), 1);
         assert_eq!(funding[0].coin, "ETH");
         assert_eq!(funding[0].usdc, "-2.50");
