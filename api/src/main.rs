@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -97,6 +97,23 @@ struct IngestRequest {
 #[derive(Deserialize)]
 struct NormalizeRequest {
     wallet: String,
+}
+
+const DEFAULT_PAGE_LIMIT: i64 = 50;
+const MAX_PAGE_LIMIT: i64 = 1000;
+
+#[derive(Deserialize)]
+struct PaginationParams {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+fn clamp_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT)
+}
+
+fn clamp_offset(offset: Option<i64>) -> i64 {
+    offset.unwrap_or(0).max(0)
 }
 
 async fn trigger_ingest(
@@ -254,10 +271,13 @@ async fn get_job_status(
 async fn get_transactions(
     State(state): State<Arc<AppState>>,
     Path(wallet): Path<String>,
+    Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<Transaction>>, StatusCode> {
+    let limit = clamp_limit(params.limit);
+    let offset = clamp_offset(params.offset);
     let repo = Repository::new(state.pool.clone());
     let txs = repo
-        .get_transactions_by_wallet(&wallet)
+        .get_transactions_by_wallet_paginated(&wallet, limit, offset)
         .await
         .map_err(|e| {
             error!(error = %e, "Failed to fetch transactions");
@@ -269,10 +289,13 @@ async fn get_transactions(
 async fn get_ledger(
     State(state): State<Arc<AppState>>,
     Path(wallet): Path<String>,
+    Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<LedgerEntry>>, StatusCode> {
+    let limit = clamp_limit(params.limit);
+    let offset = clamp_offset(params.offset);
     let repo = Repository::new(state.pool.clone());
     let entries = repo
-        .get_ledger_entries_by_wallet(&wallet)
+        .get_ledger_entries_by_wallet_paginated(&wallet, limit, offset)
         .await
         .map_err(|e| {
             error!(error = %e, "Failed to fetch ledger entries");
