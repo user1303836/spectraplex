@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use spectraplex_adapters::{
-    repo::Repository, solana::SolanaAdapter, solana_grpc::SolanaGrpcAdapter, solana_parser,
+    hyperliquid::HyperliquidAdapter, hyperliquid_parser, repo::Repository,
+    solana::SolanaAdapter, solana_grpc::SolanaGrpcAdapter, solana_parser,
 };
 use spectraplex_core::models::{ChainIngestor, Transaction};
 use sqlx::postgres::PgPoolOptions;
@@ -101,6 +102,10 @@ async fn main() -> anyhow::Result<()> {
                         anyhow::bail!("Either --grpc-url or --rpc must be provided for Solana");
                     }
                 }
+                "hyperliquid" => {
+                    let adapter = HyperliquidAdapter::new();
+                    adapter.fetch_history(&wallet, limit).await?
+                }
                 _ => {
                     println!("Unsupported chain: {}", chain);
                     return Ok(());
@@ -162,6 +167,9 @@ async fn main() -> anyhow::Result<()> {
                 let entries = match tx.chain {
                     spectraplex_core::models::Chain::Solana => {
                         solana_parser::parse_solana_transaction(&tx)?
+                    }
+                    spectraplex_core::models::Chain::Hyperliquid => {
+                        hyperliquid_parser::parse_hyperliquid_transaction(&tx)?
                     }
                     _ => {
                         println!(
