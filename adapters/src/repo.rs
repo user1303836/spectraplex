@@ -74,15 +74,28 @@ impl Repository {
         &self,
         wallet: &str,
     ) -> anyhow::Result<Vec<Transaction>> {
+        self.get_transactions_by_wallet_paginated(wallet, 1000, 0)
+            .await
+    }
+
+    pub async fn get_transactions_by_wallet_paginated(
+        &self,
+        wallet: &str,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<Transaction>> {
         let rows = sqlx::query(
             r#"
             SELECT id, user_id, wallet_address, timestamp, tx_hash, chain::text, raw_metadata
             FROM transactions
             WHERE wallet_address = $1
             ORDER BY timestamp ASC
+            LIMIT $2 OFFSET $3
             "#,
         )
         .bind(wallet)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
 
@@ -113,18 +126,30 @@ impl Repository {
         &self,
         wallet: &str,
     ) -> anyhow::Result<Vec<LedgerEntry>> {
-        // Optimized: Query directly on indexed wallet_address column
+        self.get_ledger_entries_by_wallet_paginated(wallet, 1000, 0)
+            .await
+    }
+
+    pub async fn get_ledger_entries_by_wallet_paginated(
+        &self,
+        wallet: &str,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<LedgerEntry>> {
         let rows = sqlx::query(
             r#"
-            SELECT 
-                id, transaction_id, user_id, wallet_address, asset_symbol, amount, 
+            SELECT
+                id, transaction_id, user_id, wallet_address, asset_symbol, amount,
                 entry_type::text, fiat_value
             FROM ledger_entries
             WHERE wallet_address = $1
             ORDER BY created_at ASC
+            LIMIT $2 OFFSET $3
             "#,
         )
         .bind(wallet)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
 
