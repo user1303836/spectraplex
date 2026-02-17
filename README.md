@@ -9,14 +9,14 @@ Spectraplex is a multi-chain blockchain transaction indexer written in Rust. It 
 
 | Chain | Ingestion | Parsing | Real-time Streaming | Status |
 |-------|-----------|---------|---------------------|--------|
-| Solana | RPC + gRPC | SOL + SPL tokens | Yellowstone gRPC | Active |
-| Hyperliquid | REST + WebSocket | Planned | WebSocket | In progress |
-| Ethereum (EVM) | alloy (eth_getLogs) | ERC-20 transfers, ETH transfers, gas fees | Planned | Active |
+| Solana | RPC + gRPC | SOL + SPL tokens (symbol lookup) | Yellowstone gRPC | Active |
+| Hyperliquid | REST + WebSocket | Fills, deposits, withdrawals | WebSocket | Active |
+| Ethereum (EVM) | alloy (eth_getLogs) | ERC-20 transfers (uint256 precision) | Planned | Active |
 
 ## Architecture
 
 ```
-                    CLI / REST API (Axum @ 127.0.0.1:3000)
+                    CLI / REST API (Axum, configurable host/port)
                                |
                 +--------------+--------------+
                 v              v              v
@@ -37,7 +37,7 @@ Spectraplex is a multi-chain blockchain transaction indexer written in Rust. It 
           |  Blockchain Adapters             |
           |  - SolanaAdapter (RPC)           |
           |  - SolanaGrpcAdapter (gRPC)      |
-          |  - HyperliquidAdapter (planned)  |
+          |  - HyperliquidAdapter (REST+WS)  |
           |  - EvmAdapter (alloy)            |
           +----------------------------------+
                          |
@@ -136,7 +136,7 @@ cargo run --release --bin spectraplex-cli -- normalize \
 
 ```bash
 cargo run --release --bin spectraplex-api
-# Listening on 127.0.0.1:3000
+# Listening on 127.0.0.1:3000 (configurable via SPECTRAPLEX_HOST / SPECTRAPLEX_PORT)
 ```
 
 ### 7. Query the data
@@ -145,11 +145,11 @@ cargo run --release --bin spectraplex-api
 # Health check
 curl http://127.0.0.1:3000/health
 
-# Get raw transactions for a wallet
-curl http://127.0.0.1:3000/v1/transactions/<WALLET_ADDRESS>
+# Get raw transactions for a wallet (paginated)
+curl "http://127.0.0.1:3000/v1/transactions/<WALLET_ADDRESS>?limit=50&offset=0"
 
-# Get normalized ledger entries
-curl http://127.0.0.1:3000/v1/ledger/<WALLET_ADDRESS>
+# Get normalized ledger entries (paginated)
+curl "http://127.0.0.1:3000/v1/ledger/<WALLET_ADDRESS>?limit=50&offset=0"
 ```
 
 ## CLI Reference
@@ -190,17 +190,24 @@ The API server runs on `127.0.0.1:3000` and requires `DATABASE_URL` to be set.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Health check, returns `"OK"` |
-| `POST` | `/v1/ingest` | Trigger ingestion for a wallet |
-| `POST` | `/v1/normalize` | Normalize transactions for a wallet |
-| `GET` | `/v1/transactions/:wallet` | Get raw transactions by wallet |
-| `GET` | `/v1/ledger/:wallet` | Get normalized ledger entries by wallet |
+| `POST` | `/v1/ingest` | Trigger async ingestion for a wallet (returns job ID) |
+| `POST` | `/v1/normalize` | Trigger async normalization for a wallet (returns job ID) |
+| `GET` | `/v1/jobs/:job_id` | Poll job status (pending/running/completed/failed) |
+| `GET` | `/v1/transactions/:wallet` | Get raw transactions by wallet (paginated) |
+| `GET` | `/v1/ledger/:wallet` | Get normalized ledger entries by wallet (paginated) |
+
+All wallet endpoints validate the address format and return structured JSON errors.
+
+Query endpoints support `?limit=N&offset=N` parameters (default limit: 50, max: 1000).
 
 ### POST /v1/ingest
 
 ```bash
 curl -X POST http://127.0.0.1:3000/v1/ingest \
   -H "Content-Type: application/json" \
-  -d '{"_chain": "solana", "wallet": "<WALLET>", "rpc_url": "https://api.mainnet-beta.solana.com"}'
+  -d '{"chain": "solana", "wallet": "<WALLET>"}'
+
+# Response: {"id": "<JOB_UUID>", "state": "pending", "message": "Job queued"}
 ```
 
 ### POST /v1/normalize
@@ -209,15 +216,39 @@ curl -X POST http://127.0.0.1:3000/v1/ingest \
 curl -X POST http://127.0.0.1:3000/v1/normalize \
   -H "Content-Type: application/json" \
   -d '{"wallet": "<WALLET>"}'
+
+# Response: {"id": "<JOB_UUID>", "state": "pending", "message": "Job queued"}
 ```
+
+### GET /v1/jobs/:job_id
+
+```bash
+curl http://127.0.0.1:3000/v1/jobs/<JOB_UUID>
+
+# Response: {"id": "<JOB_UUID>", "state": "completed", "message": "Ingested 42 transactions"}
+```
+
+Jobs are kept in memory for 1 hour after completion, then automatically pruned.
 
 ## Configuration
 
-Spectraplex reads configuration from environment variables. You can use a `.env` file in the project root.
+Spectraplex uses a layered configuration system powered by [figment](https://crates.io/crates/figment). Settings are loaded in order of priority:
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `DATABASE_URL` | Yes (for DB mode) | PostgreSQL connection string |
+1. Built-in defaults
+2. `spectraplex.toml` (optional config file in project root)
+3. `SPECTRAPLEX_*` environment variables (e.g., `SPECTRAPLEX_PORT=8080`)
+4. Direct env vars: `DATABASE_URL`, `SOLANA_RPC_URL`, `EVM_RPC_URL`
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATABASE_URL` | *(required)* | PostgreSQL connection string |
+| `SPECTRAPLEX_HOST` | `127.0.0.1` | API server bind address |
+| `SPECTRAPLEX_PORT` | `3000` | API server port |
+| `SPECTRAPLEX_POOL_SIZE` | `10` | Database connection pool size |
+| `SPECTRAPLEX_LOG_LEVEL` | `info` | Log level (trace/debug/info/warn/error) |
+| `SPECTRAPLEX_INGEST_LIMIT` | `50` | Default transaction fetch limit for API ingestion |
+| `SOLANA_RPC_URL` | `https://api.mainnet-beta.solana.com` | Solana RPC endpoint |
+| `EVM_RPC_URL` | `https://eth.llamarpc.com` | EVM JSON-RPC endpoint |
 
 The CLI also supports `--db-url` as a command-line flag. When neither is provided, the CLI falls back to file-based JSONL storage.
 
@@ -236,10 +267,10 @@ spectraplex/
 
 ### Data Models (`core/src/models.rs`)
 
-- **`Transaction`** (Bronze) -- Raw blockchain transaction with JSONB metadata
-- **`LedgerEntry`** (Silver) -- Normalized entry: asset symbol, amount, type (trade/fee/transfer/staking/income)
+- **`Transaction`** (Bronze) -- Raw blockchain transaction with JSONB metadata, per-user scoping via `user_id`
+- **`LedgerEntry`** (Silver) -- Normalized entry: asset symbol, amount, type (trade/fee/transfer/staking/income), with fiat value support
 - **`Chain`** -- Enum: Solana, Hyperliquid, Ethereum
-- **`ChainIngestor`** -- Async trait that all chain adapters implement
+- **`ChainIngestor`** -- Async trait that all chain adapters implement (`fetch_history`)
 
 ## Development
 
@@ -273,7 +304,9 @@ The schema uses the following tables:
 - **`blocks`** -- Stores block hashes per chain for reorg detection (EVM chains).
 - **`evm_logs`** -- Raw EVM event logs linked to transactions.
 
-Both main tables use UUIDs as primary keys and support idempotent inserts (`ON CONFLICT DO NOTHING`).
+- **`indexer_checkpoints`** -- Tracks last-processed block per chain/wallet for incremental syncing.
+
+All tables use UUIDs as primary keys and support idempotent batch inserts (`ON CONFLICT DO NOTHING`, 500 rows/batch).
 
 ## Tech Stack
 
@@ -292,16 +325,24 @@ Both main tables use UUIDs as primary keys and support idempotent inserts (`ON C
 ## Roadmap
 
 - [x] Solana RPC ingestion and transaction parsing
+- [x] SPL token symbol resolution (USDC, USDT, BONK, JUP, etc.)
 - [x] Bronze/Silver data layer with PostgreSQL
-- [x] CLI and REST API
-- [x] CI/CD with GitHub Actions
-- [ ] Yellowstone gRPC real-time streaming
-- [ ] Hyperliquid adapter (REST + WebSocket)
-- [x] EVM adapter (Ethereum and compatibles)
-- [ ] Improved entry type classification (trades, fees, staking)
+- [x] Batch SQL inserts (500 rows/batch)
+- [x] CLI and REST API with async job system
+- [x] Structured JSON error responses
+- [x] Pagination on all query endpoints
+- [x] Input validation on wallet addresses
+- [x] CI/CD with GitHub Actions (fmt, clippy, test, security audit)
+- [x] Yellowstone gRPC real-time streaming adapter
+- [x] Hyperliquid adapter (REST + WebSocket + parser)
+- [x] EVM adapter (Ethereum and compatibles) with uint256 precision
+- [x] Layered configuration (defaults / TOML / env vars)
+- [x] Docker Compose deployment
+- [x] Incremental sync with checkpointing schema
+- [ ] EVM native ETH transfer and gas fee parsing
+- [ ] Improved entry type classification (trades, staking)
 - [ ] Historical price lookups for fiat value
-- [ ] Docker Compose deployment
-- [ ] Incremental sync with checkpointing
+- [ ] API authentication and authorization
 - [ ] User identity and wallet management
 - [ ] Cross-chain portfolio views
 

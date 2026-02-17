@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use log::{error, info, warn};
 use serde_json::json;
 use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::{

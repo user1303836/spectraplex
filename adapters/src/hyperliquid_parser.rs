@@ -1,6 +1,7 @@
 use bigdecimal::BigDecimal;
 use spectraplex_core::models::{EntryType, LedgerEntry, Transaction};
 use std::str::FromStr;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::hyperliquid::{HlFill, HlFundingEntry, HlLedgerUpdate};
@@ -14,10 +15,7 @@ pub fn parse_hyperliquid_transaction(tx: &Transaction) -> anyhow::Result<Vec<Led
         "funding" => parse_funding(tx, &raw["data"]),
         "ledger_update" => parse_ledger_update(tx, &raw["data"]),
         other => {
-            eprintln!(
-                "Unknown Hyperliquid transaction type: {} (tx_hash={})",
-                other, tx.tx_hash
-            );
+            warn!(tx_hash = %tx.tx_hash, r#type = %other, "Unknown Hyperliquid transaction type");
             Ok(vec![])
         }
     }
@@ -159,10 +157,7 @@ fn parse_ledger_update(
             }])
         }
         _ => {
-            eprintln!(
-                "Unknown ledger update type: {} (tx_hash={})",
-                delta_type, tx.tx_hash
-            );
+            warn!(tx_hash = %tx.tx_hash, delta_type = %delta_type, "Unknown ledger update type");
             Ok(vec![])
         }
     }
