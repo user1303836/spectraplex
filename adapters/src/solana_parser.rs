@@ -1,51 +1,81 @@
-use bigdecimal::{BigDecimal, FromPrimitive};
+use bigdecimal::BigDecimal;
 use solana_transaction_status::option_serializer::OptionSerializer;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, UiTransactionStatusMeta,
 };
 use spectraplex_core::models::{EntryType, LedgerEntry, Transaction};
+use std::str::FromStr;
 use uuid::Uuid;
 
 pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry>> {
     let mut entries = Vec::new();
 
-    // 1. Deserialize the raw metadata back to the Solana SDK structure
-    // Note: We are using the structure from `solana_transaction_status` which matches what `get_transaction` returns (EncodedConfirmedTransactionWithStatusMeta)
     let sol_tx: EncodedConfirmedTransactionWithStatusMeta =
         serde_json::from_value(tx.raw_metadata.clone())?;
 
-    // Safety check: Ensure meta exists
     let meta = match &sol_tx.transaction.meta {
         Some(m) => m,
         None => return Ok(vec![]),
     };
 
-    // 2. Extract Native SOL Changes
-    // We need to look at account_keys to find the index of `tx.wallet_address`
+    // Skip failed transactions
+    if meta.err.is_some() {
+        return Ok(vec![]);
+    }
+
     let transaction = &sol_tx.transaction.transaction;
     if let solana_transaction_status::EncodedTransaction::Json(ui_tx) = transaction {
         if let solana_transaction_status::UiMessage::Parsed(message) = &ui_tx.message {
-            // Find index of wallet in account_keys
             if let Some(idx) = message
                 .account_keys
                 .iter()
                 .position(|k| k.pubkey == tx.wallet_address)
             {
-                let sol_change = extract_sol_change(meta, idx);
+                let lamport_change = extract_sol_change_lamports(meta, idx);
+                let fee_lamports = meta.fee;
+                let is_fee_payer = idx == 0;
 
-                if sol_change.abs() > 0.000001 {
+                // If this wallet is the fee payer, separate fee from the net transfer
+                if is_fee_payer && fee_lamports > 0 {
+                    // Fee entry (always negative)
+                    let fee_amount = lamports_to_sol(-(fee_lamports as i64));
                     entries.push(LedgerEntry {
                         id: Uuid::new_v4(),
                         transaction_id: tx.id,
                         user_id: tx.user_id,
                         wallet_address: tx.wallet_address.clone(),
                         asset_symbol: "SOL".to_string(),
-                        amount: BigDecimal::from_f64(sol_change).unwrap_or_default(),
-                        entry_type: if sol_change > 0.0 {
-                            EntryType::Transfer
-                        } else {
-                            EntryType::Transfer
-                        }, // Simplified for now
+                        amount: fee_amount,
+                        entry_type: EntryType::Fee,
+                        fiat_value: None,
+                    });
+
+                    // Net transfer amount = total balance change + fee (since fee is included in the balance change)
+                    let transfer_lamports = lamport_change + fee_lamports as i64;
+                    if transfer_lamports != 0 {
+                        let transfer_amount = lamports_to_sol(transfer_lamports);
+                        entries.push(LedgerEntry {
+                            id: Uuid::new_v4(),
+                            transaction_id: tx.id,
+                            user_id: tx.user_id,
+                            wallet_address: tx.wallet_address.clone(),
+                            asset_symbol: "SOL".to_string(),
+                            amount: transfer_amount,
+                            entry_type: EntryType::Transfer,
+                            fiat_value: None,
+                        });
+                    }
+                } else if lamport_change != 0 {
+                    // Non-fee-payer: entire balance change is a transfer
+                    let amount = lamports_to_sol(lamport_change);
+                    entries.push(LedgerEntry {
+                        id: Uuid::new_v4(),
+                        transaction_id: tx.id,
+                        user_id: tx.user_id,
+                        wallet_address: tx.wallet_address.clone(),
+                        asset_symbol: "SOL".to_string(),
+                        amount,
+                        entry_type: EntryType::Transfer,
                         fiat_value: None,
                     });
                 }
@@ -53,10 +83,9 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
         }
     }
 
-    // 3. Extract SPL Token Changes
+    // Extract SPL Token Changes
     if let OptionSerializer::Some(pre_token_balances) = &meta.pre_token_balances {
         if let OptionSerializer::Some(post_token_balances) = &meta.post_token_balances {
-            // We iterate over post_token_balances where owner == wallet_address
             for post in post_token_balances {
                 let owner_match = match &post.owner {
                     OptionSerializer::Some(owner) => owner == &tx.wallet_address,
@@ -66,25 +95,26 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
 
                 if owner_match {
                     let mint = post.mint.clone();
+                    let decimals = post.ui_token_amount.decimals as u32;
 
-                    // Find corresponding pre-balance for this account index
-                    let pre_amount = pre_token_balances
+                    let pre_raw = pre_token_balances
                         .iter()
                         .find(|p| p.account_index == post.account_index)
-                        .map(|p| p.ui_token_amount.ui_amount.unwrap_or(0.0))
-                        .unwrap_or(0.0); // If not found, it's a new token account (0 balance)
+                        .and_then(|p| p.ui_token_amount.amount.parse::<i128>().ok())
+                        .unwrap_or(0);
 
-                    let post_amount = post.ui_token_amount.ui_amount.unwrap_or(0.0);
-                    let delta = post_amount - pre_amount;
+                    let post_raw = post.ui_token_amount.amount.parse::<i128>().unwrap_or(0);
+                    let delta_raw = post_raw - pre_raw;
 
-                    if delta.abs() > 0.000001 {
+                    if delta_raw != 0 {
+                        let amount = token_raw_to_decimal(delta_raw, decimals);
                         entries.push(LedgerEntry {
                             id: Uuid::new_v4(),
                             transaction_id: tx.id,
                             user_id: tx.user_id,
                             wallet_address: tx.wallet_address.clone(),
                             asset_symbol: mint,
-                            amount: BigDecimal::from_f64(delta).unwrap_or_default(),
+                            amount,
                             entry_type: EntryType::Transfer,
                             fiat_value: None,
                         });
@@ -97,8 +127,23 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
     Ok(entries)
 }
 
-fn extract_sol_change(meta: &UiTransactionStatusMeta, wallet_index: usize) -> f64 {
-    let pre = meta.pre_balances.get(wallet_index).copied().unwrap_or(0) as f64;
-    let post = meta.post_balances.get(wallet_index).copied().unwrap_or(0) as f64;
-    (post - pre) / 1_000_000_000.0 // Lamports to SOL
+/// Extract the raw lamport balance change for a given account index.
+fn extract_sol_change_lamports(meta: &UiTransactionStatusMeta, wallet_index: usize) -> i64 {
+    let pre = meta.pre_balances.get(wallet_index).copied().unwrap_or(0) as i64;
+    let post = meta.post_balances.get(wallet_index).copied().unwrap_or(0) as i64;
+    post - pre
+}
+
+/// Convert lamports (i64) to SOL as BigDecimal without floating-point precision loss.
+fn lamports_to_sol(lamports: i64) -> BigDecimal {
+    let raw = BigDecimal::from_str(&format!("{}", lamports)).unwrap();
+    let divisor = BigDecimal::from_str("1000000000").unwrap();
+    raw / divisor
+}
+
+/// Convert raw token amount to BigDecimal using the token's decimals.
+fn token_raw_to_decimal(raw: i128, decimals: u32) -> BigDecimal {
+    let raw_bd = BigDecimal::from_str(&format!("{}", raw)).unwrap();
+    let divisor = BigDecimal::from_str(&format!("1{}", "0".repeat(decimals as usize))).unwrap();
+    raw_bd / divisor
 }
