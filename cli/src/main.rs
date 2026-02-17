@@ -8,6 +8,7 @@ use sqlx::postgres::PgPoolOptions;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(about = "Spectraplex CLI", long_about = None)]
@@ -60,6 +61,13 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
     let cli = Cli::parse();
 
     // Setup DB Pool if URL provided
@@ -72,11 +80,11 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::InitDb => {
             if let Some(p) = pool {
-                println!("Running migrations...");
+                info!("Running migrations...");
                 sqlx::migrate!("../migrations").run(&p).await?;
-                println!("Database initialized successfully.");
+                info!("Database initialized successfully.");
             } else {
-                println!("Error: --db-url is required for InitDb");
+                error!("--db-url is required for InitDb");
             }
         }
         Commands::Ingest {
@@ -88,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
             x_token,
             limit,
         } => {
-            println!("Starting ingestion for {} on chain {}", wallet, chain);
+            info!(wallet = %wallet, chain = %chain, "Starting ingestion");
 
             let events = match chain.as_str() {
                 "solana" => {
@@ -107,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
                     adapter.fetch_history(&wallet, limit).await?
                 }
                 _ => {
-                    println!("Unsupported chain: {}", chain);
+                    warn!(chain = %chain, "Unsupported chain");
                     return Ok(());
                 }
             };
@@ -116,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(p) = pool {
                 let repo = Repository::new(p);
                 repo.save_transactions(&events).await?;
-                println!("Saved {} transactions to Database.", events.len());
+                info!(count = events.len(), "Saved transactions to database");
             } else {
                 // Write to JSONL
                 let mut file = File::create(&output)?;
@@ -124,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
                     serde_json::to_writer(&file, &event)?;
                     writeln!(file)?;
                 }
-                println!("Done! Data written to {:?}", output);
+                info!(path = ?output, "Data written to file");
             }
         }
         Commands::Normalize { input, output } => {
@@ -132,11 +140,11 @@ async fn main() -> anyhow::Result<()> {
                 let input_str = input.to_string_lossy();
                 if input_str.starts_with("db:") {
                     let wallet = input_str.strip_prefix("db:").unwrap();
-                    println!("Fetching transactions for wallet {} from DB...", wallet);
+                    info!(wallet = %wallet, "Fetching transactions from DB");
                     let repo = Repository::new(p);
                     repo.get_transactions_by_wallet(wallet).await?
                 } else {
-                    println!("Reading raw data from {:?}...", input);
+                    info!(path = ?input, "Reading raw data from file");
                     let file = File::open(&input)?;
                     let reader = BufReader::new(file);
                     let mut txs = Vec::new();
@@ -148,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
                     txs
                 }
             } else {
-                println!("Reading raw data from {:?}...", input);
+                info!(path = ?input, "Reading raw data from file");
                 let file = File::open(&input)?;
                 let reader = BufReader::new(file);
                 let mut txs = Vec::new();
@@ -172,10 +180,7 @@ async fn main() -> anyhow::Result<()> {
                         hyperliquid_parser::parse_hyperliquid_transaction(&tx)?
                     }
                     _ => {
-                        println!(
-                            "Skipping unsupported chain for normalization: {:?}",
-                            tx.chain
-                        );
+                        warn!(chain = ?tx.chain, "Skipping unsupported chain for normalization");
                         vec![]
                     }
                 };
@@ -183,17 +188,20 @@ async fn main() -> anyhow::Result<()> {
             }
 
             if let Some(p) = pool {
-                println!("Saving {} ledger entries to Database...", all_entries.len());
+                info!(
+                    count = all_entries.len(),
+                    "Saving ledger entries to database"
+                );
                 let repo = Repository::new(p);
                 repo.save_ledger_entries(&all_entries).await?;
-                println!("Done.");
+                info!("Normalization complete");
             } else {
                 let mut out_file = File::create(&output)?;
                 for entry in all_entries {
                     serde_json::to_writer(&out_file, &entry)?;
                     writeln!(out_file)?;
                 }
-                println!("Normalization complete. Output written to {:?}", output);
+                info!(path = ?output, "Normalization complete, output written to file");
             }
         }
     }

@@ -43,6 +43,15 @@ pub struct LedgerEntry {
     pub fiat_value: Option<BigDecimal>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexerCheckpoint {
+    pub chain: Chain,
+    pub wallet_address: String,
+    pub last_signature: Option<String>,
+    pub last_slot: Option<i64>,
+    pub last_timestamp: Option<i64>,
+}
+
 #[async_trait::async_trait]
 pub trait ChainIngestor {
     async fn fetch_history(&self, wallet: &str, limit: usize) -> anyhow::Result<Vec<Transaction>>;
