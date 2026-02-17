@@ -15,16 +15,20 @@ const DEFAULT_BLOCK_CHUNK: u64 = 2000;
 /// EVM chain adapter that fetches logs and transactions via JSON-RPC.
 pub struct EvmAdapter {
     provider: Arc<dyn Provider + Send + Sync>,
-    rate_limiter: Arc<RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>>,
+    rate_limiter: Arc<
+        RateLimiter<
+            governor::state::NotKeyed,
+            governor::state::InMemoryState,
+            governor::clock::DefaultClock,
+        >,
+    >,
     block_chunk: u64,
 }
 
 impl EvmAdapter {
     /// Create a new adapter connected to an EVM-compatible RPC endpoint.
     pub async fn new(rpc_url: &str) -> anyhow::Result<Self> {
-        let provider = ProviderBuilder::new()
-            .connect(rpc_url)
-            .await?;
+        let provider = ProviderBuilder::new().connect(rpc_url).await?;
 
         // 5 requests per second by default (safe for public RPCs)
         let quota = Quota::per_second(NonZeroU32::new(5).unwrap());
@@ -83,7 +87,11 @@ impl EvmAdapter {
         for (block_num, known_hash) in known_blocks.iter().rev() {
             self.rate_limiter.until_ready().await;
 
-            if let Some(block) = self.provider.get_block_by_number((*block_num).into()).await? {
+            if let Some(block) = self
+                .provider
+                .get_block_by_number((*block_num).into())
+                .await?
+            {
                 if block.header.hash != *known_hash {
                     return Ok(Some(*block_num));
                 }
@@ -120,9 +128,7 @@ impl ChainIngestor for EvmAdapter {
                 None => continue,
             };
 
-            let block_timestamp = log
-                .block_timestamp
-                .unwrap_or(0);
+            let block_timestamp = log.block_timestamp.unwrap_or(0);
 
             let raw_metadata = json!({
                 "log_index": log.log_index,

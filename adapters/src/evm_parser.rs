@@ -121,9 +121,7 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
 
     // 3. Gas fee (if gas_used and effective_gas_price present)
     if let (Some(gas_used_hex), Some(gas_price_hex)) = (
-        tx.raw_metadata
-            .get("gas_used")
-            .and_then(|g| g.as_str()),
+        tx.raw_metadata.get("gas_used").and_then(|g| g.as_str()),
         tx.raw_metadata
             .get("effective_gas_price")
             .and_then(|g| g.as_str()),
@@ -218,7 +216,10 @@ mod tests {
     fn test_parse_erc20_transfer_incoming() {
         let wallet = "0xabcdef1234567890abcdef1234567890abcdef12";
         // topic1 = from (some other address), topic2 = to (our wallet, padded to 32 bytes)
-        let from_padded = format!("0x000000000000000000000000{}", "1111111111111111111111111111111111111111");
+        let from_padded = format!(
+            "0x000000000000000000000000{}",
+            "1111111111111111111111111111111111111111"
+        );
         let to_padded = format!(
             "0x000000000000000000000000{}",
             &wallet[2..] // remove 0x prefix
@@ -237,7 +238,10 @@ mod tests {
         let entries = parse_evm_transaction(&tx).unwrap();
 
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].asset_symbol, "0xdac17f958d2ee523a2206206994597c13d831ec7");
+        assert_eq!(
+            entries[0].asset_symbol,
+            "0xdac17f958d2ee523a2206206994597c13d831ec7"
+        );
         assert!(entries[0].amount > BigDecimal::from(0));
         assert!(matches!(entries[0].entry_type, EntryType::Transfer));
     }
@@ -245,11 +249,11 @@ mod tests {
     #[test]
     fn test_parse_erc20_transfer_outgoing() {
         let wallet = "0xabcdef1234567890abcdef1234567890abcdef12";
-        let from_padded = format!(
+        let from_padded = format!("0x000000000000000000000000{}", &wallet[2..]);
+        let to_padded = format!(
             "0x000000000000000000000000{}",
-            &wallet[2..]
+            "2222222222222222222222222222222222222222"
         );
-        let to_padded = format!("0x000000000000000000000000{}", "2222222222222222222222222222222222222222");
         let metadata = json!({
             "topics": [
                 ERC20_TRANSFER_TOPIC,
