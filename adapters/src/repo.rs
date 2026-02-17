@@ -10,62 +10,100 @@ impl Repository {
         Self { pool }
     }
 
-    pub async fn save_transactions(&self, txs: &[Transaction]) -> anyhow::Result<()> {
-        for tx in txs {
-            let chain_str = match tx.chain {
-                spectraplex_core::models::Chain::Solana => "solana",
-                spectraplex_core::models::Chain::Hyperliquid => "hyperliquid",
-                spectraplex_core::models::Chain::Ethereum => "ethereum",
-            };
+    /// Batch size for chunked inserts.
+    const BATCH_SIZE: usize = 500;
 
-            // Using unchecked query to avoid needing a running DB during compilation
-            sqlx::query(
-                r#"
-                INSERT INTO transactions (id, user_id, wallet_address, timestamp, tx_hash, chain, raw_metadata)
-                VALUES ($1, $2, $3, $4, $5, $6::chain_enum, $7)
-                ON CONFLICT (chain, tx_hash) DO NOTHING
-                "#,
-            )
-            .bind(tx.id)
-            .bind(tx.user_id)
-            .bind(&tx.wallet_address)
-            .bind(tx.timestamp)
-            .bind(&tx.tx_hash)
-            .bind(chain_str)
-            .bind(&tx.raw_metadata)
-            .execute(&self.pool)
-            .await?;
+    pub async fn save_transactions(&self, txs: &[Transaction]) -> anyhow::Result<()> {
+        for chunk in txs.chunks(Self::BATCH_SIZE) {
+            let mut query = String::from(
+                "INSERT INTO transactions (id, user_id, wallet_address, timestamp, tx_hash, chain, raw_metadata) VALUES ",
+            );
+            let mut args = sqlx::postgres::PgArguments::default();
+            for (i, tx) in chunk.iter().enumerate() {
+                let chain_str = match tx.chain {
+                    spectraplex_core::models::Chain::Solana => "solana",
+                    spectraplex_core::models::Chain::Hyperliquid => "hyperliquid",
+                    spectraplex_core::models::Chain::Ethereum => "ethereum",
+                };
+                let base = i * 7;
+                if i > 0 {
+                    query.push_str(", ");
+                }
+                query.push_str(&format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}::chain_enum, ${})",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6,
+                    base + 7
+                ));
+                use sqlx::Arguments;
+                args.add(tx.id).map_err(|e| anyhow::anyhow!("{e}"))?;
+                args.add(tx.user_id).map_err(|e| anyhow::anyhow!("{e}"))?;
+                args.add(&tx.wallet_address)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                args.add(tx.timestamp).map_err(|e| anyhow::anyhow!("{e}"))?;
+                args.add(&tx.tx_hash).map_err(|e| anyhow::anyhow!("{e}"))?;
+                args.add(chain_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+                args.add(&tx.raw_metadata)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            query.push_str(" ON CONFLICT (chain, tx_hash) DO NOTHING");
+            sqlx::query_with(&query, args).execute(&self.pool).await?;
         }
         Ok(())
     }
 
     pub async fn save_ledger_entries(&self, entries: &[LedgerEntry]) -> anyhow::Result<()> {
-        for entry in entries {
-            let entry_type_str = match entry.entry_type {
-                spectraplex_core::models::EntryType::Trade => "trade",
-                spectraplex_core::models::EntryType::Fee => "fee",
-                spectraplex_core::models::EntryType::Transfer => "transfer",
-                spectraplex_core::models::EntryType::Staking => "staking",
-                spectraplex_core::models::EntryType::Income => "income",
-            };
-
-            sqlx::query(
-                r#"
-                INSERT INTO ledger_entries (id, transaction_id, user_id, wallet_address, asset_symbol, amount, entry_type, fiat_value)
-                VALUES ($1, $2, $3, $4, $5, $6, $7::entry_type_enum, $8)
-                ON CONFLICT (id) DO NOTHING
-                "#
-            )
-            .bind(entry.id)
-            .bind(entry.transaction_id)
-            .bind(entry.user_id)
-            .bind(&entry.wallet_address)
-            .bind(&entry.asset_symbol)
-            .bind(&entry.amount)
-            .bind(entry_type_str)
-            .bind(&entry.fiat_value)
-            .execute(&self.pool)
-            .await?;
+        for chunk in entries.chunks(Self::BATCH_SIZE) {
+            let mut query = String::from(
+                "INSERT INTO ledger_entries (id, transaction_id, user_id, wallet_address, asset_symbol, amount, entry_type, fiat_value) VALUES ",
+            );
+            let mut args = sqlx::postgres::PgArguments::default();
+            for (i, entry) in chunk.iter().enumerate() {
+                let entry_type_str = match entry.entry_type {
+                    spectraplex_core::models::EntryType::Trade => "trade",
+                    spectraplex_core::models::EntryType::Fee => "fee",
+                    spectraplex_core::models::EntryType::Transfer => "transfer",
+                    spectraplex_core::models::EntryType::Staking => "staking",
+                    spectraplex_core::models::EntryType::Income => "income",
+                };
+                let base = i * 8;
+                if i > 0 {
+                    query.push_str(", ");
+                }
+                query.push_str(&format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}::entry_type_enum, ${})",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6,
+                    base + 7,
+                    base + 8
+                ));
+                use sqlx::Arguments;
+                args.add(entry.id).map_err(|e| anyhow::anyhow!("{e}"))?;
+                args.add(entry.transaction_id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                args.add(entry.user_id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                args.add(&entry.wallet_address)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                args.add(&entry.asset_symbol)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                args.add(&entry.amount)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                args.add(entry_type_str)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                args.add(&entry.fiat_value)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            query.push_str(" ON CONFLICT (id) DO NOTHING");
+            sqlx::query_with(&query, args).execute(&self.pool).await?;
         }
         Ok(())
     }
