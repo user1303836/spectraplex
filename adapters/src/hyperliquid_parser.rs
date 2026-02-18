@@ -2,8 +2,8 @@ use bigdecimal::BigDecimal;
 use spectraplex_core::models::{EntryType, LedgerEntry, Transaction};
 use std::str::FromStr;
 use tracing::warn;
-use uuid::Uuid;
 
+use crate::deterministic_id;
 use crate::hyperliquid::{HlFill, HlFundingEntry, HlLedgerUpdate};
 
 pub fn parse_hyperliquid_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry>> {
@@ -24,6 +24,7 @@ pub fn parse_hyperliquid_transaction(tx: &Transaction) -> anyhow::Result<Vec<Led
 fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<LedgerEntry>> {
     let fill: HlFill = serde_json::from_value(data.clone())?;
     let mut entries = Vec::new();
+    let mut entry_index: u32 = 0;
 
     let size = BigDecimal::from_str(&fill.sz).unwrap_or_default();
     let price = BigDecimal::from_str(&fill.px).unwrap_or_default();
@@ -35,7 +36,7 @@ fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<
     let signed_size = if fill.side == "B" { size } else { -size };
 
     entries.push(LedgerEntry {
-        id: Uuid::new_v4(),
+        id: deterministic_id(tx.id, entry_index),
         transaction_id: tx.id,
         user_id: tx.user_id,
         wallet_address: tx.wallet_address.clone(),
@@ -44,6 +45,7 @@ fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<
         entry_type: EntryType::Trade,
         fiat_value: Some(fiat_value),
     });
+    entry_index += 1;
 
     // Fee entry (if present)
     if let Some(ref fee_str) = fill.fee {
@@ -51,7 +53,7 @@ fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<
         if fee != BigDecimal::from(0) {
             let fee_token = fill.fee_token.as_deref().unwrap_or("USDC");
             entries.push(LedgerEntry {
-                id: Uuid::new_v4(),
+                id: deterministic_id(tx.id, entry_index),
                 transaction_id: tx.id,
                 user_id: tx.user_id,
                 wallet_address: tx.wallet_address.clone(),
@@ -60,6 +62,7 @@ fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<
                 entry_type: EntryType::Fee,
                 fiat_value: None,
             });
+            entry_index += 1;
         }
     }
 
@@ -68,7 +71,7 @@ fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<
         let pnl = BigDecimal::from_str(pnl_str).unwrap_or_default();
         if pnl != BigDecimal::from(0) {
             entries.push(LedgerEntry {
-                id: Uuid::new_v4(),
+                id: deterministic_id(tx.id, entry_index),
                 transaction_id: tx.id,
                 user_id: tx.user_id,
                 wallet_address: tx.wallet_address.clone(),
@@ -77,9 +80,11 @@ fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<
                 entry_type: EntryType::Income,
                 fiat_value: None,
             });
+            entry_index += 1;
         }
     }
 
+    let _ = entry_index;
     Ok(entries)
 }
 
@@ -89,7 +94,7 @@ fn parse_funding(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<V
 
     // Funding payments: positive = received, negative = paid
     Ok(vec![LedgerEntry {
-        id: Uuid::new_v4(),
+        id: deterministic_id(tx.id, 0),
         transaction_id: tx.id,
         user_id: tx.user_id,
         wallet_address: tx.wallet_address.clone(),
@@ -114,7 +119,7 @@ fn parse_ledger_update(
             let usdc = delta["usdc"].as_str().unwrap_or("0");
             let amount = BigDecimal::from_str(usdc).unwrap_or_default();
             Ok(vec![LedgerEntry {
-                id: Uuid::new_v4(),
+                id: deterministic_id(tx.id, 0),
                 transaction_id: tx.id,
                 user_id: tx.user_id,
                 wallet_address: tx.wallet_address.clone(),
@@ -128,7 +133,7 @@ fn parse_ledger_update(
             let usdc = delta["usdc"].as_str().unwrap_or("0");
             let amount = BigDecimal::from_str(usdc).unwrap_or_default();
             Ok(vec![LedgerEntry {
-                id: Uuid::new_v4(),
+                id: deterministic_id(tx.id, 0),
                 transaction_id: tx.id,
                 user_id: tx.user_id,
                 wallet_address: tx.wallet_address.clone(),
@@ -146,7 +151,7 @@ fn parse_ledger_update(
                 .unwrap_or("0");
             let amount = BigDecimal::from_str(usdc).unwrap_or_default();
             Ok(vec![LedgerEntry {
-                id: Uuid::new_v4(),
+                id: deterministic_id(tx.id, 0),
                 transaction_id: tx.id,
                 user_id: tx.user_id,
                 wallet_address: tx.wallet_address.clone(),
@@ -167,6 +172,7 @@ fn parse_ledger_update(
 mod tests {
     use super::*;
     use spectraplex_core::models::Chain;
+    use uuid::Uuid;
 
     fn make_tx(raw_type: &str, data: serde_json::Value) -> Transaction {
         Transaction {

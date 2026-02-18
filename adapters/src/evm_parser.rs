@@ -1,6 +1,7 @@
 use bigdecimal::BigDecimal;
 use spectraplex_core::models::{EntryType, LedgerEntry, Transaction};
-use uuid::Uuid;
+
+use crate::deterministic_id;
 
 /// ERC-20 Transfer event signature: keccak256("Transfer(address,address,uint256)")
 const ERC20_TRANSFER_TOPIC: &str =
@@ -14,6 +15,7 @@ const ERC20_TRANSFER_TOPIC: &str =
 /// - Gas fees (from raw_metadata)
 pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry>> {
     let mut entries = Vec::new();
+    let mut entry_index: u32 = 0;
     let wallet = tx.wallet_address.to_lowercase();
 
     // 1. Try to parse as an ERC-20 Transfer log
@@ -47,7 +49,7 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
                 if from == wallet {
                     // Outgoing transfer
                     entries.push(LedgerEntry {
-                        id: Uuid::new_v4(),
+                        id: deterministic_id(tx.id, entry_index),
                         transaction_id: tx.id,
                         user_id: tx.user_id,
                         wallet_address: tx.wallet_address.clone(),
@@ -56,12 +58,13 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
                         entry_type: EntryType::Transfer,
                         fiat_value: None,
                     });
+                    entry_index += 1;
                 }
 
                 if to == wallet {
                     // Incoming transfer
                     entries.push(LedgerEntry {
-                        id: Uuid::new_v4(),
+                        id: deterministic_id(tx.id, entry_index),
                         transaction_id: tx.id,
                         user_id: tx.user_id,
                         wallet_address: tx.wallet_address.clone(),
@@ -70,6 +73,7 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
                         entry_type: EntryType::Transfer,
                         fiat_value: None,
                     });
+                    entry_index += 1;
                 }
             }
         }
@@ -97,7 +101,7 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
 
             if from == wallet {
                 entries.push(LedgerEntry {
-                    id: Uuid::new_v4(),
+                    id: deterministic_id(tx.id, entry_index),
                     transaction_id: tx.id,
                     user_id: tx.user_id,
                     wallet_address: tx.wallet_address.clone(),
@@ -106,11 +110,12 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
                     entry_type: EntryType::Transfer,
                     fiat_value: None,
                 });
+                entry_index += 1;
             }
 
             if to == wallet {
                 entries.push(LedgerEntry {
-                    id: Uuid::new_v4(),
+                    id: deterministic_id(tx.id, entry_index),
                     transaction_id: tx.id,
                     user_id: tx.user_id,
                     wallet_address: tx.wallet_address.clone(),
@@ -119,6 +124,7 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
                     entry_type: EntryType::Transfer,
                     fiat_value: None,
                 });
+                entry_index += 1;
             }
         }
     }
@@ -137,7 +143,7 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
         if fee_wei > 0 {
             let fee_eth = wei_to_eth(fee_wei);
             entries.push(LedgerEntry {
-                id: Uuid::new_v4(),
+                id: deterministic_id(tx.id, entry_index),
                 transaction_id: tx.id,
                 user_id: tx.user_id,
                 wallet_address: tx.wallet_address.clone(),
@@ -146,9 +152,11 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
                 entry_type: EntryType::Fee,
                 fiat_value: None,
             });
+            entry_index += 1;
         }
     }
 
+    let _ = entry_index;
     Ok(entries)
 }
 
@@ -254,6 +262,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use spectraplex_core::models::Chain;
+    use uuid::Uuid;
 
     fn make_tx(metadata: serde_json::Value) -> Transaction {
         Transaction {
@@ -526,5 +535,22 @@ mod tests {
         // Value larger than u128 (u128::MAX + 1)
         let over_u128 = hex_to_bigdecimal("0x100000000000000000000000000000000");
         assert!(over_u128 > BigDecimal::from(u128::MAX));
+    }
+
+    #[test]
+    fn test_deterministic_ids_are_stable() {
+        let tx = make_tx(json!({
+            "topics": [],
+            "data": "0x",
+            "gas_used": "0x5208",
+            "effective_gas_price": "0x3b9aca00",
+        }));
+        let entries1 = parse_evm_transaction(&tx).unwrap();
+        let entries2 = parse_evm_transaction(&tx).unwrap();
+
+        assert_eq!(entries1.len(), entries2.len());
+        for (a, b) in entries1.iter().zip(entries2.iter()) {
+            assert_eq!(a.id, b.id);
+        }
     }
 }
