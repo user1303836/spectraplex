@@ -77,6 +77,7 @@ pub fn build_checkpoint(
     })
 }
 
+#[derive(Clone)]
 pub struct Repository {
     pool: PgPool,
 }
