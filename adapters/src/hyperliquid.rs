@@ -485,16 +485,15 @@ mod tests {
             .timeout(Duration::from_millis(200))
             .build()
             .unwrap();
-        let adapter = HyperliquidAdapter {
-            client,
-            base_url,
-        };
+        let adapter = HyperliquidAdapter { client, base_url };
 
         let result = adapter.fetch_user_fills("0xtest").await;
         assert!(result.is_err());
         let err_chain = format!("{:#}", result.unwrap_err()).to_lowercase();
         assert!(
-            err_chain.contains("timed out") || err_chain.contains("timeout") || err_chain.contains("deadline has elapsed"),
+            err_chain.contains("timed out")
+                || err_chain.contains("timeout")
+                || err_chain.contains("deadline has elapsed"),
             "expected timeout error, got: {}",
             err_chain
         );

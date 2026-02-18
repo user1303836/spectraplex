@@ -155,7 +155,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health_check))
         .merge(protected)
         .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
-        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(60)))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(60),
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(shared_state);
 
@@ -318,7 +321,7 @@ async fn trigger_ingest(
                         .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                         .await?
                 }
-                _ => unreachable!("chain validated before spawn")
+                _ => unreachable!("chain validated before spawn"),
             };
             let count = events.len();
             if let Some(cp) = build_checkpoint(&chain, &wallet, &events) {
@@ -406,13 +409,13 @@ async fn trigger_normalize(
             let mut all_entries = Vec::new();
             for tx in txs {
                 let result = match tx.chain {
-                    spectraplex_core::models::Chain::Solana => {
+                    Chain::Solana => {
                         solana_parser::parse_solana_transaction(&tx)
                     }
-                    spectraplex_core::models::Chain::Hyperliquid => {
+                    Chain::Hyperliquid => {
                         hyperliquid_parser::parse_hyperliquid_transaction(&tx)
                     }
-                    spectraplex_core::models::Chain::Ethereum => {
+                    Chain::Ethereum => {
                         evm_parser::parse_evm_transaction(&tx)
                     }
                 };
