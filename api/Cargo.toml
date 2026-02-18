@@ -16,6 +16,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio-rustls", "uuid", "chrono", "bigdecimal"] }
 dotenvy = "0.15"
 anyhow = "1.0"
+chrono = "0.4"
 bigdecimal = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.19", features = ["v4", "serde"] }
 subtle = "2"
