@@ -49,6 +49,7 @@ pub struct IndexerCheckpoint {
     pub wallet_address: String,
     pub last_signature: Option<String>,
     pub last_slot: Option<i64>,
+    pub last_block: Option<i64>,
     pub last_timestamp: Option<i64>,
 }
 
