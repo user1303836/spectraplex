@@ -339,10 +339,37 @@ async fn fire_callback(url: &str, payload: &serde_json::Value) {
     }
 }
 
+fn is_private_ip(host: &str) -> bool {
+    use std::net::IpAddr;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_unspecified()
+            }
+            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        }
+    } else {
+        host == "localhost"
+    }
+}
+
 fn validate_callback_url(url: &str) -> Result<(), AppError> {
     let parsed: Result<reqwest::Url, _> = url.parse();
     match parsed {
-        Ok(u) if u.scheme() == "https" || u.scheme() == "http" => Ok(()),
+        Ok(u) if u.scheme() == "https" || u.scheme() == "http" => {
+            if let Some(host) = u.host_str() {
+                if is_private_ip(host) {
+                    return Err(AppError::bad_request(
+                        "callback_url must not target private/loopback addresses",
+                    ));
+                }
+            }
+            Ok(())
+        }
         _ => Err(AppError::bad_request(
             "callback_url must be a valid HTTP(S) URL",
         )),
@@ -1849,7 +1876,7 @@ mod tests {
 
     #[test]
     fn test_validate_callback_url_valid_http() {
-        assert!(validate_callback_url("http://localhost:8080/callback").is_ok());
+        assert!(validate_callback_url("http://example.com/callback").is_ok());
     }
 
     #[test]
@@ -1862,6 +1889,38 @@ mod tests {
     fn test_validate_callback_url_ftp_rejected() {
         let err = validate_callback_url("ftp://example.com/file").unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_callback_url_loopback_rejected() {
+        let err = validate_callback_url("http://127.0.0.1:8080/hook").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_callback_url_localhost_rejected() {
+        let err = validate_callback_url("https://localhost/hook").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_callback_url_private_ip_rejected() {
+        assert!(validate_callback_url("http://10.0.0.1/hook").is_err());
+        assert!(validate_callback_url("http://172.16.0.1/hook").is_err());
+        assert!(validate_callback_url("http://192.168.1.1/hook").is_err());
+    }
+
+    #[test]
+    fn test_is_private_ip() {
+        assert!(is_private_ip("127.0.0.1"));
+        assert!(is_private_ip("10.0.0.1"));
+        assert!(is_private_ip("172.16.0.1"));
+        assert!(is_private_ip("192.168.1.1"));
+        assert!(is_private_ip("169.254.1.1"));
+        assert!(is_private_ip("localhost"));
+        assert!(is_private_ip("::1"));
+        assert!(!is_private_ip("8.8.8.8"));
+        assert!(!is_private_ip("example.com"));
     }
 
     #[tokio::test]
@@ -2073,6 +2132,27 @@ mod tests {
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_ingest_with_loopback_callback_rejected() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana",
+                    "wallet": "abc123",
+                    "callback_url": "http://127.0.0.1:9999/hook"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
