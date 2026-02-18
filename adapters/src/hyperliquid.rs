@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
+use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
 use uuid::Uuid;
 
 const HL_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
@@ -163,26 +163,39 @@ impl ChainIngestor for HyperliquidAdapter {
         wallet: &str,
         limit: usize,
         user_id: Uuid,
+        checkpoint: Option<&IndexerCheckpoint>,
     ) -> anyhow::Result<Vec<Transaction>> {
         let mut transactions = Vec::new();
 
-        // 1. Fetch fills (trades)
+        // Resume timestamp in milliseconds (HL API uses ms).
+        // Add 1ms to avoid re-fetching the last seen event.
+        let resume_ms = checkpoint
+            .and_then(|cp| cp.last_timestamp)
+            .map(|ts| (ts * 1000) + 1)
+            .unwrap_or(0);
+
+        // 1. Fetch fills (trades) — the fills endpoint has no startTime param,
+        //    so we filter client-side.
         let fills = self.fetch_user_fills(wallet).await?;
-        for fill in fills.iter().take(limit) {
+        for fill in fills
+            .iter()
+            .filter(|f| f.time >= resume_ms as u64)
+            .take(limit)
+        {
             let raw = serde_json::to_value(fill)?;
             transactions.push(Transaction {
                 id: Uuid::new_v4(),
                 user_id,
                 wallet_address: wallet.to_string(),
-                timestamp: (fill.time / 1000) as i64, // HL timestamps are in ms
+                timestamp: (fill.time / 1000) as i64,
                 tx_hash: fill.hash.clone(),
                 chain: Chain::Hyperliquid,
                 raw_metadata: serde_json::json!({ "type": "fill", "data": raw }),
             });
         }
 
-        // 2. Fetch funding payments (from epoch 0 to get all)
-        let funding = self.fetch_user_funding(wallet, 0).await?;
+        // 2. Fetch funding payments
+        let funding = self.fetch_user_funding(wallet, resume_ms).await?;
         for entry in funding.iter().take(limit) {
             let raw = serde_json::to_value(entry)?;
             let hash = entry
@@ -201,7 +214,7 @@ impl ChainIngestor for HyperliquidAdapter {
         }
 
         // 3. Fetch non-funding ledger updates (deposits, withdrawals, liquidations)
-        let ledger_updates = self.fetch_user_ledger_updates(wallet, 0).await?;
+        let ledger_updates = self.fetch_user_ledger_updates(wallet, resume_ms).await?;
         for update in ledger_updates.iter().take(limit) {
             let raw = serde_json::to_value(update)?;
             transactions.push(Transaction {
@@ -346,6 +359,7 @@ mod tests {
                 "0x1234567890abcdef1234567890abcdef12345678",
                 10,
                 Uuid::new_v4(),
+                None,
             )
             .await
             .unwrap();
@@ -366,6 +380,69 @@ mod tests {
         // Check ledger update transaction
         let ledger_tx = &txs[2];
         assert_eq!(ledger_tx.raw_metadata["type"], "ledger_update");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_history_with_checkpoint_filters_old_data() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut stream = stream;
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+
+                    let response_body = if request.contains("userFills") {
+                        r#"[{"coin":"BTC","px":"40000.0","sz":"0.1","side":"A","time":1700000000000,"hash":"0xold"}]"#
+                    } else {
+                        "[]"
+                    };
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        let checkpoint = IndexerCheckpoint {
+            chain: Chain::Hyperliquid,
+            wallet_address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            last_signature: None,
+            last_slot: None,
+            last_block: None,
+            last_timestamp: Some(1700000000), // same second as mock data
+        };
+
+        let adapter = HyperliquidAdapter::with_base_url(&base_url);
+        let txs = adapter
+            .fetch_history(
+                "0x1234567890abcdef1234567890abcdef12345678",
+                10,
+                Uuid::new_v4(),
+                Some(&checkpoint),
+            )
+            .await
+            .unwrap();
+
+        // Fill at time=1700000000000ms should be filtered out because
+        // resume_ms = (1700000000 * 1000) + 1 = 1700000000001 > 1700000000000
+        assert_eq!(txs.len(), 0);
 
         server.abort();
     }

@@ -12,7 +12,7 @@ use spectraplex_adapters::{
     repo::Repository, solana::SolanaAdapter, solana_parser,
 };
 use spectraplex_core::config::AppConfig;
-use spectraplex_core::models::{ChainIngestor, LedgerEntry, Transaction};
+use spectraplex_core::models::{ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -256,18 +256,30 @@ async fn trigger_ingest(
         }
 
         let result = async {
+            let checkpoint: Option<IndexerCheckpoint> = state_clone
+                .repo
+                .get_checkpoint(&chain, &wallet)
+                .await
+                .unwrap_or(None);
+
             let events: Vec<Transaction> = match chain.as_str() {
                 "hyperliquid" => {
                     let adapter = HyperliquidAdapter::new();
-                    adapter.fetch_history(&wallet, limit, user_id).await?
+                    adapter
+                        .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
+                        .await?
                 }
                 "ethereum" => {
                     let adapter = EvmAdapter::new(&state_clone.config.evm_rpc_url).await?;
-                    adapter.fetch_history(&wallet, limit, user_id).await?
+                    adapter
+                        .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
+                        .await?
                 }
                 _ => {
                     let adapter = SolanaAdapter::new(&state_clone.config.solana_rpc_url);
-                    adapter.fetch_history(&wallet, limit, user_id).await?
+                    adapter
+                        .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
+                        .await?
                 }
             };
             state_clone.repo.save_transactions(&events).await?;

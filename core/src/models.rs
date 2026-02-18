@@ -60,5 +60,6 @@ pub trait ChainIngestor {
         wallet: &str,
         limit: usize,
         user_id: Uuid,
+        checkpoint: Option<&IndexerCheckpoint>,
     ) -> anyhow::Result<Vec<Transaction>>;
 }

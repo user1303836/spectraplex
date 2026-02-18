@@ -14,7 +14,7 @@ use yellowstone_grpc_proto::prelude::{
     SubscribeRequestFilterTransactions,
 };
 
-use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
+use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
 
 /// Default program IDs to monitor when none are specified.
 const DEFAULT_PROGRAM_IDS: &[&str] = &[
@@ -288,6 +288,7 @@ impl ChainIngestor for SolanaGrpcAdapter {
         wallet: &str,
         limit: usize,
         user_id: Uuid,
+        _checkpoint: Option<&IndexerCheckpoint>,
     ) -> anyhow::Result<Vec<Transaction>> {
         let mut client = self.connect_client().await?;
 
