@@ -125,9 +125,9 @@ async fn main() -> anyhow::Result<()> {
     let protected = Router::new()
         .route("/v1/ingest", post(trigger_ingest))
         .route("/v1/normalize", post(trigger_normalize))
-        .route("/v1/jobs/:job_id", get(get_job_status))
-        .route("/v1/transactions/:wallet", get(get_transactions))
-        .route("/v1/ledger/:wallet", get(get_ledger))
+        .route("/v1/jobs/{job_id}", get(get_job_status))
+        .route("/v1/transactions/{wallet}", get(get_transactions))
+        .route("/v1/ledger/{wallet}", get(get_ledger))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared_state),
             require_auth,
@@ -482,9 +482,9 @@ mod tests {
         let protected = Router::new()
             .route("/v1/ingest", post(trigger_ingest))
             .route("/v1/normalize", post(trigger_normalize))
-            .route("/v1/jobs/:job_id", get(get_job_status))
-            .route("/v1/transactions/:wallet", get(get_transactions))
-            .route("/v1/ledger/:wallet", get(get_ledger))
+            .route("/v1/jobs/{job_id}", get(get_job_status))
+            .route("/v1/transactions/{wallet}", get(get_transactions))
+            .route("/v1/ledger/{wallet}", get(get_ledger))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_auth,
