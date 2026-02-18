@@ -226,6 +226,7 @@ struct IngestRequest {
     chain: String,
     wallet: String,
     user_id: Option<Uuid>,
+    callback_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -236,6 +237,7 @@ struct BatchIngestRequest {
 #[derive(Deserialize)]
 struct NormalizeRequest {
     wallet: String,
+    callback_url: Option<String>,
 }
 
 const DEFAULT_PAGE_LIMIT: i64 = 50;
@@ -300,6 +302,32 @@ fn validate_wallet(wallet: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+async fn fire_callback(url: &str, payload: &serde_json::Value) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build();
+    let client = match client {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, url, "Failed to build callback HTTP client");
+            return;
+        }
+    };
+    if let Err(e) = client.post(url).json(payload).send().await {
+        warn!(error = %e, url, "Callback request failed");
+    }
+}
+
+fn validate_callback_url(url: &str) -> Result<(), AppError> {
+    let parsed: Result<reqwest::Url, _> = url.parse();
+    match parsed {
+        Ok(u) if u.scheme() == "https" || u.scheme() == "http" => Ok(()),
+        _ => Err(AppError::bad_request(
+            "callback_url must be a valid HTTP(S) URL",
+        )),
+    }
+}
+
 fn check_wallet_allowed(wallet: &str, allowed: &Option<HashSet<String>>) -> Result<(), AppError> {
     if let Some(set) = allowed {
         if !set.contains(&wallet.to_lowercase()) {
@@ -315,6 +343,9 @@ async fn trigger_ingest(
 ) -> Result<Json<JobStatus>, AppError> {
     validate_wallet(&payload.wallet)?;
     check_wallet_allowed(&payload.wallet, &state.allowed_wallets)?;
+    if let Some(ref url) = payload.callback_url {
+        validate_callback_url(url)?;
+    }
 
     let chain = payload.chain.clone();
     match chain.as_str() {
@@ -349,6 +380,7 @@ async fn trigger_ingest(
 
     let state_clone = Arc::clone(&state);
     let wallet = payload.wallet.clone();
+    let callback_url = payload.callback_url.clone();
     let limit = state.config.ingest_limit;
     let user_id = payload.user_id.unwrap_or_else(Uuid::new_v4);
 
@@ -404,23 +436,39 @@ async fn trigger_ingest(
         }
         .await;
 
-        let mut jobs = state_clone.jobs.write().await;
-        if let Some(entry) = jobs.get_mut(&job_id) {
-            match result {
-                Ok(count) => {
-                    info!(job_id = %job_id, count, "Ingestion completed");
-                    entry.status.state = JobState::Completed;
-                    entry.status.message = Some(format!("Ingested {} transactions", count));
+        let (final_state, final_message) = {
+            let mut jobs = state_clone.jobs.write().await;
+            if let Some(entry) = jobs.get_mut(&job_id) {
+                match result {
+                    Ok(count) => {
+                        info!(job_id = %job_id, count, "Ingestion completed");
+                        entry.status.state = JobState::Completed;
+                        entry.status.message = Some(format!("Ingested {} transactions", count));
+                    }
+                    Err(e) => {
+                        error!(job_id = %job_id, error = %e, "Ingestion failed");
+                        entry.status.state = JobState::Failed;
+                        entry.status.message = Some(e.to_string());
+                    }
                 }
-                Err(e) => {
-                    error!(job_id = %job_id, error = %e, "Ingestion failed");
-                    entry.status.state = JobState::Failed;
-                    entry.status.message = Some(e.to_string());
-                }
+                entry.finished_at = Some(Instant::now());
+                let s = serde_json::to_value(&entry.status.state).ok();
+                let m = entry.status.message.clone();
+                (s, m)
+            } else {
+                (None, None)
             }
-            entry.finished_at = Some(Instant::now());
-        } else {
-            warn!(job_id = %job_id, "Job entry missing when recording ingestion result");
+        };
+
+        if let Some(ref url) = callback_url {
+            let payload = serde_json::json!({
+                "job_id": job_id,
+                "state": final_state,
+                "wallet": wallet,
+                "chain": chain,
+                "message": final_message,
+            });
+            fire_callback(url, &payload).await;
         }
 
         state_clone.prune_stale_jobs().await;
@@ -469,6 +517,7 @@ async fn trigger_batch_ingest(
             chain: item.chain,
             wallet: item.wallet,
             user_id: item.user_id,
+            callback_url: item.callback_url,
         });
         match trigger_ingest(State(Arc::clone(&state)), single).await {
             Ok(Json(status)) => jobs.push(status),
@@ -492,6 +541,9 @@ async fn trigger_normalize(
 ) -> Result<Json<JobStatus>, AppError> {
     validate_wallet(&payload.wallet)?;
     check_wallet_allowed(&payload.wallet, &state.allowed_wallets)?;
+    if let Some(ref url) = payload.callback_url {
+        validate_callback_url(url)?;
+    }
 
     let permit = state
         .job_semaphore
@@ -516,6 +568,7 @@ async fn trigger_normalize(
 
     let state_clone = Arc::clone(&state);
     let wallet = payload.wallet.clone();
+    let callback_url = payload.callback_url.clone();
 
     tokio::spawn(async move {
         let _permit = permit;
@@ -558,23 +611,38 @@ async fn trigger_normalize(
         }
         .await;
 
-        let mut jobs = state_clone.jobs.write().await;
-        if let Some(entry) = jobs.get_mut(&job_id) {
-            match result {
-                Ok(count) => {
-                    info!(job_id = %job_id, count, "Normalization completed");
-                    entry.status.state = JobState::Completed;
-                    entry.status.message = Some(format!("Normalized {} ledger entries", count));
+        let (final_state, final_message) = {
+            let mut jobs = state_clone.jobs.write().await;
+            if let Some(entry) = jobs.get_mut(&job_id) {
+                match result {
+                    Ok(count) => {
+                        info!(job_id = %job_id, count, "Normalization completed");
+                        entry.status.state = JobState::Completed;
+                        entry.status.message = Some(format!("Normalized {} ledger entries", count));
+                    }
+                    Err(e) => {
+                        error!(job_id = %job_id, error = %e, "Normalization failed");
+                        entry.status.state = JobState::Failed;
+                        entry.status.message = Some(e.to_string());
+                    }
                 }
-                Err(e) => {
-                    error!(job_id = %job_id, error = %e, "Normalization failed");
-                    entry.status.state = JobState::Failed;
-                    entry.status.message = Some(e.to_string());
-                }
+                entry.finished_at = Some(Instant::now());
+                let s = serde_json::to_value(&entry.status.state).ok();
+                let m = entry.status.message.clone();
+                (s, m)
+            } else {
+                (None, None)
             }
-            entry.finished_at = Some(Instant::now());
-        } else {
-            warn!(job_id = %job_id, "Job entry missing when recording normalization result");
+        };
+
+        if let Some(ref url) = callback_url {
+            let payload = serde_json::json!({
+                "job_id": job_id,
+                "state": final_state,
+                "wallet": wallet,
+                "message": final_message,
+            });
+            fire_callback(url, &payload).await;
         }
 
         state_clone.prune_stale_jobs().await;
@@ -1702,6 +1770,49 @@ mod tests {
         assert_ne!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[test]
+    fn test_validate_callback_url_valid_https() {
+        assert!(validate_callback_url("https://example.com/webhook").is_ok());
+    }
+
+    #[test]
+    fn test_validate_callback_url_valid_http() {
+        assert!(validate_callback_url("http://localhost:8080/callback").is_ok());
+    }
+
+    #[test]
+    fn test_validate_callback_url_invalid() {
+        let err = validate_callback_url("not-a-url").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_callback_url_ftp_rejected() {
+        let err = validate_callback_url("ftp://example.com/file").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_ingest_with_callback_url_accepted() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana",
+                    "wallet": "abc123",
+                    "callback_url": "https://example.com/webhook"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn test_export_csv_passes_validation() {
         let app = test_router();
@@ -1728,6 +1839,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ingest_with_invalid_callback_url_rejected() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana",
+                    "wallet": "abc123",
+                    "callback_url": "not-a-url"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn test_export_requires_auth() {
         let app = test_router();
         let req = axum::http::Request::builder()
@@ -1745,6 +1877,46 @@ mod tests {
             .uri("/v1/export/bad%20wallet")
             .header("authorization", format!("Bearer {}", TEST_API_KEY))
             .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_normalize_with_callback_url_accepted() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/normalize")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallet": "abc123",
+                    "callback_url": "https://example.com/webhook"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_normalize_with_invalid_callback_url_rejected() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/normalize")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallet": "abc123",
+                    "callback_url": "ftp://bad"
+                }))
+                .unwrap(),
+            ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -1826,6 +1998,26 @@ mod tests {
             .uri("/v1/transactions/abc123?from=1700000000&to=1700100000")
             .header("authorization", format!("Bearer {}", TEST_API_KEY))
             .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_ingest_without_callback_url_still_works() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana",
+                    "wallet": "abc123"
+                }))
+                .unwrap(),
+            ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_ne!(response.status(), StatusCode::BAD_REQUEST);
