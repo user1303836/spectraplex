@@ -15,6 +15,7 @@ use spectraplex_adapters::{
     hyperliquid_parser,
     repo::{build_checkpoint, Repository},
     solana::SolanaAdapter,
+    solana_grpc::SolanaGrpcAdapter,
     solana_parser,
 };
 use spectraplex_core::config::AppConfig;
@@ -26,6 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::sync::{RwLock, Semaphore};
+use tokio_util::sync::CancellationToken;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
@@ -83,6 +85,7 @@ impl IntoResponse for AppError {
 }
 
 const MAX_CONCURRENT_JOBS: usize = 10;
+const MAX_CONCURRENT_STREAMS: usize = 5;
 
 struct AppState {
     repo: Repository,
@@ -90,6 +93,24 @@ struct AppState {
     allowed_wallets: Option<HashSet<String>>,
     jobs: RwLock<HashMap<Uuid, JobEntry>>,
     job_semaphore: Arc<Semaphore>,
+    streams: RwLock<HashMap<Uuid, StreamEntry>>,
+    stream_semaphore: Arc<Semaphore>,
+}
+
+struct StreamEntry {
+    id: Uuid,
+    cancel: CancellationToken,
+    started_at: Instant,
+    tx_count: Arc<std::sync::atomic::AtomicU64>,
+    last_slot: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[derive(Serialize)]
+struct StreamInfo {
+    id: Uuid,
+    uptime_secs: u64,
+    transactions_ingested: u64,
+    last_slot: u64,
 }
 
 /// Wraps a JobStatus with a timestamp for TTL-based cleanup.
@@ -150,6 +171,8 @@ async fn main() -> anyhow::Result<()> {
         allowed_wallets,
         jobs: RwLock::new(HashMap::new()),
         job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
+        streams: RwLock::new(HashMap::new()),
+        stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
     });
 
     let protected = Router::new()
@@ -166,6 +189,9 @@ async fn main() -> anyhow::Result<()> {
             get(get_single_transaction),
         )
         .route("/v1/stats/{wallet}", get(get_wallet_stats))
+        .route("/v1/stream/start", post(start_stream))
+        .route("/v1/stream/{stream_id}/stop", post(stop_stream))
+        .route("/v1/streams", get(list_streams))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared_state),
             require_auth,
@@ -876,6 +902,154 @@ async fn get_wallet_stats(
     }))
 }
 
+#[derive(Deserialize)]
+struct StartStreamRequest {
+    chain: String,
+}
+
+async fn start_stream(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<StartStreamRequest>,
+) -> Result<Json<StreamInfo>, AppError> {
+    if payload.chain != "solana" {
+        return Err(AppError::bad_request(
+            "Streaming is currently only supported for solana",
+        ));
+    }
+
+    let grpc_url = state
+        .config
+        .solana_grpc_url
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| {
+            AppError::bad_request("Solana gRPC URL not configured (set SOLANA_GRPC_URL)")
+        })?;
+
+    let _permit = state
+        .stream_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::service_unavailable("Too many concurrent streams"))?;
+
+    let stream_id = Uuid::new_v4();
+    let cancel = CancellationToken::new();
+    let tx_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last_slot = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let adapter = SolanaGrpcAdapter::new(grpc_url, state.config.solana_grpc_token.clone());
+    let (mut rx, grpc_handle) = adapter.stream_transactions();
+
+    let cancel_clone = cancel.clone();
+    let tx_count_clone = Arc::clone(&tx_count);
+    let last_slot_clone = Arc::clone(&last_slot);
+    let repo = state.repo.clone();
+    let state_clone = Arc::clone(&state);
+
+    tokio::spawn(async move {
+        let _permit = _permit;
+        let mut batch: Vec<Transaction> = Vec::new();
+        let mut last_flush = Instant::now();
+        const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+        const BATCH_SIZE: usize = 100;
+
+        loop {
+            tokio::select! {
+                _ = cancel_clone.cancelled() => {
+                    info!(stream_id = %stream_id, "Stream cancelled");
+                    break;
+                }
+                maybe_tx = rx.recv() => {
+                    match maybe_tx {
+                        Some(tx) => {
+                            if let Some(slot) = tx.raw_metadata.get("slot").and_then(|v| v.as_u64()) {
+                                last_slot_clone.store(slot, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            batch.push(tx);
+                            tx_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            if batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL {
+                                if let Err(e) = repo.save_transactions(&batch).await {
+                                    error!(stream_id = %stream_id, error = %e, "Failed to save streamed transactions");
+                                }
+                                batch.clear();
+                                last_flush = Instant::now();
+                            }
+                        }
+                        None => {
+                            info!(stream_id = %stream_id, "gRPC stream channel closed");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            if let Err(e) = repo.save_transactions(&batch).await {
+                error!(stream_id = %stream_id, error = %e, "Failed to flush final batch");
+            }
+        }
+
+        grpc_handle.abort();
+        state_clone.streams.write().await.remove(&stream_id);
+        info!(stream_id = %stream_id, "Stream removed from active set");
+    });
+
+    let entry = StreamEntry {
+        id: stream_id,
+        cancel: cancel.clone(),
+        started_at: Instant::now(),
+        tx_count: Arc::clone(&tx_count),
+        last_slot: Arc::clone(&last_slot),
+    };
+
+    let info = StreamInfo {
+        id: stream_id,
+        uptime_secs: 0,
+        transactions_ingested: 0,
+        last_slot: 0,
+    };
+
+    state.streams.write().await.insert(stream_id, entry);
+    info!(stream_id = %stream_id, "Stream started");
+
+    Ok(Json(info))
+}
+
+async fn stop_stream(
+    State(state): State<Arc<AppState>>,
+    Path(stream_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let streams = state.streams.read().await;
+    let entry = streams
+        .get(&stream_id)
+        .ok_or_else(|| AppError::not_found(format!("Stream {} not found", stream_id)))?;
+    entry.cancel.cancel();
+    drop(streams);
+
+    Ok(Json(serde_json::json!({
+        "id": stream_id,
+        "status": "stopping"
+    })))
+}
+
+async fn list_streams(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<StreamInfo>>, AppError> {
+    let streams = state.streams.read().await;
+    let infos: Vec<StreamInfo> = streams
+        .values()
+        .map(|entry| StreamInfo {
+            id: entry.id,
+            uptime_secs: entry.started_at.elapsed().as_secs(),
+            transactions_ingested: entry.tx_count.load(std::sync::atomic::Ordering::Relaxed),
+            last_slot: entry.last_slot.load(std::sync::atomic::Ordering::Relaxed),
+        })
+        .collect();
+    Ok(Json(infos))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,6 +1087,8 @@ mod tests {
             allowed_wallets: allowed_wallets_set,
             jobs: RwLock::new(HashMap::new()),
             job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
+            streams: RwLock::new(HashMap::new()),
+            stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
         })
     }
 
@@ -936,6 +1112,9 @@ mod tests {
                 get(get_single_transaction),
             )
             .route("/v1/stats/{wallet}", get(get_wallet_stats))
+            .route("/v1/stream/start", post(start_stream))
+            .route("/v1/stream/{stream_id}/stop", post(stop_stream))
+            .route("/v1/streams", get(list_streams))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_auth,
@@ -1452,6 +1631,8 @@ mod tests {
             allowed_wallets: None,
             jobs: RwLock::new(HashMap::new()),
             job_semaphore: Arc::new(Semaphore::new(1)),
+            streams: RwLock::new(HashMap::new()),
+            stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
         });
         let app = test_router_with_state(Arc::clone(&state));
 
@@ -2283,5 +2464,231 @@ mod tests {
         assert_eq!(json["transactions_per_chain"].as_array().unwrap().len(), 2);
         assert_eq!(json["transactions_per_chain"][0]["chain"], "ethereum");
         assert_eq!(json["transactions_per_chain"][0]["count"], 20);
+    }
+
+    #[tokio::test]
+    async fn test_stream_start_unsupported_chain() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/stream/start")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({"chain": "ethereum"})).unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("only supported for solana"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_start_no_grpc_url_configured() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/stream/start")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({"chain": "solana"})).unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("gRPC URL not configured"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_start_requires_auth() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/stream/start")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({"chain": "solana"})).unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_stream_stop_not_found() {
+        let app = test_router();
+        let stream_id = Uuid::new_v4();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/stream/{}/stop", stream_id))
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_stream_stop_requires_auth() {
+        let app = test_router();
+        let stream_id = Uuid::new_v4();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/stream/{}/stop", stream_id))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_list_streams_empty() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/streams")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let streams: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_streams_requires_auth() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/streams")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_stream_stop_with_active_stream() {
+        let state = test_state();
+        let stream_id = Uuid::new_v4();
+        let cancel = CancellationToken::new();
+        state.streams.write().await.insert(
+            stream_id,
+            StreamEntry {
+                id: stream_id,
+                cancel: cancel.clone(),
+                started_at: Instant::now(),
+                tx_count: Arc::new(std::sync::atomic::AtomicU64::new(42)),
+                last_slot: Arc::new(std::sync::atomic::AtomicU64::new(12345)),
+            },
+        );
+
+        let app = test_router_with_state(Arc::clone(&state));
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/stream/{}/stop", stream_id))
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "stopping");
+
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_list_streams_with_active_stream() {
+        let state = test_state();
+        let stream_id = Uuid::new_v4();
+        state.streams.write().await.insert(
+            stream_id,
+            StreamEntry {
+                id: stream_id,
+                cancel: CancellationToken::new(),
+                started_at: Instant::now(),
+                tx_count: Arc::new(std::sync::atomic::AtomicU64::new(100)),
+                last_slot: Arc::new(std::sync::atomic::AtomicU64::new(50000)),
+            },
+        );
+
+        let app = test_router_with_state(Arc::clone(&state));
+        let req = axum::http::Request::builder()
+            .uri("/v1/streams")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let streams: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0]["id"], stream_id.to_string());
+        assert_eq!(streams[0]["transactions_ingested"], 100);
+        assert_eq!(streams[0]["last_slot"], 50000);
+    }
+
+    #[tokio::test]
+    async fn test_stream_semaphore_limits_concurrent_streams() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://fake:fake@localhost/fake")
+            .unwrap();
+        let config = AppConfig {
+            api_key: Some("secret".to_string()),
+            solana_grpc_url: Some("http://fake-grpc:10000".to_string()),
+            ..AppConfig::default()
+        };
+        let allowed_wallets_set = config.allowed_wallets_set();
+        let state = Arc::new(AppState {
+            repo: Repository::new(pool),
+            config,
+            allowed_wallets: allowed_wallets_set,
+            jobs: RwLock::new(HashMap::new()),
+            job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
+            streams: RwLock::new(HashMap::new()),
+            stream_semaphore: Arc::new(Semaphore::new(0)),
+        });
+
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/stream/start")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({"chain": "solana"})).unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_stream_info_serialization() {
+        let info = StreamInfo {
+            id: Uuid::nil(),
+            uptime_secs: 120,
+            transactions_ingested: 5000,
+            last_slot: 300000,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["uptime_secs"], 120);
+        assert_eq!(json["transactions_ingested"], 5000);
+        assert_eq!(json["last_slot"], 300000);
     }
 }

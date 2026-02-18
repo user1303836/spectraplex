@@ -86,6 +86,7 @@ pub struct WalletStatsRow {
     pub per_chain: Vec<(String, i64)>,
 }
 
+#[derive(Clone)]
 pub struct Repository {
     pool: PgPool,
 }
