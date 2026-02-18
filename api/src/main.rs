@@ -17,7 +17,7 @@ use spectraplex_adapters::{
     solana_parser,
 };
 use spectraplex_core::config::AppConfig;
-use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
+use spectraplex_core::models::{ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -155,7 +155,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health_check))
         .merge(protected)
         .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
-        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(60)))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(60),
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(shared_state);
 
@@ -318,7 +321,7 @@ async fn trigger_ingest(
                         .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                         .await?
                 }
-                _ => unreachable!("chain validated before spawn")
+                _ => unreachable!("chain validated before spawn"),
             };
             let count = events.len();
             if let Some(cp) = build_checkpoint(&chain, &wallet, &events) {
@@ -506,6 +509,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use http_body_util::BodyExt;
+    use spectraplex_core::models::Chain;
     use tower::ServiceExt;
 
     fn test_state() -> Arc<AppState> {
