@@ -145,13 +145,25 @@ cargo run --release --bin spectraplex-api
 # Health check (no auth required)
 curl http://127.0.0.1:3000/health
 
-# Get raw transactions for a wallet (paginated)
+# Get raw transactions for a wallet (paginated, with optional date range)
 curl -H "Authorization: Bearer <API_KEY>" \
   "http://127.0.0.1:3000/v1/transactions/<WALLET_ADDRESS>?limit=50&offset=0"
 
 # Get normalized ledger entries (paginated)
 curl -H "Authorization: Bearer <API_KEY>" \
   "http://127.0.0.1:3000/v1/ledger/<WALLET_ADDRESS>?limit=50&offset=0"
+
+# Get current balances
+curl -H "Authorization: Bearer <API_KEY>" \
+  "http://127.0.0.1:3000/v1/balances/<WALLET_ADDRESS>"
+
+# Export ledger as CSV
+curl -H "Authorization: Bearer <API_KEY>" \
+  "http://127.0.0.1:3000/v1/export/<WALLET_ADDRESS>?format=csv"
+
+# Get wallet stats
+curl -H "Authorization: Bearer <API_KEY>" \
+  "http://127.0.0.1:3000/v1/stats/<WALLET_ADDRESS>"
 ```
 
 ## CLI Reference
@@ -199,11 +211,19 @@ All `/v1/*` endpoints require authentication via `Authorization: Bearer <API_KEY
 | `POST` | `/v1/normalize` | Trigger async normalization for a wallet (returns job ID) |
 | `GET` | `/v1/jobs/:job_id` | Poll job status (pending/running/completed/failed) |
 | `GET` | `/v1/transactions/:wallet` | Get raw transactions by wallet (paginated) |
+| `GET` | `/v1/transactions/:wallet/:tx_hash` | Get a single transaction by hash |
 | `GET` | `/v1/ledger/:wallet` | Get normalized ledger entries by wallet (paginated) |
+| `GET` | `/v1/export/:wallet` | Export ledger entries as CSV or JSON |
+| `GET` | `/v1/balances/:wallet` | Get current asset balances (aggregated from ledger) |
+| `GET` | `/v1/stats/:wallet` | Get wallet statistics (tx count, chains, date range) |
 
 All wallet endpoints validate the address format and return structured JSON errors.
 
 Query endpoints support `?limit=N&offset=N` parameters (default limit: 50, max: 1000).
+
+The transactions, ledger, and export endpoints support date range filtering via `?from=<unix_ts>&to=<unix_ts>` query parameters (both optional).
+
+The ingest and normalize endpoints accept an optional `callback_url` field. When provided, the server will POST a JSON payload to that URL when the job completes or fails. Only HTTP(S) URLs targeting public addresses are accepted.
 
 ### POST /v1/ingest
 
@@ -215,6 +235,8 @@ curl -X POST http://127.0.0.1:3000/v1/ingest \
 
 # Response: {"id": "<JOB_UUID>", "state": "pending", "message": "Job queued"}
 ```
+
+Optional: add `"callback_url": "https://example.com/webhook"` to receive a POST notification when the job finishes.
 
 ### POST /v1/ingest/batch
 
@@ -250,6 +272,47 @@ curl -H "Authorization: Bearer <API_KEY>" \
 ```
 
 Jobs are kept in memory for 1 hour after completion, then automatically pruned.
+
+### GET /v1/transactions/:wallet/:tx_hash
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  http://127.0.0.1:3000/v1/transactions/<WALLET>/0xdeadbeef
+
+# Response: {"id": "...", "wallet_address": "...", "tx_hash": "0xdeadbeef", ...}
+# Returns 404 if not found
+```
+
+### GET /v1/export/:wallet
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  "http://127.0.0.1:3000/v1/export/<WALLET>?format=csv"
+
+# Response: CSV file with headers: id,transaction_id,wallet_address,asset_symbol,amount,entry_type,fiat_value
+```
+
+Supports `?format=csv` (default) or `?format=json`. Maximum 10,000 entries per export. Supports `?from=<unix_ts>&to=<unix_ts>` for date range filtering.
+
+### GET /v1/balances/:wallet
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  http://127.0.0.1:3000/v1/balances/<WALLET>
+
+# Response: [{"asset_symbol": "SOL", "balance": "12.5"}, {"asset_symbol": "USDC", "balance": "1000"}]
+```
+
+Returns aggregated balances from all ledger entries. Supports `?at=<unix_ts>` for point-in-time balance snapshots.
+
+### GET /v1/stats/:wallet
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  http://127.0.0.1:3000/v1/stats/<WALLET>
+
+# Response: {"total_transactions": 42, "earliest_timestamp": 1700000000, "latest_timestamp": 1700100000, "total_chains": 2, "unique_assets": 5, "transactions_per_chain": [{"chain": "solana", "count": 30}, ...]}
+```
 
 ## Configuration
 
@@ -366,6 +429,12 @@ All tables use UUIDs as primary keys and support idempotent batch inserts (`ON C
 - [x] Wallet scoping (restrict API access to specific wallets)
 - [x] Batch ingestion (multi-wallet, up to 50 per request)
 - [x] Request hardening (body limits, timeouts, concurrent job caps)
+- [x] Ledger export (CSV/JSON) with date range filtering
+- [x] Balance aggregation endpoint with point-in-time snapshots
+- [x] Date range filtering on transactions, ledger, and export endpoints
+- [x] Webhook callbacks for job completion notifications
+- [x] Single transaction lookup by hash
+- [x] Wallet statistics endpoint (tx count, chains, assets, date range)
 - [ ] EVM native ETH transfer and gas fee parsing
 - [ ] Improved entry type classification (trades, staking)
 - [ ] Historical price lookups for fiat value
