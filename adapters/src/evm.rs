@@ -1,7 +1,7 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use alloy::consensus::Transaction as TransactionTrait;
 use alloy::primitives::{Address, B256};
@@ -179,6 +179,7 @@ impl ChainIngestor for EvmAdapter {
         }
 
         let mut transactions = Vec::new();
+        let mut emitted_tx_hashes = HashSet::new();
 
         for log in &logs {
             let tx_hash = match log.transaction_hash {
@@ -198,14 +199,18 @@ impl ChainIngestor for EvmAdapter {
                 "data": format!("0x{}", alloy::hex::encode(log.data().data.as_ref())),
             });
 
-            // Merge transaction and receipt fields into raw_metadata
-            if let Some((tx_fields, receipt_fields)) = seen_tx_hashes.get(&tx_hash) {
-                if let Some(obj) = raw_metadata.as_object_mut() {
-                    if let Some(tx_obj) = tx_fields.as_object() {
-                        obj.extend(tx_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
-                    }
-                    if let Some(rx_obj) = receipt_fields.as_object() {
-                        obj.extend(rx_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+            // Only attach tx-level fields (value, from, to, gas_used, effective_gas_price)
+            // to the first log per tx hash to avoid duplicate gas fee / value entries.
+            let is_first_log = emitted_tx_hashes.insert(tx_hash.clone());
+            if is_first_log {
+                if let Some((tx_fields, receipt_fields)) = seen_tx_hashes.get(&tx_hash) {
+                    if let Some(obj) = raw_metadata.as_object_mut() {
+                        if let Some(tx_obj) = tx_fields.as_object() {
+                            obj.extend(tx_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        }
+                        if let Some(rx_obj) = receipt_fields.as_object() {
+                            obj.extend(rx_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        }
                     }
                 }
             }
