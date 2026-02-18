@@ -39,6 +39,44 @@ fn str_to_entry_type(s: &str) -> EntryType {
     }
 }
 
+pub fn build_checkpoint(
+    chain: &str,
+    wallet: &str,
+    txs: &[Transaction],
+) -> Option<IndexerCheckpoint> {
+    if txs.is_empty() {
+        return None;
+    }
+
+    let chain_enum = str_to_chain(chain).ok()?;
+    let latest = txs.iter().max_by_key(|tx| tx.timestamp)?;
+
+    let last_slot = match chain {
+        "solana" => txs
+            .iter()
+            .filter_map(|tx| tx.raw_metadata.get("slot").and_then(|v| v.as_i64()))
+            .max(),
+        _ => None,
+    };
+
+    let last_block = match chain {
+        "ethereum" => txs
+            .iter()
+            .filter_map(|tx| tx.raw_metadata.get("block_number").and_then(|v| v.as_i64()))
+            .max(),
+        _ => None,
+    };
+
+    Some(IndexerCheckpoint {
+        chain: chain_enum,
+        wallet_address: wallet.to_string(),
+        last_signature: Some(latest.tx_hash.clone()),
+        last_slot,
+        last_block,
+        last_timestamp: Some(latest.timestamp),
+    })
+}
+
 pub struct Repository {
     pool: PgPool,
 }

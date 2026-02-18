@@ -8,8 +8,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use spectraplex_adapters::{
-    evm::EvmAdapter, evm_parser, hyperliquid::HyperliquidAdapter, hyperliquid_parser,
-    repo::Repository, solana::SolanaAdapter, solana_parser,
+    evm::EvmAdapter,
+    evm_parser,
+    hyperliquid::HyperliquidAdapter,
+    hyperliquid_parser,
+    repo::{build_checkpoint, Repository},
+    solana::SolanaAdapter,
+    solana_parser,
 };
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::models::{ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
@@ -138,9 +143,9 @@ async fn main() -> anyhow::Result<()> {
     let protected = Router::new()
         .route("/v1/ingest", post(trigger_ingest))
         .route("/v1/normalize", post(trigger_normalize))
-        .route("/v1/jobs/:job_id", get(get_job_status))
-        .route("/v1/transactions/:wallet", get(get_transactions))
-        .route("/v1/ledger/:wallet", get(get_ledger))
+        .route("/v1/jobs/{job_id}", get(get_job_status))
+        .route("/v1/transactions/{wallet}", get(get_transactions))
+        .route("/v1/ledger/{wallet}", get(get_ledger))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared_state),
             require_auth,
@@ -150,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health_check))
         .merge(protected)
         .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
-        .layer(TimeoutLayer::new(Duration::from_secs(60)))
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(60)))
         .layer(TraceLayer::new_for_http())
         .with_state(shared_state);
 
@@ -315,8 +320,16 @@ async fn trigger_ingest(
                 }
                 _ => unreachable!("chain validated before spawn")
             };
-            state_clone.repo.save_transactions(&events).await?;
-            Ok::<usize, anyhow::Error>(events.len())
+            let count = events.len();
+            if let Some(cp) = build_checkpoint(&chain, &wallet, &events) {
+                state_clone
+                    .repo
+                    .save_transactions_and_checkpoint(&events, &cp)
+                    .await?;
+            } else {
+                state_clone.repo.save_transactions(&events).await?;
+            }
+            Ok::<usize, anyhow::Error>(count)
         }
         .await;
 
@@ -524,9 +537,9 @@ mod tests {
         let protected = Router::new()
             .route("/v1/ingest", post(trigger_ingest))
             .route("/v1/normalize", post(trigger_normalize))
-            .route("/v1/jobs/:job_id", get(get_job_status))
-            .route("/v1/transactions/:wallet", get(get_transactions))
-            .route("/v1/ledger/:wallet", get(get_ledger))
+            .route("/v1/jobs/{job_id}", get(get_job_status))
+            .route("/v1/transactions/{wallet}", get(get_transactions))
+            .route("/v1/ledger/{wallet}", get(get_ledger))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_auth,
