@@ -161,6 +161,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/ledger/{wallet}", get(get_ledger))
         .route("/v1/export/{wallet}", get(export_ledger))
         .route("/v1/balances/{wallet}", get(get_balances))
+        .route(
+            "/v1/transactions/{wallet}/{tx_hash}",
+            get(get_single_transaction),
+        )
+        .route("/v1/stats/{wallet}", get(get_wallet_stats))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared_state),
             require_auth,
@@ -265,6 +270,22 @@ struct BalanceParams {
 struct AssetBalance {
     asset_symbol: String,
     balance: BigDecimal,
+}
+
+#[derive(Serialize)]
+struct ChainTxCount {
+    chain: String,
+    count: i64,
+}
+
+#[derive(Serialize)]
+struct WalletStats {
+    total_transactions: i64,
+    earliest_timestamp: Option<i64>,
+    latest_timestamp: Option<i64>,
+    total_chains: i64,
+    unique_assets: i64,
+    transactions_per_chain: Vec<ChainTxCount>,
 }
 
 fn clamp_limit(limit: Option<i64>) -> i64 {
@@ -741,6 +762,52 @@ async fn get_balances(
     Ok(Json(balances))
 }
 
+async fn get_single_transaction(
+    State(state): State<Arc<AppState>>,
+    Path((wallet, tx_hash)): Path<(String, String)>,
+) -> Result<Json<Transaction>, AppError> {
+    validate_wallet(&wallet)?;
+    check_wallet_allowed(&wallet, &state.allowed_wallets)?;
+
+    let tx = state
+        .repo
+        .get_transaction_by_hash(&wallet, &tx_hash)
+        .await
+        .map_err(AppError::internal)?;
+
+    match tx {
+        Some(tx) => Ok(Json(tx)),
+        None => Err(AppError::not_found("Transaction not found")),
+    }
+}
+
+async fn get_wallet_stats(
+    State(state): State<Arc<AppState>>,
+    Path(wallet): Path<String>,
+) -> Result<Json<WalletStats>, AppError> {
+    validate_wallet(&wallet)?;
+    check_wallet_allowed(&wallet, &state.allowed_wallets)?;
+
+    let stats = state
+        .repo
+        .get_wallet_stats(&wallet)
+        .await
+        .map_err(AppError::internal)?;
+
+    Ok(Json(WalletStats {
+        total_transactions: stats.tx_count,
+        earliest_timestamp: stats.earliest_timestamp,
+        latest_timestamp: stats.latest_timestamp,
+        total_chains: stats.chain_count,
+        unique_assets: stats.unique_assets,
+        transactions_per_chain: stats
+            .per_chain
+            .into_iter()
+            .map(|(chain, count)| ChainTxCount { chain, count })
+            .collect(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,6 +863,11 @@ mod tests {
             .route("/v1/ledger/{wallet}", get(get_ledger))
             .route("/v1/export/{wallet}", get(export_ledger))
             .route("/v1/balances/{wallet}", get(get_balances))
+            .route(
+                "/v1/transactions/{wallet}/{tx_hash}",
+                get(get_single_transaction),
+            )
+            .route("/v1/stats/{wallet}", get(get_wallet_stats))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_auth,
@@ -1889,5 +1961,135 @@ mod tests {
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_single_transaction_invalid_wallet() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/transactions/bad%20wallet/0xabc")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_single_transaction_requires_auth() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/transactions/abc123/0xdeadbeef")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_single_transaction_respects_wallet_scoping() {
+        let state = test_state_with_config(Some("secret".to_string()), Some("abc123".to_string()));
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .uri("/v1/transactions/notallowed/0xabc")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_single_transaction_passes_validation() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/transactions/abc123/0xdeadbeef")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_stats_invalid_wallet() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/stats/bad%20wallet")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_stats_requires_auth() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/stats/abc123")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_stats_respects_wallet_scoping() {
+        let state = test_state_with_config(Some("secret".to_string()), Some("abc123".to_string()));
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .uri("/v1/stats/notallowed")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_stats_passes_validation() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/stats/abc123")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_wallet_stats_serialization() {
+        let stats = WalletStats {
+            total_transactions: 42,
+            earliest_timestamp: Some(1700000000),
+            latest_timestamp: Some(1700100000),
+            total_chains: 2,
+            unique_assets: 5,
+            transactions_per_chain: vec![
+                ChainTxCount {
+                    chain: "ethereum".to_string(),
+                    count: 20,
+                },
+                ChainTxCount {
+                    chain: "solana".to_string(),
+                    count: 22,
+                },
+            ],
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["total_transactions"], 42);
+        assert_eq!(json["earliest_timestamp"], 1700000000);
+        assert_eq!(json["latest_timestamp"], 1700100000);
+        assert_eq!(json["total_chains"], 2);
+        assert_eq!(json["unique_assets"], 5);
+        assert_eq!(json["transactions_per_chain"].as_array().unwrap().len(), 2);
+        assert_eq!(json["transactions_per_chain"][0]["chain"], "ethereum");
+        assert_eq!(json["transactions_per_chain"][0]["count"], 20);
     }
 }
