@@ -357,7 +357,7 @@ Spectraplex uses a layered configuration system powered by [figment](https://cra
 1. Built-in defaults
 2. `spectraplex.toml` (optional config file in project root)
 3. `SPECTRAPLEX_*` environment variables (e.g., `SPECTRAPLEX_PORT=8080`)
-4. Direct env vars: `DATABASE_URL`, `SOLANA_RPC_URL`, `EVM_RPC_URL`
+4. Direct env vars: `DATABASE_URL`, `SOLANA_RPC_URL`, `EVM_RPC_URL`, `SOLANA_GRPC_URL`, `SOLANA_GRPC_TOKEN`
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -371,6 +371,8 @@ Spectraplex uses a layered configuration system powered by [figment](https://cra
 | `SPECTRAPLEX_ALLOWED_WALLETS` | *(none)* | Comma-separated list of wallet addresses to restrict access to. If unset, all wallets are allowed. |
 | `SOLANA_RPC_URL` | `https://api.mainnet-beta.solana.com` | Solana RPC endpoint |
 | `EVM_RPC_URL` | `https://eth.llamarpc.com` | EVM JSON-RPC endpoint |
+| `SOLANA_GRPC_URL` | *(none)* | Yellowstone gRPC endpoint for real-time streaming |
+| `SOLANA_GRPC_TOKEN` | *(none)* | Auth token for the gRPC endpoint |
 
 The CLI also supports `--db-url` as a command-line flag. When neither is provided, the CLI falls back to file-based JSONL storage.
 
