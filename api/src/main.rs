@@ -158,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/jobs/{job_id}", get(get_job_status))
         .route("/v1/transactions/{wallet}", get(get_transactions))
         .route("/v1/ledger/{wallet}", get(get_ledger))
+        .route("/v1/export/{wallet}", get(export_ledger))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared_state),
             require_auth,
@@ -242,6 +243,11 @@ const MAX_PAGE_LIMIT: i64 = 1000;
 struct PaginationParams {
     limit: Option<i64>,
     offset: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ExportParams {
+    format: Option<String>,
 }
 
 fn clamp_limit(limit: Option<i64>) -> i64 {
@@ -593,6 +599,89 @@ async fn get_ledger(
     Ok(Json(entries))
 }
 
+const MAX_EXPORT_LIMIT: i64 = 10_000;
+
+fn format_entry_type(et: &spectraplex_core::models::EntryType) -> &'static str {
+    match et {
+        spectraplex_core::models::EntryType::Trade => "trade",
+        spectraplex_core::models::EntryType::Fee => "fee",
+        spectraplex_core::models::EntryType::Transfer => "transfer",
+        spectraplex_core::models::EntryType::Staking => "staking",
+        spectraplex_core::models::EntryType::Income => "income",
+    }
+}
+
+fn csv_escape(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+async fn export_ledger(
+    State(state): State<Arc<AppState>>,
+    Path(wallet): Path<String>,
+    Query(params): Query<ExportParams>,
+) -> Result<Response, AppError> {
+    validate_wallet(&wallet)?;
+    check_wallet_allowed(&wallet, &state.allowed_wallets)?;
+
+    let format = params.format.as_deref().unwrap_or("json");
+    if format != "csv" && format != "json" {
+        return Err(AppError::bad_request(format!(
+            "Unsupported format: {format}. Use 'csv' or 'json'"
+        )));
+    }
+
+    let entries = state
+        .repo
+        .get_ledger_entries_by_wallet_paginated(&wallet, MAX_EXPORT_LIMIT, 0)
+        .await
+        .map_err(AppError::internal)?;
+
+    match format {
+        "csv" => {
+            let mut buf = String::from(
+                "id,transaction_id,wallet_address,asset_symbol,amount,entry_type,fiat_value\n",
+            );
+            for e in &entries {
+                let fiat = e
+                    .fiat_value
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                buf.push_str(&format!(
+                    "{},{},{},{},{},{},{}\n",
+                    e.id,
+                    e.transaction_id,
+                    csv_escape(&e.wallet_address),
+                    csv_escape(&e.asset_symbol),
+                    e.amount,
+                    format_entry_type(&e.entry_type),
+                    fiat,
+                ));
+            }
+            Ok((
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")],
+                buf,
+            )
+                .into_response())
+        }
+        "json" => {
+            let json = serde_json::to_string(&entries).map_err(AppError::internal)?;
+            Ok((
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                json,
+            )
+                .into_response())
+        }
+        _ => unreachable!("format validated before query"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +735,7 @@ mod tests {
             .route("/v1/jobs/{job_id}", get(get_job_status))
             .route("/v1/transactions/{wallet}", get(get_transactions))
             .route("/v1/ledger/{wallet}", get(get_ledger))
+            .route("/v1/export/{wallet}", get(export_ledger))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_auth,
@@ -1489,5 +1579,104 @@ mod tests {
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_export_json_passes_validation() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/export/abc123")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        // With a fake DB pool the query fails, but format validation passes (not 400)
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_export_csv_passes_validation() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/export/abc123?format=csv")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        // With a fake DB pool the query fails, but format validation passes (not 400)
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_export_unsupported_format() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/export/abc123?format=xml")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_export_requires_auth() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/export/abc123")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_export_invalid_wallet() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/export/bad%20wallet")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_export_respects_wallet_scoping() {
+        let state = test_state_with_config(Some("secret".to_string()), Some("abc123".to_string()));
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .uri("/v1/export/notallowed")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_csv_escape_plain() {
+        assert_eq!(csv_escape("hello"), "hello");
+    }
+
+    #[test]
+    fn test_csv_escape_comma() {
+        assert_eq!(csv_escape("hello,world"), "\"hello,world\"");
+    }
+
+    #[test]
+    fn test_csv_escape_quotes() {
+        assert_eq!(csv_escape("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn test_format_entry_type_all_variants() {
+        use spectraplex_core::models::EntryType;
+        assert_eq!(format_entry_type(&EntryType::Trade), "trade");
+        assert_eq!(format_entry_type(&EntryType::Fee), "fee");
+        assert_eq!(format_entry_type(&EntryType::Transfer), "transfer");
+        assert_eq!(format_entry_type(&EntryType::Staking), "staking");
+        assert_eq!(format_entry_type(&EntryType::Income), "income");
     }
 }
