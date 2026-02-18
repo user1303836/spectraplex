@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub evm_rpc_url: String,
     pub api_key: Option<String>,
     pub allowed_wallets: Option<String>,
+    pub solana_grpc_url: Option<String>,
+    pub solana_grpc_token: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -32,6 +34,8 @@ impl Default for AppConfig {
             evm_rpc_url: "https://eth.llamarpc.com".to_string(),
             api_key: None,
             allowed_wallets: None,
+            solana_grpc_url: None,
+            solana_grpc_token: None,
         }
     }
 }
@@ -42,7 +46,13 @@ impl AppConfig {
             .merge(Serialized::defaults(AppConfig::default()))
             .merge(Toml::file("spectraplex.toml"))
             .merge(Env::prefixed("SPECTRAPLEX_"))
-            .merge(Env::raw().only(&["DATABASE_URL", "SOLANA_RPC_URL", "EVM_RPC_URL"]))
+            .merge(Env::raw().only(&[
+                "DATABASE_URL",
+                "SOLANA_RPC_URL",
+                "EVM_RPC_URL",
+                "SOLANA_GRPC_URL",
+                "SOLANA_GRPC_TOKEN",
+            ]))
             .extract()
             .map_err(Box::new)
     }
