@@ -224,11 +224,13 @@ impl ChainIngestor for EvmAdapter {
                 }
             }
 
+            let timestamp = i64::try_from(block_timestamp).unwrap_or(i64::MAX);
+
             transactions.push(Transaction {
                 id: Uuid::new_v4(),
                 user_id,
                 wallet_address: wallet.to_string(),
-                timestamp: block_timestamp as i64,
+                timestamp,
                 tx_hash,
                 chain: Chain::Ethereum,
                 raw_metadata,
@@ -247,5 +249,16 @@ mod tests {
     fn test_adapter_block_chunk_default() {
         // Verify default constant is sane
         assert_eq!(DEFAULT_BLOCK_CHUNK, 2000);
+    }
+
+    #[test]
+    fn test_timestamp_overflow_saturates() {
+        let huge: u64 = u64::MAX;
+        let result = i64::try_from(huge).unwrap_or(i64::MAX);
+        assert_eq!(result, i64::MAX);
+
+        let normal: u64 = 1_700_000_000;
+        let result = i64::try_from(normal).unwrap_or(i64::MAX);
+        assert_eq!(result, 1_700_000_000i64);
     }
 }
