@@ -142,23 +142,31 @@ async fn main() -> anyhow::Result<()> {
                                 adapter.checkpoint().update(slot as u64);
                             }
                         }
-                        adapter.fetch_history(&wallet, limit, user_id).await?
+                        adapter
+                            .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
+                            .await?
                     } else if let Some(rpc_url) = rpc {
                         let adapter = SolanaAdapter::new(&rpc_url);
-                        adapter.fetch_history(&wallet, limit, user_id).await?
+                        adapter
+                            .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
+                            .await?
                     } else {
                         anyhow::bail!("Either --grpc-url or --rpc must be provided for Solana");
                     }
                 }
                 "hyperliquid" => {
                     let adapter = HyperliquidAdapter::new();
-                    adapter.fetch_history(&wallet, limit, user_id).await?
+                    adapter
+                        .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
+                        .await?
                 }
                 "ethereum" => {
                     let rpc_url =
                         rpc.ok_or_else(|| anyhow::anyhow!("--rpc is required for Ethereum"))?;
                     let adapter = EvmAdapter::new(&rpc_url).await?;
-                    adapter.fetch_history(&wallet, limit, user_id).await?
+                    adapter
+                        .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
+                        .await?
                 }
                 _ => {
                     warn!(chain = %chain, "Unsupported chain");

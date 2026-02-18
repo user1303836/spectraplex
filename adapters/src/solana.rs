@@ -1,7 +1,7 @@
-use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient};
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use solana_transaction_status::UiTransactionEncoding;
-use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
+use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
@@ -26,13 +26,22 @@ impl ChainIngestor for SolanaAdapter {
         wallet: &str,
         limit: usize,
         user_id: Uuid,
+        checkpoint: Option<&IndexerCheckpoint>,
     ) -> anyhow::Result<Vec<Transaction>> {
         let client = self.client.clone();
         let wallet = wallet.to_string();
+        let until_sig = checkpoint
+            .and_then(|cp| cp.last_signature.clone())
+            .and_then(|s| Signature::from_str(&s).ok());
 
         tokio::task::spawn_blocking(move || {
             let pubkey = Pubkey::from_str(&wallet)?;
-            let signatures = client.get_signatures_for_address(&pubkey)?;
+            let config = GetConfirmedSignaturesForAddress2Config {
+                until: until_sig,
+                limit: Some(limit),
+                ..Default::default()
+            };
+            let signatures = client.get_signatures_for_address_with_config(&pubkey, config)?;
 
             let mut transactions = Vec::new();
 

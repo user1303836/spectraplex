@@ -9,7 +9,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::{Filter, Log};
 use governor::{Quota, RateLimiter};
 use serde_json::json;
-use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
+use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -112,15 +112,19 @@ impl ChainIngestor for EvmAdapter {
         wallet: &str,
         limit: usize,
         user_id: Uuid,
+        checkpoint: Option<&IndexerCheckpoint>,
     ) -> anyhow::Result<Vec<Transaction>> {
         let address: Address = wallet.parse()?;
 
         self.rate_limiter.until_ready().await;
         let latest_block = self.provider.get_block_number().await?;
 
-        // Scan backwards from head — limit translates to how many chunks to scan.
-        let total_blocks = (limit as u64) * self.block_chunk;
-        let from_block = latest_block.saturating_sub(total_blocks);
+        let from_block = if let Some(block) = checkpoint.and_then(|cp| cp.last_block) {
+            (block as u64).saturating_add(1)
+        } else {
+            let total_blocks = (limit as u64) * self.block_chunk;
+            latest_block.saturating_sub(total_blocks)
+        };
 
         let logs = self.fetch_logs(address, from_block, latest_block).await?;
 
