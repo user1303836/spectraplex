@@ -245,11 +245,15 @@ const MAX_PAGE_LIMIT: i64 = 1000;
 struct PaginationParams {
     limit: Option<i64>,
     offset: Option<i64>,
+    from: Option<i64>,
+    to: Option<i64>,
 }
 
 #[derive(Deserialize)]
 struct ExportParams {
     format: Option<String>,
+    from: Option<i64>,
+    to: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -269,6 +273,15 @@ fn clamp_limit(limit: Option<i64>) -> i64 {
 
 fn clamp_offset(offset: Option<i64>) -> i64 {
     offset.unwrap_or(0).max(0)
+}
+
+fn validate_date_range(from: Option<i64>, to: Option<i64>) -> Result<(), AppError> {
+    if let (Some(f), Some(t)) = (from, to) {
+        if f > t {
+            return Err(AppError::bad_request("'from' must be <= 'to'"));
+        }
+    }
+    Ok(())
 }
 
 /// Basic wallet address validation. Rejects obviously invalid inputs.
@@ -593,11 +606,12 @@ async fn get_transactions(
 ) -> Result<Json<Vec<Transaction>>, AppError> {
     validate_wallet(&wallet)?;
     check_wallet_allowed(&wallet, &state.allowed_wallets)?;
+    validate_date_range(params.from, params.to)?;
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
     let txs = state
         .repo
-        .get_transactions_by_wallet_paginated(&wallet, limit, offset)
+        .get_transactions_by_wallet_filtered(&wallet, limit, offset, params.from, params.to)
         .await
         .map_err(AppError::internal)?;
     Ok(Json(txs))
@@ -610,11 +624,12 @@ async fn get_ledger(
 ) -> Result<Json<Vec<LedgerEntry>>, AppError> {
     validate_wallet(&wallet)?;
     check_wallet_allowed(&wallet, &state.allowed_wallets)?;
+    validate_date_range(params.from, params.to)?;
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
     let entries = state
         .repo
-        .get_ledger_entries_by_wallet_paginated(&wallet, limit, offset)
+        .get_ledger_entries_by_wallet_filtered(&wallet, limit, offset, params.from, params.to)
         .await
         .map_err(AppError::internal)?;
     Ok(Json(entries))
@@ -647,6 +662,7 @@ async fn export_ledger(
 ) -> Result<Response, AppError> {
     validate_wallet(&wallet)?;
     check_wallet_allowed(&wallet, &state.allowed_wallets)?;
+    validate_date_range(params.from, params.to)?;
 
     let format = params.format.as_deref().unwrap_or("json");
     if format != "csv" && format != "json" {
@@ -657,7 +673,7 @@ async fn export_ledger(
 
     let entries = state
         .repo
-        .get_ledger_entries_by_wallet_paginated(&wallet, MAX_EXPORT_LIMIT, 0)
+        .get_ledger_entries_by_wallet_filtered(&wallet, MAX_EXPORT_LIMIT, 0, params.from, params.to)
         .await
         .map_err(AppError::internal)?;
 
@@ -1770,5 +1786,108 @@ mod tests {
         assert_eq!(format_entry_type(&EntryType::Transfer), "transfer");
         assert_eq!(format_entry_type(&EntryType::Staking), "staking");
         assert_eq!(format_entry_type(&EntryType::Income), "income");
+    }
+
+    #[test]
+    fn test_validate_date_range_both_none() {
+        assert!(validate_date_range(None, None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_date_range_only_from() {
+        assert!(validate_date_range(Some(1000), None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_date_range_only_to() {
+        assert!(validate_date_range(None, Some(2000)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_date_range_valid() {
+        assert!(validate_date_range(Some(1000), Some(2000)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_date_range_equal() {
+        assert!(validate_date_range(Some(1000), Some(1000)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_date_range_invalid() {
+        let err = validate_date_range(Some(2000), Some(1000)).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_transactions_with_date_range_params() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/transactions/abc123?from=1700000000&to=1700100000")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_transactions_invalid_date_range() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/transactions/abc123?from=2000&to=1000")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_ledger_with_date_range_params() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/ledger/abc123?from=1700000000&to=1700100000")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_ledger_invalid_date_range() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/ledger/abc123?from=2000&to=1000")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_export_with_date_range_params() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/export/abc123?format=csv&from=1700000000&to=1700100000")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_export_invalid_date_range() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/export/abc123?from=2000&to=1000")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

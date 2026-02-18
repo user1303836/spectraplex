@@ -202,20 +202,42 @@ impl Repository {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<Transaction>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, user_id, wallet_address, timestamp, tx_hash, chain::text, raw_metadata
-            FROM transactions
-            WHERE wallet_address = $1
-            ORDER BY timestamp ASC
-            LIMIT $2 OFFSET $3
-            "#,
-        )
-        .bind(wallet)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+        self.get_transactions_by_wallet_filtered(wallet, limit, offset, None, None)
+            .await
+    }
+
+    pub async fn get_transactions_by_wallet_filtered(
+        &self,
+        wallet: &str,
+        limit: i64,
+        offset: i64,
+        from: Option<i64>,
+        to: Option<i64>,
+    ) -> anyhow::Result<Vec<Transaction>> {
+        let mut sql = String::from(
+            "SELECT id, user_id, wallet_address, timestamp, tx_hash, chain::text, raw_metadata \
+             FROM transactions WHERE wallet_address = $1",
+        );
+        if from.is_some() {
+            sql.push_str(" AND timestamp >= $4");
+        }
+        if to.is_some() {
+            sql.push_str(if from.is_some() {
+                " AND timestamp <= $5"
+            } else {
+                " AND timestamp <= $4"
+            });
+        }
+        sql.push_str(" ORDER BY timestamp ASC LIMIT $2 OFFSET $3");
+
+        let mut query = sqlx::query(&sql).bind(wallet).bind(limit).bind(offset);
+        if let Some(f) = from {
+            query = query.bind(f);
+        }
+        if let Some(t) = to {
+            query = query.bind(t);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
 
         let mut txs = Vec::new();
         for row in rows {
@@ -249,22 +271,46 @@ impl Repository {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<LedgerEntry>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                id, transaction_id, user_id, wallet_address, asset_symbol, amount,
-                entry_type::text, fiat_value
-            FROM ledger_entries
-            WHERE wallet_address = $1
-            ORDER BY created_at ASC
-            LIMIT $2 OFFSET $3
-            "#,
-        )
-        .bind(wallet)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+        self.get_ledger_entries_by_wallet_filtered(wallet, limit, offset, None, None)
+            .await
+    }
+
+    pub async fn get_ledger_entries_by_wallet_filtered(
+        &self,
+        wallet: &str,
+        limit: i64,
+        offset: i64,
+        from: Option<i64>,
+        to: Option<i64>,
+    ) -> anyhow::Result<Vec<LedgerEntry>> {
+        let mut sql = String::from(
+            "SELECT l.id, l.transaction_id, l.user_id, l.wallet_address, l.asset_symbol, \
+             l.amount, l.entry_type::text, l.fiat_value \
+             FROM ledger_entries l",
+        );
+        let needs_join = from.is_some() || to.is_some();
+        if needs_join {
+            sql.push_str(" JOIN transactions t ON l.transaction_id = t.id");
+        }
+        sql.push_str(" WHERE l.wallet_address = $1");
+        let mut param_idx = 4_usize;
+        if from.is_some() {
+            sql.push_str(&format!(" AND t.timestamp >= ${param_idx}"));
+            param_idx += 1;
+        }
+        if to.is_some() {
+            sql.push_str(&format!(" AND t.timestamp <= ${param_idx}"));
+        }
+        sql.push_str(" ORDER BY l.created_at ASC LIMIT $2 OFFSET $3");
+
+        let mut query = sqlx::query(&sql).bind(wallet).bind(limit).bind(offset);
+        if let Some(f) = from {
+            query = query.bind(f);
+        }
+        if let Some(t) = to {
+            query = query.bind(t);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
 
         let mut entries = Vec::new();
         for row in rows {
