@@ -17,8 +17,9 @@ use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use tokio::sync::{RwLock, Semaphore};
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -30,9 +31,10 @@ struct AppError {
 
 impl AppError {
     fn internal(e: impl std::fmt::Display) -> Self {
+        error!(error = %e, "Internal server error");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: e.to_string(),
+            message: "Internal server error".to_string(),
         }
     }
 
@@ -49,6 +51,13 @@ impl AppError {
             message: msg.into(),
         }
     }
+
+    fn service_unavailable(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: msg.into(),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -59,10 +68,13 @@ impl IntoResponse for AppError {
     }
 }
 
+const MAX_CONCURRENT_JOBS: usize = 10;
+
 struct AppState {
     repo: Repository,
     config: AppConfig,
     jobs: RwLock<HashMap<Uuid, JobEntry>>,
+    job_semaphore: Arc<Semaphore>,
 }
 
 /// Wraps a JobStatus with a timestamp for TTL-based cleanup.
@@ -120,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         repo: Repository::new(pool),
         config: config.clone(),
         jobs: RwLock::new(HashMap::new()),
+        job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
     });
 
     let protected = Router::new()
@@ -136,6 +149,8 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health_check))
         .merge(protected)
+        .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
+        .layer(TimeoutLayer::new(Duration::from_secs(60)))
         .layer(TraceLayer::new_for_http())
         .with_state(shared_state);
 
@@ -226,6 +241,23 @@ async fn trigger_ingest(
     Json(payload): Json<IngestRequest>,
 ) -> Result<Json<JobStatus>, AppError> {
     validate_wallet(&payload.wallet)?;
+
+    let chain = payload.chain.clone();
+    match chain.as_str() {
+        "solana" | "ethereum" | "hyperliquid" => {}
+        other => {
+            return Err(AppError::bad_request(format!(
+                "Unsupported chain: {other}. Supported chains: solana, ethereum, hyperliquid"
+            )));
+        }
+    }
+
+    let permit = state
+        .job_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::service_unavailable("Too many concurrent jobs"))?;
+
     let job_id = Uuid::new_v4();
     let job = JobStatus {
         id: job_id,
@@ -243,11 +275,11 @@ async fn trigger_ingest(
 
     let state_clone = Arc::clone(&state);
     let wallet = payload.wallet.clone();
-    let chain = payload.chain.clone();
     let limit = state.config.ingest_limit;
     let user_id = payload.user_id.unwrap_or_else(Uuid::new_v4);
 
     tokio::spawn(async move {
+        let _permit = permit;
         {
             let mut jobs = state_clone.jobs.write().await;
             if let Some(entry) = jobs.get_mut(&job_id) {
@@ -275,12 +307,13 @@ async fn trigger_ingest(
                         .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                         .await?
                 }
-                _ => {
+                "solana" => {
                     let adapter = SolanaAdapter::new(&state_clone.config.solana_rpc_url);
                     adapter
                         .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                         .await?
                 }
+                _ => unreachable!("chain validated before spawn")
             };
             state_clone.repo.save_transactions(&events).await?;
             Ok::<usize, anyhow::Error>(events.len())
@@ -320,6 +353,13 @@ async fn trigger_normalize(
     Json(payload): Json<NormalizeRequest>,
 ) -> Result<Json<JobStatus>, AppError> {
     validate_wallet(&payload.wallet)?;
+
+    let permit = state
+        .job_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::service_unavailable("Too many concurrent jobs"))?;
+
     let job_id = Uuid::new_v4();
     let job = JobStatus {
         id: job_id,
@@ -339,6 +379,7 @@ async fn trigger_normalize(
     let wallet = payload.wallet.clone();
 
     tokio::spawn(async move {
+        let _permit = permit;
         {
             let mut jobs = state_clone.jobs.write().await;
             if let Some(entry) = jobs.get_mut(&job_id) {
@@ -470,6 +511,7 @@ mod tests {
             repo: Repository::new(pool),
             config,
             jobs: RwLock::new(HashMap::new()),
+            job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
         })
     }
 
@@ -585,10 +627,10 @@ mod tests {
     }
 
     #[test]
-    fn test_app_error_internal() {
-        let err = AppError::internal("something broke");
+    fn test_app_error_internal_hides_details() {
+        let err = AppError::internal("database connection refused on port 5432");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(err.message, "something broke");
+        assert_eq!(err.message, "Internal server error");
     }
 
     #[tokio::test]
@@ -924,5 +966,110 @@ mod tests {
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_ingest_unsupported_chain() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "bitcoin",
+                    "wallet": "abc123"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("Unsupported chain"));
+    }
+
+    #[tokio::test]
+    async fn test_ingest_valid_chains_accepted() {
+        for chain in &["solana", "ethereum", "hyperliquid"] {
+            let app = test_router();
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/ingest")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "chain": chain,
+                        "wallet": "abc123"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap();
+            let response = app.oneshot(req).await.unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "chain {chain} should be accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_semaphore_limits_concurrent_jobs() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://fake:fake@localhost/fake")
+            .unwrap();
+        let config = AppConfig::default();
+        let state = Arc::new(AppState {
+            repo: Repository::new(pool),
+            config,
+            jobs: RwLock::new(HashMap::new()),
+            job_semaphore: Arc::new(Semaphore::new(1)),
+        });
+        let app = test_router_with_state(Arc::clone(&state));
+
+        let req1 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana",
+                    "wallet": "abc123"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp1 = app.oneshot(req1).await.unwrap();
+        assert_ne!(resp1.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let app2 = test_router_with_state(Arc::clone(&state));
+        let req2 = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana",
+                    "wallet": "def456"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp2 = app2.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_app_error_service_unavailable() {
+        let err = AppError::service_unavailable("Too many concurrent jobs");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.message, "Too many concurrent jobs");
     }
 }
