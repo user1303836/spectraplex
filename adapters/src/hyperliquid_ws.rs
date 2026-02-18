@@ -1,7 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::error;
+use tracing::{error, warn};
 
 const HL_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 
@@ -86,11 +86,10 @@ impl HyperliquidWsClient {
         // Read messages
         while let Some(msg) = read.next().await {
             match msg {
-                Ok(Message::Text(text)) => {
-                    if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                        on_message(ws_msg);
-                    }
-                }
+                Ok(Message::Text(text)) => match serde_json::from_str::<WsMessage>(&text) {
+                    Ok(ws_msg) => on_message(ws_msg),
+                    Err(e) => warn!(error = %e, "Failed to parse WebSocket message"),
+                },
                 Ok(Message::Ping(data)) => {
                     write.send(Message::Pong(data)).await?;
                 }
@@ -102,6 +101,8 @@ impl HyperliquidWsClient {
                 _ => {}
             }
         }
+
+        let _ = write.send(Message::Close(None)).await;
 
         Ok(())
     }

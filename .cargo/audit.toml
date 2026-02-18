@@ -1,0 +1,23 @@
+# Ignore advisories for transitive dependencies we cannot directly upgrade.
+# These come from solana-sdk and sqlx crate trees.
+
+[advisories]
+ignore = [
+    # rsa 0.9.9 (via sqlx-mysql): no fix available upstream.
+    # We use PostgreSQL, not MySQL -- sqlx-mysql is pulled in by the sqlx
+    # macros crate unconditionally.
+    "RUSTSEC-2023-0071",
+
+    # time 0.3.44 (via solana-*, alloy, x509-parser): stack exhaustion DoS.
+    # Transitive dependency pinned by solana-sdk 3.x; cannot upgrade independently.
+    "RUSTSEC-2026-0009",
+
+    # keccak 0.1.5 (via solana-zk-sdk/merlin/sha3): unsound ARMv8 assembly.
+    # Transitive dependency pinned by solana-zk-sdk; cannot upgrade independently.
+    "RUSTSEC-2026-0012",
+]
+
+[yanked]
+# keccak 0.1.5 is yanked but pinned transitively by solana-zk-sdk/merlin.
+# Cannot be upgraded without a new solana-sdk release.
+enabled = false

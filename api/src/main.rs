@@ -27,7 +27,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{RwLock, Semaphore};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 struct AppError {
@@ -320,6 +320,8 @@ async fn trigger_ingest(
             let mut jobs = state_clone.jobs.write().await;
             if let Some(entry) = jobs.get_mut(&job_id) {
                 entry.status.state = JobState::Running;
+            } else {
+                warn!(job_id = %job_id, "Job entry missing when setting running state");
             }
         }
 
@@ -379,6 +381,8 @@ async fn trigger_ingest(
                 }
             }
             entry.finished_at = Some(Instant::now());
+        } else {
+            warn!(job_id = %job_id, "Job entry missing when recording ingestion result");
         }
 
         state_clone.prune_stale_jobs().await;
@@ -429,6 +433,8 @@ async fn trigger_normalize(
             let mut jobs = state_clone.jobs.write().await;
             if let Some(entry) = jobs.get_mut(&job_id) {
                 entry.status.state = JobState::Running;
+            } else {
+                warn!(job_id = %job_id, "Job entry missing when setting running state");
             }
         }
 
@@ -477,6 +483,8 @@ async fn trigger_normalize(
                 }
             }
             entry.finished_at = Some(Instant::now());
+        } else {
+            warn!(job_id = %job_id, "Job entry missing when recording normalization result");
         }
 
         state_clone.prune_stale_jobs().await;
