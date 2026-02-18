@@ -7043,6 +7043,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bigdecimal",
  "dotenvy",
  "http-body-util",
  "serde",

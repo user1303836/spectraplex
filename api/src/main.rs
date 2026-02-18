@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
 use spectraplex_adapters::{
     evm::EvmAdapter,
@@ -159,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/transactions/{wallet}", get(get_transactions))
         .route("/v1/ledger/{wallet}", get(get_ledger))
         .route("/v1/export/{wallet}", get(export_ledger))
+        .route("/v1/balances/{wallet}", get(get_balances))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared_state),
             require_auth,
@@ -248,6 +250,17 @@ struct PaginationParams {
 #[derive(Deserialize)]
 struct ExportParams {
     format: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BalanceParams {
+    at: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct AssetBalance {
+    asset_symbol: String,
+    balance: BigDecimal,
 }
 
 fn clamp_limit(limit: Option<i64>) -> i64 {
@@ -690,6 +703,28 @@ async fn export_ledger(
     }
 }
 
+async fn get_balances(
+    State(state): State<Arc<AppState>>,
+    Path(wallet): Path<String>,
+    Query(params): Query<BalanceParams>,
+) -> Result<Json<Vec<AssetBalance>>, AppError> {
+    validate_wallet(&wallet)?;
+    check_wallet_allowed(&wallet, &state.allowed_wallets)?;
+    let rows = state
+        .repo
+        .get_balances(&wallet, params.at)
+        .await
+        .map_err(AppError::internal)?;
+    let balances: Vec<AssetBalance> = rows
+        .into_iter()
+        .map(|(asset_symbol, balance)| AssetBalance {
+            asset_symbol,
+            balance,
+        })
+        .collect();
+    Ok(Json(balances))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,6 +779,7 @@ mod tests {
             .route("/v1/transactions/{wallet}", get(get_transactions))
             .route("/v1/ledger/{wallet}", get(get_ledger))
             .route("/v1/export/{wallet}", get(export_ledger))
+            .route("/v1/balances/{wallet}", get(get_balances))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_auth,
@@ -1304,6 +1340,54 @@ mod tests {
         let err = AppError::service_unavailable("Too many concurrent jobs");
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(err.message, "Too many concurrent jobs");
+    }
+
+    #[tokio::test]
+    async fn test_balances_invalid_wallet() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/balances/bad%20wallet")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_balances_endpoint_exists() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/balances/abc123")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_asset_balance_serialization() {
+        let balance = AssetBalance {
+            asset_symbol: "SOL".to_string(),
+            balance: bigdecimal::BigDecimal::from(42),
+        };
+        let json = serde_json::to_value(&balance).unwrap();
+        assert_eq!(json["asset_symbol"], "SOL");
+        assert_eq!(json["balance"], "42");
+    }
+
+    #[tokio::test]
+    async fn test_balances_respects_wallet_scoping() {
+        let state = test_state_with_config(Some("secret".to_string()), Some("abc123".to_string()));
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .uri("/v1/balances/notallowed")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     fn make_tx(
