@@ -17,7 +17,7 @@ use spectraplex_adapters::{
     solana_parser,
 };
 use spectraplex_core::config::AppConfig;
-use spectraplex_core::models::{ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
+use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -1084,5 +1084,85 @@ mod tests {
         let err = AppError::service_unavailable("Too many concurrent jobs");
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(err.message, "Too many concurrent jobs");
+    }
+
+    fn make_tx(
+        chain: Chain,
+        tx_hash: &str,
+        timestamp: i64,
+        metadata: serde_json::Value,
+    ) -> Transaction {
+        Transaction {
+            id: Uuid::new_v4(),
+            user_id: Uuid::nil(),
+            wallet_address: "test_wallet".to_string(),
+            timestamp,
+            tx_hash: tx_hash.to_string(),
+            chain,
+            raw_metadata: metadata,
+        }
+    }
+
+    #[test]
+    fn test_build_checkpoint_empty() {
+        assert!(build_checkpoint("solana", "wallet", &[]).is_none());
+    }
+
+    #[test]
+    fn test_build_checkpoint_unknown_chain() {
+        let tx = make_tx(Chain::Ethereum, "0xaaa", 100, serde_json::json!({}));
+        assert!(build_checkpoint("bitcoin", "wallet", &[tx]).is_none());
+    }
+
+    #[test]
+    fn test_build_checkpoint_solana() {
+        let txs = vec![
+            make_tx(
+                Chain::Solana,
+                "sig1",
+                100,
+                serde_json::json!({"slot": 5000}),
+            ),
+            make_tx(
+                Chain::Solana,
+                "sig2",
+                200,
+                serde_json::json!({"slot": 6000}),
+            ),
+        ];
+        let cp = build_checkpoint("solana", "wallet", &txs).unwrap();
+        assert!(matches!(cp.chain, Chain::Solana));
+        assert_eq!(cp.last_signature, Some("sig2".to_string()));
+        assert_eq!(cp.last_timestamp, Some(200));
+        assert_eq!(cp.last_slot, Some(6000));
+        assert_eq!(cp.last_block, None);
+    }
+
+    #[test]
+    fn test_build_checkpoint_ethereum() {
+        let txs = vec![make_tx(
+            Chain::Ethereum,
+            "0xaaa",
+            100,
+            serde_json::json!({"block_number": 1000}),
+        )];
+        let cp = build_checkpoint("ethereum", "0xwallet", &txs).unwrap();
+        assert!(matches!(cp.chain, Chain::Ethereum));
+        assert_eq!(cp.last_block, Some(1000));
+        assert_eq!(cp.last_slot, None);
+    }
+
+    #[test]
+    fn test_build_checkpoint_hyperliquid() {
+        let txs = vec![make_tx(
+            Chain::Hyperliquid,
+            "hash1",
+            500,
+            serde_json::json!({}),
+        )];
+        let cp = build_checkpoint("hyperliquid", "0xhl", &txs).unwrap();
+        assert!(matches!(cp.chain, Chain::Hyperliquid));
+        assert_eq!(cp.last_signature, Some("hash1".to_string()));
+        assert_eq!(cp.last_timestamp, Some(500));
     }
 }

@@ -5,10 +5,12 @@ use solana_transaction_status::{
 };
 use spectraplex_core::models::{EntryType, LedgerEntry, Transaction};
 use std::str::FromStr;
-use uuid::Uuid;
+
+use crate::deterministic_id;
 
 pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry>> {
     let mut entries = Vec::new();
+    let mut entry_index: u32 = 0;
 
     let sol_tx: EncodedConfirmedTransactionWithStatusMeta =
         serde_json::from_value(tx.raw_metadata.clone())?;
@@ -38,9 +40,9 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
                 // If this wallet is the fee payer, separate fee from the net transfer
                 if is_fee_payer && fee_lamports > 0 {
                     // Fee entry (always negative)
-                    let fee_amount = lamports_to_sol(-(fee_lamports as i64));
+                    let fee_amount = lamports_to_sol(-(fee_lamports as i128));
                     entries.push(LedgerEntry {
-                        id: Uuid::new_v4(),
+                        id: deterministic_id(tx.id, entry_index),
                         transaction_id: tx.id,
                         user_id: tx.user_id,
                         wallet_address: tx.wallet_address.clone(),
@@ -49,13 +51,14 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
                         entry_type: EntryType::Fee,
                         fiat_value: None,
                     });
+                    entry_index += 1;
 
                     // Net transfer amount = total balance change + fee (since fee is included in the balance change)
-                    let transfer_lamports = lamport_change + fee_lamports as i64;
+                    let transfer_lamports = lamport_change + fee_lamports as i128;
                     if transfer_lamports != 0 {
                         let transfer_amount = lamports_to_sol(transfer_lamports);
                         entries.push(LedgerEntry {
-                            id: Uuid::new_v4(),
+                            id: deterministic_id(tx.id, entry_index),
                             transaction_id: tx.id,
                             user_id: tx.user_id,
                             wallet_address: tx.wallet_address.clone(),
@@ -64,12 +67,13 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
                             entry_type: EntryType::Transfer,
                             fiat_value: None,
                         });
+                        entry_index += 1;
                     }
                 } else if lamport_change != 0 {
                     // Non-fee-payer: entire balance change is a transfer
                     let amount = lamports_to_sol(lamport_change);
                     entries.push(LedgerEntry {
-                        id: Uuid::new_v4(),
+                        id: deterministic_id(tx.id, entry_index),
                         transaction_id: tx.id,
                         user_id: tx.user_id,
                         wallet_address: tx.wallet_address.clone(),
@@ -78,6 +82,7 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
                         entry_type: EntryType::Transfer,
                         fiat_value: None,
                     });
+                    entry_index += 1;
                 }
             }
         }
@@ -110,7 +115,7 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
                         let amount = token_raw_to_decimal(delta_raw, decimals);
                         let symbol = spl_token_symbol(&mint);
                         entries.push(LedgerEntry {
-                            id: Uuid::new_v4(),
+                            id: deterministic_id(tx.id, entry_index),
                             transaction_id: tx.id,
                             user_id: tx.user_id,
                             wallet_address: tx.wallet_address.clone(),
@@ -119,24 +124,27 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
                             entry_type: EntryType::Transfer,
                             fiat_value: None,
                         });
+                        entry_index += 1;
                     }
                 }
             }
         }
     }
 
+    let _ = entry_index;
     Ok(entries)
 }
 
 /// Extract the raw lamport balance change for a given account index.
-fn extract_sol_change_lamports(meta: &UiTransactionStatusMeta, wallet_index: usize) -> i64 {
-    let pre = meta.pre_balances.get(wallet_index).copied().unwrap_or(0) as i64;
-    let post = meta.post_balances.get(wallet_index).copied().unwrap_or(0) as i64;
+/// Uses i128 to avoid truncation when u64 values exceed i64::MAX.
+fn extract_sol_change_lamports(meta: &UiTransactionStatusMeta, wallet_index: usize) -> i128 {
+    let pre = meta.pre_balances.get(wallet_index).copied().unwrap_or(0) as i128;
+    let post = meta.post_balances.get(wallet_index).copied().unwrap_or(0) as i128;
     post - pre
 }
 
-/// Convert lamports (i64) to SOL as BigDecimal without floating-point precision loss.
-fn lamports_to_sol(lamports: i64) -> BigDecimal {
+/// Convert lamports (i128) to SOL as BigDecimal without floating-point precision loss.
+fn lamports_to_sol(lamports: i128) -> BigDecimal {
     let raw = BigDecimal::from_str(&format!("{}", lamports)).unwrap();
     let divisor = BigDecimal::from_str("1000000000").unwrap();
     raw / divisor
@@ -164,5 +172,59 @@ fn spl_token_symbol(mint: &str) -> String {
         "RLBxxFkseAZ4RgJH3Sqn8jXxhmGoz9jWxDNJMh8pL7a" => "RLSOL".to_string(),
         "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn" => "jitoSOL".to_string(),
         _ => mint.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_lamports_to_sol_large_positive() {
+        let result = lamports_to_sol(10_000_000_000i128);
+        assert_eq!(result, BigDecimal::from(10));
+    }
+
+    #[test]
+    fn test_lamports_to_sol_negative() {
+        let result = lamports_to_sol(-1_000_000_000i128);
+        assert_eq!(result, BigDecimal::from(-1));
+    }
+
+    #[test]
+    fn test_lamports_to_sol_beyond_i64_max() {
+        let large: i128 = i64::MAX as i128 + 1_000_000_000;
+        let result = lamports_to_sol(large);
+        let expected = BigDecimal::from_str(&format!("{}", large)).unwrap()
+            / BigDecimal::from_str("1000000000").unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_extract_sol_change_no_truncation() {
+        use solana_transaction_status::UiTransactionStatusMeta;
+
+        let pre_val: u64 = u64::MAX - 1_000_000_000;
+        let post_val: u64 = u64::MAX;
+        let meta = UiTransactionStatusMeta {
+            err: None,
+            status: Ok(()),
+            fee: 0,
+            pre_balances: vec![pre_val],
+            post_balances: vec![post_val],
+            inner_instructions: solana_transaction_status::option_serializer::OptionSerializer::None,
+            log_messages: solana_transaction_status::option_serializer::OptionSerializer::None,
+            pre_token_balances: solana_transaction_status::option_serializer::OptionSerializer::None,
+            post_token_balances: solana_transaction_status::option_serializer::OptionSerializer::None,
+            rewards: solana_transaction_status::option_serializer::OptionSerializer::None,
+            loaded_addresses: solana_transaction_status::option_serializer::OptionSerializer::None,
+            return_data: solana_transaction_status::option_serializer::OptionSerializer::None,
+            compute_units_consumed: solana_transaction_status::option_serializer::OptionSerializer::None,
+            cost_units: solana_transaction_status::option_serializer::OptionSerializer::None,
+        };
+
+        let change = extract_sol_change_lamports(&meta, 0);
+        assert_eq!(change, 1_000_000_000i128);
     }
 }
