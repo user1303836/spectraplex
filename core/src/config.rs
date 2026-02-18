@@ -14,6 +14,7 @@ pub struct AppConfig {
     pub ingest_limit: usize,
     pub solana_rpc_url: String,
     pub evm_rpc_url: String,
+    pub api_key: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -27,6 +28,7 @@ impl Default for AppConfig {
             ingest_limit: 50,
             solana_rpc_url: "https://api.mainnet-beta.solana.com".to_string(),
             evm_rpc_url: "https://eth.llamarpc.com".to_string(),
+            api_key: None,
         }
     }
 }
