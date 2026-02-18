@@ -118,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
                             wallet = %wallet,
                             last_signature = ?cp.last_signature,
                             last_slot = ?cp.last_slot,
+                            last_block = ?cp.last_block,
                             last_timestamp = ?cp.last_timestamp,
                             "Resuming from checkpoint"
                         );
@@ -168,18 +169,23 @@ async fn main() -> anyhow::Result<()> {
             // Strategy: DB first, fallback to File
             if let Some(p) = pool {
                 let repo = Repository::new(p);
-                repo.save_transactions(&events).await?;
-                info!(count = events.len(), "Saved transactions to database");
-
                 if let Some(cp) = build_checkpoint(&chain, &wallet, &events) {
-                    repo.save_checkpoint(&cp).await?;
+                    repo.save_transactions_and_checkpoint(&events, &cp).await?;
+                    info!(count = events.len(), "Saved transactions to database");
                     info!(
                         chain = %chain,
                         wallet = %wallet,
                         last_signature = ?cp.last_signature,
                         last_slot = ?cp.last_slot,
+                        last_block = ?cp.last_block,
                         last_timestamp = ?cp.last_timestamp,
-                        "Checkpoint saved"
+                        "Checkpoint saved atomically"
+                    );
+                } else {
+                    repo.save_transactions(&events).await?;
+                    info!(
+                        count = events.len(),
+                        "Saved transactions to database (no checkpoint)"
                     );
                 }
             } else {
@@ -277,13 +283,17 @@ fn build_checkpoint(chain: &str, wallet: &str, txs: &[Transaction]) -> Option<In
     let last_timestamp = Some(latest.timestamp);
 
     let last_slot = match chain {
-        "ethereum" => txs
-            .iter()
-            .filter_map(|tx| tx.raw_metadata.get("block_number").and_then(|v| v.as_i64()))
-            .max(),
         "solana" => txs
             .iter()
             .filter_map(|tx| tx.raw_metadata.get("slot").and_then(|v| v.as_i64()))
+            .max(),
+        _ => None,
+    };
+
+    let last_block = match chain {
+        "ethereum" => txs
+            .iter()
+            .filter_map(|tx| tx.raw_metadata.get("block_number").and_then(|v| v.as_i64()))
             .max(),
         _ => None,
     };
@@ -293,6 +303,7 @@ fn build_checkpoint(chain: &str, wallet: &str, txs: &[Transaction]) -> Option<In
         wallet_address: wallet.to_string(),
         last_signature,
         last_slot,
+        last_block,
         last_timestamp,
     })
 }
@@ -344,7 +355,8 @@ mod tests {
         assert_eq!(cp.wallet_address, "0xwallet");
         assert_eq!(cp.last_signature, Some("0xbbb".to_string()));
         assert_eq!(cp.last_timestamp, Some(200));
-        assert_eq!(cp.last_slot, Some(2000));
+        assert_eq!(cp.last_block, Some(2000));
+        assert_eq!(cp.last_slot, None);
     }
 
     #[test]
@@ -359,6 +371,7 @@ mod tests {
         assert_eq!(cp.last_signature, Some("sig2".to_string()));
         assert_eq!(cp.last_timestamp, Some(400));
         assert_eq!(cp.last_slot, Some(6000));
+        assert_eq!(cp.last_block, None);
     }
 
     #[test]
@@ -373,6 +386,7 @@ mod tests {
         assert_eq!(cp.last_signature, Some("hash2".to_string()));
         assert_eq!(cp.last_timestamp, Some(600));
         assert_eq!(cp.last_slot, None);
+        assert_eq!(cp.last_block, None);
     }
 
     #[test]
