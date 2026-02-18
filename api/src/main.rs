@@ -99,7 +99,7 @@ pub enum JobState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     let config = AppConfig::load()?;
 
