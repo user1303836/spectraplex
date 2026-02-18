@@ -169,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
                 "ethereum" => {
                     let rpc_url =
                         rpc.ok_or_else(|| anyhow::anyhow!("--rpc is required for Ethereum"))?;
-                    let adapter = EvmAdapter::new(&rpc_url).await?;
+                    let adapter = EvmAdapter::new(&rpc_url)?;
                     adapter
                         .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                         .await?

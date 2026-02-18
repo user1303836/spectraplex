@@ -1,7 +1,7 @@
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
-
-use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use alloy::consensus::Transaction as TransactionTrait;
 use alloy::primitives::{Address, B256};
@@ -31,8 +31,13 @@ pub struct EvmAdapter {
 
 impl EvmAdapter {
     /// Create a new adapter connected to an EVM-compatible RPC endpoint.
-    pub async fn new(rpc_url: &str) -> anyhow::Result<Self> {
-        let provider = ProviderBuilder::new().connect(rpc_url).await?;
+    pub fn new(rpc_url: &str) -> anyhow::Result<Self> {
+        let url: reqwest::Url = rpc_url.parse()?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .build()?;
+        let provider = ProviderBuilder::new().connect_reqwest(client, url);
 
         // 5 requests per second by default (safe for public RPCs)
         let quota = Quota::per_second(NonZeroU32::new(5).unwrap());
