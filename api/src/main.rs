@@ -17,12 +17,13 @@ use spectraplex_adapters::{
     solana_parser,
 };
 use spectraplex_core::config::AppConfig;
-use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
+use spectraplex_core::models::{ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
 use sqlx::postgres::PgPoolOptions;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 use tokio::sync::{RwLock, Semaphore};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
@@ -63,6 +64,13 @@ impl AppError {
             message: msg.into(),
         }
     }
+
+    fn forbidden(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: msg.into(),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -78,6 +86,7 @@ const MAX_CONCURRENT_JOBS: usize = 10;
 struct AppState {
     repo: Repository,
     config: AppConfig,
+    allowed_wallets: Option<HashSet<String>>,
     jobs: RwLock<HashMap<Uuid, JobEntry>>,
     job_semaphore: Arc<Semaphore>,
 }
@@ -133,9 +142,11 @@ async fn main() -> anyhow::Result<()> {
         .connect(&config.database_url)
         .await?;
 
+    let allowed_wallets = config.allowed_wallets_set();
     let shared_state = Arc::new(AppState {
         repo: Repository::new(pool),
         config: config.clone(),
+        allowed_wallets,
         jobs: RwLock::new(HashMap::new()),
         job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
     });
@@ -155,7 +166,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health_check))
         .merge(protected)
         .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
-        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(60)))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(60),
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(shared_state);
 
@@ -178,7 +192,12 @@ async fn require_auth(
 ) -> Result<Response, AppError> {
     let expected = match &state.config.api_key {
         Some(key) => key,
-        None => return Ok(next.run(req).await),
+        None => {
+            return Err(AppError {
+                status: StatusCode::UNAUTHORIZED,
+                message: "API key not configured".to_string(),
+            })
+        }
     };
 
     let header = req
@@ -188,7 +207,9 @@ async fn require_auth(
         .and_then(|v| v.strip_prefix("Bearer "));
 
     match header {
-        Some(token) if token == expected => Ok(next.run(req).await),
+        Some(token) if token.as_bytes().ct_eq(expected.as_bytes()).into() => {
+            Ok(next.run(req).await)
+        }
         _ => Err(AppError {
             status: StatusCode::UNAUTHORIZED,
             message: "Missing or invalid API key".to_string(),
@@ -241,11 +262,21 @@ fn validate_wallet(wallet: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn check_wallet_allowed(wallet: &str, allowed: &Option<HashSet<String>>) -> Result<(), AppError> {
+    if let Some(set) = allowed {
+        if !set.contains(&wallet.to_lowercase()) {
+            return Err(AppError::forbidden("Wallet not in allowed set"));
+        }
+    }
+    Ok(())
+}
+
 async fn trigger_ingest(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<IngestRequest>,
 ) -> Result<Json<JobStatus>, AppError> {
     validate_wallet(&payload.wallet)?;
+    check_wallet_allowed(&payload.wallet, &state.allowed_wallets)?;
 
     let chain = payload.chain.clone();
     match chain.as_str() {
@@ -318,7 +349,7 @@ async fn trigger_ingest(
                         .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                         .await?
                 }
-                _ => unreachable!("chain validated before spawn")
+                _ => unreachable!("chain validated before spawn"),
             };
             let count = events.len();
             if let Some(cp) = build_checkpoint(&chain, &wallet, &events) {
@@ -366,6 +397,7 @@ async fn trigger_normalize(
     Json(payload): Json<NormalizeRequest>,
 ) -> Result<Json<JobStatus>, AppError> {
     validate_wallet(&payload.wallet)?;
+    check_wallet_allowed(&payload.wallet, &state.allowed_wallets)?;
 
     let permit = state
         .job_semaphore
@@ -475,6 +507,7 @@ async fn get_transactions(
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<Transaction>>, AppError> {
     validate_wallet(&wallet)?;
+    check_wallet_allowed(&wallet, &state.allowed_wallets)?;
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
     let txs = state
@@ -491,6 +524,7 @@ async fn get_ledger(
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<LedgerEntry>>, AppError> {
     validate_wallet(&wallet)?;
+    check_wallet_allowed(&wallet, &state.allowed_wallets)?;
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
     let entries = state
@@ -506,23 +540,36 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use http_body_util::BodyExt;
+    use spectraplex_core::models::Chain;
     use tower::ServiceExt;
 
+    const TEST_API_KEY: &str = "test-api-key";
+
     fn test_state() -> Arc<AppState> {
-        test_state_with_key(None)
+        test_state_with_key(Some(TEST_API_KEY.to_string()))
     }
 
     fn test_state_with_key(api_key: Option<String>) -> Arc<AppState> {
+        test_state_with_config(api_key, None)
+    }
+
+    fn test_state_with_config(
+        api_key: Option<String>,
+        allowed_wallets: Option<String>,
+    ) -> Arc<AppState> {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://fake:fake@localhost/fake")
             .unwrap();
         let config = AppConfig {
             api_key,
+            allowed_wallets,
             ..AppConfig::default()
         };
+        let allowed_wallets_set = config.allowed_wallets_set();
         Arc::new(AppState {
             repo: Repository::new(pool),
             config,
+            allowed_wallets: allowed_wallets_set,
             jobs: RwLock::new(HashMap::new()),
             job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
         })
@@ -665,6 +712,7 @@ mod tests {
         let job_id = Uuid::new_v4();
         let req = axum::http::Request::builder()
             .uri(format!("/v1/jobs/{}", job_id))
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
@@ -691,6 +739,7 @@ mod tests {
 
         let req = axum::http::Request::builder()
             .uri(format!("/v1/jobs/{}", job_id))
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
@@ -709,6 +758,7 @@ mod tests {
             .method("POST")
             .uri("/v1/ingest")
             .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
             .body(Body::from(
                 serde_json::to_string(&serde_json::json!({
                     "chain": "solana",
@@ -728,6 +778,7 @@ mod tests {
             .method("POST")
             .uri("/v1/normalize")
             .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
             .body(Body::from(
                 serde_json::to_string(&serde_json::json!({
                     "wallet": "bad;wallet"
@@ -744,6 +795,7 @@ mod tests {
         let app = test_router();
         let req = axum::http::Request::builder()
             .uri("/v1/transactions/bad%20wallet")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
@@ -755,6 +807,7 @@ mod tests {
         let app = test_router();
         let req = axum::http::Request::builder()
             .uri("/v1/ledger/bad%20wallet")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
@@ -766,6 +819,7 @@ mod tests {
         let app = test_router();
         let req = axum::http::Request::builder()
             .uri("/v1/nonexistent")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
@@ -779,6 +833,7 @@ mod tests {
             .method("POST")
             .uri("/v1/ingest")
             .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
@@ -928,7 +983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_auth_skipped_when_no_key_configured() {
+    async fn test_auth_rejects_when_no_key_configured() {
         let state = test_state_with_key(None);
         let app = test_router_with_state(state);
         let req = axum::http::Request::builder()
@@ -944,7 +999,7 @@ mod tests {
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
-        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -988,6 +1043,7 @@ mod tests {
             .method("POST")
             .uri("/v1/ingest")
             .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
             .body(Body::from(
                 serde_json::to_string(&serde_json::json!({
                     "chain": "bitcoin",
@@ -1014,6 +1070,7 @@ mod tests {
                 .method("POST")
                 .uri("/v1/ingest")
                 .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", TEST_API_KEY))
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
                         "chain": chain,
@@ -1036,10 +1093,14 @@ mod tests {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://fake:fake@localhost/fake")
             .unwrap();
-        let config = AppConfig::default();
+        let config = AppConfig {
+            api_key: Some("secret".to_string()),
+            ..AppConfig::default()
+        };
         let state = Arc::new(AppState {
             repo: Repository::new(pool),
             config,
+            allowed_wallets: None,
             jobs: RwLock::new(HashMap::new()),
             job_semaphore: Arc::new(Semaphore::new(1)),
         });
@@ -1049,6 +1110,7 @@ mod tests {
             .method("POST")
             .uri("/v1/ingest")
             .header("content-type", "application/json")
+            .header("authorization", "Bearer secret")
             .body(Body::from(
                 serde_json::to_string(&serde_json::json!({
                     "chain": "solana",
@@ -1067,6 +1129,7 @@ mod tests {
             .method("POST")
             .uri("/v1/ingest")
             .header("content-type", "application/json")
+            .header("authorization", "Bearer secret")
             .body(Body::from(
                 serde_json::to_string(&serde_json::json!({
                     "chain": "solana",
@@ -1164,5 +1227,78 @@ mod tests {
         assert!(matches!(cp.chain, Chain::Hyperliquid));
         assert_eq!(cp.last_signature, Some("hash1".to_string()));
         assert_eq!(cp.last_timestamp, Some(500));
+    }
+
+    #[test]
+    fn test_check_wallet_allowed_no_restriction() {
+        assert!(check_wallet_allowed("abc123", &None).is_ok());
+    }
+
+    #[test]
+    fn test_check_wallet_allowed_permitted() {
+        let allowed: Option<HashSet<String>> = Some(["abc123".to_string()].into_iter().collect());
+        assert!(check_wallet_allowed("abc123", &allowed).is_ok());
+    }
+
+    #[test]
+    fn test_check_wallet_allowed_case_insensitive() {
+        let allowed: Option<HashSet<String>> = Some(["abc123".to_string()].into_iter().collect());
+        assert!(check_wallet_allowed("ABC123", &allowed).is_ok());
+    }
+
+    #[test]
+    fn test_check_wallet_allowed_denied() {
+        let allowed: Option<HashSet<String>> = Some(["abc123".to_string()].into_iter().collect());
+        let err = check_wallet_allowed("xyz789", &allowed).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_wallet_scoping_allows_permitted_wallet() {
+        let state = test_state_with_config(
+            Some("secret".to_string()),
+            Some("abc123,xyz789".to_string()),
+        );
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .uri("/v1/transactions/abc123")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_wallet_scoping_rejects_unpermitted_wallet() {
+        let state = test_state_with_config(Some("secret".to_string()), Some("abc123".to_string()));
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .uri("/v1/transactions/notallowed")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_wallet_scoping_allows_all_when_not_configured() {
+        let state = test_state_with_config(Some("secret".to_string()), None);
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .uri("/v1/transactions/anywallet")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_app_error_forbidden() {
+        let err = AppError::forbidden("not allowed");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.message, "not allowed");
     }
 }

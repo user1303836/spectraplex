@@ -213,14 +213,18 @@ mod tests {
             fee: 0,
             pre_balances: vec![pre_val],
             post_balances: vec![post_val],
-            inner_instructions: solana_transaction_status::option_serializer::OptionSerializer::None,
+            inner_instructions:
+                solana_transaction_status::option_serializer::OptionSerializer::None,
             log_messages: solana_transaction_status::option_serializer::OptionSerializer::None,
-            pre_token_balances: solana_transaction_status::option_serializer::OptionSerializer::None,
-            post_token_balances: solana_transaction_status::option_serializer::OptionSerializer::None,
+            pre_token_balances:
+                solana_transaction_status::option_serializer::OptionSerializer::None,
+            post_token_balances:
+                solana_transaction_status::option_serializer::OptionSerializer::None,
             rewards: solana_transaction_status::option_serializer::OptionSerializer::None,
             loaded_addresses: solana_transaction_status::option_serializer::OptionSerializer::None,
             return_data: solana_transaction_status::option_serializer::OptionSerializer::None,
-            compute_units_consumed: solana_transaction_status::option_serializer::OptionSerializer::None,
+            compute_units_consumed:
+                solana_transaction_status::option_serializer::OptionSerializer::None,
             cost_units: solana_transaction_status::option_serializer::OptionSerializer::None,
         };
 

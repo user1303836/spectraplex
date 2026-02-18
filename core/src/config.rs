@@ -3,6 +3,7 @@ use figment::{
     Figment,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -15,6 +16,7 @@ pub struct AppConfig {
     pub solana_rpc_url: String,
     pub evm_rpc_url: String,
     pub api_key: Option<String>,
+    pub allowed_wallets: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -29,6 +31,7 @@ impl Default for AppConfig {
             solana_rpc_url: "https://api.mainnet-beta.solana.com".to_string(),
             evm_rpc_url: "https://eth.llamarpc.com".to_string(),
             api_key: None,
+            allowed_wallets: None,
         }
     }
 }
@@ -42,6 +45,15 @@ impl AppConfig {
             .merge(Env::raw().only(&["DATABASE_URL", "SOLANA_RPC_URL", "EVM_RPC_URL"]))
             .extract()
             .map_err(Box::new)
+    }
+
+    pub fn allowed_wallets_set(&self) -> Option<HashSet<String>> {
+        self.allowed_wallets.as_ref().map(|s| {
+            s.split(',')
+                .map(|w| w.trim().to_lowercase())
+                .filter(|w| !w.is_empty())
+                .collect()
+        })
     }
 }
 
@@ -75,5 +87,34 @@ mod tests {
 
         std::env::remove_var("DATABASE_URL");
         std::env::remove_var("SPECTRAPLEX_PORT");
+    }
+
+    #[test]
+    fn test_allowed_wallets_set_none() {
+        let config = AppConfig::default();
+        assert!(config.allowed_wallets_set().is_none());
+    }
+
+    #[test]
+    fn test_allowed_wallets_set_parses_csv() {
+        let config = AppConfig {
+            allowed_wallets: Some("Wallet1, wallet2 ,WALLET3".to_string()),
+            ..AppConfig::default()
+        };
+        let set = config.allowed_wallets_set().unwrap();
+        assert_eq!(set.len(), 3);
+        assert!(set.contains("wallet1"));
+        assert!(set.contains("wallet2"));
+        assert!(set.contains("wallet3"));
+    }
+
+    #[test]
+    fn test_allowed_wallets_set_ignores_empty() {
+        let config = AppConfig {
+            allowed_wallets: Some("wallet1,,wallet2,".to_string()),
+            ..AppConfig::default()
+        };
+        let set = config.allowed_wallets_set().unwrap();
+        assert_eq!(set.len(), 2);
     }
 }
