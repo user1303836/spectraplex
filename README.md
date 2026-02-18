@@ -142,14 +142,16 @@ cargo run --release --bin spectraplex-api
 ### 7. Query the data
 
 ```bash
-# Health check
+# Health check (no auth required)
 curl http://127.0.0.1:3000/health
 
 # Get raw transactions for a wallet (paginated)
-curl "http://127.0.0.1:3000/v1/transactions/<WALLET_ADDRESS>?limit=50&offset=0"
+curl -H "Authorization: Bearer <API_KEY>" \
+  "http://127.0.0.1:3000/v1/transactions/<WALLET_ADDRESS>?limit=50&offset=0"
 
 # Get normalized ledger entries (paginated)
-curl "http://127.0.0.1:3000/v1/ledger/<WALLET_ADDRESS>?limit=50&offset=0"
+curl -H "Authorization: Bearer <API_KEY>" \
+  "http://127.0.0.1:3000/v1/ledger/<WALLET_ADDRESS>?limit=50&offset=0"
 ```
 
 ## CLI Reference
@@ -187,10 +189,13 @@ The CLI binary is `spectraplex-cli`. All commands accept a global `--db-url` fla
 
 The API server runs on `127.0.0.1:3000` and requires `DATABASE_URL` to be set.
 
+All `/v1/*` endpoints require authentication via `Authorization: Bearer <API_KEY>` header. The API key is configured server-side via `SPECTRAPLEX_API_KEY`. If no API key is configured, all requests are rejected (fail-closed).
+
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/health` | Health check, returns `"OK"` |
+| `GET` | `/health` | Health check, returns `"OK"` (no auth required) |
 | `POST` | `/v1/ingest` | Trigger async ingestion for a wallet (returns job ID) |
+| `POST` | `/v1/ingest/batch` | Trigger batch ingestion for multiple wallets (max 50) |
 | `POST` | `/v1/normalize` | Trigger async normalization for a wallet (returns job ID) |
 | `GET` | `/v1/jobs/:job_id` | Poll job status (pending/running/completed/failed) |
 | `GET` | `/v1/transactions/:wallet` | Get raw transactions by wallet (paginated) |
@@ -204,16 +209,31 @@ Query endpoints support `?limit=N&offset=N` parameters (default limit: 50, max: 
 
 ```bash
 curl -X POST http://127.0.0.1:3000/v1/ingest \
+  -H "Authorization: Bearer <API_KEY>" \
   -H "Content-Type: application/json" \
   -d '{"chain": "solana", "wallet": "<WALLET>"}'
 
 # Response: {"id": "<JOB_UUID>", "state": "pending", "message": "Job queued"}
 ```
 
+### POST /v1/ingest/batch
+
+```bash
+curl -X POST http://127.0.0.1:3000/v1/ingest/batch \
+  -H "Authorization: Bearer <API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"wallets": [{"chain": "solana", "wallet": "<WALLET_1>"}, {"chain": "ethereum", "wallet": "<WALLET_2>"}]}'
+
+# Response: [{"id": "<JOB_UUID>", "state": "pending", "message": "Job queued"}, ...]
+```
+
+Batch size is capped at 50 wallets per request.
+
 ### POST /v1/normalize
 
 ```bash
 curl -X POST http://127.0.0.1:3000/v1/normalize \
+  -H "Authorization: Bearer <API_KEY>" \
   -H "Content-Type: application/json" \
   -d '{"wallet": "<WALLET>"}'
 
@@ -223,7 +243,8 @@ curl -X POST http://127.0.0.1:3000/v1/normalize \
 ### GET /v1/jobs/:job_id
 
 ```bash
-curl http://127.0.0.1:3000/v1/jobs/<JOB_UUID>
+curl -H "Authorization: Bearer <API_KEY>" \
+  http://127.0.0.1:3000/v1/jobs/<JOB_UUID>
 
 # Response: {"id": "<JOB_UUID>", "state": "completed", "message": "Ingested 42 transactions"}
 ```
@@ -247,6 +268,8 @@ Spectraplex uses a layered configuration system powered by [figment](https://cra
 | `SPECTRAPLEX_POOL_SIZE` | `10` | Database connection pool size |
 | `SPECTRAPLEX_LOG_LEVEL` | `info` | Log level (trace/debug/info/warn/error) |
 | `SPECTRAPLEX_INGEST_LIMIT` | `50` | Default transaction fetch limit for API ingestion |
+| `SPECTRAPLEX_API_KEY` | *(none)* | API key for authenticating requests. If unset, all requests are rejected. |
+| `SPECTRAPLEX_ALLOWED_WALLETS` | *(none)* | Comma-separated list of wallet addresses to restrict access to. If unset, all wallets are allowed. |
 | `SOLANA_RPC_URL` | `https://api.mainnet-beta.solana.com` | Solana RPC endpoint |
 | `EVM_RPC_URL` | `https://eth.llamarpc.com` | EVM JSON-RPC endpoint |
 
@@ -315,7 +338,7 @@ All tables use UUIDs as primary keys and support idempotent batch inserts (`ON C
 | Language | Rust (Edition 2021) |
 | Async Runtime | Tokio |
 | Database | PostgreSQL + SQLx |
-| API Framework | Axum 0.7 |
+| API Framework | Axum 0.8 |
 | CLI Framework | Clap 4 (derive) |
 | Solana | solana-sdk 3.0, Yellowstone gRPC |
 | Ethereum (EVM) | alloy 1.x, governor (rate limiting) |
@@ -339,10 +362,13 @@ All tables use UUIDs as primary keys and support idempotent batch inserts (`ON C
 - [x] Layered configuration (defaults / TOML / env vars)
 - [x] Docker Compose deployment
 - [x] Incremental sync with checkpointing schema
+- [x] API authentication (Bearer token, fail-closed, constant-time comparison)
+- [x] Wallet scoping (restrict API access to specific wallets)
+- [x] Batch ingestion (multi-wallet, up to 50 per request)
+- [x] Request hardening (body limits, timeouts, concurrent job caps)
 - [ ] EVM native ETH transfer and gas fee parsing
 - [ ] Improved entry type classification (trades, staking)
 - [ ] Historical price lookups for fiat value
-- [ ] API authentication and authorization
 - [ ] User identity and wallet management
 - [ ] Cross-chain portfolio views
 
