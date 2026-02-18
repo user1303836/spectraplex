@@ -7050,6 +7050,7 @@ dependencies = [
  "spectraplex-adapters",
  "spectraplex-core",
  "sqlx",
+ "subtle",
  "tokio",
  "tower",
  "tower-http",
