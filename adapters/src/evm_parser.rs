@@ -440,6 +440,83 @@ mod tests {
     }
 
     #[test]
+    fn test_gas_fee_not_duplicated_across_logs() {
+        let wallet = "0xabcdef1234567890abcdef1234567890abcdef12";
+        let from_padded = format!(
+            "0x000000000000000000000000{}",
+            "1111111111111111111111111111111111111111"
+        );
+        let to_padded = format!("0x000000000000000000000000{}", &wallet[2..]);
+        let tx_hash = "0xaaa";
+        let user_id = Uuid::nil();
+        let tx_id = Uuid::new_v4();
+
+        // First log: has gas fields (adapter attaches to first log only)
+        let first_log = Transaction {
+            id: tx_id,
+            user_id,
+            wallet_address: wallet.to_string(),
+            timestamp: 1700000000,
+            tx_hash: tx_hash.to_string(),
+            chain: Chain::Ethereum,
+            raw_metadata: json!({
+                "topics": [ERC20_TRANSFER_TOPIC, &from_padded, &to_padded],
+                "data": "0x0000000000000000000000000000000000000000000000000de0b6b3a7640000",
+                "address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+                "gas_used": "0x5208",
+                "effective_gas_price": "0x3b9aca00",
+                "value": "0x0",
+                "from": "0x1111111111111111111111111111111111111111",
+                "to": wallet,
+            }),
+        };
+
+        // Second log: same tx hash, no gas fields (adapter omits them)
+        let second_log = Transaction {
+            id: Uuid::new_v4(),
+            user_id,
+            wallet_address: wallet.to_string(),
+            timestamp: 1700000000,
+            tx_hash: tx_hash.to_string(),
+            chain: Chain::Ethereum,
+            raw_metadata: json!({
+                "topics": [ERC20_TRANSFER_TOPIC, &from_padded, &to_padded],
+                "data": "0x0000000000000000000000000000000000000000000000000de0b6b3a7640000",
+                "address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            }),
+        };
+
+        let entries_1 = parse_evm_transaction(&first_log).unwrap();
+        let entries_2 = parse_evm_transaction(&second_log).unwrap();
+
+        let all_entries: Vec<_> = entries_1.iter().chain(entries_2.iter()).collect();
+
+        let fee_count = all_entries
+            .iter()
+            .filter(|e| matches!(e.entry_type, EntryType::Fee))
+            .count();
+        assert_eq!(
+            fee_count, 1,
+            "gas fee should appear exactly once across all logs of the same tx"
+        );
+    }
+
+    #[test]
+    fn test_gas_fields_absent_produces_no_fee() {
+        let metadata = json!({
+            "topics": [],
+            "data": "0x",
+        });
+        let tx = make_tx(metadata);
+        let entries = parse_evm_transaction(&tx).unwrap();
+        let fee_count = entries
+            .iter()
+            .filter(|e| matches!(e.entry_type, EntryType::Fee))
+            .count();
+        assert_eq!(fee_count, 0);
+    }
+
+    #[test]
     fn test_hex_to_bigdecimal() {
         // Small value
         assert_eq!(hex_to_bigdecimal("0xff"), BigDecimal::from(255));
