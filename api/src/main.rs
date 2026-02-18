@@ -270,7 +270,7 @@ async fn trigger_ingest(
                         .await?
                 }
                 "ethereum" => {
-                    let adapter = EvmAdapter::new(&state_clone.config.evm_rpc_url).await?;
+                    let adapter = EvmAdapter::new(&state_clone.config.evm_rpc_url)?;
                     adapter
                         .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                         .await?

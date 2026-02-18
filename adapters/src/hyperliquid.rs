@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
 use uuid::Uuid;
@@ -84,16 +86,24 @@ impl Default for HyperliquidAdapter {
 impl HyperliquidAdapter {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: Self::build_client(),
             base_url: HL_INFO_URL.to_string(),
         }
     }
 
     pub fn with_base_url(base_url: &str) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: Self::build_client(),
             base_url: base_url.to_string(),
         }
+    }
+
+    fn build_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client")
     }
 
     pub async fn fetch_user_fills(&self, wallet: &str) -> anyhow::Result<Vec<HlFill>> {
@@ -443,6 +453,51 @@ mod tests {
         // Fill at time=1700000000000ms should be filtered out because
         // resume_ms = (1700000000 * 1000) + 1 = 1700000000001 > 1700000000000
         assert_eq!(txs.len(), 0);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_client_timeout_fires() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut stream = stream;
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    // Never respond -- force a timeout
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                });
+            }
+        });
+
+        // Build a client with a short timeout to keep the test fast
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let adapter = HyperliquidAdapter {
+            client,
+            base_url,
+        };
+
+        let result = adapter.fetch_user_fills("0xtest").await;
+        assert!(result.is_err());
+        let err_chain = format!("{:#}", result.unwrap_err()).to_lowercase();
+        assert!(
+            err_chain.contains("timed out") || err_chain.contains("timeout") || err_chain.contains("deadline has elapsed"),
+            "expected timeout error, got: {}",
+            err_chain
+        );
 
         server.abort();
     }

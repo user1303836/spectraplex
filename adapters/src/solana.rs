@@ -1,9 +1,11 @@
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+
 use solana_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient};
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use solana_transaction_status::UiTransactionEncoding;
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
-use std::str::FromStr;
-use std::sync::Arc;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -14,7 +16,10 @@ pub struct SolanaAdapter {
 impl SolanaAdapter {
     pub fn new(rpc_url: &str) -> Self {
         Self {
-            client: Arc::new(RpcClient::new(rpc_url.to_string())),
+            client: Arc::new(RpcClient::new_with_timeout(
+                rpc_url.to_string(),
+                Duration::from_secs(30),
+            )),
         }
     }
 }
@@ -85,5 +90,17 @@ impl ChainIngestor for SolanaAdapter {
             Ok(transactions)
         })
         .await?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_adapter_construction_with_timeout() {
+        let adapter = SolanaAdapter::new("https://api.mainnet-beta.solana.com");
+        // Verify the client was created successfully with timeout
+        assert!(Arc::strong_count(&adapter.client) == 1);
     }
 }
