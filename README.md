@@ -216,6 +216,9 @@ All `/v1/*` endpoints require authentication via `Authorization: Bearer <API_KEY
 | `GET` | `/v1/export/:wallet` | Export ledger entries as CSV or JSON |
 | `GET` | `/v1/balances/:wallet` | Get current asset balances (aggregated from ledger) |
 | `GET` | `/v1/stats/:wallet` | Get wallet statistics (tx count, chains, date range) |
+| `POST` | `/v1/stream/start` | Start real-time Solana gRPC streaming (returns stream ID) |
+| `POST` | `/v1/stream/:stream_id/stop` | Stop an active stream |
+| `GET` | `/v1/streams` | List all active streams with stats |
 
 All wallet endpoints validate the address format and return structured JSON errors.
 
@@ -313,6 +316,39 @@ curl -H "Authorization: Bearer <API_KEY>" \
 
 # Response: {"total_transactions": 42, "earliest_timestamp": 1700000000, "latest_timestamp": 1700100000, "total_chains": 2, "unique_assets": 5, "transactions_per_chain": [{"chain": "solana", "count": 30}, ...]}
 ```
+
+### POST /v1/stream/start
+
+```bash
+curl -X POST http://127.0.0.1:3000/v1/stream/start \
+  -H "Authorization: Bearer <API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"chain": "solana"}'
+
+# Response: {"id": "<STREAM_UUID>", "uptime_secs": 0, "transactions_ingested": 0, "last_slot": 0}
+```
+
+Starts a real-time Solana gRPC streaming session. Requires `SOLANA_GRPC_URL` to be configured. Transactions are batched (100 per batch or every 5 seconds) and saved to the database. Maximum 5 concurrent streams.
+
+### POST /v1/stream/:stream_id/stop
+
+```bash
+curl -X POST -H "Authorization: Bearer <API_KEY>" \
+  http://127.0.0.1:3000/v1/stream/<STREAM_UUID>/stop
+
+# Response: {"id": "<STREAM_UUID>", "status": "stopping"}
+```
+
+### GET /v1/streams
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  http://127.0.0.1:3000/v1/streams
+
+# Response: [{"id": "...", "uptime_secs": 120, "transactions_ingested": 5000, "last_slot": 300000}]
+```
+
+Lists all active streams with their current statistics.
 
 ## Configuration
 
@@ -435,6 +471,7 @@ All tables use UUIDs as primary keys and support idempotent batch inserts (`ON C
 - [x] Webhook callbacks for job completion notifications
 - [x] Single transaction lookup by hash
 - [x] Wallet statistics endpoint (tx count, chains, assets, date range)
+- [x] Real-time Solana gRPC streaming with batched persistence
 - [ ] EVM native ETH transfer and gas fee parsing
 - [ ] Improved entry type classification (trades, staking)
 - [ ] Historical price lookups for fiat value
