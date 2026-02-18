@@ -125,9 +125,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health_check))
         .route("/v1/ingest", post(trigger_ingest))
         .route("/v1/normalize", post(trigger_normalize))
-        .route("/v1/jobs/{job_id}", get(get_job_status))
-        .route("/v1/transactions/{wallet}", get(get_transactions))
-        .route("/v1/ledger/{wallet}", get(get_ledger))
+        .route("/v1/jobs/:job_id", get(get_job_status))
+        .route("/v1/transactions/:wallet", get(get_transactions))
+        .route("/v1/ledger/:wallet", get(get_ledger))
         .layer(TraceLayer::new_for_http())
         .with_state(shared_state);
 
