@@ -1,5 +1,5 @@
 use spectraplex_core::models::{Chain, IndexerCheckpoint, LedgerEntry, Transaction};
-use sqlx::{postgres::PgPool, Row};
+use sqlx::{postgres::PgPool, Executor, Postgres, Row};
 
 pub struct Repository {
     pool: PgPool,
@@ -224,7 +224,7 @@ impl Repository {
     ) -> anyhow::Result<Option<IndexerCheckpoint>> {
         let row = sqlx::query(
             r#"
-            SELECT chain::text, wallet_address, last_signature, last_slot, last_timestamp
+            SELECT chain::text, wallet_address, last_signature, last_slot, last_block, last_timestamp
             FROM indexer_checkpoints
             WHERE chain = $1::chain_enum AND wallet_address = $2
             "#,
@@ -248,6 +248,7 @@ impl Repository {
                     wallet_address: row.try_get("wallet_address")?,
                     last_signature: row.try_get("last_signature")?,
                     last_slot: row.try_get("last_slot")?,
+                    last_block: row.try_get("last_block")?,
                     last_timestamp: row.try_get("last_timestamp")?,
                 }))
             }
@@ -256,6 +257,16 @@ impl Repository {
     }
 
     pub async fn save_checkpoint(&self, checkpoint: &IndexerCheckpoint) -> anyhow::Result<()> {
+        Self::save_checkpoint_with(&self.pool, checkpoint).await
+    }
+
+    pub async fn save_checkpoint_with<'e, E>(
+        executor: E,
+        checkpoint: &IndexerCheckpoint,
+    ) -> anyhow::Result<()>
+    where
+        E: Executor<'e, Database = Postgres>,
+    {
         let chain_str = match checkpoint.chain {
             Chain::Solana => "solana",
             Chain::Hyperliquid => "hyperliquid",
@@ -264,12 +275,13 @@ impl Repository {
 
         sqlx::query(
             r#"
-            INSERT INTO indexer_checkpoints (chain, wallet_address, last_signature, last_slot, last_timestamp, updated_at)
-            VALUES ($1::chain_enum, $2, $3, $4, $5, NOW())
+            INSERT INTO indexer_checkpoints (chain, wallet_address, last_signature, last_slot, last_block, last_timestamp, updated_at)
+            VALUES ($1::chain_enum, $2, $3, $4, $5, $6, NOW())
             ON CONFLICT (chain, wallet_address)
             DO UPDATE SET
                 last_signature = EXCLUDED.last_signature,
                 last_slot = EXCLUDED.last_slot,
+                last_block = EXCLUDED.last_block,
                 last_timestamp = EXCLUDED.last_timestamp,
                 updated_at = NOW()
             "#,
@@ -278,10 +290,77 @@ impl Repository {
         .bind(&checkpoint.wallet_address)
         .bind(&checkpoint.last_signature)
         .bind(checkpoint.last_slot)
+        .bind(checkpoint.last_block)
         .bind(checkpoint.last_timestamp)
-        .execute(&self.pool)
+        .execute(executor)
         .await?;
 
+        Ok(())
+    }
+
+    pub async fn save_transactions_with<'e, E>(
+        executor: E,
+        txs: &[Transaction],
+    ) -> anyhow::Result<()>
+    where
+        E: Executor<'e, Database = Postgres>,
+    {
+        // For atomic use with a sqlx::Transaction, we can only execute one
+        // statement per Executor borrow, so callers doing chunked inserts
+        // should use save_transactions_atomic which takes &mut Transaction.
+        let mut query = String::from(
+            "INSERT INTO transactions (id, user_id, wallet_address, timestamp, tx_hash, chain, raw_metadata) VALUES ",
+        );
+        let mut args = sqlx::postgres::PgArguments::default();
+        for (i, tx) in txs.iter().enumerate() {
+            let chain_str = match tx.chain {
+                Chain::Solana => "solana",
+                Chain::Hyperliquid => "hyperliquid",
+                Chain::Ethereum => "ethereum",
+            };
+            let base = i * 7;
+            if i > 0 {
+                query.push_str(", ");
+            }
+            query.push_str(&format!(
+                "(${}, ${}, ${}, ${}, ${}, ${}::chain_enum, ${})",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7
+            ));
+            use sqlx::Arguments;
+            args.add(tx.id).map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(tx.user_id).map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(&tx.wallet_address)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(tx.timestamp).map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(&tx.tx_hash).map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(chain_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(&tx.raw_metadata)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        query.push_str(" ON CONFLICT (chain, tx_hash) DO NOTHING");
+        sqlx::query_with(&query, args).execute(executor).await?;
+        Ok(())
+    }
+
+    pub async fn save_transactions_and_checkpoint(
+        &self,
+        txs: &[Transaction],
+        checkpoint: &IndexerCheckpoint,
+    ) -> anyhow::Result<()> {
+        let mut db_tx = self.pool.begin().await?;
+
+        for chunk in txs.chunks(Self::BATCH_SIZE) {
+            Self::save_transactions_with(&mut *db_tx, chunk).await?;
+        }
+        Self::save_checkpoint_with(&mut *db_tx, checkpoint).await?;
+
+        db_tx.commit().await?;
         Ok(())
     }
 }
