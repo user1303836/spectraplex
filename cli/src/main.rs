@@ -3,7 +3,7 @@ use spectraplex_adapters::{
     evm::EvmAdapter, evm_parser, hyperliquid::HyperliquidAdapter, hyperliquid_parser,
     repo::Repository, solana::SolanaAdapter, solana_grpc::SolanaGrpcAdapter, solana_parser,
 };
-use spectraplex_core::models::{ChainIngestor, Transaction};
+use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
 use sqlx::postgres::PgPoolOptions;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -109,10 +109,38 @@ async fn main() -> anyhow::Result<()> {
             });
             info!(wallet = %wallet, chain = %chain, "Starting ingestion");
 
+            let checkpoint = if let Some(ref p) = pool {
+                let repo = Repository::new(p.clone());
+                match repo.get_checkpoint(&chain, &wallet).await? {
+                    Some(cp) => {
+                        info!(
+                            chain = %chain,
+                            wallet = %wallet,
+                            last_signature = ?cp.last_signature,
+                            last_slot = ?cp.last_slot,
+                            last_timestamp = ?cp.last_timestamp,
+                            "Resuming from checkpoint"
+                        );
+                        Some(cp)
+                    }
+                    None => {
+                        info!(chain = %chain, wallet = %wallet, "No existing checkpoint, full ingestion");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let events = match chain.as_str() {
                 "solana" => {
                     if let Some(endpoint) = grpc_url {
                         let adapter = SolanaGrpcAdapter::new(&endpoint, x_token);
+                        if let Some(ref cp) = checkpoint {
+                            if let Some(slot) = cp.last_slot {
+                                adapter.checkpoint().update(slot as u64);
+                            }
+                        }
                         adapter.fetch_history(&wallet, limit, user_id).await?
                     } else if let Some(rpc_url) = rpc {
                         let adapter = SolanaAdapter::new(&rpc_url);
@@ -142,6 +170,18 @@ async fn main() -> anyhow::Result<()> {
                 let repo = Repository::new(p);
                 repo.save_transactions(&events).await?;
                 info!(count = events.len(), "Saved transactions to database");
+
+                if let Some(cp) = build_checkpoint(&chain, &wallet, &events) {
+                    repo.save_checkpoint(&cp).await?;
+                    info!(
+                        chain = %chain,
+                        wallet = %wallet,
+                        last_signature = ?cp.last_signature,
+                        last_slot = ?cp.last_slot,
+                        last_timestamp = ?cp.last_timestamp,
+                        "Checkpoint saved"
+                    );
+                }
             } else {
                 // Write to JSONL
                 let mut file = File::create(&output)?;
@@ -217,4 +257,120 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn build_checkpoint(chain: &str, wallet: &str, txs: &[Transaction]) -> Option<IndexerCheckpoint> {
+    if txs.is_empty() {
+        return None;
+    }
+
+    let chain_enum = match chain {
+        "solana" => Chain::Solana,
+        "ethereum" => Chain::Ethereum,
+        "hyperliquid" => Chain::Hyperliquid,
+        _ => return None,
+    };
+
+    let latest = txs.iter().max_by_key(|tx| tx.timestamp)?;
+
+    let last_signature = Some(latest.tx_hash.clone());
+    let last_timestamp = Some(latest.timestamp);
+
+    let last_slot = match chain {
+        "ethereum" => txs
+            .iter()
+            .filter_map(|tx| tx.raw_metadata.get("block_number").and_then(|v| v.as_i64()))
+            .max(),
+        "solana" => txs
+            .iter()
+            .filter_map(|tx| tx.raw_metadata.get("slot").and_then(|v| v.as_i64()))
+            .max(),
+        _ => None,
+    };
+
+    Some(IndexerCheckpoint {
+        chain: chain_enum,
+        wallet_address: wallet.to_string(),
+        last_signature,
+        last_slot,
+        last_timestamp,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_tx(
+        chain: Chain,
+        tx_hash: &str,
+        timestamp: i64,
+        metadata: serde_json::Value,
+    ) -> Transaction {
+        Transaction {
+            id: Uuid::new_v4(),
+            user_id: Uuid::nil(),
+            wallet_address: "test_wallet".to_string(),
+            timestamp,
+            tx_hash: tx_hash.to_string(),
+            chain,
+            raw_metadata: metadata,
+        }
+    }
+
+    #[test]
+    fn test_build_checkpoint_empty() {
+        assert!(build_checkpoint("ethereum", "0xabc", &[]).is_none());
+    }
+
+    #[test]
+    fn test_build_checkpoint_unknown_chain() {
+        let tx = make_tx(Chain::Ethereum, "0xaaa", 100, json!({}));
+        assert!(build_checkpoint("bitcoin", "0xabc", &[tx]).is_none());
+    }
+
+    #[test]
+    fn test_build_checkpoint_ethereum() {
+        let txs = vec![
+            make_tx(Chain::Ethereum, "0xaaa", 100, json!({"block_number": 1000})),
+            make_tx(Chain::Ethereum, "0xbbb", 200, json!({"block_number": 2000})),
+            make_tx(Chain::Ethereum, "0xccc", 150, json!({"block_number": 1500})),
+        ];
+
+        let cp = build_checkpoint("ethereum", "0xwallet", &txs).unwrap();
+        assert!(matches!(cp.chain, Chain::Ethereum));
+        assert_eq!(cp.wallet_address, "0xwallet");
+        assert_eq!(cp.last_signature, Some("0xbbb".to_string()));
+        assert_eq!(cp.last_timestamp, Some(200));
+        assert_eq!(cp.last_slot, Some(2000));
+    }
+
+    #[test]
+    fn test_build_checkpoint_solana() {
+        let txs = vec![
+            make_tx(Chain::Solana, "sig1", 300, json!({"slot": 5000})),
+            make_tx(Chain::Solana, "sig2", 400, json!({"slot": 6000})),
+        ];
+
+        let cp = build_checkpoint("solana", "wallet123", &txs).unwrap();
+        assert!(matches!(cp.chain, Chain::Solana));
+        assert_eq!(cp.last_signature, Some("sig2".to_string()));
+        assert_eq!(cp.last_timestamp, Some(400));
+        assert_eq!(cp.last_slot, Some(6000));
+    }
+
+    #[test]
+    fn test_build_checkpoint_hyperliquid() {
+        let txs = vec![
+            make_tx(Chain::Hyperliquid, "hash1", 500, json!({})),
+            make_tx(Chain::Hyperliquid, "hash2", 600, json!({})),
+        ];
+
+        let cp = build_checkpoint("hyperliquid", "0xhl", &txs).unwrap();
+        assert!(matches!(cp.chain, Chain::Hyperliquid));
+        assert_eq!(cp.last_signature, Some("hash2".to_string()));
+        assert_eq!(cp.last_timestamp, Some(600));
+        assert_eq!(cp.last_slot, None);
+    }
 }
