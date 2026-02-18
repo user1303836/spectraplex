@@ -8,8 +8,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use spectraplex_adapters::{
-    evm::EvmAdapter, evm_parser, hyperliquid::HyperliquidAdapter, hyperliquid_parser,
-    repo::Repository, solana::SolanaAdapter, solana_parser,
+    evm::EvmAdapter,
+    evm_parser,
+    hyperliquid::HyperliquidAdapter,
+    hyperliquid_parser,
+    repo::{build_checkpoint, Repository},
+    solana::SolanaAdapter,
+    solana_parser,
 };
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::models::{ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
@@ -282,8 +287,16 @@ async fn trigger_ingest(
                         .await?
                 }
             };
-            state_clone.repo.save_transactions(&events).await?;
-            Ok::<usize, anyhow::Error>(events.len())
+            let count = events.len();
+            if let Some(cp) = build_checkpoint(&chain, &wallet, &events) {
+                state_clone
+                    .repo
+                    .save_transactions_and_checkpoint(&events, &cp)
+                    .await?;
+            } else {
+                state_clone.repo.save_transactions(&events).await?;
+            }
+            Ok::<usize, anyhow::Error>(count)
         }
         .await;
 

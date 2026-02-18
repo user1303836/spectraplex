@@ -1,9 +1,15 @@
 use clap::{Parser, Subcommand};
 use spectraplex_adapters::{
-    evm::EvmAdapter, evm_parser, hyperliquid::HyperliquidAdapter, hyperliquid_parser,
-    repo::Repository, solana::SolanaAdapter, solana_grpc::SolanaGrpcAdapter, solana_parser,
+    evm::EvmAdapter,
+    evm_parser,
+    hyperliquid::HyperliquidAdapter,
+    hyperliquid_parser,
+    repo::{build_checkpoint, Repository},
+    solana::SolanaAdapter,
+    solana_grpc::SolanaGrpcAdapter,
+    solana_parser,
 };
-use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
+use spectraplex_core::models::{ChainIngestor, Transaction};
 use sqlx::postgres::PgPoolOptions;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -273,54 +279,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_checkpoint(chain: &str, wallet: &str, txs: &[Transaction]) -> Option<IndexerCheckpoint> {
-    if txs.is_empty() {
-        return None;
-    }
-
-    let chain_enum = match chain {
-        "solana" => Chain::Solana,
-        "ethereum" => Chain::Ethereum,
-        "hyperliquid" => Chain::Hyperliquid,
-        _ => return None,
-    };
-
-    let latest = txs.iter().max_by_key(|tx| tx.timestamp)?;
-
-    let last_signature = Some(latest.tx_hash.clone());
-    let last_timestamp = Some(latest.timestamp);
-
-    let last_slot = match chain {
-        "solana" => txs
-            .iter()
-            .filter_map(|tx| tx.raw_metadata.get("slot").and_then(|v| v.as_i64()))
-            .max(),
-        _ => None,
-    };
-
-    let last_block = match chain {
-        "ethereum" => txs
-            .iter()
-            .filter_map(|tx| tx.raw_metadata.get("block_number").and_then(|v| v.as_i64()))
-            .max(),
-        _ => None,
-    };
-
-    Some(IndexerCheckpoint {
-        chain: chain_enum,
-        wallet_address: wallet.to_string(),
-        last_signature,
-        last_slot,
-        last_block,
-        last_timestamp,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::json;
+    use spectraplex_core::models::Chain;
 
     fn make_tx(
         chain: Chain,
