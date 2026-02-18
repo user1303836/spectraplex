@@ -77,6 +77,21 @@ pub fn build_checkpoint(
     })
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChainCount {
+    pub chain: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WalletStats {
+    pub total_transactions: i64,
+    pub chains: Vec<ChainCount>,
+    pub earliest_timestamp: Option<i64>,
+    pub latest_timestamp: Option<i64>,
+    pub unique_assets: i64,
+}
+
 pub struct Repository {
     pool: PgPool,
 }
@@ -283,6 +298,100 @@ impl Repository {
             });
         }
         Ok(entries)
+    }
+
+    pub async fn get_transaction_by_hash(
+        &self,
+        wallet: &str,
+        tx_hash: &str,
+    ) -> anyhow::Result<Option<Transaction>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, user_id, wallet_address, timestamp, tx_hash, chain::text, raw_metadata
+            FROM transactions
+            WHERE wallet_address = $1 AND tx_hash = $2
+            "#,
+        )
+        .bind(wallet)
+        .bind(tx_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => {
+                let chain_str: String = row.try_get("chain")?;
+                let chain = str_to_chain(&chain_str)?;
+                Ok(Some(Transaction {
+                    id: row.try_get("id")?,
+                    user_id: row.try_get("user_id")?,
+                    wallet_address: row.try_get("wallet_address")?,
+                    timestamp: row.try_get("timestamp")?,
+                    tx_hash: row.try_get("tx_hash")?,
+                    chain,
+                    raw_metadata: row.try_get("raw_metadata")?,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_wallet_stats(&self, wallet: &str) -> anyhow::Result<WalletStats> {
+        let chain_rows = sqlx::query(
+            r#"
+            SELECT chain::text, COUNT(*) as count
+            FROM transactions
+            WHERE wallet_address = $1
+            GROUP BY chain
+            ORDER BY chain
+            "#,
+        )
+        .bind(wallet)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut chains: Vec<ChainCount> = Vec::new();
+        let mut total_transactions: i64 = 0;
+        for row in chain_rows {
+            let chain: String = row.try_get("chain")?;
+            let count: i64 = row.try_get("count")?;
+            total_transactions += count;
+            chains.push(ChainCount { chain, count });
+        }
+
+        let range_row = sqlx::query(
+            r#"
+            SELECT MIN(timestamp) as earliest, MAX(timestamp) as latest
+            FROM transactions
+            WHERE wallet_address = $1
+            "#,
+        )
+        .bind(wallet)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let earliest_timestamp: Option<i64> = range_row.try_get("earliest")?;
+        let latest_timestamp: Option<i64> = range_row.try_get("latest")?;
+
+        let asset_row = sqlx::query(
+            r#"
+            SELECT COUNT(DISTINCT asset_symbol) as count
+            FROM ledger_entries
+            WHERE wallet_address = $1
+            "#,
+        )
+        .bind(wallet)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let unique_assets: i64 = asset_row.try_get("count")?;
+
+        Ok(WalletStats {
+            total_transactions,
+            chains,
+            earliest_timestamp,
+            latest_timestamp,
+            unique_assets,
+        })
     }
 
     pub async fn get_checkpoint(
