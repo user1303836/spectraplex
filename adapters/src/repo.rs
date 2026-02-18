@@ -285,6 +285,56 @@ impl Repository {
         Ok(entries)
     }
 
+    pub async fn get_balances(
+        &self,
+        wallet: &str,
+        at: Option<i64>,
+    ) -> anyhow::Result<Vec<(String, bigdecimal::BigDecimal)>> {
+        let rows = match at {
+            Some(ts) => {
+                sqlx::query(
+                    r#"
+                    SELECT le.asset_symbol, SUM(le.amount) as balance
+                    FROM ledger_entries le
+                    JOIN transactions t ON le.transaction_id = t.id
+                    WHERE le.wallet_address = $1 AND t.timestamp <= $2
+                    GROUP BY le.asset_symbol
+                    HAVING SUM(le.amount) != 0
+                    ORDER BY le.asset_symbol
+                    "#,
+                )
+                .bind(wallet)
+                .bind(ts)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    SELECT asset_symbol, SUM(amount) as balance
+                    FROM ledger_entries
+                    WHERE wallet_address = $1
+                    GROUP BY asset_symbol
+                    HAVING SUM(amount) != 0
+                    ORDER BY asset_symbol
+                    "#,
+                )
+                .bind(wallet)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+
+        let mut balances = Vec::new();
+        for row in rows {
+            balances.push((
+                row.try_get::<String, _>("asset_symbol")?,
+                row.try_get::<bigdecimal::BigDecimal, _>("balance")?,
+            ));
+        }
+        Ok(balances)
+    }
+
     pub async fn get_checkpoint(
         &self,
         chain: &str,
