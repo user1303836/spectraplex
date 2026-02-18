@@ -1,5 +1,43 @@
-use spectraplex_core::models::{Chain, IndexerCheckpoint, LedgerEntry, Transaction};
+use spectraplex_core::models::{Chain, EntryType, IndexerCheckpoint, LedgerEntry, Transaction};
 use sqlx::{postgres::PgPool, Row};
+
+fn chain_to_str(chain: &Chain) -> &'static str {
+    match chain {
+        Chain::Solana => "solana",
+        Chain::Hyperliquid => "hyperliquid",
+        Chain::Ethereum => "ethereum",
+    }
+}
+
+fn str_to_chain(s: &str) -> anyhow::Result<Chain> {
+    match s {
+        "solana" => Ok(Chain::Solana),
+        "hyperliquid" => Ok(Chain::Hyperliquid),
+        "ethereum" => Ok(Chain::Ethereum),
+        _ => Err(anyhow::anyhow!("Unknown chain: {}", s)),
+    }
+}
+
+fn entry_type_to_str(entry_type: &EntryType) -> &'static str {
+    match entry_type {
+        EntryType::Trade => "trade",
+        EntryType::Fee => "fee",
+        EntryType::Transfer => "transfer",
+        EntryType::Staking => "staking",
+        EntryType::Income => "income",
+    }
+}
+
+fn str_to_entry_type(s: &str) -> EntryType {
+    match s {
+        "trade" => EntryType::Trade,
+        "fee" => EntryType::Fee,
+        "transfer" => EntryType::Transfer,
+        "staking" => EntryType::Staking,
+        "income" => EntryType::Income,
+        _ => EntryType::Transfer,
+    }
+}
 
 pub struct Repository {
     pool: PgPool,
@@ -15,97 +53,101 @@ impl Repository {
 
     pub async fn save_transactions(&self, txs: &[Transaction]) -> anyhow::Result<()> {
         for chunk in txs.chunks(Self::BATCH_SIZE) {
-            let mut query = String::from(
-                "INSERT INTO transactions (id, user_id, wallet_address, timestamp, tx_hash, chain, raw_metadata) VALUES ",
-            );
-            let mut args = sqlx::postgres::PgArguments::default();
-            for (i, tx) in chunk.iter().enumerate() {
-                let chain_str = match tx.chain {
-                    spectraplex_core::models::Chain::Solana => "solana",
-                    spectraplex_core::models::Chain::Hyperliquid => "hyperliquid",
-                    spectraplex_core::models::Chain::Ethereum => "ethereum",
-                };
-                let base = i * 7;
-                if i > 0 {
-                    query.push_str(", ");
-                }
-                query.push_str(&format!(
-                    "(${}, ${}, ${}, ${}, ${}, ${}::chain_enum, ${})",
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6,
-                    base + 7
-                ));
-                use sqlx::Arguments;
-                args.add(tx.id).map_err(|e| anyhow::anyhow!("{e}"))?;
-                args.add(tx.user_id).map_err(|e| anyhow::anyhow!("{e}"))?;
-                args.add(&tx.wallet_address)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                args.add(tx.timestamp).map_err(|e| anyhow::anyhow!("{e}"))?;
-                args.add(&tx.tx_hash).map_err(|e| anyhow::anyhow!("{e}"))?;
-                args.add(chain_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-                args.add(&tx.raw_metadata)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-            }
-            query.push_str(" ON CONFLICT (chain, tx_hash) DO NOTHING");
+            let (query, args) = Self::build_transaction_insert(chunk)?;
             sqlx::query_with(&query, args).execute(&self.pool).await?;
         }
         Ok(())
     }
 
+    fn build_transaction_insert(
+        chunk: &[Transaction],
+    ) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+        let mut query = String::from(
+            "INSERT INTO transactions (id, user_id, wallet_address, timestamp, tx_hash, chain, raw_metadata) VALUES ",
+        );
+        let mut args = sqlx::postgres::PgArguments::default();
+        for (i, tx) in chunk.iter().enumerate() {
+            let chain_str = chain_to_str(&tx.chain);
+            let base = i * 7;
+            if i > 0 {
+                query.push_str(", ");
+            }
+            query.push_str(&format!(
+                "(${}, ${}, ${}, ${}, ${}, ${}::chain_enum, ${})",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7
+            ));
+            use sqlx::Arguments;
+            args.add(tx.id).map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(tx.user_id).map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(&tx.wallet_address)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(tx.timestamp).map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(&tx.tx_hash).map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(chain_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(&tx.raw_metadata)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        query.push_str(" ON CONFLICT (chain, tx_hash) DO NOTHING");
+        Ok((query, args))
+    }
+
     pub async fn save_ledger_entries(&self, entries: &[LedgerEntry]) -> anyhow::Result<()> {
         for chunk in entries.chunks(Self::BATCH_SIZE) {
-            let mut query = String::from(
-                "INSERT INTO ledger_entries (id, transaction_id, user_id, wallet_address, asset_symbol, amount, entry_type, fiat_value) VALUES ",
-            );
-            let mut args = sqlx::postgres::PgArguments::default();
-            for (i, entry) in chunk.iter().enumerate() {
-                let entry_type_str = match entry.entry_type {
-                    spectraplex_core::models::EntryType::Trade => "trade",
-                    spectraplex_core::models::EntryType::Fee => "fee",
-                    spectraplex_core::models::EntryType::Transfer => "transfer",
-                    spectraplex_core::models::EntryType::Staking => "staking",
-                    spectraplex_core::models::EntryType::Income => "income",
-                };
-                let base = i * 8;
-                if i > 0 {
-                    query.push_str(", ");
-                }
-                query.push_str(&format!(
-                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}::entry_type_enum, ${})",
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6,
-                    base + 7,
-                    base + 8
-                ));
-                use sqlx::Arguments;
-                args.add(entry.id).map_err(|e| anyhow::anyhow!("{e}"))?;
-                args.add(entry.transaction_id)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                args.add(entry.user_id)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                args.add(&entry.wallet_address)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                args.add(&entry.asset_symbol)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                args.add(&entry.amount)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                args.add(entry_type_str)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                args.add(&entry.fiat_value)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-            }
-            query.push_str(" ON CONFLICT (id) DO NOTHING");
+            let (query, args) = Self::build_ledger_insert(chunk)?;
             sqlx::query_with(&query, args).execute(&self.pool).await?;
         }
         Ok(())
+    }
+
+    fn build_ledger_insert(
+        chunk: &[LedgerEntry],
+    ) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+        let mut query = String::from(
+            "INSERT INTO ledger_entries (id, transaction_id, user_id, wallet_address, asset_symbol, amount, entry_type, fiat_value) VALUES ",
+        );
+        let mut args = sqlx::postgres::PgArguments::default();
+        for (i, entry) in chunk.iter().enumerate() {
+            let entry_type_str = entry_type_to_str(&entry.entry_type);
+            let base = i * 8;
+            if i > 0 {
+                query.push_str(", ");
+            }
+            query.push_str(&format!(
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}::entry_type_enum, ${})",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+                base + 8
+            ));
+            use sqlx::Arguments;
+            args.add(entry.id).map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(entry.transaction_id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(entry.user_id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(&entry.wallet_address)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(&entry.asset_symbol)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(&entry.amount)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(entry_type_str)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            args.add(&entry.fiat_value)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        query.push_str(" ON CONFLICT (id) DO NOTHING");
+        Ok((query, args))
     }
 
     pub async fn get_transactions_by_wallet(
@@ -140,12 +182,7 @@ impl Repository {
         let mut txs = Vec::new();
         for row in rows {
             let chain_str: String = row.try_get("chain")?;
-            let chain = match chain_str.as_str() {
-                "solana" => spectraplex_core::models::Chain::Solana,
-                "hyperliquid" => spectraplex_core::models::Chain::Hyperliquid,
-                "ethereum" => spectraplex_core::models::Chain::Ethereum,
-                _ => return Err(anyhow::anyhow!("Unknown chain: {}", chain_str)),
-            };
+            let chain = str_to_chain(&chain_str)?;
 
             txs.push(Transaction {
                 id: row.try_get("id")?,
@@ -194,14 +231,7 @@ impl Repository {
         let mut entries = Vec::new();
         for row in rows {
             let entry_type_str: String = row.try_get("entry_type")?;
-            let entry_type = match entry_type_str.as_str() {
-                "trade" => spectraplex_core::models::EntryType::Trade,
-                "fee" => spectraplex_core::models::EntryType::Fee,
-                "transfer" => spectraplex_core::models::EntryType::Transfer,
-                "staking" => spectraplex_core::models::EntryType::Staking,
-                "income" => spectraplex_core::models::EntryType::Income,
-                _ => spectraplex_core::models::EntryType::Transfer,
-            };
+            let entry_type = str_to_entry_type(&entry_type_str);
 
             entries.push(LedgerEntry {
                 id: row.try_get("id")?,
@@ -237,12 +267,7 @@ impl Repository {
         match row {
             Some(row) => {
                 let chain_str: String = row.try_get("chain")?;
-                let chain = match chain_str.as_str() {
-                    "solana" => Chain::Solana,
-                    "hyperliquid" => Chain::Hyperliquid,
-                    "ethereum" => Chain::Ethereum,
-                    _ => return Err(anyhow::anyhow!("Unknown chain: {}", chain_str)),
-                };
+                let chain = str_to_chain(&chain_str)?;
                 Ok(Some(IndexerCheckpoint {
                     chain,
                     wallet_address: row.try_get("wallet_address")?,
@@ -256,11 +281,7 @@ impl Repository {
     }
 
     pub async fn save_checkpoint(&self, checkpoint: &IndexerCheckpoint) -> anyhow::Result<()> {
-        let chain_str = match checkpoint.chain {
-            Chain::Solana => "solana",
-            Chain::Hyperliquid => "hyperliquid",
-            Chain::Ethereum => "ethereum",
-        };
+        let chain_str = chain_to_str(&checkpoint.chain);
 
         sqlx::query(
             r#"
@@ -283,5 +304,147 @@ impl Repository {
         .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bigdecimal::BigDecimal;
+    use std::str::FromStr;
+    use uuid::Uuid;
+
+    fn make_tx(chain: Chain) -> Transaction {
+        Transaction {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            wallet_address: "test_wallet".to_string(),
+            timestamp: 1700000000,
+            tx_hash: "0xdeadbeef".to_string(),
+            chain,
+            raw_metadata: serde_json::json!({}),
+        }
+    }
+
+    fn make_ledger_entry(entry_type: EntryType) -> LedgerEntry {
+        LedgerEntry {
+            id: Uuid::new_v4(),
+            transaction_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            wallet_address: "test_wallet".to_string(),
+            asset_symbol: "SOL".to_string(),
+            amount: BigDecimal::from_str("1.5").unwrap(),
+            entry_type,
+            fiat_value: None,
+        }
+    }
+
+    #[test]
+    fn test_chain_to_str() {
+        assert_eq!(chain_to_str(&Chain::Solana), "solana");
+        assert_eq!(chain_to_str(&Chain::Hyperliquid), "hyperliquid");
+        assert_eq!(chain_to_str(&Chain::Ethereum), "ethereum");
+    }
+
+    #[test]
+    fn test_str_to_chain() {
+        assert!(matches!(str_to_chain("solana").unwrap(), Chain::Solana));
+        assert!(matches!(
+            str_to_chain("hyperliquid").unwrap(),
+            Chain::Hyperliquid
+        ));
+        assert!(matches!(str_to_chain("ethereum").unwrap(), Chain::Ethereum));
+        assert!(str_to_chain("bitcoin").is_err());
+    }
+
+    #[test]
+    fn test_entry_type_to_str() {
+        assert_eq!(entry_type_to_str(&EntryType::Trade), "trade");
+        assert_eq!(entry_type_to_str(&EntryType::Fee), "fee");
+        assert_eq!(entry_type_to_str(&EntryType::Transfer), "transfer");
+        assert_eq!(entry_type_to_str(&EntryType::Staking), "staking");
+        assert_eq!(entry_type_to_str(&EntryType::Income), "income");
+    }
+
+    #[test]
+    fn test_str_to_entry_type() {
+        assert!(matches!(str_to_entry_type("trade"), EntryType::Trade));
+        assert!(matches!(str_to_entry_type("fee"), EntryType::Fee));
+        assert!(matches!(str_to_entry_type("transfer"), EntryType::Transfer));
+        assert!(matches!(str_to_entry_type("staking"), EntryType::Staking));
+        assert!(matches!(str_to_entry_type("income"), EntryType::Income));
+        assert!(matches!(str_to_entry_type("unknown"), EntryType::Transfer));
+    }
+
+    #[test]
+    fn test_build_transaction_insert_single() {
+        let tx = make_tx(Chain::Solana);
+        let (query, _args) = Repository::build_transaction_insert(&[tx]).unwrap();
+
+        assert!(query.starts_with("INSERT INTO transactions"));
+        assert!(query.contains("($1, $2, $3, $4, $5, $6::chain_enum, $7)"));
+        assert!(query.ends_with("ON CONFLICT (chain, tx_hash) DO NOTHING"));
+    }
+
+    #[test]
+    fn test_build_transaction_insert_multiple() {
+        let txs: Vec<Transaction> = (0..3).map(|_| make_tx(Chain::Ethereum)).collect();
+        let (query, _args) = Repository::build_transaction_insert(&txs).unwrap();
+
+        assert!(query.contains("($1, $2, $3, $4, $5, $6::chain_enum, $7)"));
+        assert!(query.contains("($8, $9, $10, $11, $12, $13::chain_enum, $14)"));
+        assert!(query.contains("($15, $16, $17, $18, $19, $20::chain_enum, $21)"));
+        assert!(query.ends_with("ON CONFLICT (chain, tx_hash) DO NOTHING"));
+    }
+
+    #[test]
+    fn test_build_ledger_insert_single() {
+        let entry = make_ledger_entry(EntryType::Trade);
+        let (query, _args) = Repository::build_ledger_insert(&[entry]).unwrap();
+
+        assert!(query.starts_with("INSERT INTO ledger_entries"));
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7::entry_type_enum, $8)"));
+        assert!(query.ends_with("ON CONFLICT (id) DO NOTHING"));
+    }
+
+    #[test]
+    fn test_build_ledger_insert_multiple() {
+        let entries: Vec<LedgerEntry> = vec![
+            make_ledger_entry(EntryType::Trade),
+            make_ledger_entry(EntryType::Fee),
+        ];
+        let (query, _args) = Repository::build_ledger_insert(&entries).unwrap();
+
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7::entry_type_enum, $8)"));
+        assert!(query.contains("($9, $10, $11, $12, $13, $14, $15::entry_type_enum, $16)"));
+    }
+
+    #[test]
+    fn test_batch_size_constant() {
+        assert_eq!(Repository::BATCH_SIZE, 500);
+    }
+
+    #[test]
+    fn test_chain_roundtrip() {
+        for chain in [Chain::Solana, Chain::Hyperliquid, Chain::Ethereum] {
+            let s = chain_to_str(&chain);
+            let recovered = str_to_chain(s).unwrap();
+            assert_eq!(chain_to_str(&recovered), s);
+        }
+    }
+
+    #[test]
+    fn test_entry_type_roundtrip() {
+        for et in [
+            EntryType::Trade,
+            EntryType::Fee,
+            EntryType::Transfer,
+            EntryType::Staking,
+            EntryType::Income,
+        ] {
+            let s = entry_type_to_str(&et);
+            let recovered = str_to_entry_type(s);
+            assert_eq!(entry_type_to_str(&recovered), s);
+        }
     }
 }
