@@ -1,6 +1,7 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -121,13 +122,20 @@ async fn main() -> anyhow::Result<()> {
         jobs: RwLock::new(HashMap::new()),
     });
 
-    let app = Router::new()
-        .route("/health", get(health_check))
+    let protected = Router::new()
         .route("/v1/ingest", post(trigger_ingest))
         .route("/v1/normalize", post(trigger_normalize))
         .route("/v1/jobs/:job_id", get(get_job_status))
         .route("/v1/transactions/:wallet", get(get_transactions))
         .route("/v1/ledger/:wallet", get(get_ledger))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&shared_state),
+            require_auth,
+        ));
+
+    let app = Router::new()
+        .route("/health", get(health_check))
+        .merge(protected)
         .layer(TraceLayer::new_for_http())
         .with_state(shared_state);
 
@@ -141,6 +149,31 @@ async fn main() -> anyhow::Result<()> {
 
 async fn health_check() -> &'static str {
     "OK"
+}
+
+async fn require_auth(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let expected = match &state.config.api_key {
+        Some(key) => key,
+        None => return Ok(next.run(req).await),
+    };
+
+    let header = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    match header {
+        Some(token) if token == expected => Ok(next.run(req).await),
+        _ => Err(AppError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "Missing or invalid API key".to_string(),
+        }),
+    }
 }
 
 #[derive(Deserialize)]
@@ -410,12 +443,20 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state() -> Arc<AppState> {
+        test_state_with_key(None)
+    }
+
+    fn test_state_with_key(api_key: Option<String>) -> Arc<AppState> {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://fake:fake@localhost/fake")
             .unwrap();
+        let config = AppConfig {
+            api_key,
+            ..AppConfig::default()
+        };
         Arc::new(AppState {
             repo: Repository::new(pool),
-            config: AppConfig::default(),
+            config,
             jobs: RwLock::new(HashMap::new()),
         })
     }
@@ -426,13 +467,20 @@ mod tests {
     }
 
     fn test_router_with_state(state: Arc<AppState>) -> Router {
-        Router::new()
-            .route("/health", get(health_check))
+        let protected = Router::new()
             .route("/v1/ingest", post(trigger_ingest))
             .route("/v1/normalize", post(trigger_normalize))
             .route("/v1/jobs/:job_id", get(get_job_status))
             .route("/v1/transactions/:wallet", get(get_transactions))
             .route("/v1/ledger/:wallet", get(get_ledger))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                require_auth,
+            ));
+
+        Router::new()
+            .route("/health", get(health_check))
+            .merge(protected)
             .with_state(state)
     }
 
@@ -736,5 +784,133 @@ mod tests {
             let json = serde_json::to_value(&status).unwrap();
             assert_eq!(json["state"], expected);
         }
+    }
+
+    #[tokio::test]
+    async fn test_auth_health_no_key_required() {
+        let state = test_state_with_key(Some("secret".to_string()));
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_rejects_missing_header() {
+        let state = test_state_with_key(Some("secret".to_string()));
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana",
+                    "wallet": "abc123"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_rejects_wrong_key() {
+        let state = test_state_with_key(Some("secret".to_string()));
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer wrong-key")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana",
+                    "wallet": "abc123"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_accepts_valid_key() {
+        let state = test_state_with_key(Some("secret".to_string()));
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana",
+                    "wallet": "abc123"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_skipped_when_no_key_configured() {
+        let state = test_state_with_key(None);
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana",
+                    "wallet": "abc123"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_rejects_non_bearer_scheme() {
+        let state = test_state_with_key(Some("secret".to_string()));
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .header("authorization", "Basic secret")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana",
+                    "wallet": "abc123"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_protects_get_endpoints() {
+        let state = test_state_with_key(Some("secret".to_string()));
+        let app = test_router_with_state(state);
+        let job_id = Uuid::new_v4();
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
