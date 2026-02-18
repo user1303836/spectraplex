@@ -37,8 +37,9 @@ enum Commands {
         #[arg(short, long)]
         chain: String,
 
-        #[arg(short, long)]
-        wallet: String,
+        /// Wallet address(es) to ingest. Pass multiple times for batch ingestion.
+        #[arg(short, long, required = true, num_args = 1..)]
+        wallet: Vec<String>,
 
         #[arg(short, long, default_value = "bronze_transactions.jsonl")]
         output: PathBuf,
@@ -100,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Ingest {
             chain,
-            wallet,
+            wallet: wallets,
             output,
             rpc,
             grpc_url,
@@ -113,12 +114,81 @@ async fn main() -> anyhow::Result<()> {
                 info!(user_id = %id, "No --user-id provided, auto-generated");
                 id
             });
-            info!(wallet = %wallet, chain = %chain, "Starting ingestion");
 
-            let checkpoint = if let Some(ref p) = pool {
-                let repo = Repository::new(p.clone());
-                match repo.get_checkpoint(&chain, &wallet).await? {
-                    Some(cp) => {
+            for wallet in &wallets {
+                info!(wallet = %wallet, chain = %chain, "Starting ingestion");
+
+                let checkpoint = if let Some(ref p) = pool {
+                    let repo = Repository::new(p.clone());
+                    match repo.get_checkpoint(&chain, wallet).await? {
+                        Some(cp) => {
+                            info!(
+                                chain = %chain,
+                                wallet = %wallet,
+                                last_signature = ?cp.last_signature,
+                                last_slot = ?cp.last_slot,
+                                last_block = ?cp.last_block,
+                                last_timestamp = ?cp.last_timestamp,
+                                "Resuming from checkpoint"
+                            );
+                            Some(cp)
+                        }
+                        None => {
+                            info!(chain = %chain, wallet = %wallet, "No existing checkpoint, full ingestion");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let events = match chain.as_str() {
+                    "solana" => {
+                        if let Some(ref endpoint) = grpc_url {
+                            let adapter = SolanaGrpcAdapter::new(endpoint, x_token.clone());
+                            if let Some(ref cp) = checkpoint {
+                                if let Some(slot) = cp.last_slot {
+                                    adapter.checkpoint().update(slot as u64);
+                                }
+                            }
+                            adapter
+                                .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
+                                .await?
+                        } else if let Some(ref rpc_url) = rpc {
+                            let adapter = SolanaAdapter::new(rpc_url);
+                            adapter
+                                .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
+                                .await?
+                        } else {
+                            anyhow::bail!("Either --grpc-url or --rpc must be provided for Solana");
+                        }
+                    }
+                    "hyperliquid" => {
+                        let adapter = HyperliquidAdapter::new();
+                        adapter
+                            .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
+                            .await?
+                    }
+                    "ethereum" => {
+                        let rpc_url = rpc
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("--rpc is required for Ethereum"))?;
+                        let adapter = EvmAdapter::new(rpc_url)?;
+                        adapter
+                            .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
+                            .await?
+                    }
+                    _ => {
+                        warn!(chain = %chain, "Unsupported chain");
+                        return Ok(());
+                    }
+                };
+
+                if let Some(ref p) = pool {
+                    let repo = Repository::new(p.clone());
+                    if let Some(cp) = build_checkpoint(&chain, wallet, &events) {
+                        repo.save_transactions_and_checkpoint(&events, &cp).await?;
+                        info!(count = events.len(), wallet = %wallet, "Saved transactions to database");
                         info!(
                             chain = %chain,
                             wallet = %wallet,
@@ -126,90 +196,24 @@ async fn main() -> anyhow::Result<()> {
                             last_slot = ?cp.last_slot,
                             last_block = ?cp.last_block,
                             last_timestamp = ?cp.last_timestamp,
-                            "Resuming from checkpoint"
+                            "Checkpoint saved atomically"
                         );
-                        Some(cp)
-                    }
-                    None => {
-                        info!(chain = %chain, wallet = %wallet, "No existing checkpoint, full ingestion");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            let events = match chain.as_str() {
-                "solana" => {
-                    if let Some(endpoint) = grpc_url {
-                        let adapter = SolanaGrpcAdapter::new(&endpoint, x_token);
-                        if let Some(ref cp) = checkpoint {
-                            if let Some(slot) = cp.last_slot {
-                                adapter.checkpoint().update(slot as u64);
-                            }
-                        }
-                        adapter
-                            .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
-                            .await?
-                    } else if let Some(rpc_url) = rpc {
-                        let adapter = SolanaAdapter::new(&rpc_url);
-                        adapter
-                            .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
-                            .await?
                     } else {
-                        anyhow::bail!("Either --grpc-url or --rpc must be provided for Solana");
+                        repo.save_transactions(&events).await?;
+                        info!(
+                            count = events.len(),
+                            wallet = %wallet,
+                            "Saved transactions to database (no checkpoint)"
+                        );
                     }
-                }
-                "hyperliquid" => {
-                    let adapter = HyperliquidAdapter::new();
-                    adapter
-                        .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
-                        .await?
-                }
-                "ethereum" => {
-                    let rpc_url =
-                        rpc.ok_or_else(|| anyhow::anyhow!("--rpc is required for Ethereum"))?;
-                    let adapter = EvmAdapter::new(&rpc_url)?;
-                    adapter
-                        .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
-                        .await?
-                }
-                _ => {
-                    warn!(chain = %chain, "Unsupported chain");
-                    return Ok(());
-                }
-            };
-
-            // Strategy: DB first, fallback to File
-            if let Some(p) = pool {
-                let repo = Repository::new(p);
-                if let Some(cp) = build_checkpoint(&chain, &wallet, &events) {
-                    repo.save_transactions_and_checkpoint(&events, &cp).await?;
-                    info!(count = events.len(), "Saved transactions to database");
-                    info!(
-                        chain = %chain,
-                        wallet = %wallet,
-                        last_signature = ?cp.last_signature,
-                        last_slot = ?cp.last_slot,
-                        last_block = ?cp.last_block,
-                        last_timestamp = ?cp.last_timestamp,
-                        "Checkpoint saved atomically"
-                    );
                 } else {
-                    repo.save_transactions(&events).await?;
-                    info!(
-                        count = events.len(),
-                        "Saved transactions to database (no checkpoint)"
-                    );
+                    let mut file = File::create(&output)?;
+                    for event in events {
+                        serde_json::to_writer(&file, &event)?;
+                        writeln!(file)?;
+                    }
+                    info!(path = ?output, wallet = %wallet, "Data written to file");
                 }
-            } else {
-                // Write to JSONL
-                let mut file = File::create(&output)?;
-                for event in events {
-                    serde_json::to_writer(&file, &event)?;
-                    writeln!(file)?;
-                }
-                info!(path = ?output, "Data written to file");
             }
         }
         Commands::Normalize { input, output } => {
@@ -402,7 +406,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(chain, "solana");
-                assert_eq!(wallet, "abc123");
+                assert_eq!(wallet, vec!["abc123"]);
                 assert_eq!(rpc.unwrap(), "https://api.mainnet.solana.com");
                 assert_eq!(limit, 10);
                 assert_eq!(output, PathBuf::from("bronze_transactions.jsonl"));
@@ -456,12 +460,37 @@ mod tests {
                 ..
             } => {
                 assert_eq!(chain, "solana");
-                assert_eq!(wallet, "abc123");
+                assert_eq!(wallet, vec!["abc123"]);
                 assert_eq!(output, PathBuf::from("custom.jsonl"));
                 assert_eq!(grpc_url.unwrap(), "https://grpc.example.com");
                 assert_eq!(x_token.unwrap(), "secret");
                 assert_eq!(limit, 50);
                 assert!(user_id.is_some());
+            }
+            _ => panic!("expected Ingest command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ingest_multiple_wallets() {
+        let cli = Cli::try_parse_from([
+            "spectraplex",
+            "ingest",
+            "--chain",
+            "solana",
+            "--wallet",
+            "abc123",
+            "--wallet",
+            "def456",
+            "--wallet",
+            "ghi789",
+            "--rpc",
+            "https://api.mainnet.solana.com",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Ingest { wallet, .. } => {
+                assert_eq!(wallet, vec!["abc123", "def456", "ghi789"]);
             }
             _ => panic!("expected Ingest command"),
         }
