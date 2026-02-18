@@ -1,0 +1,4 @@
+# Transitive dependency via sqlx-mysql; no fix available upstream.
+# We don't use MySQL (only Postgres), but sqlx enables all DB backends by default.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
