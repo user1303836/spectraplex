@@ -153,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
 
     let protected = Router::new()
         .route("/v1/ingest", post(trigger_ingest))
+        .route("/v1/ingest/batch", post(trigger_batch_ingest))
         .route("/v1/normalize", post(trigger_normalize))
         .route("/v1/jobs/{job_id}", get(get_job_status))
         .route("/v1/transactions/{wallet}", get(get_transactions))
@@ -222,6 +223,11 @@ struct IngestRequest {
     chain: String,
     wallet: String,
     user_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct BatchIngestRequest {
+    wallets: Vec<IngestRequest>,
 }
 
 #[derive(Deserialize)]
@@ -390,6 +396,58 @@ async fn trigger_ingest(
         state: JobState::Pending,
         message: Some("Job queued".to_string()),
     }))
+}
+
+const MAX_BATCH_SIZE: usize = 50;
+
+async fn trigger_batch_ingest(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<BatchIngestRequest>,
+) -> Result<Json<Vec<JobStatus>>, AppError> {
+    if payload.wallets.is_empty() {
+        return Err(AppError::bad_request("wallets array must not be empty"));
+    }
+    if payload.wallets.len() > MAX_BATCH_SIZE {
+        return Err(AppError::bad_request(format!(
+            "batch size {} exceeds maximum of {MAX_BATCH_SIZE}",
+            payload.wallets.len()
+        )));
+    }
+
+    for item in &payload.wallets {
+        validate_wallet(&item.wallet)?;
+        check_wallet_allowed(&item.wallet, &state.allowed_wallets)?;
+        match item.chain.as_str() {
+            "solana" | "ethereum" | "hyperliquid" => {}
+            other => {
+                return Err(AppError::bad_request(format!(
+                    "Unsupported chain: {other}. Supported chains: solana, ethereum, hyperliquid"
+                )));
+            }
+        }
+    }
+
+    let mut jobs = Vec::with_capacity(payload.wallets.len());
+    for item in payload.wallets {
+        let single = Json(IngestRequest {
+            chain: item.chain,
+            wallet: item.wallet,
+            user_id: item.user_id,
+        });
+        match trigger_ingest(State(Arc::clone(&state)), single).await {
+            Ok(Json(status)) => jobs.push(status),
+            Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => {
+                return Err(AppError::service_unavailable(format!(
+                    "Concurrency limit reached after queuing {} of {} jobs",
+                    jobs.len(),
+                    jobs.len() + 1
+                )));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(Json(jobs))
 }
 
 async fn trigger_normalize(
@@ -583,6 +641,7 @@ mod tests {
     fn test_router_with_state(state: Arc<AppState>) -> Router {
         let protected = Router::new()
             .route("/v1/ingest", post(trigger_ingest))
+            .route("/v1/ingest/batch", post(trigger_batch_ingest))
             .route("/v1/normalize", post(trigger_normalize))
             .route("/v1/jobs/{job_id}", get(get_job_status))
             .route("/v1/transactions/{wallet}", get(get_transactions))
@@ -1300,5 +1359,135 @@ mod tests {
         let err = AppError::forbidden("not allowed");
         assert_eq!(err.status, StatusCode::FORBIDDEN);
         assert_eq!(err.message, "not allowed");
+    }
+
+    #[tokio::test]
+    async fn test_batch_ingest_multiple_wallets() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest/batch")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallets": [
+                        {"chain": "solana", "wallet": "abc123"},
+                        {"chain": "ethereum", "wallet": "0xdef456"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let jobs: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0]["state"], "pending");
+        assert_eq!(jobs[1]["state"], "pending");
+    }
+
+    #[tokio::test]
+    async fn test_batch_ingest_empty_wallets() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest/batch")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallets": []
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_batch_ingest_invalid_chain() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest/batch")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallets": [
+                        {"chain": "bitcoin", "wallet": "abc123"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_batch_ingest_invalid_wallet() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest/batch")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallets": [
+                        {"chain": "solana", "wallet": "bad;wallet"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_batch_ingest_respects_wallet_scoping() {
+        let state = test_state_with_config(Some("secret".to_string()), Some("abc123".to_string()));
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest/batch")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallets": [
+                        {"chain": "solana", "wallet": "notallowed"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_batch_ingest_requires_auth() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest/batch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallets": [
+                        {"chain": "solana", "wallet": "abc123"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
