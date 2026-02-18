@@ -17,3 +17,7 @@ sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio-rustls", "uui
 dotenv = "0.15"
 anyhow = "1.0"
 uuid = { version = "1.19", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

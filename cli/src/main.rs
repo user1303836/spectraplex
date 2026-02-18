@@ -300,6 +300,7 @@ fn build_checkpoint(chain: &str, wallet: &str, txs: &[Transaction]) -> Option<In
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use serde_json::json;
 
     fn make_tx(
@@ -372,5 +373,189 @@ mod tests {
         assert_eq!(cp.last_signature, Some("hash2".to_string()));
         assert_eq!(cp.last_timestamp, Some(600));
         assert_eq!(cp.last_slot, None);
+    }
+
+    #[test]
+    fn test_parse_init_db() {
+        let cli = Cli::try_parse_from(["spectraplex", "init-db"]).unwrap();
+        assert!(matches!(cli.command, Commands::InitDb));
+    }
+
+    #[test]
+    fn test_parse_init_db_with_db_url() {
+        let cli = Cli::try_parse_from([
+            "spectraplex",
+            "--db-url",
+            "postgres://localhost/test",
+            "init-db",
+        ])
+        .unwrap();
+        assert_eq!(cli.db_url.unwrap(), "postgres://localhost/test");
+    }
+
+    #[test]
+    fn test_parse_ingest_required_args() {
+        let cli = Cli::try_parse_from([
+            "spectraplex",
+            "ingest",
+            "--chain",
+            "solana",
+            "--wallet",
+            "abc123",
+            "--rpc",
+            "https://api.mainnet.solana.com",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Ingest {
+                chain,
+                wallet,
+                rpc,
+                limit,
+                output,
+                ..
+            } => {
+                assert_eq!(chain, "solana");
+                assert_eq!(wallet, "abc123");
+                assert_eq!(rpc.unwrap(), "https://api.mainnet.solana.com");
+                assert_eq!(limit, 10);
+                assert_eq!(output, PathBuf::from("bronze_transactions.jsonl"));
+            }
+            _ => panic!("expected Ingest command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ingest_missing_chain() {
+        let result = Cli::try_parse_from(["spectraplex", "ingest", "--wallet", "abc123"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_ingest_missing_wallet() {
+        let result = Cli::try_parse_from(["spectraplex", "ingest", "--chain", "solana"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_ingest_all_options() {
+        let cli = Cli::try_parse_from([
+            "spectraplex",
+            "ingest",
+            "--chain",
+            "solana",
+            "--wallet",
+            "abc123",
+            "--output",
+            "custom.jsonl",
+            "--grpc-url",
+            "https://grpc.example.com",
+            "--x-token",
+            "secret",
+            "--limit",
+            "50",
+            "--user-id",
+            "00000000-0000-0000-0000-000000000001",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Ingest {
+                chain,
+                wallet,
+                output,
+                grpc_url,
+                x_token,
+                limit,
+                user_id,
+                ..
+            } => {
+                assert_eq!(chain, "solana");
+                assert_eq!(wallet, "abc123");
+                assert_eq!(output, PathBuf::from("custom.jsonl"));
+                assert_eq!(grpc_url.unwrap(), "https://grpc.example.com");
+                assert_eq!(x_token.unwrap(), "secret");
+                assert_eq!(limit, 50);
+                assert!(user_id.is_some());
+            }
+            _ => panic!("expected Ingest command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_normalize_defaults() {
+        let cli = Cli::try_parse_from(["spectraplex", "normalize"]).unwrap();
+        match cli.command {
+            Commands::Normalize { input, output } => {
+                assert_eq!(input, PathBuf::from("bronze_transactions.jsonl"));
+                assert_eq!(output, PathBuf::from("silver_ledger.jsonl"));
+            }
+            _ => panic!("expected Normalize command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_normalize_custom_paths() {
+        let cli = Cli::try_parse_from([
+            "spectraplex",
+            "normalize",
+            "--input",
+            "custom_input.jsonl",
+            "--output",
+            "custom_output.jsonl",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Normalize { input, output } => {
+                assert_eq!(input, PathBuf::from("custom_input.jsonl"));
+                assert_eq!(output, PathBuf::from("custom_output.jsonl"));
+            }
+            _ => panic!("expected Normalize command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_no_subcommand() {
+        let result = Cli::try_parse_from(["spectraplex"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_unknown_subcommand() {
+        let result = Cli::try_parse_from(["spectraplex", "unknown"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_ingest_ethereum() {
+        let cli = Cli::try_parse_from([
+            "spectraplex",
+            "ingest",
+            "--chain",
+            "ethereum",
+            "--wallet",
+            "0xabc",
+            "--rpc",
+            "https://eth.rpc.com",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Ingest { chain, rpc, .. } => {
+                assert_eq!(chain, "ethereum");
+                assert_eq!(rpc.unwrap(), "https://eth.rpc.com");
+            }
+            _ => panic!("expected Ingest command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_explicit_db_url_overrides() {
+        let cli = Cli::try_parse_from([
+            "spectraplex",
+            "--db-url",
+            "postgres://explicit/db",
+            "init-db",
+        ])
+        .unwrap();
+        assert_eq!(cli.db_url.unwrap(), "postgres://explicit/db");
     }
 }

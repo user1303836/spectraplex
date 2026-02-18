@@ -125,9 +125,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health_check))
         .route("/v1/ingest", post(trigger_ingest))
         .route("/v1/normalize", post(trigger_normalize))
-        .route("/v1/jobs/{job_id}", get(get_job_status))
-        .route("/v1/transactions/{wallet}", get(get_transactions))
-        .route("/v1/ledger/{wallet}", get(get_ledger))
+        .route("/v1/jobs/:job_id", get(get_job_status))
+        .route("/v1/transactions/:wallet", get(get_transactions))
+        .route("/v1/ledger/:wallet", get(get_ledger))
         .layer(TraceLayer::new_for_http())
         .with_state(shared_state);
 
@@ -400,4 +400,341 @@ async fn get_ledger(
         .await
         .map_err(AppError::internal)?;
     Ok(Json(entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn test_state() -> Arc<AppState> {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://fake:fake@localhost/fake")
+            .unwrap();
+        Arc::new(AppState {
+            repo: Repository::new(pool),
+            config: AppConfig::default(),
+            jobs: RwLock::new(HashMap::new()),
+        })
+    }
+
+    fn test_router() -> Router {
+        let state = test_state();
+        test_router_with_state(state)
+    }
+
+    fn test_router_with_state(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/health", get(health_check))
+            .route("/v1/ingest", post(trigger_ingest))
+            .route("/v1/normalize", post(trigger_normalize))
+            .route("/v1/jobs/:job_id", get(get_job_status))
+            .route("/v1/transactions/:wallet", get(get_transactions))
+            .route("/v1/ledger/:wallet", get(get_ledger))
+            .with_state(state)
+    }
+
+    #[test]
+    fn test_validate_wallet_valid() {
+        assert!(validate_wallet("abc123").is_ok());
+        assert!(validate_wallet("0xabcdef1234567890").is_ok());
+        assert!(validate_wallet("SoLaNaWaLLeT123").is_ok());
+    }
+
+    #[test]
+    fn test_validate_wallet_empty() {
+        let err = validate_wallet("").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_wallet_too_long() {
+        let long = "a".repeat(129);
+        let err = validate_wallet(&long).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_wallet_max_length() {
+        let max = "a".repeat(128);
+        assert!(validate_wallet(&max).is_ok());
+    }
+
+    #[test]
+    fn test_validate_wallet_invalid_chars() {
+        let err = validate_wallet("wallet-with-dashes").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+
+        let err = validate_wallet("wallet with spaces").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+
+        let err = validate_wallet("wallet;drop table").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_clamp_limit_default() {
+        assert_eq!(clamp_limit(None), DEFAULT_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn test_clamp_limit_within_range() {
+        assert_eq!(clamp_limit(Some(100)), 100);
+    }
+
+    #[test]
+    fn test_clamp_limit_too_high() {
+        assert_eq!(clamp_limit(Some(5000)), MAX_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn test_clamp_limit_too_low() {
+        assert_eq!(clamp_limit(Some(0)), 1);
+        assert_eq!(clamp_limit(Some(-10)), 1);
+    }
+
+    #[test]
+    fn test_clamp_offset_default() {
+        assert_eq!(clamp_offset(None), 0);
+    }
+
+    #[test]
+    fn test_clamp_offset_positive() {
+        assert_eq!(clamp_offset(Some(50)), 50);
+    }
+
+    #[test]
+    fn test_clamp_offset_negative() {
+        assert_eq!(clamp_offset(Some(-5)), 0);
+    }
+
+    #[test]
+    fn test_app_error_into_response() {
+        let err = AppError::bad_request("test error");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_app_error_not_found() {
+        let err = AppError::not_found("missing");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert_eq!(err.message, "missing");
+    }
+
+    #[test]
+    fn test_app_error_internal() {
+        let err = AppError::internal("something broke");
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.message, "something broke");
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"OK");
+    }
+
+    #[tokio::test]
+    async fn test_job_status_not_found() {
+        let app = test_router();
+        let job_id = Uuid::new_v4();
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_job_status_found() {
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        state.jobs.write().await.insert(
+            job_id,
+            JobEntry {
+                status: JobStatus {
+                    id: job_id,
+                    state: JobState::Completed,
+                    message: Some("done".to_string()),
+                },
+                finished_at: Some(Instant::now()),
+            },
+        );
+
+        let app = test_router_with_state(Arc::clone(&state));
+
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(job["state"], "completed");
+        assert_eq!(job["message"], "done");
+    }
+
+    #[tokio::test]
+    async fn test_ingest_invalid_wallet() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana",
+                    "wallet": "bad;wallet"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_normalize_invalid_wallet() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/normalize")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallet": "bad;wallet"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_transactions_invalid_wallet() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/transactions/bad%20wallet")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_ledger_invalid_wallet() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/ledger/bad%20wallet")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_nonexistent_route_returns_404() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/nonexistent")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_ingest_missing_body() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert!(response.status().is_client_error());
+    }
+
+    #[tokio::test]
+    async fn test_prune_stale_jobs() {
+        let state = test_state();
+        let old_id = Uuid::new_v4();
+        let new_id = Uuid::new_v4();
+
+        state.jobs.write().await.insert(
+            old_id,
+            JobEntry {
+                status: JobStatus {
+                    id: old_id,
+                    state: JobState::Completed,
+                    message: None,
+                },
+                finished_at: Some(
+                    Instant::now() - std::time::Duration::from_secs(JOB_TTL_SECS + 1),
+                ),
+            },
+        );
+        state.jobs.write().await.insert(
+            new_id,
+            JobEntry {
+                status: JobStatus {
+                    id: new_id,
+                    state: JobState::Running,
+                    message: None,
+                },
+                finished_at: None,
+            },
+        );
+
+        state.prune_stale_jobs().await;
+
+        let jobs = state.jobs.read().await;
+        assert!(!jobs.contains_key(&old_id));
+        assert!(jobs.contains_key(&new_id));
+    }
+
+    #[test]
+    fn test_job_state_serialization() {
+        let status = JobStatus {
+            id: Uuid::nil(),
+            state: JobState::Pending,
+            message: Some("test".to_string()),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["state"], "pending");
+        assert_eq!(json["message"], "test");
+    }
+
+    #[test]
+    fn test_job_state_variants_serialize() {
+        for (variant, expected) in [
+            (JobState::Pending, "pending"),
+            (JobState::Running, "running"),
+            (JobState::Completed, "completed"),
+            (JobState::Failed, "failed"),
+        ] {
+            let status = JobStatus {
+                id: Uuid::nil(),
+                state: variant,
+                message: None,
+            };
+            let json = serde_json::to_value(&status).unwrap();
+            assert_eq!(json["state"], expected);
+        }
+    }
 }
