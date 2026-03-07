@@ -1,3 +1,13 @@
 /target
 n*.md
 p*.md
+design/
+/workflow.tsx
+/.smithers/
+node_modules/*
+.claude/*
+.entire/*
+AGENTS.md
+CLAUDE.md
+bun.lock
+package.json

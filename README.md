@@ -3,7 +3,23 @@
 [![CI](https://github.com/user1303836/spectraplex/actions/workflows/ci.yml/badge.svg)](https://github.com/user1303836/spectraplex/actions/workflows/ci.yml)
 [![Security Audit](https://github.com/user1303836/spectraplex/actions/workflows/audit.yml/badge.svg)](https://github.com/user1303836/spectraplex/actions/workflows/audit.yml)
 
-Spectraplex is a multi-chain blockchain transaction indexer written in Rust. It ingests raw transactions from supported blockchains, normalizes them into structured ledger entries, and serves the data through both a CLI and REST API. Built around a **Bronze/Silver data layer architecture**, it transforms messy on-chain data into clean, queryable financial records.
+Spectraplex is a multi-chain blockchain indexing and normalization system written in Rust. It ingests raw data from supported chains, normalizes that data into reusable downstream datasets, and serves it through both a CLI and REST API. Built around a **Bronze/Silver data layer architecture**, it is intended to become a general-purpose indexing layer for ETL and analytics workflows, while still keeping wallet-centric indexing first-class for tax, portfolio, and forensics use cases.
+
+## Project Direction
+
+Today, the implementation is strongest around wallet-centric ingestion and ledger normalization. That remains an important capability, but it is not the intended end state of the project.
+
+The long-term direction is a **target-centric indexing platform** that can support:
+
+- wallet indexing
+- contract and program indexing
+- protocol and pool indexing
+- Hyperliquid market and user analytics
+- downstream ETL, warehousing, and dashboard pipelines
+
+For the current strategy and execution plan, see [`SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md`](SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md).
+
+For the condensed external landscape and source list, see [`INDEXER_RESEARCH.md`](INDEXER_RESEARCH.md).
 
 ## Supported Chains
 
@@ -12,6 +28,8 @@ Spectraplex is a multi-chain blockchain transaction indexer written in Rust. It 
 | Solana | RPC + gRPC | SOL + SPL tokens (symbol lookup) | Yellowstone gRPC | Active |
 | Hyperliquid | REST + WebSocket | Fills, deposits, withdrawals | WebSocket | Active |
 | Ethereum (EVM) | alloy (eth_getLogs) | ERC-20 transfers (uint256 precision) | Planned | Active |
+
+Current CLI and API workflows are mostly wallet-oriented. Broader target types are part of the planned architecture.
 
 ## Architecture
 
@@ -48,9 +66,9 @@ Spectraplex is a multi-chain blockchain transaction indexer written in Rust. It 
 
 ### Data Flow
 
-1. **Ingest (Bronze)** -- Fetch raw transactions from a blockchain RPC/gRPC endpoint. Store the full transaction as JSONB in the `transactions` table.
-2. **Normalize (Silver)** -- Read raw transactions, parse balance changes (native tokens, SPL tokens, etc.), and write structured `ledger_entries` with fields like asset, amount, and entry type (trade, fee, transfer, staking, income).
-3. **Query** -- Retrieve transactions or ledger entries by wallet address via the API or CLI.
+1. **Ingest (Bronze)** -- Fetch raw chain data from RPC, gRPC, REST, or WebSocket endpoints and store it durably.
+2. **Normalize (Silver)** -- Parse raw data into reusable normalized datasets. Today the main implemented Silver dataset is `ledger_entries`.
+3. **Query / Export** -- Retrieve indexed data through the API or CLI. Today the query surface is mostly wallet-oriented; broader ETL-oriented delivery is planned.
 
 ## Quick Start
 
@@ -448,37 +466,17 @@ All tables use UUIDs as primary keys and support idempotent batch inserts (`ON C
 
 ## Roadmap
 
-- [x] Solana RPC ingestion and transaction parsing
-- [x] SPL token symbol resolution (USDC, USDT, BONK, JUP, etc.)
-- [x] Bronze/Silver data layer with PostgreSQL
-- [x] Batch SQL inserts (500 rows/batch)
-- [x] CLI and REST API with async job system
-- [x] Structured JSON error responses
-- [x] Pagination on all query endpoints
-- [x] Input validation on wallet addresses
-- [x] CI/CD with GitHub Actions (fmt, clippy, test, security audit)
-- [x] Yellowstone gRPC real-time streaming adapter
-- [x] Hyperliquid adapter (REST + WebSocket + parser)
-- [x] EVM adapter (Ethereum and compatibles) with uint256 precision
-- [x] Layered configuration (defaults / TOML / env vars)
-- [x] Docker Compose deployment
-- [x] Incremental sync with checkpointing schema
-- [x] API authentication (Bearer token, fail-closed, constant-time comparison)
-- [x] Wallet scoping (restrict API access to specific wallets)
-- [x] Batch ingestion (multi-wallet, up to 50 per request)
-- [x] Request hardening (body limits, timeouts, concurrent job caps)
-- [x] Ledger export (CSV/JSON) with date range filtering
-- [x] Balance aggregation endpoint with point-in-time snapshots
-- [x] Date range filtering on transactions, ledger, and export endpoints
-- [x] Webhook callbacks for job completion notifications
-- [x] Single transaction lookup by hash
-- [x] Wallet statistics endpoint (tx count, chains, assets, date range)
-- [x] Real-time Solana gRPC streaming with batched persistence
-- [ ] EVM native ETH transfer and gas fee parsing
-- [ ] Improved entry type classification (trades, staking)
-- [ ] Historical price lookups for fiat value
-- [ ] User identity and wallet management
-- [ ] Cross-chain portfolio views
+- [x] Build a working multi-chain Rust workspace with Bronze/Silver storage, CLI, API, and chain adapters
+- [x] Support wallet-centric ingestion and normalization for Solana, Hyperliquid, and EVM-compatible chains
+- [x] Add operational basics: auth, checkpoints, exports, streaming hooks, CI, Docker, and test coverage
+- [ ] Refactor the Bronze model so raw chain data is canonical and not shaped around a single wallet or user
+- [ ] Introduce a general index target model: wallet, contract, program, topic filter, market, pool, protocol
+- [ ] Split chain family from network identity so EVM-compatible networks are modeled correctly
+- [ ] Expand Silver beyond `ledger_entries` into reusable datasets like transfers, decoded events, fills, swaps, and balance snapshots
+- [ ] Add ETL-first delivery modes such as dataset exports, sink jobs, and warehouse-friendly outputs
+- [ ] Keep wallet/tax/forensics materializations first-class, but as downstream products of the broader indexing core
+
+The detailed roadmap lives in [`SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md`](SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md).
 
 ## License
 
