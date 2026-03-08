@@ -3,7 +3,7 @@
   "checkpoint_id": "c317c5c03437",
   "strategy": "manual-commit",
   "branch": "p3-w6-completeness-metadata",
-  "checkpoints_count": 5,
+  "checkpoints_count": 6,
   "files_touched": [
     "adapters/src/v2_repo.rs",
     "core/src/v2.rs",
@@ -72,13 +72,20 @@
       "context": "/c3/17c5c03437/8/context.md",
       "content_hash": "/c3/17c5c03437/8/content_hash.txt",
       "prompt": "/c3/17c5c03437/8/prompt.txt"
+    },
+    {
+      "metadata": "/c3/17c5c03437/9/metadata.json",
+      "transcript": "/c3/17c5c03437/9/full.jsonl",
+      "context": "/c3/17c5c03437/9/context.md",
+      "content_hash": "/c3/17c5c03437/9/content_hash.txt",
+      "prompt": "/c3/17c5c03437/9/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 311,
-    "cache_creation_tokens": 967350,
-    "cache_read_tokens": 17508042,
-    "output_tokens": 129294,
-    "api_call_count": 226
+    "input_tokens": 368,
+    "cache_creation_tokens": 1095006,
+    "cache_read_tokens": 23292675,
+    "output_tokens": 155955,
+    "api_call_count": 281
   }
 }
