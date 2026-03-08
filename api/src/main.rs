@@ -20,7 +20,9 @@ use spectraplex_adapters::{
 };
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::connector::validate_target;
-use spectraplex_core::materializer::{DatasetName, ExportFormat};
+use spectraplex_core::materializer::{
+    DatasetName, DeliveryMetadata, DeliveryReceipt, ExportFormat, ExportSink, SinkConfig, SinkType,
+};
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
 use spectraplex_core::v2::{
     normalize_evm_address, normalize_solana_address, ChainFamily, DatasetCompleteness,
@@ -167,6 +169,12 @@ struct ExportJobStatus {
     format: String,
     record_count: Option<usize>,
     message: Option<String>,
+    /// Where the export data was delivered (e.g. file path, webhook URL).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivered_to: Option<String>,
+    /// Delivery status: "pending", "delivered", "failed", or null if no sink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -376,6 +384,9 @@ struct ExportJobRequest {
     network: Option<String>,
     time_start: Option<i64>,
     time_end: Option<i64>,
+    /// Optional sink config. When provided, export data is delivered to the
+    /// specified sink in addition to being stored in-memory for download.
+    sink: Option<SinkConfig>,
 }
 
 #[derive(Serialize)]
@@ -484,6 +495,155 @@ fn validate_callback_url(url: &str) -> Result<(), AppError> {
         _ => Err(AppError::bad_request(
             "callback_url must be a valid HTTP(S) URL",
         )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sink implementations
+// ---------------------------------------------------------------------------
+
+/// Validates a SinkConfig at job creation time.
+fn validate_sink_config(config: &SinkConfig) -> Result<(), AppError> {
+    config
+        .validate()
+        .map_err(|e| AppError::bad_request(format!("Invalid sink config: {e}")))?;
+
+    match config.sink_type {
+        SinkType::Webhook => {
+            if let Some(ref url) = config.url {
+                validate_callback_url(url)?;
+            }
+        }
+        SinkType::LocalFile => {
+            if let Some(ref path) = config.file_path {
+                // Reject obviously dangerous paths
+                if path.contains("..") {
+                    return Err(AppError::bad_request(
+                        "file_path must not contain '..' path traversal",
+                    ));
+                }
+            }
+        }
+        SinkType::Database => {
+            // Database sink is not yet implemented at runtime.
+            return Err(AppError::bad_request(
+                "Database sink is not yet implemented. Use local_file or webhook.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Writes export data to a local file path.
+struct LocalFileSink {
+    path: String,
+}
+
+#[async_trait::async_trait]
+impl ExportSink for LocalFileSink {
+    async fn deliver(
+        &self,
+        data: &[u8],
+        _metadata: &DeliveryMetadata,
+    ) -> Result<DeliveryReceipt, String> {
+        tokio::fs::write(&self.path, data)
+            .await
+            .map_err(|e| format!("Failed to write to {}: {e}", self.path))?;
+
+        Ok(DeliveryReceipt {
+            sink_type: SinkType::LocalFile,
+            destination: self.path.clone(),
+            bytes_written: data.len(),
+            delivered_at: chrono::Utc::now(),
+        })
+    }
+}
+
+/// POSTs export data to an HTTP(S) webhook URL.
+struct WebhookSink {
+    url: String,
+    headers: Option<std::collections::HashMap<String, String>>,
+}
+
+#[async_trait::async_trait]
+impl ExportSink for WebhookSink {
+    async fn deliver(
+        &self,
+        data: &[u8],
+        metadata: &DeliveryMetadata,
+    ) -> Result<DeliveryReceipt, String> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+
+        let content_type = match metadata.format.as_str() {
+            "csv" => "text/csv; charset=utf-8",
+            _ => "application/x-ndjson",
+        };
+
+        let mut req = client
+            .post(&self.url)
+            .header("Content-Type", content_type)
+            .header("X-Export-Dataset", &metadata.dataset)
+            .header("X-Export-Format", &metadata.format)
+            .header("X-Export-Record-Count", metadata.record_count.to_string())
+            .header("X-Export-Job-Id", metadata.job_id.to_string());
+
+        if let Some(ref headers) = self.headers {
+            for (key, value) in headers {
+                req = req.header(key, value);
+            }
+        }
+
+        let response = req
+            .body(data.to_vec())
+            .send()
+            .await
+            .map_err(|e| format!("Webhook POST to {} failed: {e}", self.url))?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "Webhook returned non-success status: {}",
+                response.status()
+            ));
+        }
+
+        Ok(DeliveryReceipt {
+            sink_type: SinkType::Webhook,
+            destination: self.url.clone(),
+            bytes_written: data.len(),
+            delivered_at: chrono::Utc::now(),
+        })
+    }
+}
+
+/// Builds the appropriate ExportSink from a SinkConfig.
+/// Database sink is not yet implemented and returns an error.
+fn build_sink(config: &SinkConfig) -> Result<Box<dyn ExportSink>, String> {
+    match config.sink_type {
+        SinkType::LocalFile => {
+            let path = config
+                .file_path
+                .as_ref()
+                .ok_or("LocalFile sink requires file_path")?;
+            Ok(Box::new(LocalFileSink { path: path.clone() }))
+        }
+        SinkType::Webhook => {
+            let url = config.url.as_ref().ok_or("Webhook sink requires url")?;
+            Ok(Box::new(WebhookSink {
+                url: url.clone(),
+                headers: config.headers.clone(),
+            }))
+        }
+        SinkType::Database => {
+            // TODO: Implement runtime Database sink delivery.
+            // This requires external connection management (separate pool,
+            // credential handling, schema negotiation) which is out of scope
+            // for P4-W3. The config parsing and validation are in place;
+            // runtime delivery will be added in a future packet.
+            Err("Database sink is not yet implemented at runtime".to_string())
+        }
     }
 }
 
@@ -1759,6 +1919,11 @@ async fn create_export_job(
 
     validate_date_range(req.time_start, req.time_end)?;
 
+    // Validate sink config if provided
+    if let Some(ref sink_config) = req.sink {
+        validate_sink_config(sink_config)?;
+    }
+
     let permit = state
         .job_semaphore
         .clone()
@@ -1775,6 +1940,8 @@ async fn create_export_job(
         format: format_str.to_string(),
         record_count: None,
         message: None,
+        delivered_to: None,
+        delivery_status: req.sink.as_ref().map(|_| "pending".to_string()),
     };
 
     state.export_jobs.write().await.insert(
@@ -1792,6 +1959,7 @@ async fn create_export_job(
     let network = req.network.clone();
     let time_start = req.time_start;
     let time_end = req.time_end;
+    let sink_config = req.sink.clone();
 
     tokio::spawn(async move {
         let _permit = permit;
@@ -1822,6 +1990,43 @@ async fn create_export_job(
                     entry.status.state = JobState::Completed;
                     entry.status.record_count = Some(record_count);
                     entry.status.message = Some(format!("Exported {record_count} records"));
+
+                    // Deliver to sink if configured
+                    if let Some(ref sc) = sink_config {
+                        match build_sink(sc) {
+                            Ok(sink) => {
+                                let meta = DeliveryMetadata {
+                                    job_id,
+                                    dataset: dataset.clone(),
+                                    format: format.to_string(),
+                                    record_count,
+                                };
+                                match sink.deliver(&body, &meta).await {
+                                    Ok(receipt) => {
+                                        entry.status.delivered_to = Some(receipt.destination);
+                                        entry.status.delivery_status =
+                                            Some("delivered".to_string());
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "Sink delivery failed");
+                                        entry.status.delivery_status = Some("failed".to_string());
+                                        entry.status.message = Some(format!(
+                                            "Exported {record_count} records, but sink delivery failed: {e}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to build sink");
+                                entry.status.delivery_status = Some("failed".to_string());
+                                entry.status.message = Some(format!(
+                                    "Exported {record_count} records, but sink build failed: {e}"
+                                ));
+                            }
+                        }
+                    }
+
+                    // Always store in-memory for download (backward compatibility)
                     entry.data = Some(ExportData {
                         content_type: content_type_for_format(format),
                         body,
@@ -1830,6 +2035,9 @@ async fn create_export_job(
                 Err(e) => {
                     entry.status.state = JobState::Failed;
                     entry.status.message = Some(format!("Export failed: {e}"));
+                    if sink_config.is_some() {
+                        entry.status.delivery_status = Some("failed".to_string());
+                    }
                 }
             }
             entry.finished_at = Some(Instant::now());
@@ -4466,6 +4674,8 @@ mod tests {
                     format: "jsonl".to_string(),
                     record_count: Some(2),
                     message: Some("Exported 2 records".to_string()),
+                    delivered_to: None,
+                    delivery_status: None,
                 },
                 finished_at: Some(Instant::now()),
                 data: Some(ExportData {
@@ -4519,6 +4729,8 @@ mod tests {
                     format: "csv".to_string(),
                     record_count: None,
                     message: None,
+                    delivered_to: None,
+                    delivery_status: None,
                 },
                 finished_at: None,
                 data: None,
@@ -4549,6 +4761,8 @@ mod tests {
                     format: "jsonl".to_string(),
                     record_count: None,
                     message: Some("DB connection refused".to_string()),
+                    delivered_to: None,
+                    delivery_status: None,
                 },
                 finished_at: Some(Instant::now()),
                 data: None,
@@ -4579,6 +4793,8 @@ mod tests {
                     format: "csv".to_string(),
                     record_count: Some(42),
                     message: Some("Exported 42 records".to_string()),
+                    delivered_to: None,
+                    delivery_status: None,
                 },
                 finished_at: Some(Instant::now()),
                 data: None,
@@ -4611,6 +4827,8 @@ mod tests {
             format: "jsonl".to_string(),
             record_count: None,
             message: None,
+            delivered_to: None,
+            delivery_status: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["state"], "pending");
@@ -4635,6 +4853,8 @@ mod tests {
                     format: "jsonl".to_string(),
                     record_count: Some(0),
                     message: None,
+                    delivered_to: None,
+                    delivery_status: None,
                 },
                 finished_at: Some(
                     Instant::now() - std::time::Duration::from_secs(JOB_TTL_SECS + 1),
@@ -4652,6 +4872,8 @@ mod tests {
                     format: "csv".to_string(),
                     record_count: None,
                     message: None,
+                    delivered_to: None,
+                    delivery_status: None,
                 },
                 finished_at: None,
                 data: None,
@@ -4769,5 +4991,359 @@ mod tests {
             content_type_for_format(ExportFormat::Csv),
             "text/csv; charset=utf-8"
         );
+    }
+
+    // -- Sink tests (P4-W3) --
+
+    #[test]
+    fn test_validate_sink_config_local_file_valid() {
+        let config = SinkConfig {
+            sink_type: SinkType::LocalFile,
+            file_path: Some("/tmp/export.jsonl".to_string()),
+            url: None,
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        assert!(validate_sink_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_sink_config_local_file_path_traversal() {
+        let config = SinkConfig {
+            sink_type: SinkType::LocalFile,
+            file_path: Some("/tmp/../etc/passwd".to_string()),
+            url: None,
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        let err = validate_sink_config(&config).unwrap_err();
+        assert!(err.message.contains("path traversal"));
+    }
+
+    #[test]
+    fn test_validate_sink_config_webhook_valid() {
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: Some("https://example.com/hook".to_string()),
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        assert!(validate_sink_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_sink_config_webhook_loopback_rejected() {
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: Some("http://127.0.0.1:8080/hook".to_string()),
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        let err = validate_sink_config(&config).unwrap_err();
+        assert!(err.message.contains("private"));
+    }
+
+    #[test]
+    fn test_validate_sink_config_webhook_missing_url() {
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: None,
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        let err = validate_sink_config(&config).unwrap_err();
+        assert!(err.message.contains("url"));
+    }
+
+    #[test]
+    fn test_validate_sink_config_database_rejected() {
+        let config = SinkConfig {
+            sink_type: SinkType::Database,
+            file_path: None,
+            url: None,
+            headers: None,
+            connection_string: Some("postgresql://localhost/exports".to_string()),
+            table: Some("export_data".to_string()),
+        };
+        let err = validate_sink_config(&config).unwrap_err();
+        assert!(err.message.contains("not yet implemented"));
+    }
+
+    #[test]
+    fn test_build_sink_local_file() {
+        let config = SinkConfig {
+            sink_type: SinkType::LocalFile,
+            file_path: Some("/tmp/test.jsonl".to_string()),
+            url: None,
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        assert!(build_sink(&config).is_ok());
+    }
+
+    #[test]
+    fn test_build_sink_webhook() {
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: Some("https://example.com/hook".to_string()),
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        assert!(build_sink(&config).is_ok());
+    }
+
+    #[test]
+    fn test_build_sink_database_not_implemented() {
+        let config = SinkConfig {
+            sink_type: SinkType::Database,
+            file_path: None,
+            url: None,
+            headers: None,
+            connection_string: Some("postgresql://localhost/db".to_string()),
+            table: Some("export_data".to_string()),
+        };
+        assert!(build_sink(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_local_file_sink_write_and_readback() {
+        let dir = std::env::temp_dir().join(format!("spectraplex_test_{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("export.jsonl");
+
+        let sink = LocalFileSink {
+            path: path.to_str().unwrap().to_string(),
+        };
+
+        let data = b"{\"foo\":1}\n{\"bar\":2}\n";
+        let meta = DeliveryMetadata {
+            job_id: Uuid::new_v4(),
+            dataset: "token_transfers".to_string(),
+            format: "jsonl".to_string(),
+            record_count: 2,
+        };
+
+        let receipt = sink.deliver(data, &meta).await.unwrap();
+        assert_eq!(receipt.sink_type, SinkType::LocalFile);
+        assert_eq!(receipt.bytes_written, data.len());
+        assert!(receipt.destination.contains("export.jsonl"));
+
+        // Verify file content
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(content.as_bytes(), data);
+
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_local_file_sink_bad_path() {
+        let sink = LocalFileSink {
+            path: "/nonexistent_dir_abc123/impossible/export.jsonl".to_string(),
+        };
+        let data = b"test";
+        let meta = DeliveryMetadata {
+            job_id: Uuid::new_v4(),
+            dataset: "test".to_string(),
+            format: "jsonl".to_string(),
+            record_count: 1,
+        };
+        let result = sink.deliver(data, &meta).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_webhook_sink_url_validation_via_sink_config() {
+        // The webhook URL validation happens at validate_sink_config level.
+        // Here we verify that invalid URLs are caught properly.
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: Some("ftp://badprotocol.com/hook".to_string()),
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        let err = validate_sink_config(&config).unwrap_err();
+        assert!(err.message.contains("HTTP(S)"));
+    }
+
+    #[tokio::test]
+    async fn test_export_job_with_sink_accepted() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "token_transfers",
+                    "format": "jsonl",
+                    "sink": {
+                        "sink_type": "local_file",
+                        "file_path": "/tmp/spectraplex_export_test.jsonl"
+                    }
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(job["state"], "pending");
+        assert_eq!(job["delivery_status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn test_export_job_with_invalid_sink_rejected() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "token_transfers",
+                    "sink": {
+                        "sink_type": "webhook"
+                    }
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("url"));
+    }
+
+    #[tokio::test]
+    async fn test_export_job_with_database_sink_rejected() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "token_transfers",
+                    "sink": {
+                        "sink_type": "database",
+                        "connection_string": "postgresql://localhost/db",
+                        "table": "export_data"
+                    }
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("not yet implemented"));
+    }
+
+    #[tokio::test]
+    async fn test_export_job_without_sink_still_works() {
+        // Backward compatibility: no sink field → same behavior as before
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "token_transfers",
+                    "format": "jsonl"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(job["state"], "pending");
+        // No sink means no delivery_status field (skip_serializing_if)
+        assert!(job.get("delivery_status").is_none() || job["delivery_status"].is_null());
+        assert!(job.get("delivered_to").is_none() || job["delivered_to"].is_null());
+    }
+
+    #[test]
+    fn test_export_job_status_with_delivery_fields_serialization() {
+        let status = ExportJobStatus {
+            id: Uuid::nil(),
+            state: JobState::Completed,
+            dataset: "token_transfers".to_string(),
+            format: "jsonl".to_string(),
+            record_count: Some(10),
+            message: Some("Exported 10 records".to_string()),
+            delivered_to: Some("/tmp/export.jsonl".to_string()),
+            delivery_status: Some("delivered".to_string()),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["delivered_to"], "/tmp/export.jsonl");
+        assert_eq!(json["delivery_status"], "delivered");
+    }
+
+    #[test]
+    fn test_export_job_status_skip_none_delivery_fields() {
+        let status = ExportJobStatus {
+            id: Uuid::nil(),
+            state: JobState::Pending,
+            dataset: "token_transfers".to_string(),
+            format: "jsonl".to_string(),
+            record_count: None,
+            message: None,
+            delivered_to: None,
+            delivery_status: None,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        // These fields should be absent when None (skip_serializing_if)
+        assert!(json.get("delivered_to").is_none());
+        assert!(json.get("delivery_status").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_export_job_with_webhook_sink_path_traversal_rejected() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "token_transfers",
+                    "sink": {
+                        "sink_type": "local_file",
+                        "file_path": "/tmp/../etc/passwd"
+                    }
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

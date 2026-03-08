@@ -434,6 +434,58 @@ curl -X POST http://127.0.0.1:3000/v1/export/dataset \
 
 Creates an async export job for a Silver dataset. Supported formats: `jsonl` (default), `csv`. Optional filters: `target_id`, `network`, `time_start`, `time_end`. Exportable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`. Maximum 100,000 records per export.
 
+#### Sink delivery
+
+Export jobs support an optional `sink` field to deliver completed export data to an external destination. When a sink is configured, data is delivered to the sink **and** stored in-memory for download via the existing `/v1/export/jobs/:job_id/download` endpoint (backward compatible).
+
+Supported sink types:
+
+| Sink type | Description | Required fields |
+|-----------|-------------|-----------------|
+| `local_file` | Write export data to a local file path | `file_path` |
+| `webhook` | POST export data to an HTTP(S) URL | `url`, optional `headers` |
+| `database` | Deliver to an external database (not yet implemented) | `connection_string`, `table` |
+
+Example with local file sink:
+
+```bash
+curl -X POST http://127.0.0.1:3000/v1/export/dataset \
+  -H "Authorization: Bearer <API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dataset": "token_transfers",
+    "format": "jsonl",
+    "sink": {
+      "sink_type": "local_file",
+      "file_path": "/tmp/token_transfers_export.jsonl"
+    }
+  }'
+```
+
+Example with webhook sink:
+
+```bash
+curl -X POST http://127.0.0.1:3000/v1/export/dataset \
+  -H "Authorization: Bearer <API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dataset": "hl_fills",
+    "format": "csv",
+    "sink": {
+      "sink_type": "webhook",
+      "url": "https://example.com/receive-export",
+      "headers": {"X-API-Key": "your-key"}
+    }
+  }'
+```
+
+When a sink is configured, the export job status response includes additional fields:
+
+- `delivered_to`: destination description (file path, URL, etc.) — set on successful delivery
+- `delivery_status`: one of `"pending"`, `"delivered"`, or `"failed"`
+
+Webhook URLs are validated against the same rules as `callback_url` (HTTPS/HTTP only, no private/loopback addresses). Local file paths must not contain `..` path traversal. The `database` sink type is reserved but not yet implemented at runtime.
+
 ### GET /v1/export/jobs/:job_id
 
 ```bash

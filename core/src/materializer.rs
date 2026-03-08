@@ -176,6 +176,138 @@ pub struct RegenerationRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Sink Types
+// ---------------------------------------------------------------------------
+
+/// Supported export sink types.
+///
+/// Determines where completed export data is delivered. The default behavior
+/// (no sink) stores data in-memory for download via the existing endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum SinkType {
+    /// Write export data to a local file path.
+    LocalFile,
+    /// POST export data to an HTTP(S) webhook URL.
+    Webhook,
+    /// Deliver export data to an external database (stub — not yet implemented at runtime).
+    Database,
+    // ObjectStorage is the planned next extension point.
+    // It is intentionally not included as a variant yet to avoid dead code,
+    // but the enum is designed to accommodate it without breaking changes.
+}
+
+/// Configuration for an export sink.
+///
+/// Each sink type has its own required fields. The API validates the config
+/// at job creation time based on the `sink_type`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SinkConfig {
+    /// Which sink type to deliver to.
+    pub sink_type: SinkType,
+
+    // -- LocalFile fields --
+    /// Absolute file path for LocalFile sink output.
+    pub file_path: Option<String>,
+
+    // -- Webhook fields --
+    /// HTTP(S) URL for Webhook sink delivery.
+    pub url: Option<String>,
+    /// Optional HTTP headers to include with the webhook POST.
+    pub headers: Option<std::collections::HashMap<String, String>>,
+
+    // -- Database fields --
+    /// Connection string for Database sink (e.g. `postgresql://host/db`).
+    pub connection_string: Option<String>,
+    /// Target table name for Database sink.
+    pub table: Option<String>,
+}
+
+impl SinkConfig {
+    /// Validate that the config has the required fields for its sink type.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.sink_type {
+            SinkType::LocalFile => {
+                let path = self
+                    .file_path
+                    .as_deref()
+                    .ok_or("LocalFile sink requires 'file_path'")?;
+                if path.is_empty() {
+                    return Err("file_path must not be empty".to_string());
+                }
+                Ok(())
+            }
+            SinkType::Webhook => {
+                let url = self.url.as_deref().ok_or("Webhook sink requires 'url'")?;
+                if url.is_empty() {
+                    return Err("url must not be empty".to_string());
+                }
+                Ok(())
+            }
+            SinkType::Database => {
+                let cs = self
+                    .connection_string
+                    .as_deref()
+                    .ok_or("Database sink requires 'connection_string'")?;
+                if cs.is_empty() {
+                    return Err("connection_string must not be empty".to_string());
+                }
+                let tbl = self
+                    .table
+                    .as_deref()
+                    .ok_or("Database sink requires 'table'")?;
+                if tbl.is_empty() {
+                    return Err("table must not be empty".to_string());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Metadata about an export delivery for receipt tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryMetadata {
+    /// Job ID that produced the export data.
+    pub job_id: Uuid,
+    /// Dataset that was exported.
+    pub dataset: String,
+    /// Export format (e.g. "jsonl", "csv").
+    pub format: String,
+    /// Number of records in the export.
+    pub record_count: usize,
+}
+
+/// Receipt returned after successful sink delivery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryReceipt {
+    /// Sink type that delivered the data.
+    pub sink_type: SinkType,
+    /// Human-readable description of where data was delivered.
+    pub destination: String,
+    /// Number of bytes delivered.
+    pub bytes_written: usize,
+    /// When delivery completed.
+    pub delivered_at: DateTime<Utc>,
+}
+
+/// Async trait for export sink implementations.
+///
+/// Each sink type implements this trait to deliver serialized export data
+/// to its destination. Sinks receive the raw bytes (already serialized as
+/// JSONL or CSV) plus metadata about the export job.
+#[async_trait::async_trait]
+pub trait ExportSink: Send + Sync {
+    /// Deliver export data to the sink destination.
+    async fn deliver(
+        &self,
+        data: &[u8],
+        metadata: &DeliveryMetadata,
+    ) -> Result<DeliveryReceipt, String>;
+}
+
+// ---------------------------------------------------------------------------
 // Export Format
 // ---------------------------------------------------------------------------
 
@@ -986,5 +1118,236 @@ mod tests {
             !json.contains("user_id"),
             "HlPositionChange must not have user_id"
         );
+    }
+
+    // -- SinkType tests (P4-W3) --
+
+    #[test]
+    fn sink_type_serde_roundtrip() {
+        for (variant, expected) in [
+            (SinkType::LocalFile, "\"local_file\""),
+            (SinkType::Webhook, "\"webhook\""),
+            (SinkType::Database, "\"database\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected, "serialize {variant:?}");
+            let back: SinkType = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "deserialize {expected}");
+        }
+    }
+
+    #[test]
+    fn sink_type_from_str() {
+        assert_eq!(
+            SinkType::from_str("local_file").unwrap(),
+            SinkType::LocalFile
+        );
+        assert_eq!(SinkType::from_str("webhook").unwrap(), SinkType::Webhook);
+        assert_eq!(SinkType::from_str("database").unwrap(), SinkType::Database);
+        assert!(SinkType::from_str("object_storage").is_err());
+        assert!(SinkType::from_str("s3").is_err());
+    }
+
+    #[test]
+    fn sink_type_display() {
+        assert_eq!(SinkType::LocalFile.to_string(), "local_file");
+        assert_eq!(SinkType::Webhook.to_string(), "webhook");
+        assert_eq!(SinkType::Database.to_string(), "database");
+    }
+
+    // -- SinkConfig tests (P4-W3) --
+
+    #[test]
+    fn sink_config_local_file_valid() {
+        let config = SinkConfig {
+            sink_type: SinkType::LocalFile,
+            file_path: Some("/tmp/export.jsonl".to_string()),
+            url: None,
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn sink_config_local_file_missing_path() {
+        let config = SinkConfig {
+            sink_type: SinkType::LocalFile,
+            file_path: None,
+            url: None,
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("file_path"));
+    }
+
+    #[test]
+    fn sink_config_local_file_empty_path() {
+        let config = SinkConfig {
+            sink_type: SinkType::LocalFile,
+            file_path: Some(String::new()),
+            url: None,
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("file_path"));
+    }
+
+    #[test]
+    fn sink_config_webhook_valid() {
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: Some("https://example.com/hook".to_string()),
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn sink_config_webhook_missing_url() {
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: None,
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("url"));
+    }
+
+    #[test]
+    fn sink_config_webhook_with_headers() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-API-Key".to_string(), "secret".to_string());
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: Some("https://example.com/hook".to_string()),
+            headers: Some(headers),
+            connection_string: None,
+            table: None,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn sink_config_database_valid() {
+        let config = SinkConfig {
+            sink_type: SinkType::Database,
+            file_path: None,
+            url: None,
+            headers: None,
+            connection_string: Some("postgresql://localhost/exports".to_string()),
+            table: Some("export_data".to_string()),
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn sink_config_database_missing_connection_string() {
+        let config = SinkConfig {
+            sink_type: SinkType::Database,
+            file_path: None,
+            url: None,
+            headers: None,
+            connection_string: None,
+            table: Some("export_data".to_string()),
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("connection_string"));
+    }
+
+    #[test]
+    fn sink_config_database_missing_table() {
+        let config = SinkConfig {
+            sink_type: SinkType::Database,
+            file_path: None,
+            url: None,
+            headers: None,
+            connection_string: Some("postgresql://localhost/exports".to_string()),
+            table: None,
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("table"));
+    }
+
+    #[test]
+    fn sink_config_serde_roundtrip() {
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: Some("https://example.com/hook".to_string()),
+            headers: Some({
+                let mut h = std::collections::HashMap::new();
+                h.insert("Authorization".to_string(), "Bearer tok".to_string());
+                h
+            }),
+            connection_string: None,
+            table: None,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: SinkConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sink_type, SinkType::Webhook);
+        assert_eq!(back.url, Some("https://example.com/hook".to_string()));
+        assert!(back.headers.is_some());
+    }
+
+    #[test]
+    fn sink_config_local_file_serde_roundtrip() {
+        let config = SinkConfig {
+            sink_type: SinkType::LocalFile,
+            file_path: Some("/tmp/export.csv".to_string()),
+            url: None,
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: SinkConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sink_type, SinkType::LocalFile);
+        assert_eq!(back.file_path, Some("/tmp/export.csv".to_string()));
+    }
+
+    // -- DeliveryMetadata tests --
+
+    #[test]
+    fn delivery_metadata_serde_roundtrip() {
+        let meta = DeliveryMetadata {
+            job_id: uuid::Uuid::new_v4(),
+            dataset: "token_transfers".to_string(),
+            format: "jsonl".to_string(),
+            record_count: 42,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: DeliveryMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.dataset, "token_transfers");
+        assert_eq!(back.record_count, 42);
+    }
+
+    // -- DeliveryReceipt tests --
+
+    #[test]
+    fn delivery_receipt_serde_roundtrip() {
+        let receipt = DeliveryReceipt {
+            sink_type: SinkType::LocalFile,
+            destination: "/tmp/export.jsonl".to_string(),
+            bytes_written: 1024,
+            delivered_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&receipt).unwrap();
+        let back: DeliveryReceipt = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sink_type, SinkType::LocalFile);
+        assert_eq!(back.destination, "/tmp/export.jsonl");
+        assert_eq!(back.bytes_written, 1024);
     }
 }
