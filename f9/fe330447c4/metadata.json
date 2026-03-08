@@ -3,7 +3,7 @@
   "checkpoint_id": "f9fe330447c4",
   "strategy": "manual-commit",
   "branch": "p2-w5-hyperliquid-target-model",
-  "checkpoints_count": 6,
+  "checkpoints_count": 7,
   "files_touched": [
     "adapters/src/hyperliquid.rs",
     "adapters/src/hyperliquid_ws.rs"
@@ -64,13 +64,20 @@
       "context": "/f9/fe330447c4/7/context.md",
       "content_hash": "/f9/fe330447c4/7/content_hash.txt",
       "prompt": "/f9/fe330447c4/7/prompt.txt"
+    },
+    {
+      "metadata": "/f9/fe330447c4/8/metadata.json",
+      "transcript": "/f9/fe330447c4/8/full.jsonl",
+      "context": "/f9/fe330447c4/8/context.md",
+      "content_hash": "/f9/fe330447c4/8/content_hash.txt",
+      "prompt": "/f9/fe330447c4/8/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 215,
-    "cache_creation_tokens": 921286,
-    "cache_read_tokens": 15612907,
-    "output_tokens": 127568,
-    "api_call_count": 189
+    "input_tokens": 234,
+    "cache_creation_tokens": 1006733,
+    "cache_read_tokens": 16863924,
+    "output_tokens": 148202,
+    "api_call_count": 206
   }
 }
