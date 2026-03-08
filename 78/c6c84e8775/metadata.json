@@ -3,7 +3,7 @@
   "checkpoint_id": "78c6c84e8775",
   "strategy": "manual-commit",
   "branch": "p2-w6-e2e-ingestion-compat-suite",
-  "checkpoints_count": 4,
+  "checkpoints_count": 5,
   "files_touched": [
     "adapters/tests/ingestion_compat_test.rs",
     "docs/phase2/p2-w6-e2e-compat-handoff.md"
@@ -50,13 +50,20 @@
       "context": "/78/c6c84e8775/5/context.md",
       "content_hash": "/78/c6c84e8775/5/content_hash.txt",
       "prompt": "/78/c6c84e8775/5/prompt.txt"
+    },
+    {
+      "metadata": "/78/c6c84e8775/6/metadata.json",
+      "transcript": "/78/c6c84e8775/6/full.jsonl",
+      "context": "/78/c6c84e8775/6/context.md",
+      "content_hash": "/78/c6c84e8775/6/content_hash.txt",
+      "prompt": "/78/c6c84e8775/6/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 152,
-    "cache_creation_tokens": 690666,
-    "cache_read_tokens": 10361236,
-    "output_tokens": 84838,
-    "api_call_count": 134
+    "input_tokens": 183,
+    "cache_creation_tokens": 825018,
+    "cache_read_tokens": 13580017,
+    "output_tokens": 105135,
+    "api_call_count": 163
   }
 }
