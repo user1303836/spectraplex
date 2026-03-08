@@ -1,0 +1,30 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "d59c5cadaef6",
+  "strategy": "manual-commit",
+  "branch": "p4-w3-sink-abstraction",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "Cargo.lock",
+    "README.md",
+    "api/Cargo.toml",
+    "api/src/main.rs",
+    "core/src/materializer.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/d5/9c5cadaef6/0/metadata.json",
+      "transcript": "/d5/9c5cadaef6/0/full.jsonl",
+      "context": "/d5/9c5cadaef6/0/context.md",
+      "content_hash": "/d5/9c5cadaef6/0/content_hash.txt",
+      "prompt": "/d5/9c5cadaef6/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 187541,
+    "cache_read_tokens": 1448786,
+    "output_tokens": 13742,
+    "api_call_count": 22
+  }
+}
