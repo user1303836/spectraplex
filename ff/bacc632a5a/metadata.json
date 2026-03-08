@@ -3,7 +3,7 @@
   "checkpoint_id": "ffbacc632a5a",
   "strategy": "manual-commit",
   "branch": "p3-w3-event-instruction-datasets",
-  "checkpoints_count": 3,
+  "checkpoints_count": 4,
   "files_touched": [
     "migrations/20260309200000_add_decoded_events.sql"
   ],
@@ -42,13 +42,20 @@
       "context": "/ff/bacc632a5a/4/context.md",
       "content_hash": "/ff/bacc632a5a/4/content_hash.txt",
       "prompt": "/ff/bacc632a5a/4/prompt.txt"
+    },
+    {
+      "metadata": "/ff/bacc632a5a/5/metadata.json",
+      "transcript": "/ff/bacc632a5a/5/full.jsonl",
+      "context": "/ff/bacc632a5a/5/context.md",
+      "content_hash": "/ff/bacc632a5a/5/content_hash.txt",
+      "prompt": "/ff/bacc632a5a/5/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 171,
-    "cache_creation_tokens": 524293,
-    "cache_read_tokens": 6734589,
-    "output_tokens": 62669,
-    "api_call_count": 96
+    "input_tokens": 204,
+    "cache_creation_tokens": 659341,
+    "cache_read_tokens": 9701340,
+    "output_tokens": 82260,
+    "api_call_count": 125
   }
 }
