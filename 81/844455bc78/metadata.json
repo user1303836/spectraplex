@@ -1,0 +1,34 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "81844455bc78",
+  "strategy": "manual-commit",
+  "branch": "p3-w2-transfer-balance-delta-datasets",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "adapters/src/evm_parser.rs",
+    "adapters/src/hyperliquid_parser.rs",
+    "adapters/src/lib.rs",
+    "adapters/src/solana_parser.rs",
+    "adapters/src/v2_repo.rs",
+    "core/src/materializer.rs",
+    "docs/phase3/p3-w2-transfer-balance-delta-handoff.md",
+    "migrations/20260309100000_add_token_transfers.sql",
+    "migrations/20260309100001_add_native_balance_deltas.sql"
+  ],
+  "sessions": [
+    {
+      "metadata": "/81/844455bc78/0/metadata.json",
+      "transcript": "/81/844455bc78/0/full.jsonl",
+      "context": "/81/844455bc78/0/context.md",
+      "content_hash": "/81/844455bc78/0/content_hash.txt",
+      "prompt": "/81/844455bc78/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 187541,
+    "cache_read_tokens": 1448786,
+    "output_tokens": 13742,
+    "api_call_count": 22
+  }
+}
