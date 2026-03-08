@@ -3,7 +3,7 @@
   "checkpoint_id": "fcd1dd9930fe",
   "strategy": "manual-commit",
   "branch": "codex/p1-w1-v2-core-types",
-  "checkpoints_count": 1,
+  "checkpoints_count": 2,
   "files_touched": [
     "Cargo.lock",
     "core/Cargo.toml",
@@ -25,13 +25,20 @@
       "context": "/fc/d1dd9930fe/1/context.md",
       "content_hash": "/fc/d1dd9930fe/1/content_hash.txt",
       "prompt": "/fc/d1dd9930fe/1/prompt.txt"
+    },
+    {
+      "metadata": "/fc/d1dd9930fe/2/metadata.json",
+      "transcript": "/fc/d1dd9930fe/2/full.jsonl",
+      "context": "/fc/d1dd9930fe/2/context.md",
+      "content_hash": "/fc/d1dd9930fe/2/content_hash.txt",
+      "prompt": "/fc/d1dd9930fe/2/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 51,
-    "cache_creation_tokens": 257201,
-    "cache_read_tokens": 2690590,
-    "output_tokens": 26987,
-    "api_call_count": 43
+    "input_tokens": 71,
+    "cache_creation_tokens": 373621,
+    "cache_read_tokens": 4365131,
+    "output_tokens": 43256,
+    "api_call_count": 61
   }
 }

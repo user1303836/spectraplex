@@ -1,0 +1,148 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- mode: fix_validation
+- phase: Phase 0: Lock The V2 Architecture
+- work packet: P0-W3: Network Model Spec
+- objective: Freeze the V2 chain_family/network taxonomy, finality model, and checkpoint semantics in a tracked artifact that stays aligned with the local source-of-truth design docs.
+- branch: codex/p0-w3-network-model-spec
+- existing PR: https://github.com/user1303836/spectraplex/pull/101
+
+Repo touchpoints:
+- .gitignore
+- docs/phase0/p0-w3-network-model-handoff.md
+- design/NETWORK_MODEL.md
+- design/V2_ARCHITECTURE_RFC.md
+- adapters/src/repo.rs
+- adapters/src/solana.rs
+- adapters/src/solana_grpc.rs
+- adapters/src/hyperliquid.rs
+- cli/src/main.rs
+
+Implementation steps:
+1. Update `design/NETWORK_MODEL.md` Section 9.4 so legacy checkpoint migration guidance matches the corrected Solana semantics already captured locally: legacy Solana rows are source-ambiguous, default to `source = "rpc"`, keep `last_signature` as the authoritative persisted cursor, and treat `last_slot` as informational-only for migration.
+2. Keep the HyperCore second-precision `last_timestamp_ms` caveat and the EVM legacy network reclassification requirement consistent between `design/NETWORK_MODEL.md` and the tracked handoff.
+3. Re-run a manual consistency pass across `design/NETWORK_MODEL.md`, `design/V2_ARCHITECTURE_RFC.md`, and `docs/phase0/p0-w3-network-model-handoff.md` so the handoff no longer claims behavior absent from the source-of-truth design doc.
+4. Push the docs-only branch update to `origin/codex/p0-w3-network-model-spec` and update PR #101 body to remove the stale note that the tracked artifact is still missing.
+5. Keep PR #101 in draft and re-request review only after the doc consistency and validation pass is clean.
+
+Verification expectations:
+1. Verify the documented Solana migration semantics against `cli/src/main.rs`, `adapters/src/repo.rs`, `adapters/src/solana.rs`, and `adapters/src/solana_grpc.rs`.
+2. Verify the HyperCore timestamp-precision caveat against `adapters/src/hyperliquid.rs` and keep the V2 `last_timestamp_ms` field naming consistent with the handoff.
+3. Confirm `design/NETWORK_MODEL.md` and `docs/phase0/p0-w3-network-model-handoff.md` now agree on legacy migration mappings, default `source` values, and the RFC-alignment caveat.
+4. Confirm `git diff origin/codex/p0-w3-network-model-spec..HEAD` is the intended docs-only publication diff and that PR #101 shows the tracked handoff file after push.
+5. Docs-only packet: no Rust test run is required by `CLAUDE.md`; validation is source-backed doc consistency plus PR publication.
+
+Outstanding validation or review feedback:
+Validation failures:
+- [p0-w3-network-model-handoff.md](/Users/user1303836/Development/spectraplex/docs/phase0/p0-w3-network-model-handoff.md#L15) still claims the handoff is wholly drawn from [NETWORK_MODEL.md](REDACTED.md#L1), but its Solana legacy migration guidance at [p0-w3-network-model-handoff.md](/Users/user1303836/Development/spectraplex/docs/phase0/p0-w3-network-model-handoff.md#L361) now disagrees with [NETWORK_MODEL.md](REDACTED.md#L706), which still maps legacy Solana `last_slot` directly to `cursor.last_slot`. This is a blocking migration/doc-sync regression.
+- `gh pr view 101 --json files,body,isDraft,reviewDecision` did not show the corrected tracked diff or refreshed PR body. GitHub reported `files: []` and the stale PR shell body, while local git shows `codex/p0-w3-network-model-spec` is ahead of `origin/codex/p0-w3-network-model-spec` by 2 commits. The packet is not actually published on GitHub yet.
+
+Validation warnings:
+- Docs-only packet: cargo fmt/clippy/test were not run, consistent with CLAUDE.md docs-only guidance.
+- Compatibility regression: none found in taxonomy, finality labels, or HyperCore vs HyperEVM routing.
+- Wallet-assumption regression: none found in the touched handoff; the blocking issues are migration/doc-sync and PR publication state.
+
+Local review blockers:
+- PR #101 has no tracked diff; the P0-W3 network contract currently exists only in ignored design docs, so there is nothing mergeable freezing the Phase 1 contract.
+- The proposed checkpoint migration incorrectly defaults all legacy Solana checkpoints to source="rpc" even though the current CLI can persist gRPC-derived Solana checkpoints that resume by slot.
+- The proposed HyperCore checkpoint migration maps second-precision last_timestamp to exact millisecond last_timestamp_ms, which overstates the precision of existing data and needs explicit replay/dedupe semantics.
+
+Local review follow-ups:
+- The spec correctly documents that legacy Chain::Ethereum data may need manual network reclassification, but Phase 1 still needs to define the exact override mechanism before migration code ships.
+
+PR review blockers:
+- PR #101 is still an empty draft shell with zero tracked file changes, so there is no published packet artifact to review or approve on GitHub.
+- The packet content currently appears to live only in REDACTED.md while /Users/user1303836/Development/spectraplex/.gitignore:4 excludes design/, which blocks validation of the HyperCore vs HyperEVM routing, Phase 1 networks table contract, finality/cursor semantics, and compatibility guidance as submitted.
+
+PR review follow-ups:
+- GitHub would not allow a formal REQUEST_CHANGES review on your own PR, so I posted a blocking PR comment instead: https://github.com/user1303836/spectraplex/pull/101#issuecomment-4017837478
+
+Requirements:
+1. If this is a new packet, create or reset the local branch codex/p0-w3-network-model-spec from the latest main branch state.
+2. If this is a fix iteration, stay on the existing branch and address the outstanding validation or review feedback first.
+3. Make only the changes needed for P0-W3: Network Model Spec.
+4. Run the relevant verification commands before finishing.
+5. Create a local commit if changes were made and verification is good.
+6. Do not push, do not open a PR, and do not merge a PR.
+
+Return JSON with:
+- phase: "Phase 0: Lock The V2 Architecture"
+- workPacket: "P0-W3: Network Model Spec"
+- branchName: "codex/p0-w3-network-model-spec"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
