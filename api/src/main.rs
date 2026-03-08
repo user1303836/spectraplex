@@ -20,7 +20,7 @@ use spectraplex_adapters::{
 };
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::connector::validate_target;
-use spectraplex_core::materializer::DatasetName;
+use spectraplex_core::materializer::{DatasetName, ExportFormat};
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
 use spectraplex_core::v2::{
     normalize_evm_address, normalize_solana_address, ChainFamily, DatasetCompleteness,
@@ -39,6 +39,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+#[derive(Debug)]
 struct AppError {
     status: StatusCode,
     message: String,
@@ -101,6 +102,7 @@ struct AppState {
     job_semaphore: Arc<Semaphore>,
     streams: RwLock<HashMap<Uuid, StreamEntry>>,
     stream_semaphore: Arc<Semaphore>,
+    export_jobs: RwLock<HashMap<Uuid, ExportJobEntry>>,
 }
 
 struct StreamEntry {
@@ -134,6 +136,37 @@ impl AppState {
         let cutoff = Instant::now() - std::time::Duration::from_secs(JOB_TTL_SECS);
         jobs.retain(|_, entry| entry.finished_at.is_none_or(|finished| finished > cutoff));
     }
+
+    /// Remove completed/failed export jobs older than JOB_TTL_SECS.
+    async fn prune_stale_export_jobs(&self) {
+        let mut exports = self.export_jobs.write().await;
+        let cutoff = Instant::now() - std::time::Duration::from_secs(JOB_TTL_SECS);
+        exports.retain(|_, entry| entry.finished_at.is_none_or(|finished| finished > cutoff));
+    }
+}
+
+/// An in-flight or completed export job.
+struct ExportJobEntry {
+    status: ExportJobStatus,
+    finished_at: Option<Instant>,
+    /// Completed export data (populated when state == completed).
+    data: Option<ExportData>,
+}
+
+/// Completed export payload.
+struct ExportData {
+    content_type: &'static str,
+    body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExportJobStatus {
+    id: Uuid,
+    state: JobState,
+    dataset: String,
+    format: String,
+    record_count: Option<usize>,
+    message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -179,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
         job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
         streams: RwLock::new(HashMap::new()),
         stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
+        export_jobs: RwLock::new(HashMap::new()),
     });
 
     let protected = Router::new()
@@ -213,6 +247,9 @@ async fn main() -> anyhow::Result<()> {
             "/v1/datasets/{name}/completeness",
             get(get_dataset_completeness_handler),
         )
+        .route("/v1/export/dataset", post(create_export_job))
+        .route("/v1/export/jobs/{job_id}", get(get_export_job_status))
+        .route("/v1/export/jobs/{job_id}/download", get(download_export))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared_state),
             require_auth,
@@ -329,6 +366,16 @@ struct DatasetQueryParams {
     time_end: Option<i64>,
     limit: Option<i64>,
     offset: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ExportJobRequest {
+    dataset: String,
+    format: Option<String>,
+    target_id: Option<Uuid>,
+    network: Option<String>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -1489,6 +1536,464 @@ async fn query_dataset_records(
     Ok(Json(result))
 }
 
+// ---------------------------------------------------------------------------
+// Export job handlers (P4-W2)
+// ---------------------------------------------------------------------------
+
+/// Datasets that support export via the /v1/export/dataset endpoint.
+const EXPORTABLE_DATASETS: &[&str] = &[
+    "token_transfers",
+    "native_balance_deltas",
+    "decoded_events",
+    "hl_fills",
+    "hl_funding",
+    "positions",
+];
+
+fn content_type_for_format(format: ExportFormat) -> &'static str {
+    match format {
+        ExportFormat::Jsonl => "application/x-ndjson",
+        ExportFormat::Csv => "text/csv; charset=utf-8",
+    }
+}
+
+fn serialize_to_jsonl<T: Serialize>(records: &[T]) -> Result<Vec<u8>, AppError> {
+    let mut buf = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut buf, record).map_err(AppError::internal)?;
+        buf.push(b'\n');
+    }
+    Ok(buf)
+}
+
+fn token_transfers_to_csv(records: &[spectraplex_core::materializer::TokenTransfer]) -> Vec<u8> {
+    let mut buf = String::from(
+        "id,raw_transaction_id,network,token_address,token_symbol,from_address,to_address,amount,decimals,dataset_version_id,created_at\n",
+    );
+    for r in records {
+        buf.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            r.id,
+            r.raw_transaction_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            csv_escape(&r.network),
+            csv_escape(&r.token_address),
+            r.token_symbol.as_deref().unwrap_or(""),
+            csv_escape(&r.from_address),
+            csv_escape(&r.to_address),
+            r.amount,
+            r.decimals,
+            r.dataset_version_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            r.created_at.to_rfc3339(),
+        ));
+    }
+    buf.into_bytes()
+}
+
+fn native_balance_deltas_to_csv(
+    records: &[spectraplex_core::materializer::NativeBalanceDelta],
+) -> Vec<u8> {
+    let mut buf = String::from(
+        "id,raw_transaction_id,network,account_address,native_token,pre_balance,post_balance,delta,is_fee_payer,dataset_version_id,created_at\n",
+    );
+    for r in records {
+        buf.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            r.id,
+            r.raw_transaction_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            csv_escape(&r.network),
+            csv_escape(&r.account_address),
+            csv_escape(&r.native_token),
+            r.pre_balance,
+            r.post_balance,
+            r.delta,
+            r.is_fee_payer,
+            r.dataset_version_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            r.created_at.to_rfc3339(),
+        ));
+    }
+    buf.into_bytes()
+}
+
+fn decoded_events_to_csv(records: &[spectraplex_core::materializer::DecodedEvent]) -> Vec<u8> {
+    let mut buf = String::from(
+        "id,raw_transaction_id,network,program_or_contract,event_signature,event_name,log_index,dataset_version_id,created_at\n",
+    );
+    for r in records {
+        buf.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{}\n",
+            r.id,
+            r.raw_transaction_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            csv_escape(&r.network),
+            csv_escape(&r.program_or_contract),
+            csv_escape(r.event_signature.as_deref().unwrap_or("")),
+            csv_escape(r.event_name.as_deref().unwrap_or("")),
+            r.log_index,
+            r.dataset_version_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            r.created_at.to_rfc3339(),
+        ));
+    }
+    buf.into_bytes()
+}
+
+fn hl_fills_to_csv(records: &[spectraplex_core::materializer::HlFillRecord]) -> Vec<u8> {
+    let mut buf = String::from(
+        "id,raw_transaction_id,network,coin,side,price,size,direction,closed_pnl,fee,fee_token,fill_time,order_id,trade_id,dataset_version_id,created_at\n",
+    );
+    for r in records {
+        buf.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            r.id,
+            r.raw_transaction_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            csv_escape(&r.network),
+            csv_escape(&r.coin),
+            csv_escape(&r.side),
+            r.price,
+            r.size,
+            r.direction.as_deref().unwrap_or(""),
+            r.closed_pnl
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            r.fee.as_ref().map(|v| v.to_string()).unwrap_or_default(),
+            r.fee_token.as_deref().unwrap_or(""),
+            r.fill_time,
+            r.order_id.map(|v| v.to_string()).unwrap_or_default(),
+            r.trade_id.map(|v| v.to_string()).unwrap_or_default(),
+            r.dataset_version_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            r.created_at.to_rfc3339(),
+        ));
+    }
+    buf.into_bytes()
+}
+
+fn hl_funding_to_csv(records: &[spectraplex_core::materializer::HlFundingPayment]) -> Vec<u8> {
+    let mut buf = String::from(
+        "id,raw_transaction_id,network,coin,amount,funding_rate,payment_time,dataset_version_id,created_at\n",
+    );
+    for r in records {
+        buf.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{}\n",
+            r.id,
+            r.raw_transaction_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            csv_escape(&r.network),
+            csv_escape(&r.coin),
+            r.amount,
+            r.funding_rate
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            r.payment_time,
+            r.dataset_version_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            r.created_at.to_rfc3339(),
+        ));
+    }
+    buf.into_bytes()
+}
+
+fn hl_positions_to_csv(records: &[spectraplex_core::materializer::HlPositionChange]) -> Vec<u8> {
+    let mut buf = String::from(
+        "id,raw_transaction_id,network,coin,side,size_delta,price,direction,source_event,dataset_version_id,created_at\n",
+    );
+    for r in records {
+        buf.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            r.id,
+            r.raw_transaction_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            csv_escape(&r.network),
+            csv_escape(&r.coin),
+            csv_escape(&r.side),
+            r.size_delta,
+            r.price,
+            r.direction.as_deref().unwrap_or(""),
+            csv_escape(&r.source_event),
+            r.dataset_version_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            r.created_at.to_rfc3339(),
+        ));
+    }
+    buf.into_bytes()
+}
+
+async fn create_export_job(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ExportJobRequest>,
+) -> Result<Json<ExportJobStatus>, AppError> {
+    validate_dataset_name(&req.dataset)?;
+    if !EXPORTABLE_DATASETS.contains(&req.dataset.as_str()) {
+        return Err(AppError::bad_request(format!(
+            "Dataset '{}' is not exportable. Exportable datasets: {}",
+            req.dataset,
+            EXPORTABLE_DATASETS.join(", ")
+        )));
+    }
+
+    let format_str = req.format.as_deref().unwrap_or("jsonl");
+    let format: ExportFormat = format_str.parse().map_err(|_| {
+        AppError::bad_request(format!(
+            "Unsupported export format: {format_str}. Use 'jsonl' or 'csv'"
+        ))
+    })?;
+
+    validate_date_range(req.time_start, req.time_end)?;
+
+    let permit = state
+        .job_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::service_unavailable("Too many concurrent jobs"))?;
+
+    state.prune_stale_export_jobs().await;
+
+    let job_id = Uuid::new_v4();
+    let status = ExportJobStatus {
+        id: job_id,
+        state: JobState::Pending,
+        dataset: req.dataset.clone(),
+        format: format_str.to_string(),
+        record_count: None,
+        message: None,
+    };
+
+    state.export_jobs.write().await.insert(
+        job_id,
+        ExportJobEntry {
+            status: status.clone(),
+            finished_at: None,
+            data: None,
+        },
+    );
+
+    let state_clone = Arc::clone(&state);
+    let dataset = req.dataset.clone();
+    let target_id = req.target_id;
+    let network = req.network.clone();
+    let time_start = req.time_start;
+    let time_end = req.time_end;
+
+    tokio::spawn(async move {
+        let _permit = permit;
+
+        // Mark as running
+        {
+            let mut exports = state_clone.export_jobs.write().await;
+            if let Some(entry) = exports.get_mut(&job_id) {
+                entry.status.state = JobState::Running;
+            }
+        }
+
+        let result = run_export_job(
+            &state_clone.repo,
+            &dataset,
+            format,
+            target_id,
+            network.as_deref(),
+            time_start,
+            time_end,
+        )
+        .await;
+
+        let mut exports = state_clone.export_jobs.write().await;
+        if let Some(entry) = exports.get_mut(&job_id) {
+            match result {
+                Ok((body, record_count)) => {
+                    entry.status.state = JobState::Completed;
+                    entry.status.record_count = Some(record_count);
+                    entry.status.message = Some(format!("Exported {record_count} records"));
+                    entry.data = Some(ExportData {
+                        content_type: content_type_for_format(format),
+                        body,
+                    });
+                }
+                Err(e) => {
+                    entry.status.state = JobState::Failed;
+                    entry.status.message = Some(format!("Export failed: {e}"));
+                }
+            }
+            entry.finished_at = Some(Instant::now());
+        }
+    });
+
+    Ok(Json(status))
+}
+
+async fn run_export_job(
+    repo: &Repository,
+    dataset: &str,
+    format: ExportFormat,
+    target_id: Option<Uuid>,
+    network: Option<&str>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
+) -> anyhow::Result<(Vec<u8>, usize)> {
+    match dataset {
+        "token_transfers" => {
+            let records = repo
+                .export_token_transfers(target_id, network, time_start, time_end)
+                .await?;
+            let count = records.len();
+            let body = match format {
+                ExportFormat::Jsonl => {
+                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
+                }
+                ExportFormat::Csv => token_transfers_to_csv(&records),
+            };
+            Ok((body, count))
+        }
+        "native_balance_deltas" => {
+            let records = repo
+                .export_native_balance_deltas(target_id, network, time_start, time_end)
+                .await?;
+            let count = records.len();
+            let body = match format {
+                ExportFormat::Jsonl => {
+                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
+                }
+                ExportFormat::Csv => native_balance_deltas_to_csv(&records),
+            };
+            Ok((body, count))
+        }
+        "decoded_events" => {
+            let records = repo
+                .export_decoded_events(target_id, network, time_start, time_end)
+                .await?;
+            let count = records.len();
+            let body = match format {
+                ExportFormat::Jsonl => {
+                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
+                }
+                ExportFormat::Csv => decoded_events_to_csv(&records),
+            };
+            Ok((body, count))
+        }
+        "hl_fills" => {
+            let records = repo
+                .export_hl_fill_records(target_id, network, time_start, time_end)
+                .await?;
+            let count = records.len();
+            let body = match format {
+                ExportFormat::Jsonl => {
+                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
+                }
+                ExportFormat::Csv => hl_fills_to_csv(&records),
+            };
+            Ok((body, count))
+        }
+        "hl_funding" => {
+            let records = repo
+                .export_hl_funding_payments(target_id, network, time_start, time_end)
+                .await?;
+            let count = records.len();
+            let body = match format {
+                ExportFormat::Jsonl => {
+                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
+                }
+                ExportFormat::Csv => hl_funding_to_csv(&records),
+            };
+            Ok((body, count))
+        }
+        "positions" => {
+            let records = repo
+                .export_hl_position_changes(target_id, network, time_start, time_end)
+                .await?;
+            let count = records.len();
+            let body = match format {
+                ExportFormat::Jsonl => {
+                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
+                }
+                ExportFormat::Csv => hl_positions_to_csv(&records),
+            };
+            Ok((body, count))
+        }
+        _ => Err(anyhow::anyhow!("Unknown dataset: {dataset}")),
+    }
+}
+
+async fn get_export_job_status(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<Uuid>,
+) -> Result<Json<ExportJobStatus>, AppError> {
+    let exports = state.export_jobs.read().await;
+    match exports.get(&job_id) {
+        Some(entry) => Ok(Json(entry.status.clone())),
+        None => Err(AppError::not_found("Export job not found")),
+    }
+}
+
+async fn download_export(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    let exports = state.export_jobs.read().await;
+    let entry = exports
+        .get(&job_id)
+        .ok_or_else(|| AppError::not_found("Export job not found"))?;
+
+    match entry.status.state {
+        JobState::Completed => {
+            let data = entry
+                .data
+                .as_ref()
+                .ok_or_else(|| AppError::internal("Export data missing"))?;
+            let disposition = format!(
+                "attachment; filename=\"{}-{}.{}\"",
+                entry.status.dataset, job_id, entry.status.format,
+            );
+            let mut response = (StatusCode::OK, data.body.clone()).into_response();
+            let headers = response.headers_mut();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::HeaderValue::from_static(data.content_type),
+            );
+            headers.insert(
+                axum::http::header::CONTENT_DISPOSITION,
+                axum::http::header::HeaderValue::from_str(&disposition)
+                    .map_err(|_| AppError::internal("Invalid disposition header"))?,
+            );
+            Ok(response)
+        }
+        JobState::Running | JobState::Pending => Err(AppError {
+            status: StatusCode::CONFLICT,
+            message: format!(
+                "Export job {} is still {}",
+                job_id,
+                if matches!(entry.status.state, JobState::Running) {
+                    "running"
+                } else {
+                    "pending"
+                }
+            ),
+        }),
+        JobState::Failed => Err(AppError::bad_request(format!(
+            "Export job {} failed: {}",
+            job_id,
+            entry.status.message.as_deref().unwrap_or("unknown error")
+        ))),
+    }
+}
+
 async fn get_dataset_completeness_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -1541,6 +2046,7 @@ mod tests {
             job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
             streams: RwLock::new(HashMap::new()),
             stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
+            export_jobs: RwLock::new(HashMap::new()),
         })
     }
 
@@ -1582,6 +2088,9 @@ mod tests {
                 "/v1/datasets/{name}/completeness",
                 get(get_dataset_completeness_handler),
             )
+            .route("/v1/export/dataset", post(create_export_job))
+            .route("/v1/export/jobs/{job_id}", get(get_export_job_status))
+            .route("/v1/export/jobs/{job_id}/download", get(download_export))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_auth,
@@ -2100,6 +2609,7 @@ mod tests {
             job_semaphore: Arc::new(Semaphore::new(1)),
             streams: RwLock::new(HashMap::new()),
             stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
+            export_jobs: RwLock::new(HashMap::new()),
         });
         let app = test_router_with_state(Arc::clone(&state));
 
@@ -3182,6 +3692,7 @@ mod tests {
             job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
             streams: RwLock::new(HashMap::new()),
             stream_semaphore: Arc::new(Semaphore::new(0)),
+            export_jobs: RwLock::new(HashMap::new()),
         });
 
         let app = test_router_with_state(state);
@@ -3727,5 +4238,536 @@ mod tests {
         // Route exists (not 404); may fail with 500 due to fake DB pool
         assert_ne!(response.status(), StatusCode::NOT_FOUND);
         assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // Export job tests (P4-W2)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_export_job_requires_auth() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "token_transfers"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_export_job_invalid_dataset() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "nonexistent_dataset"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_export_job_unsupported_format() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "token_transfers",
+                    "format": "parquet"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("Unsupported export format"));
+    }
+
+    #[tokio::test]
+    async fn test_export_job_invalid_time_range() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "token_transfers",
+                    "time_start": 2000,
+                    "time_end": 1000
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_export_job_accepted_jsonl() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "token_transfers",
+                    "format": "jsonl"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        // Job is accepted (200), background task will fail due to fake DB pool
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(job["state"], "pending");
+        assert_eq!(job["dataset"], "token_transfers");
+        assert_eq!(job["format"], "jsonl");
+    }
+
+    #[tokio::test]
+    async fn test_export_job_accepted_csv() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "hl_fills",
+                    "format": "csv"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(job["state"], "pending");
+        assert_eq!(job["dataset"], "hl_fills");
+        assert_eq!(job["format"], "csv");
+    }
+
+    #[tokio::test]
+    async fn test_export_job_default_format_is_jsonl() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "native_balance_deltas"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(job["format"], "jsonl");
+    }
+
+    #[tokio::test]
+    async fn test_export_job_with_filters() {
+        let app = test_router();
+        let target_id = Uuid::new_v4();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "decoded_events",
+                    "format": "jsonl",
+                    "target_id": target_id,
+                    "network": "ethereum-mainnet",
+                    "time_start": 1700000000,
+                    "time_end": 1700100000
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_export_job_status_not_found() {
+        let app = test_router();
+        let job_id = Uuid::new_v4();
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/export/jobs/{}", job_id))
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_export_download_not_found() {
+        let app = test_router();
+        let job_id = Uuid::new_v4();
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/export/jobs/{}/download", job_id))
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_export_download_completed_job() {
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        state.export_jobs.write().await.insert(
+            job_id,
+            ExportJobEntry {
+                status: ExportJobStatus {
+                    id: job_id,
+                    state: JobState::Completed,
+                    dataset: "token_transfers".to_string(),
+                    format: "jsonl".to_string(),
+                    record_count: Some(2),
+                    message: Some("Exported 2 records".to_string()),
+                },
+                finished_at: Some(Instant::now()),
+                data: Some(ExportData {
+                    content_type: "application/x-ndjson",
+                    body: b"{\"test\":1}\n{\"test\":2}\n".to_vec(),
+                }),
+            },
+        );
+
+        let app = test_router_with_state(Arc::clone(&state));
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/export/jobs/{}/download", job_id))
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let ct = response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "application/x-ndjson");
+
+        let disp = response
+            .headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(disp.contains("token_transfers"));
+        assert!(disp.contains(".jsonl"));
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"{\"test\":1}\n{\"test\":2}\n");
+    }
+
+    #[tokio::test]
+    async fn test_export_download_pending_job_returns_conflict() {
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        state.export_jobs.write().await.insert(
+            job_id,
+            ExportJobEntry {
+                status: ExportJobStatus {
+                    id: job_id,
+                    state: JobState::Running,
+                    dataset: "hl_fills".to_string(),
+                    format: "csv".to_string(),
+                    record_count: None,
+                    message: None,
+                },
+                finished_at: None,
+                data: None,
+            },
+        );
+
+        let app = test_router_with_state(Arc::clone(&state));
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/export/jobs/{}/download", job_id))
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_export_download_failed_job() {
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        state.export_jobs.write().await.insert(
+            job_id,
+            ExportJobEntry {
+                status: ExportJobStatus {
+                    id: job_id,
+                    state: JobState::Failed,
+                    dataset: "hl_fills".to_string(),
+                    format: "jsonl".to_string(),
+                    record_count: None,
+                    message: Some("DB connection refused".to_string()),
+                },
+                finished_at: Some(Instant::now()),
+                data: None,
+            },
+        );
+
+        let app = test_router_with_state(Arc::clone(&state));
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/export/jobs/{}/download", job_id))
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_export_job_status_found() {
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        state.export_jobs.write().await.insert(
+            job_id,
+            ExportJobEntry {
+                status: ExportJobStatus {
+                    id: job_id,
+                    state: JobState::Completed,
+                    dataset: "positions".to_string(),
+                    format: "csv".to_string(),
+                    record_count: Some(42),
+                    message: Some("Exported 42 records".to_string()),
+                },
+                finished_at: Some(Instant::now()),
+                data: None,
+            },
+        );
+
+        let app = test_router_with_state(Arc::clone(&state));
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/export/jobs/{}", job_id))
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(job["state"], "completed");
+        assert_eq!(job["dataset"], "positions");
+        assert_eq!(job["format"], "csv");
+        assert_eq!(job["record_count"], 42);
+    }
+
+    #[test]
+    fn test_export_job_status_serialization() {
+        let status = ExportJobStatus {
+            id: Uuid::nil(),
+            state: JobState::Pending,
+            dataset: "token_transfers".to_string(),
+            format: "jsonl".to_string(),
+            record_count: None,
+            message: None,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["state"], "pending");
+        assert_eq!(json["dataset"], "token_transfers");
+        assert_eq!(json["format"], "jsonl");
+        assert!(json["record_count"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_export_prune_stale_jobs() {
+        let state = test_state();
+        let old_id = Uuid::new_v4();
+        let new_id = Uuid::new_v4();
+
+        state.export_jobs.write().await.insert(
+            old_id,
+            ExportJobEntry {
+                status: ExportJobStatus {
+                    id: old_id,
+                    state: JobState::Completed,
+                    dataset: "hl_fills".to_string(),
+                    format: "jsonl".to_string(),
+                    record_count: Some(0),
+                    message: None,
+                },
+                finished_at: Some(
+                    Instant::now() - std::time::Duration::from_secs(JOB_TTL_SECS + 1),
+                ),
+                data: None,
+            },
+        );
+        state.export_jobs.write().await.insert(
+            new_id,
+            ExportJobEntry {
+                status: ExportJobStatus {
+                    id: new_id,
+                    state: JobState::Running,
+                    dataset: "hl_fills".to_string(),
+                    format: "csv".to_string(),
+                    record_count: None,
+                    message: None,
+                },
+                finished_at: None,
+                data: None,
+            },
+        );
+
+        state.prune_stale_export_jobs().await;
+
+        let exports = state.export_jobs.read().await;
+        assert!(!exports.contains_key(&old_id));
+        assert!(exports.contains_key(&new_id));
+    }
+
+    #[tokio::test]
+    async fn test_export_all_six_datasets_accepted() {
+        for dataset in EXPORTABLE_DATASETS {
+            let app = test_router();
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/export/dataset")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", TEST_API_KEY))
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "dataset": dataset
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap();
+            let response = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "dataset {dataset} should be accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_ledger_entries_not_exportable() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "ledger_entries"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_serialize_to_jsonl() {
+        use spectraplex_core::materializer::TokenTransfer;
+        let records = vec![TokenTransfer {
+            id: Uuid::nil(),
+            raw_transaction_id: None,
+            network: "solana-mainnet".to_string(),
+            token_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            token_symbol: Some("USDC".to_string()),
+            from_address: "sender".to_string(),
+            to_address: "receiver".to_string(),
+            amount: bigdecimal::BigDecimal::from(100),
+            decimals: 6,
+            dataset_version_id: None,
+            created_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
+        }];
+        let bytes = serialize_to_jsonl(&records).unwrap();
+        let output = String::from_utf8(bytes).unwrap();
+        let lines: Vec<&str> = output.trim().split('\n').collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["network"], "solana-mainnet");
+        assert_eq!(parsed["token_symbol"], "USDC");
+    }
+
+    #[test]
+    fn test_token_transfers_to_csv() {
+        use spectraplex_core::materializer::TokenTransfer;
+        let records = vec![TokenTransfer {
+            id: Uuid::nil(),
+            raw_transaction_id: None,
+            network: "ethereum-mainnet".to_string(),
+            token_address: "0xtoken".to_string(),
+            token_symbol: Some("USDC".to_string()),
+            from_address: "0xfrom".to_string(),
+            to_address: "0xto".to_string(),
+            amount: bigdecimal::BigDecimal::from(50),
+            decimals: 6,
+            dataset_version_id: None,
+            created_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
+        }];
+        let bytes = token_transfers_to_csv(&records);
+        let csv = String::from_utf8(bytes).unwrap();
+        let lines: Vec<&str> = csv.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2); // header + 1 row
+        assert!(lines[0].starts_with("id,"));
+        assert!(lines[1].contains("ethereum-mainnet"));
+        assert!(lines[1].contains("USDC"));
+    }
+
+    #[test]
+    fn test_content_type_for_format() {
+        assert_eq!(
+            content_type_for_format(ExportFormat::Jsonl),
+            "application/x-ndjson"
+        );
+        assert_eq!(
+            content_type_for_format(ExportFormat::Csv),
+            "text/csv; charset=utf-8"
+        );
     }
 }

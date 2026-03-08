@@ -2059,6 +2059,134 @@ impl Repository {
         rows.iter().map(row_to_hl_position_change).collect()
     }
 
+    // -----------------------------------------------------------------------
+    // Export queries — higher limit for batch export jobs (P4-W2)
+    // -----------------------------------------------------------------------
+
+    /// Maximum records per export job chunk (100k is practical for in-memory
+    /// serialization of Silver rows without exhausting API memory).
+    const EXPORT_MAX_RECORDS: i64 = 100_000;
+
+    /// Query token transfers for export with a high record limit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn export_token_transfers(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+    ) -> anyhow::Result<Vec<TokenTransfer>> {
+        self.query_token_transfers(
+            target_id,
+            network,
+            time_start,
+            time_end,
+            Self::EXPORT_MAX_RECORDS,
+            0,
+        )
+        .await
+    }
+
+    /// Query native balance deltas for export with a high record limit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn export_native_balance_deltas(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+    ) -> anyhow::Result<Vec<NativeBalanceDelta>> {
+        self.query_native_balance_deltas(
+            target_id,
+            network,
+            time_start,
+            time_end,
+            Self::EXPORT_MAX_RECORDS,
+            0,
+        )
+        .await
+    }
+
+    /// Query decoded events for export with a high record limit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn export_decoded_events(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+    ) -> anyhow::Result<Vec<DecodedEvent>> {
+        self.query_decoded_events(
+            target_id,
+            network,
+            time_start,
+            time_end,
+            Self::EXPORT_MAX_RECORDS,
+            0,
+        )
+        .await
+    }
+
+    /// Query Hyperliquid fill records for export with a high record limit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn export_hl_fill_records(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+    ) -> anyhow::Result<Vec<HlFillRecord>> {
+        self.query_hl_fill_records(
+            target_id,
+            network,
+            time_start,
+            time_end,
+            Self::EXPORT_MAX_RECORDS,
+            0,
+        )
+        .await
+    }
+
+    /// Query Hyperliquid funding payments for export with a high record limit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn export_hl_funding_payments(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+    ) -> anyhow::Result<Vec<HlFundingPayment>> {
+        self.query_hl_funding_payments(
+            target_id,
+            network,
+            time_start,
+            time_end,
+            Self::EXPORT_MAX_RECORDS,
+            0,
+        )
+        .await
+    }
+
+    /// Query Hyperliquid position changes for export with a high record limit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn export_hl_position_changes(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+    ) -> anyhow::Result<Vec<HlPositionChange>> {
+        self.query_hl_position_changes(
+            target_id,
+            network,
+            time_start,
+            time_end,
+            Self::EXPORT_MAX_RECORDS,
+            0,
+        )
+        .await
+    }
+
     /// Update completeness after an ingestion run completes.
     /// Expands the coverage window, updates status, records_count, and
     /// last_ingestion_run_id for the given (target_id, dataset_name, network).
