@@ -13,7 +13,7 @@ which lives in the gitignored `design/` directory) so that reviewers can validat
 the target model contract on GitHub without accessing local-only design docs.
 
 No new scope is introduced here. Every item below is drawn directly from the
-frozen `design/TARGET_MODEL.md` (927 lines).
+frozen `design/TARGET_MODEL.md` (926 lines).
 
 ---
 
@@ -569,6 +569,11 @@ tenants tracking the same wallet address on the same network share the same
 This preserves the P0-W1 RFC principle (Section 3.1, rule 3): one row per on-chain
 fact, regardless of how many targets reference it.
 
+### 7.4 Ownership transfer
+
+Targets can be transferred between owners by updating `owner_id`. This does not
+affect the underlying raw data or target matches.
+
 ---
 
 ## 8. Example Specs (One Per Target Kind)
@@ -831,8 +836,10 @@ Additionally, this spec is consistent with:
 ### 10.2 P0-W3 (Network Model) dependencies
 
 This spec uses network IDs defined by P0-W3:
-- `solana-mainnet`, `ethereum-mainnet`, `base-mainnet`, `hypercore-mainnet`,
-  `hyperevm-mainnet` (all appear in example specs, Section 8)
+- `solana-mainnet`, `ethereum-mainnet`, `hypercore-mainnet` (appear in example
+  specs, Section 8)
+- `base-mainnet`, `hyperevm-mainnet` (referenced in target kind definitions,
+  Sections 1 and 2.2)
 - `chain_family_enum` values: `solana`, `evm`, `hyperliquid` (Section 1)
 
 The P0-W3 handoff (`docs/phase0/p0-w3-network-model-handoff.md`) Section 8.1
@@ -869,8 +876,14 @@ are consistent with the frozen P0-W3 network registry.
 | 6 | `owner_id` is optional and control-plane-only | Not baked into raw data | Preserves RFC principle of target-agnostic Bronze |
 | 7 | Addresses normalized before storage | Lowercase hex for EVM/HL, base58 as-is for Solana | Prevents duplicate targets due to case differences |
 | 8 | `mode` controls connector invocation | backfill/stream/both with cross-connector coordination | Maps to the two-method Connector trait from RFC Section 4.2 |
-| 9 | Wallet filter_spec narrows queries, not ingestion | Connectors fetch all wallet activity; filtering at match/query layer | Ensures canonical raw completeness for all wallet targets |
-| 10 | Protocol targets expand to per-address sub-queries | Control plane handles expansion as an implementation detail | External API presents one target; internal execution fans out |
+
+The following are key semantic clarifications drawn from the spec body text
+(Sections 2.1 and 2.8) that downstream packets should treat as binding:
+
+| # | Clarification | Detail | Source |
+|---|---|---|---|
+| 9 | Wallet filter_spec narrows queries, not ingestion | Connectors fetch all wallet activity; filtering at match/query layer | Section 2.1 |
+| 10 | Protocol targets expand to per-address sub-queries | Control plane handles expansion as an implementation detail | Section 2.8 |
 
 ---
 
