@@ -3,7 +3,7 @@
   "checkpoint_id": "945ee7ce6421",
   "strategy": "manual-commit",
   "branch": "p3-w3-event-instruction-datasets",
-  "checkpoints_count": 5,
+  "checkpoints_count": 6,
   "files_touched": [
     "adapters/src/evm_parser.rs",
     "adapters/src/lib.rs",
@@ -68,13 +68,20 @@
       "context": "/94/5ee7ce6421/7/context.md",
       "content_hash": "/94/5ee7ce6421/7/content_hash.txt",
       "prompt": "/94/5ee7ce6421/7/prompt.txt"
+    },
+    {
+      "metadata": "/94/5ee7ce6421/8/metadata.json",
+      "transcript": "/94/5ee7ce6421/8/full.jsonl",
+      "context": "/94/5ee7ce6421/8/context.md",
+      "content_hash": "/94/5ee7ce6421/8/content_hash.txt",
+      "prompt": "/94/5ee7ce6421/8/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 236,
-    "cache_creation_tokens": 951724,
-    "cache_read_tokens": 18818505,
-    "output_tokens": 130698,
-    "api_call_count": 214
+    "input_tokens": 255,
+    "cache_creation_tokens": 1037171,
+    "cache_read_tokens": 20069522,
+    "output_tokens": 151332,
+    "api_call_count": 231
   }
 }
