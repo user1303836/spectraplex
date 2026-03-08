@@ -1,0 +1,123 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- mode: implement_packet
+- phase: Phase 0: Lock The V2 Architecture
+- work packet: P0-W3
+- objective: Write `design/NETWORK_MODEL.md` to lock the `chain_family` and `network` taxonomy plus finality and checkpoint semantics for Solana, EVM networks, HyperCore, and HyperEVM before any Phase 1 schema work starts.
+- branch: codex/p0-w3-network-model-spec
+- existing PR: (none)
+
+Repo touchpoints:
+- design/NETWORK_MODEL.md
+- design/V2_ARCHITECTURE_RFC.md
+- design/TARGET_MODEL.md
+- core/src/models.rs
+- adapters/src/solana.rs
+- adapters/src/solana_grpc.rs
+- adapters/src/evm.rs
+- adapters/src/hyperliquid.rs
+
+Implementation steps:
+1. Audit the current `Chain`, checkpoint, and adapter assumptions in `core/src/models.rs` and the Solana, EVM, and Hyperliquid ingestors so the spec reflects the real baseline rather than stale notes.
+2. Author `design/NETWORK_MODEL.md` defining `chain_family`, canonical `network` IDs, per-family finality behavior, and per-family checkpoint semantics.
+3. Include explicit worked examples for Solana mainnet, Ethereum mainnet, Base, Arbitrum, HyperCore, and HyperEVM, with HyperCore and HyperEVM treated as separate ingestion models.
+4. Tighten any terminology drift between the new network spec, `design/V2_ARCHITECTURE_RFC.md`, and `design/TARGET_MODEL.md` without starting Phase 1 code changes.
+
+Verification expectations:
+1. Check that the new spec covers every required network example from P0-W3 and freezes names that Phase 1 migrations can use directly.
+2. Cross-read the spec against `design/V2_ARCHITECTURE_RFC.md` Section 3.3 and `design/TARGET_MODEL.md` so `chain_family` and `network` semantics stay consistent across Phase 0 documents.
+3. Verify that the documented checkpoint semantics map to the actual connector shapes today: Solana slot/signature checkpoints, EVM block/log range checkpoints, and HyperCore cursor/time-based checkpoints.
+4. Keep validation doc-scoped; no Phase 1 schema or runtime refactors should be introduced in this packet.
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet, create or reset the local branch codex/p0-w3-network-model-spec from the latest main branch state.
+2. If this is a fix iteration, stay on the existing branch and address the outstanding validation or review feedback first.
+3. Make only the changes needed for P0-W3.
+4. Run the relevant verification commands before finishing.
+5. Create a local commit if changes were made and verification is good.
+6. Do not push, do not open a PR, and do not merge a PR.
+
+Return JSON with:
+- phase: "Phase 0: Lock The V2 Architecture"
+- workPacket: "P0-W3"
+- branchName: "codex/p0-w3-network-model-spec"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
