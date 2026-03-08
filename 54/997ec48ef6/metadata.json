@@ -3,7 +3,7 @@
   "checkpoint_id": "54997ec48ef6",
   "strategy": "manual-commit",
   "branch": "p4-w1-dataset-query-api",
-  "checkpoints_count": 3,
+  "checkpoints_count": 4,
   "files_touched": [
     "README.md",
     "adapters/src/v2_repo.rs",
@@ -51,13 +51,20 @@
       "context": "/54/997ec48ef6/5/context.md",
       "content_hash": "/54/997ec48ef6/5/content_hash.txt",
       "prompt": "/54/997ec48ef6/5/prompt.txt"
+    },
+    {
+      "metadata": "/54/997ec48ef6/6/metadata.json",
+      "transcript": "/54/997ec48ef6/6/full.jsonl",
+      "context": "/54/997ec48ef6/6/context.md",
+      "content_hash": "/54/997ec48ef6/6/content_hash.txt",
+      "prompt": "/54/997ec48ef6/6/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 645,
-    "cache_creation_tokens": 719578,
-    "cache_read_tokens": 10864073,
-    "output_tokens": 102408,
-    "api_call_count": 159
+    "input_tokens": 678,
+    "cache_creation_tokens": 854626,
+    "cache_read_tokens": 13830824,
+    "output_tokens": 121999,
+    "api_call_count": 188
   }
 }
