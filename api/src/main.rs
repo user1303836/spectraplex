@@ -1983,64 +1983,94 @@ async fn create_export_job(
         )
         .await;
 
-        let mut exports = state_clone.export_jobs.write().await;
-        if let Some(entry) = exports.get_mut(&job_id) {
-            match result {
-                Ok((body, record_count)) => {
-                    entry.status.state = JobState::Completed;
-                    entry.status.record_count = Some(record_count);
-                    entry.status.message = Some(format!("Exported {record_count} records"));
+        // Separate the export result handling from sink delivery to avoid
+        // holding the write lock during potentially slow async I/O.
+        match result {
+            Ok((body, record_count)) => {
+                // Only clone body when a sink needs it after storage
+                let sink_body = if sink_config.is_some() {
+                    Some(body.clone())
+                } else {
+                    None
+                };
 
-                    // Deliver to sink if configured
-                    if let Some(ref sc) = sink_config {
-                        match build_sink(sc) {
-                            Ok(sink) => {
-                                let meta = DeliveryMetadata {
-                                    job_id,
-                                    dataset: dataset.clone(),
-                                    format: format.to_string(),
-                                    record_count,
-                                };
-                                match sink.deliver(&body, &meta).await {
-                                    Ok(receipt) => {
-                                        entry.status.delivered_to = Some(receipt.destination);
-                                        entry.status.delivery_status =
-                                            Some("delivered".to_string());
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, "Sink delivery failed");
-                                        entry.status.delivery_status = Some("failed".to_string());
-                                        entry.status.message = Some(format!(
-                                            "Exported {record_count} records, but sink delivery failed: {e}"
-                                        ));
-                                    }
+                // Mark completed and store data (short lock scope)
+                {
+                    let mut exports = state_clone.export_jobs.write().await;
+                    if let Some(entry) = exports.get_mut(&job_id) {
+                        entry.status.state = JobState::Completed;
+                        entry.status.record_count = Some(record_count);
+                        entry.status.message = Some(format!("Exported {record_count} records"));
+                        // Always store in-memory for download (backward compatibility)
+                        entry.data = Some(ExportData {
+                            content_type: content_type_for_format(format),
+                            body,
+                        });
+                    }
+                }
+
+                // Deliver to sink outside the lock (may involve network I/O)
+                if let Some(ref sc) = sink_config {
+                    let body = sink_body.expect("sink_body set when sink_config is Some");
+                    let delivery_result = match build_sink(sc) {
+                        Ok(sink) => {
+                            let meta = DeliveryMetadata {
+                                job_id,
+                                dataset: dataset.clone(),
+                                format: format.to_string(),
+                                record_count,
+                            };
+                            match sink.deliver(&body, &meta).await {
+                                Ok(receipt) => Ok(receipt.destination),
+                                Err(e) => {
+                                    warn!(error = %e, "Sink delivery failed");
+                                    Err(format!(
+                                        "Exported {record_count} records, but sink delivery failed: {e}"
+                                    ))
                                 }
                             }
-                            Err(e) => {
-                                warn!(error = %e, "Failed to build sink");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to build sink");
+                            Err(format!(
+                                "Exported {record_count} records, but sink build failed: {e}"
+                            ))
+                        }
+                    };
+
+                    // Brief re-lock to record delivery outcome
+                    let mut exports = state_clone.export_jobs.write().await;
+                    if let Some(entry) = exports.get_mut(&job_id) {
+                        match delivery_result {
+                            Ok(destination) => {
+                                entry.status.delivered_to = Some(destination);
+                                entry.status.delivery_status = Some("delivered".to_string());
+                            }
+                            Err(msg) => {
                                 entry.status.delivery_status = Some("failed".to_string());
-                                entry.status.message = Some(format!(
-                                    "Exported {record_count} records, but sink build failed: {e}"
-                                ));
+                                entry.status.message = Some(msg);
                             }
                         }
                     }
-
-                    // Always store in-memory for download (backward compatibility)
-                    entry.data = Some(ExportData {
-                        content_type: content_type_for_format(format),
-                        body,
-                    });
                 }
-                Err(e) => {
+
+                // Mark finished time
+                let mut exports = state_clone.export_jobs.write().await;
+                if let Some(entry) = exports.get_mut(&job_id) {
+                    entry.finished_at = Some(Instant::now());
+                }
+            }
+            Err(e) => {
+                let mut exports = state_clone.export_jobs.write().await;
+                if let Some(entry) = exports.get_mut(&job_id) {
                     entry.status.state = JobState::Failed;
                     entry.status.message = Some(format!("Export failed: {e}"));
                     if sink_config.is_some() {
                         entry.status.delivery_status = Some("failed".to_string());
                     }
+                    entry.finished_at = Some(Instant::now());
                 }
             }
-            entry.finished_at = Some(Instant::now());
         }
     });
 
