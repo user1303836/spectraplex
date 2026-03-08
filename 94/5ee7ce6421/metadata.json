@@ -1,0 +1,31 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "945ee7ce6421",
+  "strategy": "manual-commit",
+  "branch": "p3-w3-event-instruction-datasets",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "adapters/src/evm_parser.rs",
+    "adapters/src/lib.rs",
+    "adapters/src/solana_parser.rs",
+    "adapters/src/v2_repo.rs",
+    "core/src/materializer.rs",
+    "migrations/20260309200000_add_decoded_events.sql"
+  ],
+  "sessions": [
+    {
+      "metadata": "/94/5ee7ce6421/0/metadata.json",
+      "transcript": "/94/5ee7ce6421/0/full.jsonl",
+      "context": "/94/5ee7ce6421/0/context.md",
+      "content_hash": "/94/5ee7ce6421/0/content_hash.txt",
+      "prompt": "/94/5ee7ce6421/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 187541,
+    "cache_read_tokens": 1448786,
+    "output_tokens": 13742,
+    "api_call_count": 22
+  }
+}
