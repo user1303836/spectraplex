@@ -1,0 +1,28 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "cccb9643db6d",
+  "strategy": "manual-commit",
+  "branch": "p1-w5-migration-verification",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "adapters/Cargo.toml",
+    "adapters/tests/migration_test.rs",
+    "docs/phase1/p1-w5-migration-verification-handoff.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/cc/cb9643db6d/0/metadata.json",
+      "transcript": "/cc/cb9643db6d/0/full.jsonl",
+      "context": "/cc/cb9643db6d/0/context.md",
+      "content_hash": "/cc/cb9643db6d/0/content_hash.txt",
+      "prompt": "/cc/cb9643db6d/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 48,
+    "cache_creation_tokens": 86855,
+    "cache_read_tokens": 2737293,
+    "output_tokens": 20520,
+    "api_call_count": 44
+  }
+}

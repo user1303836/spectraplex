@@ -1,0 +1,134 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 1: Canonical Bronze And Control Plane
+- work packet: P1-W5: Migration and rollback verification
+- objective: Add a dedicated migration test suite verifying V2 schema correctness: fresh-DB and upgraded-DB migration paths, uniqueness constraints, foreign keys, multi-target linkage for a single raw transaction, and V1-V2 coexistence.
+- branch: p1-w5-migration-verification
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- adapters/tests/ — new migration integration test file(s)
+- adapters/Cargo.toml — possible test dependency additions (testcontainers, sqlx test helpers)
+- migrations/ — all 10 migration files validated (7 V1 + 3 V2)
+- docs/phase1/p1-w5-migration-verification-handoff.md — handoff artifact
+
+Implementation steps:
+1. 1. Create branch p1-w5-migration-verification from main at a3b9420
+2. 2. Add a migration integration test module (likely adapters/tests/migration_test.rs) that spins up a PostgreSQL instance using testcontainers or similar
+3. 3. Test fresh-DB path: apply all 10 migrations in order on an empty database, verify all V1 and V2 tables exist with correct columns
+4. 4. Test upgraded-DB path: apply V1 migrations (7), insert sample V1 data, then apply V2 migrations (3), verify V1 data is intact and V2 tables are available
+5. 5. Test uniqueness constraints: verify uq_index_targets_address (kind, network, address), uq_raw_transactions_network_tx_hash, uq_target_matches_target_raw_tx, uq_checkpoints_target_network_source
+6. 6. Test foreign keys: verify raw_transactions.network → networks.id, target_matches.target_id → index_targets.id, target_matches.raw_transaction_id → raw_transactions.id, checkpoints.target_id → index_targets.id, ingestion_runs.target_id → index_targets.id, raw_transactions.ingestion_run_id → ingestion_runs.id
+7. 7. Test multi-target linkage: create one raw_transaction, two index_targets, two target_matches linking both targets to the same raw tx, verify both matches exist and can be queried by either target
+8. 8. Test network seed data: verify all 13 canonical networks were inserted correctly
+9. 9. Test V2 enum types: verify chain_family_enum, target_kind_enum, target_mode_enum values match Rust enum variants
+10. 10. Write handoff artifact at docs/phase1/p1-w5-migration-verification-handoff.md
+11. 11. Run full validation suite (fmt, clippy, tests)
+
+Verification expectations:
+1. cargo fmt --all --check — clean
+2. cargo clippy --workspace --all-targets -- -D warnings — clean
+3. cargo test --workspace — all tests pass including new migration tests
+4. New migration tests actually connect to PostgreSQL (not skipped due to missing Docker)
+5. Multi-target linkage test proves a single raw_transaction links to 2+ targets
+6. Uniqueness constraint tests prove duplicates are rejected
+7. Foreign key tests prove orphan records are rejected
+8. V1 data survives V2 migration without loss or corruption
+
+Tracked review artifacts required in the PR:
+- docs/phase1/p1-w5-migration-verification-handoff.md
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p1-w5-migration-verification from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P1-W5: Migration and rollback verification.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 1: Canonical Bronze And Control Plane"
+- workPacket: "P1-W5: Migration and rollback verification"
+- branchName: "p1-w5-migration-verification"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
