@@ -1,0 +1,28 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "c317c5c03437",
+  "strategy": "manual-commit",
+  "branch": "p3-w6-completeness-metadata",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "adapters/src/v2_repo.rs",
+    "core/src/v2.rs",
+    "migrations/20260310100000_add_dataset_completeness.sql"
+  ],
+  "sessions": [
+    {
+      "metadata": "/c3/17c5c03437/0/metadata.json",
+      "transcript": "/c3/17c5c03437/0/full.jsonl",
+      "context": "/c3/17c5c03437/0/context.md",
+      "content_hash": "/c3/17c5c03437/0/content_hash.txt",
+      "prompt": "/c3/17c5c03437/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 187541,
+    "cache_read_tokens": 1448786,
+    "output_tokens": 13742,
+    "api_call_count": 22
+  }
+}
