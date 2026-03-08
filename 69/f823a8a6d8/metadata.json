@@ -42,13 +42,20 @@
       "context": "/69/f823a8a6d8/4/context.md",
       "content_hash": "/69/f823a8a6d8/4/content_hash.txt",
       "prompt": "/69/f823a8a6d8/4/prompt.txt"
+    },
+    {
+      "metadata": "/69/f823a8a6d8/5/metadata.json",
+      "transcript": "/69/f823a8a6d8/5/full.jsonl",
+      "context": "/69/f823a8a6d8/5/context.md",
+      "content_hash": "/69/f823a8a6d8/5/content_hash.txt",
+      "prompt": "/69/f823a8a6d8/5/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 124,
-    "cache_creation_tokens": 630220,
-    "cache_read_tokens": 9212704,
-    "output_tokens": 77112,
-    "api_call_count": 108
+    "input_tokens": 140,
+    "cache_creation_tokens": 739001,
+    "cache_read_tokens": 10343129,
+    "output_tokens": 91103,
+    "api_call_count": 122
   }
 }

@@ -1,0 +1,141 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 0: Lock The V2 Architecture
+- work packet: P0-W1: V2 Architecture RFC
+- objective: Formalize the V2 Architecture RFC through the PR workflow. The comprehensive 604-line design doc already exists at design/V2_ARCHITECTURE_RFC.md. Create a tracked handoff artifact at docs/phase0/p0-w1-v2-architecture-rfc-handoff.md capturing all locked decisions, documented wallet-centric mismatches, the connector redesign, the dual-write compatibility strategy, and the downstream packet mapping. Open a PR, validate, review, and merge.
+- branch: codex/p0-w1-v2-architecture-rfc
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- docs/phase0/p0-w1-v2-architecture-rfc-handoff.md (new tracked handoff artifact)
+- design/V2_ARCHITECTURE_RFC.md (source design doc, gitignored, 604 lines)
+- core/src/models.rs (referenced for wallet-centric mismatches: Transaction struct, Chain enum, ChainIngestor trait)
+- adapters/src/repo.rs (referenced for wallet-scoped repository methods)
+- adapters/src/evm.rs (referenced for EVM eth_getLogs semantic mismatch)
+- adapters/src/solana_grpc.rs (referenced for Solana gRPC target mismatch)
+- adapters/src/hyperliquid.rs (referenced for Hyperliquid user/market semantics)
+- api/src/main.rs (referenced for wallet-parameterized API surface)
+- cli/src/main.rs (referenced for wallet-only CLI flags)
+- migrations/ (referenced for current schema wallet assumptions)
+
+Implementation steps:
+1. 1. Create branch codex/p0-w1-v2-architecture-rfc from main at c1752ff
+2. 2. Read design/V2_ARCHITECTURE_RFC.md and verify all code references against current codebase
+3. 3. Create docs/phase0/p0-w1-v2-architecture-rfc-handoff.md with: (a) frozen status header and dependencies, (b) locked decisions table from RFC §7, (c) canonical Bronze model summary from RFC §3.1, (d) target matching model summary from RFC §3.2 including index_targets and target_matches schemas, (e) network and chain family model summary from RFC §3.3 (cross-referencing P0-W3), (f) control plane summary from RFC §3.4 (ingestion_runs, checkpoints, dataset_versions), (g) Silver dataset catalog from RFC §3.5, (h) Gold materialization model from RFC §3.6, (i) V2 connector trait from RFC §4.2, (j) documented wallet-centric mismatches from RFC §2 with verified file/line references, (k) chain-specific semantic corrections from RFC §6, (l) dual-write compatibility strategy from RFC §5, (m) deprecation sequence from RFC §5.5, (n) downstream packet mapping from RFC §9, (o) open questions deferred to follow-on packets from RFC §8
+4. 4. Verify all file/line references in the handoff artifact against the actual codebase
+5. 5. Run cargo fmt --all --check, cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace
+6. 6. Commit the tracked artifact (do NOT commit until explicitly told to)
+7. 7. Push branch and open PR
+8. 8. Post validation review comment on PR
+9. 9. Conduct local and remote review
+10. 10. Merge after all review concerns are addressed
+
+Verification expectations:
+1. cargo fmt --all --check passes
+2. cargo clippy --workspace --all-targets -- -D warnings passes
+3. cargo test --workspace passes (no runtime code changes expected)
+4. All 10 locked decisions from RFC §7 are faithfully represented in the handoff
+5. All wallet-centric mismatches from RFC §2 are present with current file/line references verified against the codebase
+6. Connector trait redesign from RFC §4.2 is documented
+7. Dual-write compatibility strategy from RFC §5 is complete
+8. Deprecation sequence from RFC §5.5 is present
+9. Downstream packet mapping from RFC §9 is complete and cross-references P0-W2, P0-W3, P0-W4
+10. P0-W3 cross-reference is verified (P0-W3 handoff references RFC §3.3)
+
+Tracked review artifacts required in the PR:
+- docs/phase0/p0-w1-v2-architecture-rfc-handoff.md
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch codex/p0-w1-v2-architecture-rfc from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P0-W1: V2 Architecture RFC.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 0: Lock The V2 Architecture"
+- workPacket: "P0-W1: V2 Architecture RFC"
+- branchName: "codex/p0-w1-v2-architecture-rfc"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
