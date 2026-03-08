@@ -263,6 +263,96 @@ pub struct NativeBalanceDelta {
     pub created_at: DateTime<Utc>,
 }
 
+/// Normalized Hyperliquid fill record.
+///
+/// Each record represents a single fill (trade execution) on Hyperliquid,
+/// extracted from Bronze raw_transactions metadata. Not wallet-specific —
+/// any account's fills can be represented.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HlFillRecord {
+    pub id: Uuid,
+    /// FK to raw_transactions; nullable during transition.
+    pub raw_transaction_id: Option<Uuid>,
+    pub network: String,
+    /// The traded asset (e.g. "ETH", "BTC").
+    pub coin: String,
+    /// Trade side: "B" (buy) or "A"/"S" (sell).
+    pub side: String,
+    /// Execution price as a decimal string.
+    pub price: BigDecimal,
+    /// Fill size (quantity).
+    pub size: BigDecimal,
+    /// Trade direction (e.g. "Open Long", "Close Short").
+    pub direction: Option<String>,
+    /// Realized PnL from closing a position.
+    pub closed_pnl: Option<BigDecimal>,
+    /// Fee charged for this fill.
+    pub fee: Option<BigDecimal>,
+    /// Token used to pay the fee (typically "USDC").
+    pub fee_token: Option<String>,
+    /// Timestamp of the fill (milliseconds since epoch).
+    pub fill_time: i64,
+    /// Hyperliquid order ID.
+    pub order_id: Option<i64>,
+    /// Hyperliquid trade ID.
+    pub trade_id: Option<i64>,
+    /// FK to dataset_versions; nullable during transition.
+    pub dataset_version_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Normalized Hyperliquid funding payment record.
+///
+/// Each record represents a single funding payment received or paid on
+/// Hyperliquid. Not wallet-specific — any account's funding payments
+/// can be represented.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HlFundingPayment {
+    pub id: Uuid,
+    /// FK to raw_transactions; nullable during transition.
+    pub raw_transaction_id: Option<Uuid>,
+    pub network: String,
+    /// The asset the funding rate applies to (e.g. "ETH").
+    pub coin: String,
+    /// USDC amount: positive = received, negative = paid.
+    pub amount: BigDecimal,
+    /// The funding rate applied.
+    pub funding_rate: Option<BigDecimal>,
+    /// Timestamp of the funding payment (milliseconds since epoch).
+    pub payment_time: i64,
+    /// FK to dataset_versions; nullable during transition.
+    pub dataset_version_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Normalized Hyperliquid position change record.
+///
+/// Each record represents a position state change derived from fills,
+/// liquidations, or other events. Not wallet-specific — any account's
+/// position changes can be represented.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HlPositionChange {
+    pub id: Uuid,
+    /// FK to raw_transactions; nullable during transition.
+    pub raw_transaction_id: Option<Uuid>,
+    pub network: String,
+    /// The asset whose position changed (e.g. "ETH").
+    pub coin: String,
+    /// Trade side that caused the change: "B" (buy) or "A"/"S" (sell).
+    pub side: String,
+    /// Size delta from this event (signed: positive = increase, negative = decrease).
+    pub size_delta: BigDecimal,
+    /// Execution price of the triggering event.
+    pub price: BigDecimal,
+    /// Direction of the position change (e.g. "Open Long", "Close Short").
+    pub direction: Option<String>,
+    /// Source event type: "fill", "liquidation".
+    pub source_event: String,
+    /// FK to dataset_versions; nullable during transition.
+    pub dataset_version_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -673,5 +763,177 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
         assert_eq!(nbd.delta, BigDecimal::from(0));
+    }
+
+    // -- HlFillRecord tests (P3-W4) --
+
+    #[test]
+    fn hl_fill_record_serde_roundtrip() {
+        use bigdecimal::BigDecimal;
+        use std::str::FromStr;
+
+        let fill = HlFillRecord {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: Some(uuid::Uuid::new_v4()),
+            network: "hypercore-mainnet".to_string(),
+            coin: "ETH".to_string(),
+            side: "B".to_string(),
+            price: BigDecimal::from_str("3500.0").unwrap(),
+            size: BigDecimal::from_str("2.0").unwrap(),
+            direction: Some("Open Long".to_string()),
+            closed_pnl: Some(BigDecimal::from(0)),
+            fee: Some(BigDecimal::from_str("3.50").unwrap()),
+            fee_token: Some("USDC".to_string()),
+            fill_time: 1700000000000,
+            order_id: Some(12345),
+            trade_id: Some(67890),
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&fill).unwrap();
+        let back: HlFillRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.network, "hypercore-mainnet");
+        assert_eq!(back.coin, "ETH");
+        assert_eq!(back.side, "B");
+        assert_eq!(back.price, BigDecimal::from_str("3500.0").unwrap());
+        assert_eq!(back.size, BigDecimal::from_str("2.0").unwrap());
+        assert_eq!(back.direction, Some("Open Long".to_string()));
+        assert_eq!(back.fill_time, 1700000000000);
+    }
+
+    #[test]
+    fn hl_fill_record_no_wallet_specific_fields() {
+        let fill = HlFillRecord {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: None,
+            network: "hypercore-mainnet".to_string(),
+            coin: "BTC".to_string(),
+            side: "A".to_string(),
+            price: BigDecimal::from(42000),
+            size: BigDecimal::from(1),
+            direction: None,
+            closed_pnl: None,
+            fee: None,
+            fee_token: None,
+            fill_time: 1700000000000,
+            order_id: None,
+            trade_id: None,
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&fill).unwrap();
+        assert!(
+            !json.contains("wallet_address"),
+            "HlFillRecord must not have wallet_address"
+        );
+        assert!(
+            !json.contains("user_id"),
+            "HlFillRecord must not have user_id"
+        );
+    }
+
+    // -- HlFundingPayment tests (P3-W4) --
+
+    #[test]
+    fn hl_funding_payment_serde_roundtrip() {
+        use bigdecimal::BigDecimal;
+        use std::str::FromStr;
+
+        let fp = HlFundingPayment {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: Some(uuid::Uuid::new_v4()),
+            network: "hypercore-mainnet".to_string(),
+            coin: "ETH".to_string(),
+            amount: BigDecimal::from_str("-2.50").unwrap(),
+            funding_rate: Some(BigDecimal::from_str("0.0001").unwrap()),
+            payment_time: 1700000000000,
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&fp).unwrap();
+        let back: HlFundingPayment = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.network, "hypercore-mainnet");
+        assert_eq!(back.coin, "ETH");
+        assert_eq!(back.amount, BigDecimal::from_str("-2.50").unwrap());
+        assert_eq!(back.payment_time, 1700000000000);
+    }
+
+    #[test]
+    fn hl_funding_payment_no_wallet_specific_fields() {
+        let fp = HlFundingPayment {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: None,
+            network: "hypercore-mainnet".to_string(),
+            coin: "BTC".to_string(),
+            amount: BigDecimal::from(5),
+            funding_rate: None,
+            payment_time: 1700000000000,
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&fp).unwrap();
+        assert!(
+            !json.contains("wallet_address"),
+            "HlFundingPayment must not have wallet_address"
+        );
+        assert!(
+            !json.contains("user_id"),
+            "HlFundingPayment must not have user_id"
+        );
+    }
+
+    // -- HlPositionChange tests (P3-W4) --
+
+    #[test]
+    fn hl_position_change_serde_roundtrip() {
+        use bigdecimal::BigDecimal;
+        use std::str::FromStr;
+
+        let pc = HlPositionChange {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: Some(uuid::Uuid::new_v4()),
+            network: "hypercore-mainnet".to_string(),
+            coin: "ETH".to_string(),
+            side: "B".to_string(),
+            size_delta: BigDecimal::from_str("2.0").unwrap(),
+            price: BigDecimal::from_str("3500.0").unwrap(),
+            direction: Some("Open Long".to_string()),
+            source_event: "fill".to_string(),
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&pc).unwrap();
+        let back: HlPositionChange = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.network, "hypercore-mainnet");
+        assert_eq!(back.coin, "ETH");
+        assert_eq!(back.side, "B");
+        assert_eq!(back.size_delta, BigDecimal::from_str("2.0").unwrap());
+        assert_eq!(back.source_event, "fill");
+    }
+
+    #[test]
+    fn hl_position_change_no_wallet_specific_fields() {
+        let pc = HlPositionChange {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: None,
+            network: "hypercore-mainnet".to_string(),
+            coin: "BTC".to_string(),
+            side: "A".to_string(),
+            size_delta: BigDecimal::from(-1),
+            price: BigDecimal::from(42000),
+            direction: None,
+            source_event: "liquidation".to_string(),
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&pc).unwrap();
+        assert!(
+            !json.contains("wallet_address"),
+            "HlPositionChange must not have wallet_address"
+        );
+        assert!(
+            !json.contains("user_id"),
+            "HlPositionChange must not have user_id"
+        );
     }
 }

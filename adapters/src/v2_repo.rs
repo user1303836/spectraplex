@@ -4,7 +4,10 @@
 //! `Repository` value they already hold for V1 wallet-scoped queries.
 
 use chrono::{DateTime, Utc};
-use spectraplex_core::materializer::{DecodedEvent, NativeBalanceDelta, TokenTransfer};
+use spectraplex_core::materializer::{
+    DecodedEvent, HlFillRecord, HlFundingPayment, HlPositionChange, NativeBalanceDelta,
+    TokenTransfer,
+};
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, DatasetVersion, DatasetVersionStatus, IndexTarget, IngestionRun,
     Network, RawTransaction, TargetKind, TargetMatch, TargetMode,
@@ -633,6 +636,229 @@ pub fn build_decoded_event_insert(
 }
 
 // ---------------------------------------------------------------------------
+// Row-mapping helpers for Silver tables (P3-W4)
+// ---------------------------------------------------------------------------
+
+fn row_to_hl_fill_record(row: &sqlx::postgres::PgRow) -> anyhow::Result<HlFillRecord> {
+    Ok(HlFillRecord {
+        id: row.try_get("id")?,
+        raw_transaction_id: row.try_get("raw_transaction_id")?,
+        network: row.try_get("network")?,
+        coin: row.try_get("coin")?,
+        side: row.try_get("side")?,
+        price: row.try_get("price")?,
+        size: row.try_get("size")?,
+        direction: row.try_get("direction")?,
+        closed_pnl: row.try_get("closed_pnl")?,
+        fee: row.try_get("fee")?,
+        fee_token: row.try_get("fee_token")?,
+        fill_time: row.try_get("fill_time")?,
+        order_id: row.try_get("order_id")?,
+        trade_id: row.try_get("trade_id")?,
+        dataset_version_id: row.try_get("dataset_version_id")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn row_to_hl_funding_payment(row: &sqlx::postgres::PgRow) -> anyhow::Result<HlFundingPayment> {
+    Ok(HlFundingPayment {
+        id: row.try_get("id")?,
+        raw_transaction_id: row.try_get("raw_transaction_id")?,
+        network: row.try_get("network")?,
+        coin: row.try_get("coin")?,
+        amount: row.try_get("amount")?,
+        funding_rate: row.try_get("funding_rate")?,
+        payment_time: row.try_get("payment_time")?,
+        dataset_version_id: row.try_get("dataset_version_id")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn row_to_hl_position_change(row: &sqlx::postgres::PgRow) -> anyhow::Result<HlPositionChange> {
+    Ok(HlPositionChange {
+        id: row.try_get("id")?,
+        raw_transaction_id: row.try_get("raw_transaction_id")?,
+        network: row.try_get("network")?,
+        coin: row.try_get("coin")?,
+        side: row.try_get("side")?,
+        size_delta: row.try_get("size_delta")?,
+        price: row.try_get("price")?,
+        direction: row.try_get("direction")?,
+        source_event: row.try_get("source_event")?,
+        dataset_version_id: row.try_get("dataset_version_id")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Query builders for Silver tables (P3-W4)
+// ---------------------------------------------------------------------------
+
+/// Build a batch INSERT for `hl_fill_records` with ON CONFLICT DO NOTHING.
+pub fn build_hl_fill_record_insert(
+    fills: &[HlFillRecord],
+) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+    let mut query = String::from(
+        "INSERT INTO hl_fill_records \
+         (id, raw_transaction_id, network, coin, side, price, size, direction, closed_pnl, fee, fee_token, fill_time, order_id, trade_id, dataset_version_id, created_at) \
+         VALUES ",
+    );
+    let mut args = sqlx::postgres::PgArguments::default();
+    for (i, f) in fills.iter().enumerate() {
+        let base = i * 16;
+        if i > 0 {
+            query.push_str(", ");
+        }
+        query.push_str(&format!(
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+            base + 7,
+            base + 8,
+            base + 9,
+            base + 10,
+            base + 11,
+            base + 12,
+            base + 13,
+            base + 14,
+            base + 15,
+            base + 16,
+        ));
+        use sqlx::Arguments;
+        args.add(f.id).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(f.raw_transaction_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&f.network).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&f.coin).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&f.side).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&f.price).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&f.size).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&f.direction).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&f.closed_pnl)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&f.fee).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&f.fee_token).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(f.fill_time).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(f.order_id).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(f.trade_id).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(f.dataset_version_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(f.created_at).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    query.push_str(
+        " ON CONFLICT (raw_transaction_id, coin, fill_time, side) \
+         WHERE raw_transaction_id IS NOT NULL DO NOTHING",
+    );
+    Ok((query, args))
+}
+
+/// Build a batch INSERT for `hl_funding_payments` with ON CONFLICT DO NOTHING.
+pub fn build_hl_funding_payment_insert(
+    payments: &[HlFundingPayment],
+) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+    let mut query = String::from(
+        "INSERT INTO hl_funding_payments \
+         (id, raw_transaction_id, network, coin, amount, funding_rate, payment_time, dataset_version_id, created_at) \
+         VALUES ",
+    );
+    let mut args = sqlx::postgres::PgArguments::default();
+    for (i, p) in payments.iter().enumerate() {
+        let base = i * 9;
+        if i > 0 {
+            query.push_str(", ");
+        }
+        query.push_str(&format!(
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+            base + 7,
+            base + 8,
+            base + 9,
+        ));
+        use sqlx::Arguments;
+        args.add(p.id).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(p.raw_transaction_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&p.network).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&p.coin).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&p.amount).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&p.funding_rate)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(p.payment_time)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(p.dataset_version_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(p.created_at).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    query.push_str(
+        " ON CONFLICT (raw_transaction_id, coin, payment_time) \
+         WHERE raw_transaction_id IS NOT NULL DO NOTHING",
+    );
+    Ok((query, args))
+}
+
+/// Build a batch INSERT for `hl_position_changes` with ON CONFLICT DO NOTHING.
+pub fn build_hl_position_change_insert(
+    changes: &[HlPositionChange],
+) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+    let mut query = String::from(
+        "INSERT INTO hl_position_changes \
+         (id, raw_transaction_id, network, coin, side, size_delta, price, direction, source_event, dataset_version_id, created_at) \
+         VALUES ",
+    );
+    let mut args = sqlx::postgres::PgArguments::default();
+    for (i, c) in changes.iter().enumerate() {
+        let base = i * 11;
+        if i > 0 {
+            query.push_str(", ");
+        }
+        query.push_str(&format!(
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+            base + 7,
+            base + 8,
+            base + 9,
+            base + 10,
+            base + 11,
+        ));
+        use sqlx::Arguments;
+        args.add(c.id).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(c.raw_transaction_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&c.network).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&c.coin).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&c.side).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&c.size_delta)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&c.price).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&c.direction).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&c.source_event)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(c.dataset_version_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(c.created_at).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    query.push_str(
+        " ON CONFLICT (raw_transaction_id, coin, side, source_event) \
+         WHERE raw_transaction_id IS NOT NULL DO NOTHING",
+    );
+    Ok((query, args))
+}
+
+// ---------------------------------------------------------------------------
 // V2 Repository impl
 // ---------------------------------------------------------------------------
 
@@ -1219,6 +1445,165 @@ impl Repository {
         .await?;
         rows.iter().map(row_to_decoded_event).collect()
     }
+
+    // -----------------------------------------------------------------------
+    // HlFillRecords (P3-W4)
+    // -----------------------------------------------------------------------
+
+    /// Bulk insert Hyperliquid fill records.
+    pub async fn save_hl_fill_records(&self, fills: &[HlFillRecord]) -> anyhow::Result<()> {
+        for chunk in fills.chunks(Self::V2_BATCH_SIZE) {
+            let (query, args) = build_hl_fill_record_insert(chunk)?;
+            sqlx::query_with(&query, args).execute(self.pool()).await?;
+        }
+        Ok(())
+    }
+
+    /// Query Hyperliquid fill records by coin.
+    pub async fn get_hl_fill_records_by_coin(
+        &self,
+        coin: &str,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<HlFillRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, raw_transaction_id, network, coin, side, price, size, direction, \
+             closed_pnl, fee, fee_token, fill_time, order_id, trade_id, dataset_version_id, created_at \
+             FROM hl_fill_records \
+             WHERE coin = $1 \
+             ORDER BY fill_time DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(coin)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_hl_fill_record).collect()
+    }
+
+    /// Query Hyperliquid fill records by raw transaction ID.
+    pub async fn get_hl_fill_records_by_raw_tx(
+        &self,
+        raw_tx_id: Uuid,
+    ) -> anyhow::Result<Vec<HlFillRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, raw_transaction_id, network, coin, side, price, size, direction, \
+             closed_pnl, fee, fee_token, fill_time, order_id, trade_id, dataset_version_id, created_at \
+             FROM hl_fill_records WHERE raw_transaction_id = $1 ORDER BY fill_time",
+        )
+        .bind(raw_tx_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_hl_fill_record).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // HlFundingPayments (P3-W4)
+    // -----------------------------------------------------------------------
+
+    /// Bulk insert Hyperliquid funding payment records.
+    pub async fn save_hl_funding_payments(
+        &self,
+        payments: &[HlFundingPayment],
+    ) -> anyhow::Result<()> {
+        for chunk in payments.chunks(Self::V2_BATCH_SIZE) {
+            let (query, args) = build_hl_funding_payment_insert(chunk)?;
+            sqlx::query_with(&query, args).execute(self.pool()).await?;
+        }
+        Ok(())
+    }
+
+    /// Query Hyperliquid funding payments by coin.
+    pub async fn get_hl_funding_payments_by_coin(
+        &self,
+        coin: &str,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<HlFundingPayment>> {
+        let rows = sqlx::query(
+            "SELECT id, raw_transaction_id, network, coin, amount, funding_rate, \
+             payment_time, dataset_version_id, created_at \
+             FROM hl_funding_payments \
+             WHERE coin = $1 \
+             ORDER BY payment_time DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(coin)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_hl_funding_payment).collect()
+    }
+
+    /// Query Hyperliquid funding payments by raw transaction ID.
+    pub async fn get_hl_funding_payments_by_raw_tx(
+        &self,
+        raw_tx_id: Uuid,
+    ) -> anyhow::Result<Vec<HlFundingPayment>> {
+        let rows = sqlx::query(
+            "SELECT id, raw_transaction_id, network, coin, amount, funding_rate, \
+             payment_time, dataset_version_id, created_at \
+             FROM hl_funding_payments WHERE raw_transaction_id = $1 ORDER BY payment_time",
+        )
+        .bind(raw_tx_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_hl_funding_payment).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // HlPositionChanges (P3-W4)
+    // -----------------------------------------------------------------------
+
+    /// Bulk insert Hyperliquid position change records.
+    pub async fn save_hl_position_changes(
+        &self,
+        changes: &[HlPositionChange],
+    ) -> anyhow::Result<()> {
+        for chunk in changes.chunks(Self::V2_BATCH_SIZE) {
+            let (query, args) = build_hl_position_change_insert(chunk)?;
+            sqlx::query_with(&query, args).execute(self.pool()).await?;
+        }
+        Ok(())
+    }
+
+    /// Query Hyperliquid position changes by coin.
+    pub async fn get_hl_position_changes_by_coin(
+        &self,
+        coin: &str,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<HlPositionChange>> {
+        let rows = sqlx::query(
+            "SELECT id, raw_transaction_id, network, coin, side, size_delta, price, \
+             direction, source_event, dataset_version_id, created_at \
+             FROM hl_position_changes \
+             WHERE coin = $1 \
+             ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(coin)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_hl_position_change).collect()
+    }
+
+    /// Query Hyperliquid position changes by raw transaction ID.
+    pub async fn get_hl_position_changes_by_raw_tx(
+        &self,
+        raw_tx_id: Uuid,
+    ) -> anyhow::Result<Vec<HlPositionChange>> {
+        let rows = sqlx::query(
+            "SELECT id, raw_transaction_id, network, coin, side, size_delta, price, \
+             direction, source_event, dataset_version_id, created_at \
+             FROM hl_position_changes WHERE raw_transaction_id = $1 ORDER BY created_at",
+        )
+        .bind(raw_tx_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_hl_position_change).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1743,6 +2128,242 @@ mod tests {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
             _assert_send(repo.get_decoded_events_by_contract("0xabc", 10, 0));
+        }
+        let _ = _check;
+    }
+
+    // -- hl_fill_record batch insert (P3-W4) --
+
+    fn make_hl_fill_record() -> HlFillRecord {
+        use bigdecimal::BigDecimal;
+        HlFillRecord {
+            id: Uuid::new_v4(),
+            raw_transaction_id: Some(Uuid::new_v4()),
+            network: "hypercore-mainnet".to_string(),
+            coin: "ETH".to_string(),
+            side: "B".to_string(),
+            price: BigDecimal::from(3500),
+            size: BigDecimal::from(2),
+            direction: Some("Open Long".to_string()),
+            closed_pnl: Some(BigDecimal::from(0)),
+            fee: Some(BigDecimal::from(3)),
+            fee_token: Some("USDC".to_string()),
+            fill_time: 1700000000000,
+            order_id: Some(12345),
+            trade_id: Some(67890),
+            dataset_version_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn make_hl_funding_payment() -> HlFundingPayment {
+        use bigdecimal::BigDecimal;
+        HlFundingPayment {
+            id: Uuid::new_v4(),
+            raw_transaction_id: Some(Uuid::new_v4()),
+            network: "hypercore-mainnet".to_string(),
+            coin: "ETH".to_string(),
+            amount: BigDecimal::from(-3),
+            funding_rate: Some(BigDecimal::from(1)),
+            payment_time: 1700000000000,
+            dataset_version_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn make_hl_position_change() -> HlPositionChange {
+        use bigdecimal::BigDecimal;
+        HlPositionChange {
+            id: Uuid::new_v4(),
+            raw_transaction_id: Some(Uuid::new_v4()),
+            network: "hypercore-mainnet".to_string(),
+            coin: "ETH".to_string(),
+            side: "B".to_string(),
+            size_delta: BigDecimal::from(2),
+            price: BigDecimal::from(3500),
+            direction: Some("Open Long".to_string()),
+            source_event: "fill".to_string(),
+            dataset_version_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn hl_fill_record_insert_single() {
+        let fill = make_hl_fill_record();
+        let (query, _) = build_hl_fill_record_insert(&[fill]).unwrap();
+
+        assert!(query.starts_with("INSERT INTO hl_fill_records"));
+        assert!(query
+            .contains("($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"));
+        assert!(query.contains("ON CONFLICT"));
+    }
+
+    #[test]
+    fn hl_fill_record_insert_multiple() {
+        let fills: Vec<_> = (0..3).map(|_| make_hl_fill_record()).collect();
+        let (query, _) = build_hl_fill_record_insert(&fills).unwrap();
+
+        assert!(query
+            .contains("($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"));
+        assert!(query.contains(
+            "($17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)"
+        ));
+    }
+
+    #[test]
+    fn hl_fill_record_insert_param_count() {
+        let fills: Vec<_> = (0..5).map(|_| make_hl_fill_record()).collect();
+        let (query, _) = build_hl_fill_record_insert(&fills).unwrap();
+        // 5 rows * 16 params = 80 => highest param is $80
+        assert!(query.contains("$80"));
+        assert!(!query.contains("$81"));
+    }
+
+    #[test]
+    fn hl_fill_record_insert_dedup_clause() {
+        let fill = make_hl_fill_record();
+        let (query, _) = build_hl_fill_record_insert(&[fill]).unwrap();
+
+        assert!(query.contains("ON CONFLICT (raw_transaction_id, coin, fill_time, side)"));
+        assert!(query.contains("WHERE raw_transaction_id IS NOT NULL"));
+        assert!(query.contains("DO NOTHING"));
+    }
+
+    // -- hl_funding_payment batch insert (P3-W4) --
+
+    #[test]
+    fn hl_funding_payment_insert_single() {
+        let payment = make_hl_funding_payment();
+        let (query, _) = build_hl_funding_payment_insert(&[payment]).unwrap();
+
+        assert!(query.starts_with("INSERT INTO hl_funding_payments"));
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9)"));
+        assert!(query.contains("ON CONFLICT"));
+    }
+
+    #[test]
+    fn hl_funding_payment_insert_multiple() {
+        let payments: Vec<_> = (0..3).map(|_| make_hl_funding_payment()).collect();
+        let (query, _) = build_hl_funding_payment_insert(&payments).unwrap();
+
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9)"));
+        assert!(query.contains("($10, $11, $12, $13, $14, $15, $16, $17, $18)"));
+        assert!(query.contains("($19, $20, $21, $22, $23, $24, $25, $26, $27)"));
+    }
+
+    #[test]
+    fn hl_funding_payment_insert_param_count() {
+        let payments: Vec<_> = (0..5).map(|_| make_hl_funding_payment()).collect();
+        let (query, _) = build_hl_funding_payment_insert(&payments).unwrap();
+        // 5 rows * 9 params = 45 => highest param is $45
+        assert!(query.contains("$45"));
+        assert!(!query.contains("$46"));
+    }
+
+    #[test]
+    fn hl_funding_payment_insert_dedup_clause() {
+        let payment = make_hl_funding_payment();
+        let (query, _) = build_hl_funding_payment_insert(&[payment]).unwrap();
+
+        assert!(query.contains("ON CONFLICT (raw_transaction_id, coin, payment_time)"));
+        assert!(query.contains("WHERE raw_transaction_id IS NOT NULL"));
+        assert!(query.contains("DO NOTHING"));
+    }
+
+    // -- hl_position_change batch insert (P3-W4) --
+
+    #[test]
+    fn hl_position_change_insert_single() {
+        let change = make_hl_position_change();
+        let (query, _) = build_hl_position_change_insert(&[change]).unwrap();
+
+        assert!(query.starts_with("INSERT INTO hl_position_changes"));
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"));
+        assert!(query.contains("ON CONFLICT"));
+    }
+
+    #[test]
+    fn hl_position_change_insert_multiple() {
+        let changes: Vec<_> = (0..3).map(|_| make_hl_position_change()).collect();
+        let (query, _) = build_hl_position_change_insert(&changes).unwrap();
+
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"));
+        assert!(query.contains("($12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)"));
+        assert!(query.contains("($23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)"));
+    }
+
+    #[test]
+    fn hl_position_change_insert_param_count() {
+        let changes: Vec<_> = (0..5).map(|_| make_hl_position_change()).collect();
+        let (query, _) = build_hl_position_change_insert(&changes).unwrap();
+        // 5 rows * 11 params = 55 => highest param is $55
+        assert!(query.contains("$55"));
+        assert!(!query.contains("$56"));
+    }
+
+    #[test]
+    fn hl_position_change_insert_dedup_clause() {
+        let change = make_hl_position_change();
+        let (query, _) = build_hl_position_change_insert(&[change]).unwrap();
+
+        assert!(query.contains("ON CONFLICT (raw_transaction_id, coin, side, source_event)"));
+        assert!(query.contains("WHERE raw_transaction_id IS NOT NULL"));
+        assert!(query.contains("DO NOTHING"));
+    }
+
+    // -- Repository method signatures (P3-W4) --
+
+    #[test]
+    fn repo_save_hl_fill_records_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.save_hl_fill_records(&[]));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_get_hl_fill_records_by_coin_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.get_hl_fill_records_by_coin("ETH", 10, 0));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_save_hl_funding_payments_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.save_hl_funding_payments(&[]));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_get_hl_funding_payments_by_coin_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.get_hl_funding_payments_by_coin("ETH", 10, 0));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_save_hl_position_changes_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.save_hl_position_changes(&[]));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_get_hl_position_changes_by_coin_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.get_hl_position_changes_by_coin("ETH", 10, 0));
         }
         let _ = _check;
     }
