@@ -1,0 +1,132 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 4: ETL-First Delivery
+- work packet: P4-W2: Export jobs
+- objective: Add async export job definitions by dataset and target with JSONL and CSV format support, preserving the existing wallet export endpoint
+- branch: p4-w2-export-jobs
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- core/src/materializer.rs — ExportFormat enum with Serialize/Deserialize/Display/FromStr
+- adapters/src/v2_repo.rs — Export query methods with 100k record limit for all 6 datasets
+- api/src/main.rs — Export job system (ExportJobEntry, ExportJobStatus, ExportData), 3 new endpoints, JSONL/CSV serializers for all 6 datasets, 24 new tests
+- README.md — API endpoint table and detailed docs for 3 new export endpoints
+- CLAUDE.md — Updated API surface list
+
+Implementation steps:
+1. Added ExportFormat enum (Jsonl, Csv) with serde/strum derives and tests to core/src/materializer.rs
+2. Added export_* query methods to adapters/src/v2_repo.rs with EXPORT_MAX_RECORDS=100,000 limit
+3. Added ExportJobEntry, ExportJobStatus, ExportData types to api/src/main.rs
+4. Added export_jobs: RwLock<HashMap<Uuid, ExportJobEntry>> to AppState with TTL-based pruning
+5. Added POST /v1/export/dataset handler with validation, async job spawn, and job state tracking
+6. Added GET /v1/export/jobs/:job_id handler to poll export job status
+7. Added GET /v1/export/jobs/:job_id/download handler with Content-Type and Content-Disposition headers
+8. Implemented serialize_to_jsonl<T: Serialize> for generic JSONL serialization
+9. Implemented per-dataset CSV serializers (token_transfers, native_balance_deltas, decoded_events, hl_fills, hl_funding, positions)
+10. Added run_export_job async function dispatching to appropriate query and serializer by dataset name
+11. Added 24 new tests covering auth, validation, format handling, job lifecycle, serialization, and all 6 datasets
+12. Updated README.md with new endpoint table rows and detailed API documentation
+13. Updated CLAUDE.md API surface list with 3 new endpoints
+
+Verification expectations:
+1. cargo fmt --all --check — PASS
+2. cargo clippy --workspace --all-targets -- -D warnings — PASS
+3. cargo test --workspace — 737 tests pass, 0 failed
+
+Tracked review artifacts required in the PR:
+- No tracked review artifact required.
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p4-w2-export-jobs from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P4-W2: Export jobs.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 4: ETL-First Delivery"
+- workPacket: "P4-W2: Export jobs"
+- branchName: "p4-w2-export-jobs"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
