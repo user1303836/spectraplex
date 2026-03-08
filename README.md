@@ -237,12 +237,18 @@ All `/v1/*` endpoints require authentication via `Authorization: Bearer <API_KEY
 | `POST` | `/v1/stream/start` | Start real-time Solana gRPC streaming (returns stream ID) |
 | `POST` | `/v1/stream/:stream_id/stop` | Stop an active stream |
 | `GET` | `/v1/streams` | List all active streams with stats |
+| `GET` | `/v1/datasets` | List all Silver datasets with latest version info |
+| `GET` | `/v1/datasets/:name/versions` | List version history for a dataset |
+| `GET` | `/v1/datasets/:name/records` | Query dataset records with filters (paginated) |
+| `GET` | `/v1/datasets/:name/completeness` | Get completeness status for a dataset |
 
 All wallet endpoints validate the address format and return structured JSON errors.
 
 Query endpoints support `?limit=N&offset=N` parameters (default limit: 50, max: 1000).
 
 The transactions, ledger, and export endpoints support date range filtering via `?from=<unix_ts>&to=<unix_ts>` query parameters (both optional).
+
+The dataset records endpoint supports filtering via `?target_id=<UUID>&network=<id>&time_start=<unix_ts>&time_end=<unix_ts>&limit=N&offset=N` query parameters (all optional). Queryable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`.
 
 The ingest and normalize endpoints accept an optional `callback_url` field. When provided, the server will POST a JSON payload to that URL when the job completes or fails. Only HTTP(S) URLs targeting public addresses are accepted.
 
@@ -367,6 +373,50 @@ curl -H "Authorization: Bearer <API_KEY>" \
 ```
 
 Lists all active streams with their current statistics.
+
+### GET /v1/datasets
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  http://127.0.0.1:3000/v1/datasets
+
+# Response: [{"name": "token_transfers", "latest_version": 1, "latest_version_status": "complete"}, ...]
+```
+
+Lists all Silver datasets with their latest version info.
+
+### GET /v1/datasets/:name/versions
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  http://127.0.0.1:3000/v1/datasets/token_transfers/versions
+
+# Response: [{"id": "...", "dataset_name": "token_transfers", "version": 1, "status": "complete", ...}]
+```
+
+Returns the version history for a specific dataset.
+
+### GET /v1/datasets/:name/records
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  "http://127.0.0.1:3000/v1/datasets/token_transfers/records?network=solana-mainnet&limit=50"
+
+# Response: [{"tx_hash": "...", "mint": "So11...", "from_owner": "...", "to_owner": "...", "amount": "1000000000", ...}]
+```
+
+Query dataset records with optional filters. Supported query parameters: `target_id`, `network`, `time_start`, `time_end`, `limit` (default 100, max 1000), `offset`. Queryable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`.
+
+### GET /v1/datasets/:name/completeness
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  http://127.0.0.1:3000/v1/datasets/token_transfers/completeness
+
+# Response: [{"target_id": "...", "dataset_name": "token_transfers", "network": "solana-mainnet", "status": "complete", ...}]
+```
+
+Returns completeness tracking records for a dataset.
 
 ## Configuration
 
