@@ -3,7 +3,7 @@
   "checkpoint_id": "81844455bc78",
   "strategy": "manual-commit",
   "branch": "p3-w2-transfer-balance-delta-datasets",
-  "checkpoints_count": 3,
+  "checkpoints_count": 4,
   "files_touched": [
     "adapters/src/evm_parser.rs",
     "adapters/src/hyperliquid_parser.rs",
@@ -50,13 +50,20 @@
       "context": "/81/844455bc78/4/context.md",
       "content_hash": "/81/844455bc78/4/content_hash.txt",
       "prompt": "/81/844455bc78/4/prompt.txt"
+    },
+    {
+      "metadata": "/81/844455bc78/5/metadata.json",
+      "transcript": "/81/844455bc78/5/full.jsonl",
+      "context": "/81/844455bc78/5/context.md",
+      "content_hash": "/81/844455bc78/5/content_hash.txt",
+      "prompt": "/81/844455bc78/5/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 345,
-    "cache_creation_tokens": 635660,
-    "cache_read_tokens": 12000515,
-    "output_tokens": 91883,
-    "api_call_count": 130
+    "input_tokens": 378,
+    "cache_creation_tokens": 770708,
+    "cache_read_tokens": 14967266,
+    "output_tokens": 111474,
+    "api_call_count": 159
   }
 }
