@@ -3,7 +3,7 @@
   "checkpoint_id": "69f823a8a6d8",
   "strategy": "manual-commit",
   "branch": "codex/p0-w1-v2-architecture-rfc",
-  "checkpoints_count": 2,
+  "checkpoints_count": 3,
   "files_touched": [
     "docs/phase0/p0-w1-v2-architecture-rfc-handoff.md"
   ],
@@ -21,13 +21,20 @@
       "context": "/69/f823a8a6d8/1/context.md",
       "content_hash": "/69/f823a8a6d8/1/content_hash.txt",
       "prompt": "/69/f823a8a6d8/1/prompt.txt"
+    },
+    {
+      "metadata": "/69/f823a8a6d8/2/metadata.json",
+      "transcript": "/69/f823a8a6d8/2/full.jsonl",
+      "context": "/69/f823a8a6d8/2/context.md",
+      "content_hash": "/69/f823a8a6d8/2/content_hash.txt",
+      "prompt": "/69/f823a8a6d8/2/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 48,
-    "cache_creation_tokens": 303961,
-    "cache_read_tokens": 3123327,
-    "output_tokens": 30011,
-    "api_call_count": 40
+    "input_tokens": 64,
+    "cache_creation_tokens": 399719,
+    "cache_read_tokens": 4153100,
+    "output_tokens": 46719,
+    "api_call_count": 54
   }
 }
