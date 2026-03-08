@@ -1,0 +1,28 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "0837a58c35d8",
+  "strategy": "manual-commit",
+  "branch": "p1-w5-migration-verification",
+  "checkpoints_count": 1,
+  "files_touched": [
+    ".github/workflows/ci.yml",
+    "adapters/tests/migration_test.rs",
+    "docs/phase1/p1-w5-migration-verification-handoff.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/08/37a58c35d8/0/metadata.json",
+      "transcript": "/08/37a58c35d8/0/full.jsonl",
+      "context": "/08/37a58c35d8/0/context.md",
+      "content_hash": "/08/37a58c35d8/0/content_hash.txt",
+      "prompt": "/08/37a58c35d8/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 187541,
+    "cache_read_tokens": 1448786,
+    "output_tokens": 13742,
+    "api_call_count": 22
+  }
+}
