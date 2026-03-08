@@ -285,6 +285,70 @@ pub struct IngestionBatch {
 }
 
 // ---------------------------------------------------------------------------
+// Completeness Status
+// ---------------------------------------------------------------------------
+
+/// Tracks the completeness state of a dataset for a given target and network.
+/// Serializes to lowercase strings matching the SQL CHECK constraint.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Display, EnumString,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum CompletenessStatus {
+    /// Dataset coverage is incomplete — some data is present but gaps exist.
+    #[default]
+    Partial,
+    /// Dataset is fully covered for the target and time range.
+    Complete,
+    /// A backfill operation is actively filling gaps.
+    Backfilling,
+    /// Known gap(s) exist in coverage that have not yet been addressed.
+    Gap,
+}
+
+// ---------------------------------------------------------------------------
+// Dataset Completeness
+// ---------------------------------------------------------------------------
+
+/// Tracks dataset completeness per target and time range.
+///
+/// Downstream consumers use this to determine whether a dataset is partial,
+/// complete, or backfilling for a given target and network.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetCompleteness {
+    pub id: Uuid,
+    /// FK to index_targets.
+    pub target_id: Uuid,
+    /// Canonical dataset name (e.g. "token_transfers", "ledger_entries").
+    pub dataset_name: String,
+    /// Optional FK to dataset_versions — links to the specific version.
+    pub dataset_version_id: Option<Uuid>,
+    /// Network identifier (FK to networks).
+    pub network: String,
+    /// Current completeness status.
+    pub status: CompletenessStatus,
+    /// Start of the covered time range (Unix timestamp). `None` if unknown.
+    pub coverage_start: Option<i64>,
+    /// End of the covered time range (Unix timestamp). `None` if unknown.
+    pub coverage_end: Option<i64>,
+    /// Start of the covered block range. `None` for blockless chains.
+    pub block_start: Option<i64>,
+    /// End of the covered block range. `None` for blockless chains.
+    pub block_end: Option<i64>,
+    /// FK to the most recent ingestion run that updated this record.
+    pub last_ingestion_run_id: Option<Uuid>,
+    /// Number of records in the dataset for this target + network.
+    pub records_count: i64,
+    /// JSON array of gap ranges, e.g. `[{"start": 100, "end": 200}]`.
+    pub gap_ranges: Option<serde_json::Value>,
+    /// Optional human-readable notes.
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
 // Address normalization helpers
 // ---------------------------------------------------------------------------
 
@@ -824,6 +888,165 @@ mod tests {
         }"#;
         let dv: DatasetVersion = serde_json::from_str(json).unwrap();
         assert_eq!(dv.status, DatasetVersionStatus::Active);
+    }
+
+    // -- CompletenessStatus --
+
+    #[test]
+    fn completeness_status_default_is_partial() {
+        assert_eq!(CompletenessStatus::default(), CompletenessStatus::Partial);
+    }
+
+    #[test]
+    fn completeness_status_serde_roundtrip() {
+        for (variant, expected_str) in [
+            (CompletenessStatus::Partial, "\"partial\""),
+            (CompletenessStatus::Complete, "\"complete\""),
+            (CompletenessStatus::Backfilling, "\"backfilling\""),
+            (CompletenessStatus::Gap, "\"gap\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_str, "serialize {variant:?}");
+            let back: CompletenessStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "deserialize {expected_str}");
+        }
+    }
+
+    #[test]
+    fn completeness_status_display() {
+        assert_eq!(CompletenessStatus::Partial.to_string(), "partial");
+        assert_eq!(CompletenessStatus::Complete.to_string(), "complete");
+        assert_eq!(CompletenessStatus::Backfilling.to_string(), "backfilling");
+        assert_eq!(CompletenessStatus::Gap.to_string(), "gap");
+    }
+
+    #[test]
+    fn completeness_status_from_str() {
+        assert_eq!(
+            CompletenessStatus::from_str("partial").unwrap(),
+            CompletenessStatus::Partial
+        );
+        assert_eq!(
+            CompletenessStatus::from_str("complete").unwrap(),
+            CompletenessStatus::Complete
+        );
+        assert_eq!(
+            CompletenessStatus::from_str("backfilling").unwrap(),
+            CompletenessStatus::Backfilling
+        );
+        assert_eq!(
+            CompletenessStatus::from_str("gap").unwrap(),
+            CompletenessStatus::Gap
+        );
+        assert!(CompletenessStatus::from_str("unknown").is_err());
+    }
+
+    // -- DatasetCompleteness --
+
+    #[test]
+    fn dataset_completeness_serde_roundtrip() {
+        let now = Utc::now();
+        let dc = DatasetCompleteness {
+            id: Uuid::new_v4(),
+            target_id: Uuid::new_v4(),
+            dataset_name: "token_transfers".to_string(),
+            dataset_version_id: Some(Uuid::new_v4()),
+            network: "solana-mainnet".to_string(),
+            status: CompletenessStatus::Partial,
+            coverage_start: Some(1700000000),
+            coverage_end: Some(1700100000),
+            block_start: Some(200_000_000),
+            block_end: Some(200_100_000),
+            last_ingestion_run_id: Some(Uuid::new_v4()),
+            records_count: 42,
+            gap_ranges: Some(serde_json::json!([{"start": 1700050000, "end": 1700060000}])),
+            notes: Some("initial partial ingest".to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+        let json = serde_json::to_string(&dc).unwrap();
+        let back: DatasetCompleteness = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.dataset_name, "token_transfers");
+        assert_eq!(back.network, "solana-mainnet");
+        assert_eq!(back.status, CompletenessStatus::Partial);
+        assert_eq!(back.records_count, 42);
+        assert_eq!(back.coverage_start, Some(1700000000));
+        assert_eq!(back.coverage_end, Some(1700100000));
+        assert!(back.gap_ranges.is_some());
+    }
+
+    #[test]
+    fn dataset_completeness_minimal_construction() {
+        let now = Utc::now();
+        let dc = DatasetCompleteness {
+            id: Uuid::new_v4(),
+            target_id: Uuid::new_v4(),
+            dataset_name: "ledger_entries".to_string(),
+            dataset_version_id: None,
+            network: "ethereum-mainnet".to_string(),
+            status: CompletenessStatus::default(),
+            coverage_start: None,
+            coverage_end: None,
+            block_start: None,
+            block_end: None,
+            last_ingestion_run_id: None,
+            records_count: 0,
+            gap_ranges: None,
+            notes: None,
+            created_at: now,
+            updated_at: now,
+        };
+        assert_eq!(dc.status, CompletenessStatus::Partial);
+        assert_eq!(dc.records_count, 0);
+        assert!(dc.coverage_start.is_none());
+        assert!(dc.gap_ranges.is_none());
+    }
+
+    #[test]
+    fn dataset_completeness_status_transitions() {
+        let statuses = [
+            CompletenessStatus::Partial,
+            CompletenessStatus::Backfilling,
+            CompletenessStatus::Complete,
+        ];
+        // Verify the natural progression serializes correctly
+        for (i, status) in statuses.iter().enumerate() {
+            let json = serde_json::to_string(status).unwrap();
+            let back: CompletenessStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, status, "transition step {i}");
+        }
+    }
+
+    #[test]
+    fn dataset_completeness_no_wallet_specific_fields() {
+        let now = Utc::now();
+        let dc = DatasetCompleteness {
+            id: Uuid::new_v4(),
+            target_id: Uuid::new_v4(),
+            dataset_name: "hl_fills".to_string(),
+            dataset_version_id: None,
+            network: "hypercore-mainnet".to_string(),
+            status: CompletenessStatus::Complete,
+            coverage_start: Some(1700000000),
+            coverage_end: Some(1700100000),
+            block_start: None,
+            block_end: None,
+            last_ingestion_run_id: None,
+            records_count: 100,
+            gap_ranges: None,
+            notes: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let json = serde_json::to_string(&dc).unwrap();
+        assert!(
+            !json.contains("wallet_address"),
+            "DatasetCompleteness must not have wallet_address"
+        );
+        assert!(
+            !json.contains("user_id"),
+            "DatasetCompleteness must not have user_id"
+        );
     }
 
     #[test]
