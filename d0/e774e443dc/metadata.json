@@ -3,7 +3,7 @@
   "checkpoint_id": "d0e774e443dc",
   "strategy": "manual-commit",
   "branch": "p4-w3-sink-abstraction",
-  "checkpoints_count": 4,
+  "checkpoints_count": 5,
   "files_touched": [
     "api/src/main.rs"
   ],
@@ -63,13 +63,20 @@
       "context": "/d0/e774e443dc/7/context.md",
       "content_hash": "/d0/e774e443dc/7/content_hash.txt",
       "prompt": "/d0/e774e443dc/7/prompt.txt"
+    },
+    {
+      "metadata": "/d0/e774e443dc/8/metadata.json",
+      "transcript": "/d0/e774e443dc/8/full.jsonl",
+      "context": "/d0/e774e443dc/8/context.md",
+      "content_hash": "/d0/e774e443dc/8/content_hash.txt",
+      "prompt": "/d0/e774e443dc/8/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 702,
-    "cache_creation_tokens": 824627,
-    "cache_read_tokens": 13567233,
-    "output_tokens": 116283,
-    "api_call_count": 212
+    "input_tokens": 735,
+    "cache_creation_tokens": 959675,
+    "cache_read_tokens": 16533984,
+    "output_tokens": 135874,
+    "api_call_count": 241
   }
 }
