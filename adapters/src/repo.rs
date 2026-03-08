@@ -96,6 +96,11 @@ impl Repository {
         Self { pool }
     }
 
+    /// Crate-visible accessor for the connection pool (used by `v2_repo`).
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Batch size for chunked inserts.
     const BATCH_SIZE: usize = 500;
 
