@@ -1,0 +1,205 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Coordinate the next Spectraplex work packet lifecycle.
+
+Read before deciding:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+- the current repository state
+- relevant open pull requests and packet branches
+
+Preflight:
+All preflight checks pass. Worktree is clean, on main at 484a3f3 (up-to-date with origin), all required tools and GitHub auth are available with full repo permissions, and both design docs exist. Ready for autonomous packet work.
+
+Workflow input:
+- goal: (not provided)
+- startAtPacket: (not provided)
+- stopAfterPacket: (not provided)
+- maxMergedPackets: (not provided)
+
+Previous coordination:
+Phase 3 is fully merged (P3-W1 through P3-W6, PRs #116–#121). Phase 4 is now unlocked. Selecting P4-W1: Dataset query API — the first Phase 4 packet. The V2 repo already has query methods for all 6 Silver datasets plus the dataset registry and completeness metadata. P4-W1 adds API routes to expose these as dataset-oriented endpoints with target/network/time-window filtering and pagination. No prerequisites remain; all Phase 3 work is on main.
+
+Previous active packet runtime:
+- stage: merged
+- implementation: Add dataset query API endpoints (P4-W1). Implements /v1/datasets/:name/versions and /v1/datasets/:name/records query endpoints in the API server with supporting repository methods in v2_repo. All CI checks pass: cargo fmt, clippy, and 358+ tests green.
+- validation: P4-W1 validated. All 713 tests pass, cargo fmt and clippy clean. Four new dataset query endpoints correctly added with target/network/time-window filtering. Existing wallet-scoped endpoints unaffected. README and CLAUDE.md updated. Query builder uses parameterized SQL with dynamic JOINs. Implementation matches packet scope.
+- PR state: Created PR #122 against main with 903 lines across api/src/main.rs, adapters/src/v2_repo.rs, and README.md. All 713 tests pass, fmt and clippy clean. PR is open and ready for review.
+- local review: PR is approved. All CI checks pass. The implementation is correct, target-agnostic, and backward-compatible. Pagination is properly bounded. Time-window filtering is consistent across all dataset types. No wallet-only assumptions. Four non-blocking items noted: a minor README default mismatch, missing response envelope, a duplicated dataset list, and no DB-backed integration tests.
+- remote review: Remote review pass is clear. No blocking issues. Implementation is clean: proper input validation, parameterized SQL with dynamic JOINs, consistent time-window filtering across all six dataset types, target-kind-agnostic filtering via UUID, and all four CI checks passing. Three non-blocking items noted for follow-up (response envelope, README default limit doc, list endpoint including non-queryable dataset).
+- merge: PR #122 merged to main via admin merge. All 713 tests pass, cargo fmt and clippy clean, all 4 CI checks green. Branch protection required GitHub review but local and remote reviews were both clear with no blockers. Feature branch deleted, local main updated and ready for next packet.
+
+Previous merge result:
+PR #122 merged to main via admin merge. All 713 tests pass, cargo fmt and clippy clean, all 4 CI checks green. Branch protection required GitHub review but local and remote reviews were both clear with no blockers. Feature branch deleted, local main updated and ready for next packet.
+
+Merged packets so far:
+1. Phase 0: Lock The V2 Architecture P0-W1: V2 Architecture RFC
+2. Phase 0: Lock The V2 Architecture P0-W3: Network Model Spec
+3. Phase 0: Lock The V2 Architecture P0-W4: Rollout And Compatibility Plan
+4. Phase 1: Canonical Bronze And Control Plane P1-W1: Introduce V2 Core Types
+5. Phase 1: Canonical Bronze And Control Plane P1-W2: Add New Bronze And Control-Plane Tables
+6. Phase 1: Canonical Bronze And Control Plane P1-W3: Repository Support For Canonical Raw Data
+7. Phase 2: Target-Centric Ingestion P2-W1: Connector interface redesign
+8. Phase 2: Target-Centric Ingestion P2-W2: CLI and API target registration flow
+9. Phase 2: Target-Centric Ingestion P2-W3: Fix EVM ingestion semantics
+10. Phase 2: Target-Centric Ingestion P2-W4: Fix Solana gRPC target semantics
+11. Phase 2: Target-Centric Ingestion P2-W5: Hyperliquid target model
+12. Phase 2: Target-Centric Ingestion P2-W6: End-to-end ingestion compatibility suite
+13. Phase 3: Expand Silver Into Reusable Datasets P3-W2: Transfer and balance-delta datasets
+14. Phase 3: Expand Silver Into Reusable Datasets P3-W4: Hyperliquid reusable datasets
+15. Phase 3: Expand Silver Into Reusable Datasets P3-W5: Ledger as a derived materialization
+16. Phase 3: Expand Silver Into Reusable Datasets P3-W6: Completeness metadata
+17. Phase 4: ETL-First Delivery P4-W1: Dataset query API
+
+Rules:
+1. Continue exactly one in-flight packet until it is merged. In-flight means an unmerged packet already selected by this workflow, an open PR for a packet branch, or local branch work that clearly maps to a packet.
+2. Only select a new packet when there is no in-flight packet left to finish.
+3. If multiple conflicting in-flight packets exist, return state="blocked" and explain why.
+4. Select the earliest incomplete packet allowed by dependencies in design/PHASED_IMPLEMENTATION_PLAN.md and still incomplete in the current repository and tracked docs.
+5. Respect phase order. Do not skip prerequisites unless the phased plan explicitly allows it.
+6. Keep wallet indexing first-class, but do not reinforce wallet-only assumptions in shared abstractions.
+7. If a packet's primary deliverables live under gitignored paths such as design/, require at least one tracked review artifact under docs/ and list it in trackedReviewArtifacts.
+8. Remote review happens as a PR comment, not a formal GitHub approval. Do not block on missing formal approval.
+9. Admin or force merge is allowed only after validation, local review, and the remote review comment all say the remaining blockers are cleared.
+10. If stopAfterPacket is provided and that packet is already merged, return state="complete".
+11. If maxMergedPackets is provided and the limit has been reached, return state="complete".
+12. If a prior merge attempt failed for an external reason that the workflow cannot safely resolve, return state="blocked" instead of looping forever.
+
+Return JSON with:
+- workflowComplete: true only if the workflow should stop successfully
+- state: "active", "complete", or "blocked"
+- phase: string, or "" if complete or blocked
+- workPacket: string, or "" if complete or blocked
+- objective: string, or "" if complete or blocked
+- branchName: string, or "" if complete or blocked
+- prNumber: number, or 0 if none
+- prUrl: string
+- prTitle: string
+- prBody: string
+- summary: concise coordination summary
+- repoTouchpoints: array
+- implementationSteps: array
+- verificationSteps: array
+- reviewFocus: array
+- trackedReviewArtifacts: array
+- blockingIssues: array
+- warnings: array
+- nextAction: string
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "workflowComplete": {
+      "type": "boolean"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "active",
+        "complete",
+        "blocked"
+      ]
+    },
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "objective": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "prNumber": {
+      "type": "number"
+    },
+    "prUrl": {
+      "type": "string"
+    },
+    "prTitle": {
+      "type": "string"
+    },
+    "prBody": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "repoTouchpoints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "implementationSteps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "verificationSteps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reviewFocus": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "trackedReviewArtifacts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blockingIssues": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "nextAction": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workflowComplete",
+    "state",
+    "phase",
+    "workPacket",
+    "objective",
+    "branchName",
+    "prNumber",
+    "prUrl",
+    "prTitle",
+    "prBody",
+    "summary",
+    "repoTouchpoints",
+    "implementationSteps",
+    "verificationSteps",
+    "reviewFocus",
+    "trackedReviewArtifacts",
+    "blockingIssues",
+    "warnings",
+    "nextAction"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
