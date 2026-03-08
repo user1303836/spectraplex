@@ -1,0 +1,34 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "d59c5cadaef6",
+  "session_id": "3583c87f-97ac-4d81-9d60-c915aec6e1bc",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T23:47:17.745273Z",
+  "branch": "p4-w3-sink-abstraction",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "core/src/materializer.rs",
+    "api/src/main.rs",
+    "api/Cargo.toml",
+    "README.md"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "7a4a110af335",
+  "token_usage": {
+    "input_tokens": 50,
+    "cache_creation_tokens": 87255,
+    "cache_read_tokens": 3620859,
+    "output_tokens": 22396,
+    "api_call_count": 48
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T23:47:16.377386Z",
+    "agent_lines": 993,
+    "human_added": 1,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 994,
+    "agent_percentage": 99.89939637826963
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/3583c87f-97ac-4d81-9d60-c915aec6e1bc.jsonl"
+}
