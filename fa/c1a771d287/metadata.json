@@ -1,0 +1,29 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "fac1a771d287",
+  "strategy": "manual-commit",
+  "branch": "p4-w2-export-jobs",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "README.md",
+    "adapters/src/v2_repo.rs",
+    "api/src/main.rs",
+    "core/src/materializer.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/fa/c1a771d287/0/metadata.json",
+      "transcript": "/fa/c1a771d287/0/full.jsonl",
+      "context": "/fa/c1a771d287/0/context.md",
+      "content_hash": "/fa/c1a771d287/0/content_hash.txt",
+      "prompt": "/fa/c1a771d287/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 187541,
+    "cache_read_tokens": 1448786,
+    "output_tokens": 13742,
+    "api_call_count": 22
+  }
+}
