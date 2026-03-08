@@ -1,0 +1,41 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "81844455bc78",
+  "session_id": "dedb3e86-e617-4bc7-9f11-d5c005e55ed9",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T21:14:39.991486Z",
+  "branch": "p3-w2-transfer-balance-delta-datasets",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "migrations/20260309100001_add_native_balance_deltas.sql",
+    "adapters/src/evm_parser.rs",
+    "adapters/src/hyperliquid_parser.rs",
+    "adapters/src/lib.rs",
+    "core/src/materializer.rs",
+    "adapters/src/solana_parser.rs",
+    "adapters/src/v2_repo.rs",
+    "docs/phase3/p3-w2-transfer-balance-delta-handoff.md",
+    "migrations/20260309100000_add_token_transfers.sql"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "7b5d5212bbf3",
+  "checkpoint_transcript_start": 191,
+  "transcript_lines_at_start": 191,
+  "token_usage": {
+    "input_tokens": 68,
+    "cache_creation_tokens": 81622,
+    "cache_read_tokens": 3911793,
+    "output_tokens": 19916,
+    "api_call_count": 66
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T21:14:39.603565Z",
+    "agent_lines": 0,
+    "human_added": 1788,
+    "human_modified": 8,
+    "human_removed": 0,
+    "total_committed": 1788,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/dedb3e86-e617-4bc7-9f11-d5c005e55ed9.jsonl"
+}
