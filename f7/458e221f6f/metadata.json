@@ -3,7 +3,7 @@
   "checkpoint_id": "f7458e221f6f",
   "strategy": "manual-commit",
   "branch": "p2-w1-connector-interface",
-  "checkpoints_count": 3,
+  "checkpoints_count": 4,
   "files_touched": [
     "Cargo.lock",
     "adapters/src/compat.rs",
@@ -41,13 +41,20 @@
       "context": "/f7/458e221f6f/3/context.md",
       "content_hash": "/f7/458e221f6f/3/content_hash.txt",
       "prompt": "/f7/458e221f6f/3/prompt.txt"
+    },
+    {
+      "metadata": "/f7/458e221f6f/4/metadata.json",
+      "transcript": "/f7/458e221f6f/4/full.jsonl",
+      "context": "/f7/458e221f6f/4/context.md",
+      "content_hash": "/f7/458e221f6f/4/content_hash.txt",
+      "prompt": "/f7/458e221f6f/4/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 91,
-    "cache_creation_tokens": 495172,
-    "cache_read_tokens": 6245953,
-    "output_tokens": 57521,
-    "api_call_count": 79
+    "input_tokens": 124,
+    "cache_creation_tokens": 630220,
+    "cache_read_tokens": 9212704,
+    "output_tokens": 77112,
+    "api_call_count": 108
   }
 }
