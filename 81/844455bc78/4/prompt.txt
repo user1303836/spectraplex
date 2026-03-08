@@ -1,0 +1,145 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 3: Expand Silver Into Reusable Datasets
+- work packet: P3-W2: Transfer and balance-delta datasets
+- objective: Add normalized token_transfers and native_balance_deltas Silver tables, implement Materializer structs for each chain family, create parser extraction functions from Bronze data, and add repository methods for bulk insert and query. Defer EVM native balance deltas if trace API support is not yet in Bronze.
+- branch: p3-w2-transfer-balance-delta-datasets
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- core/src/materializer.rs — add TokenTransfer and NativeBalanceDelta domain structs
+- core/src/v2.rs — possible extension for new Silver record types
+- core/src/lib.rs — re-export new types
+- adapters/src/solana_parser.rs — add token transfer and native balance delta extraction functions, new Materializer impls
+- adapters/src/evm_parser.rs — add token transfer extraction from ERC-20 Transfer logs, new Materializer impl; native balance delta may be deferred
+- adapters/src/hyperliquid_parser.rs — add token transfer extraction from deposits/withdrawals, native balance delta from account value changes, new Materializer impls
+- adapters/src/lib.rs — re-export new materializer impls and integration tests
+- adapters/src/v2_repo.rs — add repository methods for token_transfers and native_balance_deltas tables
+- migrations/ — new migration for token_transfers and native_balance_deltas tables with FK to raw_transactions and dataset_versions
+- docs/phase3/p3-w2-transfer-balance-delta-handoff.md — handoff doc
+
+Implementation steps:
+1. 1. Define TokenTransfer and NativeBalanceDelta domain structs in core/src/materializer.rs or core/src/v2.rs with all required fields (id, raw_transaction_id, network, addresses, amounts, dataset_version_id, timestamps)
+2. 2. Write migration creating token_transfers table with columns: id UUID PK, raw_transaction_id UUID FK to raw_transactions, network TEXT, token_address TEXT, token_symbol TEXT, from_address TEXT, to_address TEXT, amount NUMERIC, decimals INT, dataset_version_id UUID FK to dataset_versions, created_at TIMESTAMPTZ; add appropriate indexes and uniqueness constraints
+3. 3. Write migration creating native_balance_deltas table with columns: id UUID PK, raw_transaction_id UUID FK to raw_transactions, network TEXT, account_address TEXT, native_token TEXT, pre_balance NUMERIC, post_balance NUMERIC, delta NUMERIC, is_fee_payer BOOLEAN, dataset_version_id UUID FK to dataset_versions, created_at TIMESTAMPTZ; add indexes
+4. 4. Add Solana token transfer materializer: extract SPL token pre/post balance deltas from raw transaction metadata, emit TokenTransfer records with mint address, owner addresses, and normalized amounts
+5. 5. Add Solana native balance delta materializer: extract SOL pre/post balances from raw transaction metadata, compute deltas, flag fee payer from first signer index
+6. 6. Add EVM token transfer materializer: extract ERC-20 Transfer events from raw logs using the existing TRANSFER_TOPIC constant, decode from/to from padded topic fields, extract amount from data
+7. 7. Evaluate EVM native balance delta feasibility: if raw_transactions carry sufficient data (e.g., value field, gas used), implement a partial materializer; otherwise defer with explicit justification and mark DatasetName::NativeBalanceDeltas as not yet supported for EVM
+8. 8. Add Hyperliquid token transfer materializer: extract deposit/withdraw events as USDC transfers with source/destination addresses
+9. 9. Add Hyperliquid native balance delta materializer: extract account value changes from fill and funding events as USDC balance deltas
+10. 10. Implement Materializer trait for each new struct (up to 6 materializer structs: 3 chains × 2 datasets, minus any deferred)
+11. 11. Add repository methods: save_token_transfers (bulk insert), get_token_transfers_by_address, save_native_balance_deltas (bulk insert), get_native_balance_deltas_by_account
+12. 12. Add unit tests for all new types (serde roundtrip, validation), parser extraction functions (edge cases: multi-transfer txs, zero amounts, missing data), and materializer trait contracts
+13. 13. Write handoff doc at docs/phase3/p3-w2-transfer-balance-delta-handoff.md covering schema, materializer details, deferred decisions, and downstream packet dependencies
+
+Verification expectations:
+1. cargo fmt --all --check
+2. cargo clippy --workspace --all-targets -- -D warnings
+3. cargo test --workspace — all existing 538+ tests must pass plus new tests
+4. Verify TokenTransfer struct has all required fields and serializes correctly
+5. Verify NativeBalanceDelta struct has all required fields and serializes correctly
+6. Verify migration applies cleanly (IF NOT EXISTS guards, nullable FKs for transition safety)
+7. Verify all new Materializer impls return correct dataset_name (TokenTransfers or NativeBalanceDeltas), distinct parser_hash values, and valid descriptors
+8. Verify repository methods use correct SQL (parameterized queries, proper column mapping)
+9. Verify no wallet-only assumptions in new Silver tables — addresses are generic, not wallet-specific
+10. Verify EVM native balance delta gap is either resolved or explicitly documented with justification
+11. Verify handoff doc accurately describes what was built
+
+Tracked review artifacts required in the PR:
+- docs/phase3/p3-w2-transfer-balance-delta-handoff.md
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p3-w2-transfer-balance-delta-datasets from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P3-W2: Transfer and balance-delta datasets.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 3: Expand Silver Into Reusable Datasets"
+- workPacket: "P3-W2: Transfer and balance-delta datasets"
+- branchName: "p3-w2-transfer-balance-delta-datasets"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
