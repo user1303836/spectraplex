@@ -29,6 +29,36 @@ fn base_url() -> String {
         .unwrap_or_else(|_| "postgres://localhost/postgres".to_string())
 }
 
+/// Returns true if PostgreSQL is reachable at the base URL.
+/// Uses a 2-second timeout to avoid long hangs in CI without a service container.
+async fn pg_is_available() -> bool {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        PgConnection::connect(&base_url()),
+    )
+    .await;
+    match result {
+        Ok(Ok(conn)) => {
+            drop(conn);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Skip guard: call at the top of each test. Returns early if PG is unreachable.
+macro_rules! require_pg {
+    () => {
+        if !pg_is_available().await {
+            eprintln!(
+                "SKIPPED: PostgreSQL not available at {} — set TEST_DATABASE_URL or start PostgreSQL",
+                base_url()
+            );
+            return;
+        }
+    };
+}
+
 /// Create an ephemeral database with a unique name and return a pool connected
 /// to it. The caller must call `drop_test_db` when done.
 async fn create_test_db(prefix: &str) -> (PgPool, String) {
@@ -195,6 +225,7 @@ async fn row_count(pool: &PgPool, table: &str) -> i64 {
 
 #[tokio::test]
 async fn fresh_db_all_tables_exist() {
+    require_pg!();
     let (pool, db_name) = create_test_db("fresh").await;
     run_all_migrations(&pool).await;
 
@@ -239,6 +270,7 @@ async fn fresh_db_all_tables_exist() {
 
 #[tokio::test]
 async fn fresh_db_v2_table_columns() {
+    require_pg!();
     let (pool, db_name) = create_test_db("cols").await;
     run_all_migrations(&pool).await;
 
@@ -371,6 +403,7 @@ async fn fresh_db_v2_table_columns() {
 
 #[tokio::test]
 async fn upgraded_db_v1_data_survives_v2_migration() {
+    require_pg!();
     let (pool, db_name) = create_test_db("upgrade").await;
 
     // Apply 7 V1 migrations
@@ -455,6 +488,7 @@ async fn upgraded_db_v1_data_survives_v2_migration() {
 
 #[tokio::test]
 async fn network_seed_data_13_networks() {
+    require_pg!();
     let (pool, db_name) = create_test_db("nets").await;
     run_all_migrations(&pool).await;
 
@@ -577,6 +611,7 @@ async fn network_seed_data_13_networks() {
 
 #[tokio::test]
 async fn v2_enum_chain_family_values() {
+    require_pg!();
     let (pool, db_name) = create_test_db("enumcf").await;
     run_all_migrations(&pool).await;
 
@@ -589,6 +624,7 @@ async fn v2_enum_chain_family_values() {
 
 #[tokio::test]
 async fn v2_enum_target_kind_values() {
+    require_pg!();
     let (pool, db_name) = create_test_db("enumtk").await;
     run_all_migrations(&pool).await;
 
@@ -613,6 +649,7 @@ async fn v2_enum_target_kind_values() {
 
 #[tokio::test]
 async fn v2_enum_target_mode_values() {
+    require_pg!();
     let (pool, db_name) = create_test_db("enumtm").await;
     run_all_migrations(&pool).await;
 
@@ -678,6 +715,7 @@ async fn insert_match(pool: &PgPool, target_id: Uuid, raw_tx_id: Uuid) -> Uuid {
 
 #[tokio::test]
 async fn uniqueness_index_targets_address() {
+    require_pg!();
     let (pool, db_name) = create_test_db("uqaddr").await;
     run_all_migrations(&pool).await;
 
@@ -714,7 +752,73 @@ async fn uniqueness_index_targets_address() {
 }
 
 #[tokio::test]
+async fn uniqueness_index_targets_filter_spec() {
+    require_pg!();
+    let (pool, db_name) = create_test_db("uqfspec").await;
+    run_all_migrations(&pool).await;
+
+    // Insert an index_target with a non-null filter_spec_hash.
+    sqlx::query(
+        "INSERT INTO index_targets (id, kind, network, chain_family, filter_spec, filter_spec_hash, mode, created_at, updated_at)
+         VALUES ($1, 'topic_filter'::target_kind_enum, 'solana-mainnet', 'solana'::chain_family_enum, '{\"program\":\"11111111111111111111111111111111\"}'::jsonb, 'abc123hash', 'both'::target_mode_enum, NOW(), NOW())",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Duplicate (kind, network, filter_spec_hash) must fail.
+    let dup = sqlx::query(
+        "INSERT INTO index_targets (id, kind, network, chain_family, filter_spec, filter_spec_hash, mode, created_at, updated_at)
+         VALUES ($1, 'topic_filter'::target_kind_enum, 'solana-mainnet', 'solana'::chain_family_enum, '{\"program\":\"different\"}'::jsonb, 'abc123hash', 'both'::target_mode_enum, NOW(), NOW())",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await;
+    assert!(
+        dup.is_err(),
+        "uq_index_targets_filter_spec should reject duplicate (kind, network, filter_spec_hash)"
+    );
+
+    // NULL filter_spec_hash rows are exempt — multiple NULLs allowed.
+    let null1 = sqlx::query(
+        "INSERT INTO index_targets (id, kind, network, chain_family, address, mode, created_at, updated_at)
+         VALUES ($1, 'topic_filter'::target_kind_enum, 'solana-mainnet', 'solana'::chain_family_enum, 'NullFSAddr1', 'both'::target_mode_enum, NOW(), NOW())",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await;
+    assert!(null1.is_ok(), "NULL filter_spec_hash should be exempt (1)");
+
+    let null2 = sqlx::query(
+        "INSERT INTO index_targets (id, kind, network, chain_family, address, mode, created_at, updated_at)
+         VALUES ($1, 'topic_filter'::target_kind_enum, 'solana-mainnet', 'solana'::chain_family_enum, 'NullFSAddr2', 'both'::target_mode_enum, NOW(), NOW())",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await;
+    assert!(null2.is_ok(), "NULL filter_spec_hash should be exempt (2)");
+
+    // Different kind with same (network, filter_spec_hash) is allowed.
+    let diff_kind = sqlx::query(
+        "INSERT INTO index_targets (id, kind, network, chain_family, filter_spec, filter_spec_hash, mode, created_at, updated_at)
+         VALUES ($1, 'protocol'::target_kind_enum, 'solana-mainnet', 'solana'::chain_family_enum, '{\"program\":\"other\"}'::jsonb, 'abc123hash', 'both'::target_mode_enum, NOW(), NOW())",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await;
+    assert!(
+        diff_kind.is_ok(),
+        "different kind should be allowed for same (network, filter_spec_hash)"
+    );
+
+    pool.close().await;
+    drop_test_db(&db_name).await;
+}
+
+#[tokio::test]
 async fn uniqueness_raw_transactions_network_tx_hash() {
+    require_pg!();
     let (pool, db_name) = create_test_db("uqtx").await;
     run_all_migrations(&pool).await;
 
@@ -743,6 +847,7 @@ async fn uniqueness_raw_transactions_network_tx_hash() {
 
 #[tokio::test]
 async fn uniqueness_target_matches_target_raw_tx() {
+    require_pg!();
     let (pool, db_name) = create_test_db("uqmatch").await;
     run_all_migrations(&pool).await;
 
@@ -771,6 +876,7 @@ async fn uniqueness_target_matches_target_raw_tx() {
 
 #[tokio::test]
 async fn uniqueness_checkpoints_target_network_source() {
+    require_pg!();
     let (pool, db_name) = create_test_db("uqcp").await;
     run_all_migrations(&pool).await;
 
@@ -821,6 +927,7 @@ async fn uniqueness_checkpoints_target_network_source() {
 
 #[tokio::test]
 async fn fk_raw_transactions_network_references_networks() {
+    require_pg!();
     let (pool, db_name) = create_test_db("fknet").await;
     run_all_migrations(&pool).await;
 
@@ -843,6 +950,7 @@ async fn fk_raw_transactions_network_references_networks() {
 
 #[tokio::test]
 async fn fk_target_matches_target_id_references_index_targets() {
+    require_pg!();
     let (pool, db_name) = create_test_db("fktgt").await;
     run_all_migrations(&pool).await;
 
@@ -869,6 +977,7 @@ async fn fk_target_matches_target_id_references_index_targets() {
 
 #[tokio::test]
 async fn fk_target_matches_raw_transaction_id_references_raw_transactions() {
+    require_pg!();
     let (pool, db_name) = create_test_db("fkrtx").await;
     run_all_migrations(&pool).await;
 
@@ -895,6 +1004,7 @@ async fn fk_target_matches_raw_transaction_id_references_raw_transactions() {
 
 #[tokio::test]
 async fn fk_checkpoints_target_id_references_index_targets() {
+    require_pg!();
     let (pool, db_name) = create_test_db("fkcp").await;
     run_all_migrations(&pool).await;
 
@@ -917,6 +1027,7 @@ async fn fk_checkpoints_target_id_references_index_targets() {
 
 #[tokio::test]
 async fn fk_ingestion_runs_target_id_references_index_targets() {
+    require_pg!();
     let (pool, db_name) = create_test_db("fkrun").await;
     run_all_migrations(&pool).await;
 
@@ -939,6 +1050,7 @@ async fn fk_ingestion_runs_target_id_references_index_targets() {
 
 #[tokio::test]
 async fn fk_raw_transactions_ingestion_run_id_references_ingestion_runs() {
+    require_pg!();
     let (pool, db_name) = create_test_db("fkirun").await;
     run_all_migrations(&pool).await;
 
@@ -965,6 +1077,7 @@ async fn fk_raw_transactions_ingestion_run_id_references_ingestion_runs() {
 
 #[tokio::test]
 async fn multi_target_linkage_single_raw_tx() {
+    require_pg!();
     let (pool, db_name) = create_test_db("multi").await;
     run_all_migrations(&pool).await;
 
@@ -1025,6 +1138,7 @@ async fn multi_target_linkage_single_raw_tx() {
 
 #[tokio::test]
 async fn v1_v2_coexistence() {
+    require_pg!();
     let (pool, db_name) = create_test_db("coexist").await;
     run_all_migrations(&pool).await;
 
@@ -1066,6 +1180,7 @@ async fn v1_v2_coexistence() {
 
 #[tokio::test]
 async fn v1_enums_preserved() {
+    require_pg!();
     let (pool, db_name) = create_test_db("v1enum").await;
     run_all_migrations(&pool).await;
 
@@ -1088,6 +1203,7 @@ async fn v1_enums_preserved() {
 
 #[tokio::test]
 async fn fk_index_targets_network_references_networks() {
+    require_pg!();
     let (pool, db_name) = create_test_db("fkitnet").await;
     run_all_migrations(&pool).await;
 

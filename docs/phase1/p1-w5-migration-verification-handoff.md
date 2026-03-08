@@ -13,18 +13,21 @@ This packet adds a dedicated migration integration test suite that verifies the
 V2 schema is correct across fresh-DB and upgraded-DB paths. Tests run against a
 real PostgreSQL instance (no mocks), creating and dropping ephemeral databases
 per test for full isolation. The suite covers all 10 migrations (7 V1 + 3 V2),
-uniqueness constraints, foreign keys, multi-target linkage, network seed data,
-enum correctness, and V1-V2 coexistence.
+all 5 uniqueness constraints, 7 foreign keys, multi-target linkage, network seed
+data, enum correctness, and V1-V2 coexistence. Tests include a `require_pg!`
+skip guard so they gracefully skip when PostgreSQL is unavailable, and the CI
+workflow provisions a PostgreSQL 16 service container to run them.
 
 ## Files Changed
 
 | File | Change |
 |---|---|
-| `adapters/tests/migration_test.rs` | **New** — 21 integration tests against real PostgreSQL |
+| `adapters/tests/migration_test.rs` | **New** — 22 integration tests against real PostgreSQL with graceful skip guard |
 | `adapters/Cargo.toml` | Added `[dev-dependencies]` section with `log = "0.4"` |
+| `.github/workflows/ci.yml` | Added PostgreSQL 16 service container and `TEST_DATABASE_URL` env to CI test job |
 | `docs/phase1/p1-w5-migration-verification-handoff.md` | **New** — this handoff document |
 
-## Test Coverage (21 tests)
+## Test Coverage (22 tests)
 
 ### Fresh-DB Path
 | Test | What it verifies |
@@ -41,6 +44,7 @@ enum correctness, and V1-V2 coexistence.
 | Test | Constraint verified |
 |---|---|
 | `uniqueness_index_targets_address` | `uq_index_targets_address` on `(kind, network, address)` — rejects duplicates, allows different kind for same network+address |
+| `uniqueness_index_targets_filter_spec` | `uq_index_targets_filter_spec` on `(kind, network, filter_spec_hash) WHERE filter_spec_hash IS NOT NULL` — rejects duplicates, verifies NULL exemption, allows different kind for same network+filter_spec_hash |
 | `uniqueness_raw_transactions_network_tx_hash` | `uq_raw_transactions_network_tx_hash` on `(network, tx_hash)` — rejects duplicates, allows same tx_hash on different network |
 | `uniqueness_target_matches_target_raw_tx` | `uq_target_matches_target_raw_tx` on `(target_id, raw_transaction_id)` — rejects duplicates |
 | `uniqueness_checkpoints_target_network_source` | `uq_checkpoints_target_network_source` on `(target_id, network, source)` — rejects duplicates, allows different source for same target+network |
@@ -82,6 +86,8 @@ enum correctness, and V1-V2 coexistence.
 ## Test Infrastructure
 
 - Tests use **real PostgreSQL** (not mocked). Requires a local PostgreSQL instance.
+- Each test starts with `require_pg!()` — a macro that gracefully skips the test if PostgreSQL is unreachable (2-second timeout), preventing panics in environments without a database.
+- CI provisions a **PostgreSQL 16 service container** and sets `TEST_DATABASE_URL` so all tests run automatically in GHA.
 - Each test creates an **ephemeral database** (`spx_test_{prefix}_{uuid}`) and drops it on cleanup.
 - Connection URL defaults to `postgres://localhost/postgres`; override with `TEST_DATABASE_URL`.
 - `run_all_migrations` uses `sqlx::migrate!("../migrations").run()` — identical to production.
@@ -94,7 +100,7 @@ enum correctness, and V1-V2 coexistence.
 |---|---|
 | `cargo fmt --all --check` | ✅ Clean |
 | `cargo clippy --workspace --all-targets -- -D warnings` | ✅ Clean |
-| `cargo test -p spectraplex-core -p spectraplex-adapters -p spectraplex-cli` | ✅ 198 tests pass (110 adapters unit + 21 migration + 11 solana parser + 18 CLI + 38 core) |
+| `cargo test -p spectraplex-core -p spectraplex-adapters -p spectraplex-cli` | ✅ 199 tests pass (110 adapters unit + 22 migration + 11 solana parser + 18 CLI + 38 core) |
 
 ### Pre-existing issue
 
@@ -107,5 +113,4 @@ enum correctness, and V1-V2 coexistence.
 
 ## Follow-ups
 
-- None required for P1-W5 scope
 - The flaky `test_semaphore_limits_concurrent_jobs` in the API crate predates this work and should be addressed separately
