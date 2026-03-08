@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "b9e9d36cc3d0",
+  "strategy": "manual-commit",
+  "branch": "p2-w3-evm-ingestion-semantics",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "adapters/src/evm.rs",
+    "docs/phase2/p2-w3-evm-ingestion-handoff.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/b9/e9d36cc3d0/0/metadata.json",
+      "transcript": "/b9/e9d36cc3d0/0/full.jsonl",
+      "context": "/b9/e9d36cc3d0/0/context.md",
+      "content_hash": "/b9/e9d36cc3d0/0/content_hash.txt",
+      "prompt": "/b9/e9d36cc3d0/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 187541,
+    "cache_read_tokens": 1448786,
+    "output_tokens": 13742,
+    "api_call_count": 22
+  }
+}
