@@ -1,0 +1,31 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "ffbacc632a5a",
+  "session_id": "8f549305-e8c1-4fea-9811-f3ffed7967a0",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T21:44:02.629545Z",
+  "branch": "p3-w3-event-instruction-datasets",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "migrations/20260309200000_add_decoded_events.sql"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "884a3c61967f",
+  "token_usage": {
+    "input_tokens": 57,
+    "cache_creation_tokens": 127656,
+    "cache_read_tokens": 5784633,
+    "output_tokens": 26661,
+    "api_call_count": 55
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T21:44:02.076059Z",
+    "agent_lines": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 0,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/8f549305-e8c1-4fea-9811-f3ffed7967a0.jsonl"
+}
