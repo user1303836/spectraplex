@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "3c9049944435",
+  "strategy": "manual-commit",
+  "branch": "p2-w2-target-registration",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "Cargo.lock",
+    "adapters/src/v2_repo.rs",
+    "api/Cargo.toml",
+    "api/src/main.rs",
+    "cli/Cargo.toml",
+    "cli/src/main.rs",
+    "docs/phase2/p2-w2-target-registration-handoff.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/3c/9049944435/0/metadata.json",
+      "transcript": "/3c/9049944435/0/full.jsonl",
+      "context": "/3c/9049944435/0/context.md",
+      "content_hash": "/3c/9049944435/0/content_hash.txt",
+      "prompt": "/3c/9049944435/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 187541,
+    "cache_read_tokens": 1448786,
+    "output_tokens": 13742,
+    "api_call_count": 22
+  }
+}
