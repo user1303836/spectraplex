@@ -3,7 +3,7 @@
   "checkpoint_id": "0c4b2d47cf88",
   "strategy": "manual-commit",
   "branch": "p1-w3-v2-repo-layer",
-  "checkpoints_count": 4,
+  "checkpoints_count": 5,
   "files_touched": [
     "adapters/src/lib.rs",
     "adapters/src/repo.rs",
@@ -45,13 +45,20 @@
       "context": "/0c/4b2d47cf88/4/context.md",
       "content_hash": "/0c/4b2d47cf88/4/content_hash.txt",
       "prompt": "/0c/4b2d47cf88/4/prompt.txt"
+    },
+    {
+      "metadata": "/0c/4b2d47cf88/5/metadata.json",
+      "transcript": "/0c/4b2d47cf88/5/full.jsonl",
+      "context": "/0c/4b2d47cf88/5/context.md",
+      "content_hash": "/0c/4b2d47cf88/5/content_hash.txt",
+      "prompt": "/0c/4b2d47cf88/5/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 124,
-    "cache_creation_tokens": 630220,
-    "cache_read_tokens": 9212704,
-    "output_tokens": 77112,
-    "api_call_count": 108
+    "input_tokens": 143,
+    "cache_creation_tokens": 715667,
+    "cache_read_tokens": 10463721,
+    "output_tokens": 97746,
+    "api_call_count": 125
   }
 }
