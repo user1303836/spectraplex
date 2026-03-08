@@ -9,8 +9,9 @@ use spectraplex_core::materializer::{
     TokenTransfer,
 };
 use spectraplex_core::v2::{
-    ChainFamily, Checkpoint, DatasetVersion, DatasetVersionStatus, IndexTarget, IngestionRun,
-    Network, RawTransaction, TargetKind, TargetMatch, TargetMode,
+    ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
+    DatasetVersionStatus, IndexTarget, IngestionRun, Network, RawTransaction, TargetKind,
+    TargetMatch, TargetMode,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -104,6 +105,27 @@ pub fn sql_to_dataset_version_status(s: &str) -> anyhow::Result<DatasetVersionSt
         "superseded" => Ok(DatasetVersionStatus::Superseded),
         "failed" => Ok(DatasetVersionStatus::Failed),
         _ => Err(anyhow::anyhow!("Unknown dataset_version_status: {s}")),
+    }
+}
+
+/// Convert a `CompletenessStatus` to the string stored in SQL.
+pub fn completeness_status_to_sql(s: &CompletenessStatus) -> &'static str {
+    match s {
+        CompletenessStatus::Partial => "partial",
+        CompletenessStatus::Complete => "complete",
+        CompletenessStatus::Backfilling => "backfilling",
+        CompletenessStatus::Gap => "gap",
+    }
+}
+
+/// Parse a SQL completeness status string back to `CompletenessStatus`.
+pub fn sql_to_completeness_status(s: &str) -> anyhow::Result<CompletenessStatus> {
+    match s {
+        "partial" => Ok(CompletenessStatus::Partial),
+        "complete" => Ok(CompletenessStatus::Complete),
+        "backfilling" => Ok(CompletenessStatus::Backfilling),
+        "gap" => Ok(CompletenessStatus::Gap),
+        _ => Err(anyhow::anyhow!("Unknown completeness_status: {s}")),
     }
 }
 
@@ -859,6 +881,93 @@ pub fn build_hl_position_change_insert(
 }
 
 // ---------------------------------------------------------------------------
+// Row-mapping helpers for dataset_completeness (P3-W6)
+// ---------------------------------------------------------------------------
+
+fn row_to_dataset_completeness(row: &sqlx::postgres::PgRow) -> anyhow::Result<DatasetCompleteness> {
+    let status_str: String = row.try_get("status")?;
+    Ok(DatasetCompleteness {
+        id: row.try_get("id")?,
+        target_id: row.try_get("target_id")?,
+        dataset_name: row.try_get("dataset_name")?,
+        dataset_version_id: row.try_get("dataset_version_id")?,
+        network: row.try_get("network")?,
+        status: sql_to_completeness_status(&status_str)?,
+        coverage_start: row.try_get("coverage_start")?,
+        coverage_end: row.try_get("coverage_end")?,
+        block_start: row.try_get("block_start")?,
+        block_end: row.try_get("block_end")?,
+        last_ingestion_run_id: row.try_get("last_ingestion_run_id")?,
+        records_count: row.try_get("records_count")?,
+        gap_ranges: row.try_get("gap_ranges")?,
+        notes: row.try_get("notes")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Query builders for dataset_completeness (P3-W6)
+// ---------------------------------------------------------------------------
+
+/// Build an UPSERT for a single `dataset_completeness` record.
+/// ON CONFLICT on (target_id, dataset_name, network) updates all mutable fields.
+pub fn build_dataset_completeness_upsert(
+    dc: &DatasetCompleteness,
+) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+    let query = String::from(
+        "INSERT INTO dataset_completeness \
+         (id, target_id, dataset_name, dataset_version_id, network, status, \
+          coverage_start, coverage_end, block_start, block_end, \
+          last_ingestion_run_id, records_count, gap_ranges, notes, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
+         ON CONFLICT (target_id, dataset_name, network) \
+         DO UPDATE SET \
+             dataset_version_id = EXCLUDED.dataset_version_id, \
+             status = EXCLUDED.status, \
+             coverage_start = EXCLUDED.coverage_start, \
+             coverage_end = EXCLUDED.coverage_end, \
+             block_start = EXCLUDED.block_start, \
+             block_end = EXCLUDED.block_end, \
+             last_ingestion_run_id = EXCLUDED.last_ingestion_run_id, \
+             records_count = EXCLUDED.records_count, \
+             gap_ranges = EXCLUDED.gap_ranges, \
+             notes = EXCLUDED.notes, \
+             updated_at = EXCLUDED.updated_at",
+    );
+    let mut args = sqlx::postgres::PgArguments::default();
+    use sqlx::Arguments;
+    args.add(dc.id).map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(dc.target_id).map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(&dc.dataset_name)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(dc.dataset_version_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(&dc.network).map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(completeness_status_to_sql(&dc.status))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(dc.coverage_start)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(dc.coverage_end)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(dc.block_start)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(dc.block_end).map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(dc.last_ingestion_run_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(dc.records_count)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(&dc.gap_ranges)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(&dc.notes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(dc.created_at)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(dc.updated_at)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok((query, args))
+}
+
+// ---------------------------------------------------------------------------
 // V2 Repository impl
 // ---------------------------------------------------------------------------
 
@@ -1603,6 +1712,158 @@ impl Repository {
         .fetch_all(self.pool())
         .await?;
         rows.iter().map(row_to_hl_position_change).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // DatasetCompleteness (P3-W6)
+    // -----------------------------------------------------------------------
+
+    /// Upsert a dataset completeness record.
+    /// On conflict (target_id, dataset_name, network), all mutable fields are
+    /// updated from the incoming record.
+    pub async fn upsert_dataset_completeness(
+        &self,
+        dc: &DatasetCompleteness,
+    ) -> anyhow::Result<()> {
+        let (query, args) = build_dataset_completeness_upsert(dc)?;
+        sqlx::query_with(&query, args).execute(self.pool()).await?;
+        Ok(())
+    }
+
+    /// Get a single completeness record by (target_id, dataset_name, network).
+    pub async fn get_dataset_completeness(
+        &self,
+        target_id: Uuid,
+        dataset_name: &str,
+        network: &str,
+    ) -> anyhow::Result<Option<DatasetCompleteness>> {
+        let row = sqlx::query(
+            "SELECT id, target_id, dataset_name, dataset_version_id, network, status, \
+             coverage_start, coverage_end, block_start, block_end, \
+             last_ingestion_run_id, records_count, gap_ranges, notes, created_at, updated_at \
+             FROM dataset_completeness \
+             WHERE target_id = $1 AND dataset_name = $2 AND network = $3",
+        )
+        .bind(target_id)
+        .bind(dataset_name)
+        .bind(network)
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref().map(row_to_dataset_completeness).transpose()
+    }
+
+    /// List all completeness records for a given target.
+    pub async fn list_completeness_by_target(
+        &self,
+        target_id: Uuid,
+    ) -> anyhow::Result<Vec<DatasetCompleteness>> {
+        let rows = sqlx::query(
+            "SELECT id, target_id, dataset_name, dataset_version_id, network, status, \
+             coverage_start, coverage_end, block_start, block_end, \
+             last_ingestion_run_id, records_count, gap_ranges, notes, created_at, updated_at \
+             FROM dataset_completeness \
+             WHERE target_id = $1 ORDER BY dataset_name, network",
+        )
+        .bind(target_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_dataset_completeness).collect()
+    }
+
+    /// List all target completeness records for a given dataset name.
+    pub async fn list_completeness_by_dataset(
+        &self,
+        dataset_name: &str,
+    ) -> anyhow::Result<Vec<DatasetCompleteness>> {
+        let rows = sqlx::query(
+            "SELECT id, target_id, dataset_name, dataset_version_id, network, status, \
+             coverage_start, coverage_end, block_start, block_end, \
+             last_ingestion_run_id, records_count, gap_ranges, notes, created_at, updated_at \
+             FROM dataset_completeness \
+             WHERE dataset_name = $1 ORDER BY target_id, network",
+        )
+        .bind(dataset_name)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_dataset_completeness).collect()
+    }
+
+    /// List all completeness records matching a given status.
+    pub async fn list_completeness_by_status(
+        &self,
+        status: CompletenessStatus,
+    ) -> anyhow::Result<Vec<DatasetCompleteness>> {
+        let rows = sqlx::query(
+            "SELECT id, target_id, dataset_name, dataset_version_id, network, status, \
+             coverage_start, coverage_end, block_start, block_end, \
+             last_ingestion_run_id, records_count, gap_ranges, notes, created_at, updated_at \
+             FROM dataset_completeness \
+             WHERE status = $1 ORDER BY dataset_name, target_id, network",
+        )
+        .bind(completeness_status_to_sql(&status))
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_dataset_completeness).collect()
+    }
+
+    /// Update completeness after an ingestion run completes.
+    /// Expands the coverage window, updates status, records_count, and
+    /// last_ingestion_run_id for the given (target_id, dataset_name, network).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_completeness_after_run(
+        &self,
+        target_id: Uuid,
+        dataset_name: &str,
+        network: &str,
+        status: CompletenessStatus,
+        coverage_start: Option<i64>,
+        coverage_end: Option<i64>,
+        block_start: Option<i64>,
+        block_end: Option<i64>,
+        records_count: i64,
+        ingestion_run_id: Uuid,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE dataset_completeness SET \
+                 status = $4, \
+                 coverage_start = CASE \
+                     WHEN $5::BIGINT IS NULL THEN coverage_start \
+                     WHEN coverage_start IS NULL THEN $5 \
+                     WHEN $5 < coverage_start THEN $5 \
+                     ELSE coverage_start END, \
+                 coverage_end = CASE \
+                     WHEN $6::BIGINT IS NULL THEN coverage_end \
+                     WHEN coverage_end IS NULL THEN $6 \
+                     WHEN $6 > coverage_end THEN $6 \
+                     ELSE coverage_end END, \
+                 block_start = CASE \
+                     WHEN $7::BIGINT IS NULL THEN block_start \
+                     WHEN block_start IS NULL THEN $7 \
+                     WHEN $7 < block_start THEN $7 \
+                     ELSE block_start END, \
+                 block_end = CASE \
+                     WHEN $8::BIGINT IS NULL THEN block_end \
+                     WHEN block_end IS NULL THEN $8 \
+                     WHEN $8 > block_end THEN $8 \
+                     ELSE block_end END, \
+                 records_count = $9, \
+                 last_ingestion_run_id = $10, \
+                 updated_at = NOW() \
+             WHERE target_id = $1 AND dataset_name = $2 AND network = $3",
+        )
+        .bind(target_id)
+        .bind(dataset_name)
+        .bind(network)
+        .bind(completeness_status_to_sql(&status))
+        .bind(coverage_start)
+        .bind(coverage_end)
+        .bind(block_start)
+        .bind(block_end)
+        .bind(records_count)
+        .bind(ingestion_run_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
     }
 }
 
@@ -2364,6 +2625,167 @@ mod tests {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
             _assert_send(repo.get_hl_position_changes_by_coin("ETH", 10, 0));
+        }
+        let _ = _check;
+    }
+
+    // -- completeness_status SQL helpers (P3-W6) --
+
+    #[test]
+    fn completeness_status_sql_roundtrip() {
+        for status in [
+            CompletenessStatus::Partial,
+            CompletenessStatus::Complete,
+            CompletenessStatus::Backfilling,
+            CompletenessStatus::Gap,
+        ] {
+            let s = completeness_status_to_sql(&status);
+            let back = sql_to_completeness_status(s).unwrap();
+            assert_eq!(status, back, "roundtrip failed for {status:?}");
+        }
+    }
+
+    #[test]
+    fn completeness_status_sql_unknown() {
+        assert!(sql_to_completeness_status("missing").is_err());
+    }
+
+    // -- dataset_completeness upsert (P3-W6) --
+
+    fn make_dataset_completeness() -> DatasetCompleteness {
+        let now = Utc::now();
+        DatasetCompleteness {
+            id: Uuid::new_v4(),
+            target_id: Uuid::new_v4(),
+            dataset_name: "token_transfers".to_string(),
+            dataset_version_id: None,
+            network: "solana-mainnet".to_string(),
+            status: CompletenessStatus::Partial,
+            coverage_start: Some(1700000000),
+            coverage_end: Some(1700100000),
+            block_start: Some(200_000_000),
+            block_end: Some(200_100_000),
+            last_ingestion_run_id: None,
+            records_count: 42,
+            gap_ranges: None,
+            notes: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn dataset_completeness_upsert_query_structure() {
+        let dc = make_dataset_completeness();
+        let (query, _) = build_dataset_completeness_upsert(&dc).unwrap();
+
+        assert!(query.starts_with("INSERT INTO dataset_completeness"));
+        assert!(query.contains("ON CONFLICT (target_id, dataset_name, network)"));
+        assert!(query.contains("DO UPDATE SET"));
+        assert!(query.contains("status = EXCLUDED.status"));
+        assert!(query.contains("coverage_start = EXCLUDED.coverage_start"));
+        assert!(query.contains("coverage_end = EXCLUDED.coverage_end"));
+        assert!(query.contains("records_count = EXCLUDED.records_count"));
+        assert!(query.contains("updated_at = EXCLUDED.updated_at"));
+    }
+
+    #[test]
+    fn dataset_completeness_upsert_has_16_params() {
+        let dc = make_dataset_completeness();
+        let (query, _) = build_dataset_completeness_upsert(&dc).unwrap();
+        assert!(query.contains("$16"));
+        assert!(!query.contains("$17"));
+    }
+
+    #[test]
+    fn dataset_completeness_upsert_idempotent_query() {
+        let dc = make_dataset_completeness();
+        let (query1, _) = build_dataset_completeness_upsert(&dc).unwrap();
+        let (query2, _) = build_dataset_completeness_upsert(&dc).unwrap();
+        assert_eq!(query1, query2, "upsert query should be deterministic");
+    }
+
+    // -- Repository method signatures (P3-W6) --
+
+    #[test]
+    fn repo_upsert_dataset_completeness_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            let dc = DatasetCompleteness {
+                id: Uuid::new_v4(),
+                target_id: Uuid::new_v4(),
+                dataset_name: "test".to_string(),
+                dataset_version_id: None,
+                network: "test-net".to_string(),
+                status: CompletenessStatus::Partial,
+                coverage_start: None,
+                coverage_end: None,
+                block_start: None,
+                block_end: None,
+                last_ingestion_run_id: None,
+                records_count: 0,
+                gap_ranges: None,
+                notes: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            _assert_send(repo.upsert_dataset_completeness(&dc));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_get_dataset_completeness_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.get_dataset_completeness(Uuid::new_v4(), "test", "net"));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_list_completeness_by_target_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.list_completeness_by_target(Uuid::new_v4()));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_list_completeness_by_dataset_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.list_completeness_by_dataset("token_transfers"));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_list_completeness_by_status_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.list_completeness_by_status(CompletenessStatus::Partial));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_update_completeness_after_run_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.update_completeness_after_run(
+                Uuid::new_v4(),
+                "token_transfers",
+                "solana-mainnet",
+                CompletenessStatus::Complete,
+                Some(1700000000),
+                Some(1700100000),
+                Some(200_000_000),
+                Some(200_100_000),
+                100,
+                Uuid::new_v4(),
+            ));
         }
         let _ = _check;
     }
