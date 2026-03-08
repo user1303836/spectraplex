@@ -3,7 +3,7 @@
   "checkpoint_id": "3c9049944435",
   "strategy": "manual-commit",
   "branch": "p2-w2-target-registration",
-  "checkpoints_count": 4,
+  "checkpoints_count": 5,
   "files_touched": [
     "Cargo.lock",
     "adapters/src/v2_repo.rs",
@@ -55,13 +55,20 @@
       "context": "/3c/9049944435/5/context.md",
       "content_hash": "/3c/9049944435/5/content_hash.txt",
       "prompt": "/3c/9049944435/5/prompt.txt"
+    },
+    {
+      "metadata": "/3c/9049944435/6/metadata.json",
+      "transcript": "/3c/9049944435/6/full.jsonl",
+      "context": "/3c/9049944435/6/context.md",
+      "content_hash": "/3c/9049944435/6/content_hash.txt",
+      "prompt": "/3c/9049944435/6/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 152,
-    "cache_creation_tokens": 690666,
-    "cache_read_tokens": 10361236,
-    "output_tokens": 84838,
-    "api_call_count": 134
+    "input_tokens": 171,
+    "cache_creation_tokens": 776113,
+    "cache_read_tokens": 11612253,
+    "output_tokens": 105472,
+    "api_call_count": 151
   }
 }
