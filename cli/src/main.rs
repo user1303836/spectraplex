@@ -9,7 +9,12 @@ use spectraplex_adapters::{
     solana_grpc::SolanaGrpcAdapter,
     solana_parser,
 };
+use spectraplex_core::connector::validate_target;
 use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
+use spectraplex_core::v2::{
+    normalize_evm_address, normalize_solana_address, ChainFamily, IndexTarget, TargetKind,
+    TargetMode,
+};
 use sqlx::postgres::PgPoolOptions;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -68,6 +73,47 @@ enum Commands {
         #[arg(short, long, default_value = "silver_ledger.jsonl")]
         output: PathBuf,
     },
+
+    /// Register a new index target
+    RegisterTarget {
+        /// Target kind: wallet, contract, program, account, topic_filter, market, pool, protocol
+        #[arg(long)]
+        kind: String,
+
+        /// Network identifier, e.g. solana-mainnet, ethereum-mainnet
+        #[arg(long)]
+        network: String,
+
+        /// Target address (required for most kinds)
+        #[arg(long)]
+        address: Option<String>,
+
+        /// Filter spec as a JSON string (required for topic_filter and protocol)
+        #[arg(long)]
+        filter_spec: Option<String>,
+
+        /// Ingestion mode: backfill, stream, both (default: both)
+        #[arg(long, default_value = "both")]
+        mode: String,
+
+        /// Human-readable label
+        #[arg(long)]
+        label: Option<String>,
+    },
+
+    /// List registered index targets
+    ListTargets {
+        /// Filter by network
+        #[arg(long)]
+        network: Option<String>,
+
+        /// Filter by kind
+        #[arg(long)]
+        kind: Option<String>,
+    },
+
+    /// List available networks
+    ListNetworks,
 }
 
 #[tokio::main]
@@ -248,6 +294,139 @@ async fn main() -> anyhow::Result<()> {
                     }
                     info!(path = ?output, wallet = %wallet, "Data written to file");
                 }
+            }
+        }
+        Commands::RegisterTarget {
+            kind,
+            network,
+            address,
+            filter_spec,
+            mode,
+            label,
+        } => {
+            let p =
+                pool.ok_or_else(|| anyhow::anyhow!("--db-url is required for register-target"))?;
+            let repo = Repository::new(p);
+
+            // Parse kind
+            let target_kind: TargetKind = kind
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid target kind: {kind}"))?;
+
+            // Parse mode
+            let target_mode: TargetMode = mode
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid mode: {mode}"))?;
+
+            // Look up network
+            let net = repo
+                .get_network(&network)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Unknown network: {network}"))?;
+
+            // Parse filter_spec JSON
+            let filter_spec_value: Option<serde_json::Value> = match filter_spec {
+                Some(ref json_str) => Some(
+                    serde_json::from_str(json_str)
+                        .map_err(|e| anyhow::anyhow!("Invalid filter-spec JSON: {e}"))?,
+                ),
+                None => None,
+            };
+
+            // Normalize address
+            let normalized_address = address.map(|addr| match net.chain_family {
+                ChainFamily::Evm | ChainFamily::Hyperliquid => normalize_evm_address(&addr),
+                ChainFamily::Solana => normalize_solana_address(&addr),
+            });
+
+            let now = chrono::Utc::now();
+            let target = IndexTarget {
+                id: Uuid::new_v4(),
+                kind: target_kind,
+                network,
+                chain_family: net.chain_family,
+                address: normalized_address,
+                filter_spec: filter_spec_value,
+                mode: target_mode,
+                label,
+                owner_id: None,
+                created_at: now,
+                updated_at: now,
+            };
+
+            // Validate
+            if let Err(errors) = validate_target(&target) {
+                error!("Validation failed: {}", errors.join("; "));
+                return Err(anyhow::anyhow!("Target validation failed"));
+            }
+
+            let created = repo.create_index_target(&target).await?;
+            info!(
+                id = %created.id,
+                kind = %created.kind,
+                network = %created.network,
+                address = ?created.address,
+                mode = %created.mode,
+                "Target registered"
+            );
+        }
+        Commands::ListTargets { network, kind } => {
+            let p = pool.ok_or_else(|| anyhow::anyhow!("--db-url is required for list-targets"))?;
+            let repo = Repository::new(p);
+
+            let targets = if let Some(ref net) = network {
+                repo.list_index_targets_by_network(net).await?
+            } else if let Some(ref kind_str) = kind {
+                let tk: TargetKind = kind_str
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid target kind: {kind_str}"))?;
+                repo.list_index_targets_by_kind(tk).await?
+            } else {
+                repo.list_index_targets(100, 0).await?
+            };
+
+            if targets.is_empty() {
+                info!("No targets found");
+            } else {
+                println!(
+                    "{:<38} {:<14} {:<20} {:<44} {:<10}",
+                    "ID", "KIND", "NETWORK", "ADDRESS", "MODE"
+                );
+                println!("{}", "-".repeat(126));
+                for t in &targets {
+                    println!(
+                        "{:<38} {:<14} {:<20} {:<44} {:<10}",
+                        t.id,
+                        t.kind,
+                        t.network,
+                        t.address.as_deref().unwrap_or("-"),
+                        t.mode,
+                    );
+                }
+                info!(count = targets.len(), "Targets listed");
+            }
+        }
+        Commands::ListNetworks => {
+            let p =
+                pool.ok_or_else(|| anyhow::anyhow!("--db-url is required for list-networks"))?;
+            let repo = Repository::new(p);
+
+            let networks = repo.list_networks().await?;
+            if networks.is_empty() {
+                info!("No networks found");
+            } else {
+                println!(
+                    "{:<24} {:<14} {:<30} {:<10}",
+                    "ID", "FAMILY", "DISPLAY NAME", "TESTNET"
+                );
+                println!("{}", "-".repeat(78));
+                for n in &networks {
+                    println!(
+                        "{:<24} {:<14} {:<30} {:<10}",
+                        n.id, n.chain_family, n.display_name, n.is_testnet,
+                    );
+                }
+                info!(count = networks.len(), "Networks listed");
             }
         }
         Commands::Normalize { input, output } => {
@@ -606,5 +785,174 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.db_url.unwrap(), "postgres://explicit/db");
+    }
+
+    // -----------------------------------------------------------------------
+    // Target registration CLI tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_register_target_required_args() {
+        let cli = Cli::try_parse_from([
+            "spectraplex",
+            "register-target",
+            "--kind",
+            "wallet",
+            "--network",
+            "solana-mainnet",
+            "--address",
+            "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::RegisterTarget {
+                kind,
+                network,
+                address,
+                mode,
+                label,
+                filter_spec,
+            } => {
+                assert_eq!(kind, "wallet");
+                assert_eq!(network, "solana-mainnet");
+                assert_eq!(
+                    address.as_deref(),
+                    Some("DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy")
+                );
+                assert_eq!(mode, "both"); // default
+                assert!(label.is_none());
+                assert!(filter_spec.is_none());
+            }
+            _ => panic!("expected RegisterTarget command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_register_target_all_options() {
+        let cli = Cli::try_parse_from([
+            "spectraplex",
+            "register-target",
+            "--kind",
+            "contract",
+            "--network",
+            "ethereum-mainnet",
+            "--address",
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "--mode",
+            "backfill",
+            "--label",
+            "USDC Contract",
+            "--filter-spec",
+            r#"{"event_signatures":["Transfer(address,address,uint256)"]}"#,
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::RegisterTarget {
+                kind,
+                network,
+                address,
+                mode,
+                label,
+                filter_spec,
+            } => {
+                assert_eq!(kind, "contract");
+                assert_eq!(network, "ethereum-mainnet");
+                assert_eq!(
+                    address.as_deref(),
+                    Some("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
+                );
+                assert_eq!(mode, "backfill");
+                assert_eq!(label.as_deref(), Some("USDC Contract"));
+                assert!(filter_spec.is_some());
+            }
+            _ => panic!("expected RegisterTarget command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_register_target_missing_kind() {
+        let result = Cli::try_parse_from([
+            "spectraplex",
+            "register-target",
+            "--network",
+            "solana-mainnet",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_register_target_missing_network() {
+        let result = Cli::try_parse_from(["spectraplex", "register-target", "--kind", "wallet"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_list_targets() {
+        let cli = Cli::try_parse_from(["spectraplex", "list-targets"]).unwrap();
+        match cli.command {
+            Commands::ListTargets { network, kind } => {
+                assert!(network.is_none());
+                assert!(kind.is_none());
+            }
+            _ => panic!("expected ListTargets command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_list_targets_with_network() {
+        let cli =
+            Cli::try_parse_from(["spectraplex", "list-targets", "--network", "solana-mainnet"])
+                .unwrap();
+        match cli.command {
+            Commands::ListTargets { network, kind } => {
+                assert_eq!(network.as_deref(), Some("solana-mainnet"));
+                assert!(kind.is_none());
+            }
+            _ => panic!("expected ListTargets command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_list_targets_with_kind() {
+        let cli = Cli::try_parse_from(["spectraplex", "list-targets", "--kind", "wallet"]).unwrap();
+        match cli.command {
+            Commands::ListTargets { network, kind } => {
+                assert!(network.is_none());
+                assert_eq!(kind.as_deref(), Some("wallet"));
+            }
+            _ => panic!("expected ListTargets command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_list_networks() {
+        let cli = Cli::try_parse_from(["spectraplex", "list-networks"]).unwrap();
+        assert!(matches!(cli.command, Commands::ListNetworks));
+    }
+
+    #[test]
+    fn test_parse_ingest_still_works() {
+        // Backward compatibility: existing ingest command unchanged
+        let cli = Cli::try_parse_from([
+            "spectraplex",
+            "ingest",
+            "--chain",
+            "solana",
+            "--wallet",
+            "abc123",
+            "--rpc",
+            "https://api.mainnet.solana.com",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Ingest {
+                chain, wallet, rpc, ..
+            } => {
+                assert_eq!(chain, "solana");
+                assert_eq!(wallet, vec!["abc123"]);
+                assert!(rpc.is_some());
+            }
+            _ => panic!("expected Ingest command"),
+        }
     }
 }

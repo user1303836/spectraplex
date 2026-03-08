@@ -19,7 +19,12 @@ use spectraplex_adapters::{
     solana_parser,
 };
 use spectraplex_core::config::AppConfig;
+use spectraplex_core::connector::validate_target;
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
+use spectraplex_core::v2::{
+    normalize_evm_address, normalize_solana_address, ChainFamily, IndexTarget, Network, TargetKind,
+    TargetMode,
+};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -192,6 +197,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/stream/start", post(start_stream))
         .route("/v1/stream/{stream_id}/stop", post(stop_stream))
         .route("/v1/streams", get(list_streams))
+        .route("/v1/targets", post(register_target))
+        .route("/v1/targets", get(list_targets))
+        .route("/v1/targets/{target_id}", get(get_target))
+        .route("/v1/networks", get(list_networks))
+        .route("/v1/networks/{network_id}", get(get_network))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared_state),
             require_auth,
@@ -1114,6 +1124,169 @@ async fn list_streams(
     Ok(Json(infos))
 }
 
+// ---------------------------------------------------------------------------
+// Target registration types and handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RegisterTargetRequest {
+    kind: String,
+    network: String,
+    address: Option<String>,
+    filter_spec: Option<serde_json::Value>,
+    mode: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TargetListParams {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    kind: Option<String>,
+    network: Option<String>,
+}
+
+fn conflict(msg: impl Into<String>) -> AppError {
+    AppError {
+        status: StatusCode::CONFLICT,
+        message: msg.into(),
+    }
+}
+
+async fn register_target(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegisterTargetRequest>,
+) -> Result<(StatusCode, Json<IndexTarget>), AppError> {
+    // Parse kind
+    let kind: TargetKind = req
+        .kind
+        .parse()
+        .map_err(|_| AppError::bad_request(format!("Invalid target kind: {}", req.kind)))?;
+
+    // Parse mode (default to "both")
+    let mode_str = req.mode.as_deref().unwrap_or("both");
+    let mode: TargetMode = mode_str
+        .parse()
+        .map_err(|_| AppError::bad_request(format!("Invalid mode: {mode_str}")))?;
+
+    // Look up network
+    let network = state
+        .repo
+        .get_network(&req.network)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::bad_request(format!("Unknown network: {}", req.network)))?;
+
+    // Normalize address
+    let address = req.address.map(|addr| match network.chain_family {
+        ChainFamily::Evm | ChainFamily::Hyperliquid => normalize_evm_address(&addr),
+        ChainFamily::Solana => normalize_solana_address(&addr),
+    });
+
+    let now = chrono::Utc::now();
+    let target = IndexTarget {
+        id: Uuid::new_v4(),
+        kind,
+        network: req.network,
+        chain_family: network.chain_family,
+        address,
+        filter_spec: req.filter_spec,
+        mode,
+        label: req.label,
+        owner_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    // Validate
+    if let Err(errors) = validate_target(&target) {
+        return Err(AppError::bad_request(errors.join("; ")));
+    }
+
+    // Persist
+    match state.repo.create_index_target(&target).await {
+        Ok(created) => Ok((StatusCode::CREATED, Json(created))),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("duplicate key") || msg.contains("unique constraint") {
+                Err(conflict(
+                    "A target with the same kind, network, and address already exists",
+                ))
+            } else {
+                Err(AppError::internal(e))
+            }
+        }
+    }
+}
+
+async fn list_targets(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<TargetListParams>,
+) -> Result<Json<Vec<IndexTarget>>, AppError> {
+    let limit = clamp_limit(params.limit);
+    let offset = clamp_offset(params.offset);
+
+    let targets = if let Some(ref network) = params.network {
+        state
+            .repo
+            .list_index_targets_by_network(network)
+            .await
+            .map_err(AppError::internal)?
+    } else if let Some(ref kind_str) = params.kind {
+        let kind: TargetKind = kind_str
+            .parse()
+            .map_err(|_| AppError::bad_request(format!("Invalid target kind: {kind_str}")))?;
+        state
+            .repo
+            .list_index_targets_by_kind(kind)
+            .await
+            .map_err(AppError::internal)?
+    } else {
+        state
+            .repo
+            .list_index_targets(limit, offset)
+            .await
+            .map_err(AppError::internal)?
+    };
+
+    Ok(Json(targets))
+}
+
+async fn get_target(
+    State(state): State<Arc<AppState>>,
+    Path(target_id): Path<Uuid>,
+) -> Result<Json<IndexTarget>, AppError> {
+    let target = state
+        .repo
+        .get_index_target(target_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found(format!("Target {} not found", target_id)))?;
+    Ok(Json(target))
+}
+
+async fn list_networks(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Network>>, AppError> {
+    let networks = state
+        .repo
+        .list_networks()
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(networks))
+}
+
+async fn get_network(
+    State(state): State<Arc<AppState>>,
+    Path(network_id): Path<String>,
+) -> Result<Json<Network>, AppError> {
+    let network = state
+        .repo
+        .get_network(&network_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found(format!("Network {} not found", network_id)))?;
+    Ok(Json(network))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1179,6 +1352,11 @@ mod tests {
             .route("/v1/stream/start", post(start_stream))
             .route("/v1/stream/{stream_id}/stop", post(stop_stream))
             .route("/v1/streams", get(list_streams))
+            .route("/v1/targets", post(register_target))
+            .route("/v1/targets", get(list_targets))
+            .route("/v1/targets/{target_id}", get(get_target))
+            .route("/v1/networks", get(list_networks))
+            .route("/v1/networks/{network_id}", get(get_network))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_auth,
@@ -2807,5 +2985,329 @@ mod tests {
         assert_eq!(json["uptime_secs"], 120);
         assert_eq!(json["transactions_ingested"], 5000);
         assert_eq!(json["last_slot"], 300000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Target registration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_register_target_request_deserialization() {
+        let json = serde_json::json!({
+            "kind": "wallet",
+            "network": "solana-mainnet",
+            "address": "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy",
+            "mode": "both",
+            "label": "My Wallet"
+        });
+        let req: RegisterTargetRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.kind, "wallet");
+        assert_eq!(req.network, "solana-mainnet");
+        assert_eq!(
+            req.address.as_deref(),
+            Some("DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy")
+        );
+        assert_eq!(req.mode.as_deref(), Some("both"));
+        assert_eq!(req.label.as_deref(), Some("My Wallet"));
+        assert!(req.filter_spec.is_none());
+    }
+
+    #[test]
+    fn test_register_target_request_minimal() {
+        let json = serde_json::json!({
+            "kind": "contract",
+            "network": "ethereum-mainnet"
+        });
+        let req: RegisterTargetRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.kind, "contract");
+        assert_eq!(req.network, "ethereum-mainnet");
+        assert!(req.address.is_none());
+        assert!(req.mode.is_none());
+        assert!(req.label.is_none());
+        assert!(req.filter_spec.is_none());
+    }
+
+    #[test]
+    fn test_register_target_request_with_filter_spec() {
+        let json = serde_json::json!({
+            "kind": "topic_filter",
+            "network": "ethereum-mainnet",
+            "filter_spec": {
+                "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]
+            }
+        });
+        let req: RegisterTargetRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.kind, "topic_filter");
+        assert!(req.filter_spec.is_some());
+    }
+
+    #[test]
+    fn test_target_validation_rejects_missing_address_for_wallet() {
+        let now = chrono::Utc::now();
+        let target = IndexTarget {
+            id: Uuid::new_v4(),
+            kind: TargetKind::Wallet,
+            network: "solana-mainnet".to_string(),
+            chain_family: ChainFamily::Solana,
+            address: None,
+            filter_spec: None,
+            mode: TargetMode::Both,
+            label: None,
+            owner_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let result = validate_target(&target);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("requires a non-empty address")));
+    }
+
+    #[test]
+    fn test_target_validation_rejects_invalid_kind_for_family() {
+        let now = chrono::Utc::now();
+        let target = IndexTarget {
+            id: Uuid::new_v4(),
+            kind: TargetKind::Contract,
+            network: "solana-mainnet".to_string(),
+            chain_family: ChainFamily::Solana,
+            address: Some("abc".to_string()),
+            filter_spec: None,
+            mode: TargetMode::Backfill,
+            label: None,
+            owner_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let result = validate_target(&target);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("not valid for chain family")));
+    }
+
+    #[test]
+    fn test_target_validation_rejects_missing_filter_spec_for_topic_filter() {
+        let now = chrono::Utc::now();
+        let target = IndexTarget {
+            id: Uuid::new_v4(),
+            kind: TargetKind::TopicFilter,
+            network: "ethereum-mainnet".to_string(),
+            chain_family: ChainFamily::Evm,
+            address: None,
+            filter_spec: None,
+            mode: TargetMode::Backfill,
+            label: None,
+            owner_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let result = validate_target(&target);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("requires filter_spec")));
+    }
+
+    #[test]
+    fn test_target_validation_accepts_valid_wallet() {
+        let now = chrono::Utc::now();
+        let target = IndexTarget {
+            id: Uuid::new_v4(),
+            kind: TargetKind::Wallet,
+            network: "solana-mainnet".to_string(),
+            chain_family: ChainFamily::Solana,
+            address: Some("DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy".to_string()),
+            filter_spec: None,
+            mode: TargetMode::Both,
+            label: None,
+            owner_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(validate_target(&target).is_ok());
+    }
+
+    #[test]
+    fn test_target_kind_parsing() {
+        assert!("wallet".parse::<TargetKind>().is_ok());
+        assert!("contract".parse::<TargetKind>().is_ok());
+        assert!("program".parse::<TargetKind>().is_ok());
+        assert!("account".parse::<TargetKind>().is_ok());
+        assert!("topic_filter".parse::<TargetKind>().is_ok());
+        assert!("market".parse::<TargetKind>().is_ok());
+        assert!("pool".parse::<TargetKind>().is_ok());
+        assert!("protocol".parse::<TargetKind>().is_ok());
+        assert!("invalid_kind".parse::<TargetKind>().is_err());
+    }
+
+    #[test]
+    fn test_target_mode_parsing() {
+        assert!("backfill".parse::<TargetMode>().is_ok());
+        assert!("stream".parse::<TargetMode>().is_ok());
+        assert!("both".parse::<TargetMode>().is_ok());
+        assert!("invalid_mode".parse::<TargetMode>().is_err());
+    }
+
+    #[test]
+    fn test_target_list_params_deserialization() {
+        let json = serde_json::json!({
+            "limit": 10,
+            "offset": 5,
+            "kind": "wallet",
+            "network": "solana-mainnet"
+        });
+        let params: TargetListParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.limit, Some(10));
+        assert_eq!(params.offset, Some(5));
+        assert_eq!(params.kind.as_deref(), Some("wallet"));
+        assert_eq!(params.network.as_deref(), Some("solana-mainnet"));
+    }
+
+    #[test]
+    fn test_target_list_params_empty() {
+        let json = serde_json::json!({});
+        let params: TargetListParams = serde_json::from_value(json).unwrap();
+        assert!(params.limit.is_none());
+        assert!(params.offset.is_none());
+        assert!(params.kind.is_none());
+        assert!(params.network.is_none());
+    }
+
+    #[test]
+    fn test_conflict_error() {
+        let err = conflict("duplicate target");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.message, "duplicate target");
+    }
+
+    #[tokio::test]
+    async fn test_register_target_bad_kind() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/targets")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "kind": "invalid_kind",
+                    "network": "solana-mainnet"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid target kind"));
+    }
+
+    #[tokio::test]
+    async fn test_register_target_bad_mode() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/targets")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "kind": "wallet",
+                    "network": "solana-mainnet",
+                    "address": "abc123",
+                    "mode": "invalid_mode"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("Invalid mode"));
+    }
+
+    #[tokio::test]
+    async fn test_register_target_requires_auth() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/targets")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "kind": "wallet",
+                    "network": "solana-mainnet",
+                    "address": "abc123"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_list_targets_requires_auth() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/targets")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_get_target_requires_auth() {
+        let app = test_router();
+        let target_id = Uuid::new_v4();
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/targets/{}", target_id))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_list_networks_requires_auth() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/networks")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_get_network_requires_auth() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/networks/solana-mainnet")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_list_targets_bad_kind_filter() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/targets?kind=invalid_kind")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
