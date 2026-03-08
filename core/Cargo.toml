@@ -12,3 +12,4 @@ uuid = { version = "1.19.0", features = ["v4", "serde"] }
 chrono = { version = "0.4.42", features = ["serde"] }
 bigdecimal = { version = "0.4.9", features = ["serde"] }
 figment = { version = "0.10", features = ["toml", "env"] }
+strum = { version = "0.26", features = ["derive"] }
