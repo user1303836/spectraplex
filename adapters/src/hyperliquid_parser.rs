@@ -174,7 +174,8 @@ fn parse_ledger_update(
 
 use chrono::Utc;
 use spectraplex_core::materializer::{
-    DatasetDescriptor, DatasetName, Materializer, NativeBalanceDelta, TokenTransfer,
+    DatasetDescriptor, DatasetName, HlFillRecord, HlFundingPayment, HlPositionChange, Materializer,
+    NativeBalanceDelta, TokenTransfer,
 };
 use spectraplex_core::v2::ChainFamily;
 use uuid::Uuid;
@@ -424,6 +425,305 @@ impl Materializer for HyperliquidNativeBalanceDeltaMaterializer {
             name: self.dataset_name(),
             description:
                 "Hyperliquid native balance deltas: USDC balance changes from fills and funding"
+                    .to_string(),
+            source_bronze_tables: vec!["raw_transactions".to_string()],
+            chain_families: vec![self.chain_family()],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HlFillRecord extraction (P3-W4)
+// ---------------------------------------------------------------------------
+
+/// Extract a normalized Hyperliquid fill record from raw transaction metadata.
+///
+/// Produces a fill record from "fill"-type Bronze raw_transactions.
+pub fn extract_hl_fill_records(
+    raw_tx_id: Option<Uuid>,
+    network: &str,
+    raw_metadata: &serde_json::Value,
+) -> Vec<HlFillRecord> {
+    let entry_type = raw_metadata["type"].as_str().unwrap_or("unknown");
+
+    if entry_type != "fill" {
+        return vec![];
+    }
+
+    let data = &raw_metadata["data"];
+    let fill: HlFill = match serde_json::from_value(data.clone()) {
+        Ok(f) => f,
+        Err(_) => return vec![],
+    };
+
+    let price = BigDecimal::from_str(&fill.px).unwrap_or_default();
+    let size = BigDecimal::from_str(&fill.sz).unwrap_or_default();
+
+    let closed_pnl = fill
+        .closed_pnl
+        .as_deref()
+        .and_then(|s| BigDecimal::from_str(s).ok());
+    let fee = fill
+        .fee
+        .as_deref()
+        .and_then(|s| BigDecimal::from_str(s).ok());
+
+    vec![HlFillRecord {
+        id: Uuid::new_v4(),
+        raw_transaction_id: raw_tx_id,
+        network: network.to_string(),
+        coin: fill.coin,
+        side: fill.side,
+        price,
+        size,
+        direction: fill.dir,
+        closed_pnl,
+        fee,
+        fee_token: fill.fee_token,
+        fill_time: fill.time as i64,
+        order_id: fill.oid.map(|v| v as i64),
+        trade_id: fill.tid.map(|v| v as i64),
+        dataset_version_id: None,
+        created_at: Utc::now(),
+    }]
+}
+
+// ---------------------------------------------------------------------------
+// HlFundingPayment extraction (P3-W4)
+// ---------------------------------------------------------------------------
+
+/// Extract a normalized Hyperliquid funding payment from raw transaction metadata.
+///
+/// Produces a funding payment record from "funding"-type Bronze raw_transactions.
+pub fn extract_hl_funding_payments(
+    raw_tx_id: Option<Uuid>,
+    network: &str,
+    raw_metadata: &serde_json::Value,
+) -> Vec<HlFundingPayment> {
+    let entry_type = raw_metadata["type"].as_str().unwrap_or("unknown");
+
+    if entry_type != "funding" {
+        return vec![];
+    }
+
+    let data = &raw_metadata["data"];
+    let funding: HlFundingEntry = match serde_json::from_value(data.clone()) {
+        Ok(f) => f,
+        Err(_) => return vec![],
+    };
+
+    let amount = BigDecimal::from_str(&funding.usdc).unwrap_or_default();
+    let funding_rate = funding
+        .funding_rate
+        .as_deref()
+        .and_then(|s| BigDecimal::from_str(s).ok());
+
+    vec![HlFundingPayment {
+        id: Uuid::new_v4(),
+        raw_transaction_id: raw_tx_id,
+        network: network.to_string(),
+        coin: funding.coin,
+        amount,
+        funding_rate,
+        payment_time: funding.time as i64,
+        dataset_version_id: None,
+        created_at: Utc::now(),
+    }]
+}
+
+// ---------------------------------------------------------------------------
+// HlPositionChange extraction (P3-W4)
+// ---------------------------------------------------------------------------
+
+/// Extract a normalized Hyperliquid position change from raw transaction metadata.
+///
+/// Position changes are derived from fills (and liquidations). Each fill that
+/// opens, increases, or closes a position produces a position change record.
+pub fn extract_hl_position_changes(
+    raw_tx_id: Option<Uuid>,
+    network: &str,
+    raw_metadata: &serde_json::Value,
+) -> Vec<HlPositionChange> {
+    let entry_type = raw_metadata["type"].as_str().unwrap_or("unknown");
+
+    match entry_type {
+        "fill" => extract_position_change_from_fill(raw_tx_id, network, raw_metadata),
+        "ledger_update" => {
+            extract_position_change_from_liquidation(raw_tx_id, network, raw_metadata)
+        }
+        _ => vec![],
+    }
+}
+
+fn extract_position_change_from_fill(
+    raw_tx_id: Option<Uuid>,
+    network: &str,
+    raw_metadata: &serde_json::Value,
+) -> Vec<HlPositionChange> {
+    let data = &raw_metadata["data"];
+    let fill: HlFill = match serde_json::from_value(data.clone()) {
+        Ok(f) => f,
+        Err(_) => return vec![],
+    };
+
+    let size = BigDecimal::from_str(&fill.sz).unwrap_or_default();
+    let price = BigDecimal::from_str(&fill.px).unwrap_or_default();
+
+    // Determine signed size_delta: buy = positive, sell = negative
+    let size_delta = if fill.side == "B" { size } else { -size };
+
+    vec![HlPositionChange {
+        id: Uuid::new_v4(),
+        raw_transaction_id: raw_tx_id,
+        network: network.to_string(),
+        coin: fill.coin,
+        side: fill.side,
+        size_delta,
+        price,
+        direction: fill.dir,
+        source_event: "fill".to_string(),
+        dataset_version_id: None,
+        created_at: Utc::now(),
+    }]
+}
+
+fn extract_position_change_from_liquidation(
+    raw_tx_id: Option<Uuid>,
+    network: &str,
+    raw_metadata: &serde_json::Value,
+) -> Vec<HlPositionChange> {
+    let data = &raw_metadata["data"];
+    let delta = &data["delta"];
+    let delta_type = delta["type"].as_str().unwrap_or("unknown");
+
+    if delta_type != "liquidation" {
+        return vec![];
+    }
+
+    // Liquidation events may contain leveraged position info
+    let coin = delta["coin"].as_str().unwrap_or("UNKNOWN");
+    let size_str = delta["sz"].as_str().unwrap_or("0");
+    let price_str = delta["px"].as_str().unwrap_or("0");
+    let side = delta["side"].as_str().unwrap_or("A");
+
+    let size = BigDecimal::from_str(size_str).unwrap_or_default();
+    let price = BigDecimal::from_str(price_str).unwrap_or_default();
+
+    if size == BigDecimal::from(0) {
+        return vec![];
+    }
+
+    // Liquidation closes a position, so size_delta is opposite to position side
+    let size_delta = if side == "B" { size } else { -size };
+
+    vec![HlPositionChange {
+        id: Uuid::new_v4(),
+        raw_transaction_id: raw_tx_id,
+        network: network.to_string(),
+        coin: coin.to_string(),
+        side: side.to_string(),
+        size_delta,
+        price,
+        direction: Some("Liquidation".to_string()),
+        source_event: "liquidation".to_string(),
+        dataset_version_id: None,
+        created_at: Utc::now(),
+    }]
+}
+
+// ---------------------------------------------------------------------------
+// Materializer implementations (P3-W4)
+// ---------------------------------------------------------------------------
+
+/// Materializer for Hyperliquid fill records.
+pub struct HlFillMaterializer;
+
+impl Materializer for HlFillMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::HlFills
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:hl_fill_records_v1_a1b2c3d4"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Hyperliquid
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description:
+                "Hyperliquid fill records: normalized trade executions with price, size, fees, and PnL"
+                    .to_string(),
+            source_bronze_tables: vec!["raw_transactions".to_string()],
+            chain_families: vec![self.chain_family()],
+        }
+    }
+}
+
+/// Materializer for Hyperliquid funding payments.
+pub struct HlFundingPaymentMaterializer;
+
+impl Materializer for HlFundingPaymentMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::HlFunding
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:hl_funding_payments_v1_e5f6g7h8"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Hyperliquid
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description:
+                "Hyperliquid funding payments: periodic funding rate payments received or paid"
+                    .to_string(),
+            source_bronze_tables: vec!["raw_transactions".to_string()],
+            chain_families: vec![self.chain_family()],
+        }
+    }
+}
+
+/// Materializer for Hyperliquid position changes.
+pub struct HlPositionChangeMaterializer;
+
+impl Materializer for HlPositionChangeMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::Positions
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:hl_position_changes_v1_i9j0k1l2"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Hyperliquid
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description:
+                "Hyperliquid position changes: state changes derived from fills and liquidations"
                     .to_string(),
             source_bronze_tables: vec!["raw_transactions".to_string()],
             chain_families: vec![self.chain_family()],
@@ -777,6 +1077,361 @@ mod tests {
         assert!(
             deltas.is_empty(),
             "ledger_update does not produce native balance deltas"
+        );
+    }
+
+    // -- HlFillRecord extraction tests (P3-W4) --
+
+    #[test]
+    fn test_extract_hl_fill_record_buy() {
+        let metadata = serde_json::json!({
+            "type": "fill",
+            "data": {
+                "coin": "ETH",
+                "px": "3500.0",
+                "sz": "2.0",
+                "side": "B",
+                "time": 1700000000000u64,
+                "hash": "0xfill1",
+                "fee": "3.50",
+                "feeToken": "USDC",
+                "closedPnl": "0.0",
+                "dir": "Open Long",
+                "oid": 12345,
+                "tid": 67890
+            }
+        });
+
+        let fills = extract_hl_fill_records(Some(Uuid::new_v4()), "hypercore-mainnet", &metadata);
+
+        assert_eq!(fills.len(), 1);
+        let f = &fills[0];
+        assert_eq!(f.coin, "ETH");
+        assert_eq!(f.side, "B");
+        assert_eq!(f.price, BigDecimal::from_str("3500.0").unwrap());
+        assert_eq!(f.size, BigDecimal::from_str("2.0").unwrap());
+        assert_eq!(f.direction, Some("Open Long".to_string()));
+        assert_eq!(f.fee, Some(BigDecimal::from_str("3.50").unwrap()));
+        assert_eq!(f.fee_token, Some("USDC".to_string()));
+        assert_eq!(f.fill_time, 1700000000000);
+        assert_eq!(f.order_id, Some(12345));
+        assert_eq!(f.trade_id, Some(67890));
+        assert_eq!(f.network, "hypercore-mainnet");
+    }
+
+    #[test]
+    fn test_extract_hl_fill_record_sell_with_pnl() {
+        let metadata = serde_json::json!({
+            "type": "fill",
+            "data": {
+                "coin": "BTC",
+                "px": "42000.0",
+                "sz": "0.5",
+                "side": "A",
+                "time": 1700000000000u64,
+                "hash": "0xfill2",
+                "fee": "10.50",
+                "feeToken": "USDC",
+                "closedPnl": "500.0",
+                "dir": "Close Long"
+            }
+        });
+
+        let fills = extract_hl_fill_records(None, "hypercore-mainnet", &metadata);
+
+        assert_eq!(fills.len(), 1);
+        let f = &fills[0];
+        assert_eq!(f.coin, "BTC");
+        assert_eq!(f.side, "A");
+        assert_eq!(f.closed_pnl, Some(BigDecimal::from_str("500.0").unwrap()));
+        assert_eq!(f.direction, Some("Close Long".to_string()));
+    }
+
+    #[test]
+    fn test_extract_hl_fill_record_funding_returns_none() {
+        let metadata = serde_json::json!({
+            "type": "funding",
+            "data": {
+                "time": 1700000000000u64,
+                "coin": "ETH",
+                "usdc": "-2.50",
+                "fundingRate": "0.0001"
+            }
+        });
+
+        let fills = extract_hl_fill_records(None, "hypercore-mainnet", &metadata);
+        assert!(
+            fills.is_empty(),
+            "funding events should not produce fill records"
+        );
+    }
+
+    // -- HlFundingPayment extraction tests (P3-W4) --
+
+    #[test]
+    fn test_extract_hl_funding_payment() {
+        let metadata = serde_json::json!({
+            "type": "funding",
+            "data": {
+                "time": 1700000000000u64,
+                "coin": "ETH",
+                "usdc": "-2.50",
+                "fundingRate": "0.0001"
+            }
+        });
+
+        let payments =
+            extract_hl_funding_payments(Some(Uuid::new_v4()), "hypercore-mainnet", &metadata);
+
+        assert_eq!(payments.len(), 1);
+        let p = &payments[0];
+        assert_eq!(p.coin, "ETH");
+        assert_eq!(p.amount, BigDecimal::from_str("-2.50").unwrap());
+        assert_eq!(
+            p.funding_rate,
+            Some(BigDecimal::from_str("0.0001").unwrap())
+        );
+        assert_eq!(p.payment_time, 1700000000000);
+        assert_eq!(p.network, "hypercore-mainnet");
+    }
+
+    #[test]
+    fn test_extract_hl_funding_payment_positive() {
+        let metadata = serde_json::json!({
+            "type": "funding",
+            "data": {
+                "time": 1700000001000u64,
+                "coin": "BTC",
+                "usdc": "5.00",
+                "fundingRate": "-0.0002"
+            }
+        });
+
+        let payments = extract_hl_funding_payments(None, "hypercore-mainnet", &metadata);
+
+        assert_eq!(payments.len(), 1);
+        let p = &payments[0];
+        assert_eq!(p.coin, "BTC");
+        assert_eq!(p.amount, BigDecimal::from_str("5.00").unwrap());
+    }
+
+    #[test]
+    fn test_extract_hl_funding_payment_fill_returns_none() {
+        let metadata = serde_json::json!({
+            "type": "fill",
+            "data": {
+                "coin": "ETH",
+                "px": "3500.0",
+                "sz": "2.0",
+                "side": "B",
+                "time": 1700000000000u64,
+                "hash": "0xfill1"
+            }
+        });
+
+        let payments = extract_hl_funding_payments(None, "hypercore-mainnet", &metadata);
+        assert!(
+            payments.is_empty(),
+            "fills should not produce funding payments"
+        );
+    }
+
+    // -- HlPositionChange extraction tests (P3-W4) --
+
+    #[test]
+    fn test_extract_hl_position_change_from_fill_buy() {
+        let metadata = serde_json::json!({
+            "type": "fill",
+            "data": {
+                "coin": "ETH",
+                "px": "3500.0",
+                "sz": "2.0",
+                "side": "B",
+                "time": 1700000000000u64,
+                "hash": "0xfill1",
+                "dir": "Open Long"
+            }
+        });
+
+        let changes =
+            extract_hl_position_changes(Some(Uuid::new_v4()), "hypercore-mainnet", &metadata);
+
+        assert_eq!(changes.len(), 1);
+        let c = &changes[0];
+        assert_eq!(c.coin, "ETH");
+        assert_eq!(c.side, "B");
+        assert_eq!(c.size_delta, BigDecimal::from_str("2.0").unwrap());
+        assert_eq!(c.price, BigDecimal::from_str("3500.0").unwrap());
+        assert_eq!(c.direction, Some("Open Long".to_string()));
+        assert_eq!(c.source_event, "fill");
+    }
+
+    #[test]
+    fn test_extract_hl_position_change_from_fill_sell() {
+        let metadata = serde_json::json!({
+            "type": "fill",
+            "data": {
+                "coin": "BTC",
+                "px": "42000.0",
+                "sz": "0.5",
+                "side": "A",
+                "time": 1700000000000u64,
+                "hash": "0xfill2",
+                "dir": "Close Long"
+            }
+        });
+
+        let changes = extract_hl_position_changes(None, "hypercore-mainnet", &metadata);
+
+        assert_eq!(changes.len(), 1);
+        let c = &changes[0];
+        assert_eq!(c.coin, "BTC");
+        assert_eq!(c.side, "A");
+        assert_eq!(c.size_delta, BigDecimal::from_str("-0.5").unwrap());
+        assert_eq!(c.direction, Some("Close Long".to_string()));
+        assert_eq!(c.source_event, "fill");
+    }
+
+    #[test]
+    fn test_extract_hl_position_change_from_liquidation() {
+        let metadata = serde_json::json!({
+            "type": "ledger_update",
+            "data": {
+                "time": 1700000000000u64,
+                "hash": "0xliq1",
+                "delta": {
+                    "type": "liquidation",
+                    "coin": "ETH",
+                    "sz": "5.0",
+                    "px": "3000.0",
+                    "side": "A"
+                }
+            }
+        });
+
+        let changes =
+            extract_hl_position_changes(Some(Uuid::new_v4()), "hypercore-mainnet", &metadata);
+
+        assert_eq!(changes.len(), 1);
+        let c = &changes[0];
+        assert_eq!(c.coin, "ETH");
+        assert_eq!(c.side, "A");
+        assert_eq!(c.size_delta, BigDecimal::from_str("-5.0").unwrap());
+        assert_eq!(c.direction, Some("Liquidation".to_string()));
+        assert_eq!(c.source_event, "liquidation");
+    }
+
+    #[test]
+    fn test_extract_hl_position_change_from_deposit_returns_none() {
+        let metadata = serde_json::json!({
+            "type": "ledger_update",
+            "data": {
+                "time": 1700000000000u64,
+                "hash": "0xdep1",
+                "delta": { "type": "deposit", "usdc": "10000.0" }
+            }
+        });
+
+        let changes = extract_hl_position_changes(None, "hypercore-mainnet", &metadata);
+        assert!(
+            changes.is_empty(),
+            "deposits should not produce position changes"
+        );
+    }
+
+    #[test]
+    fn test_extract_hl_position_change_from_funding_returns_none() {
+        let metadata = serde_json::json!({
+            "type": "funding",
+            "data": {
+                "time": 1700000000000u64,
+                "coin": "ETH",
+                "usdc": "-2.50",
+                "fundingRate": "0.0001"
+            }
+        });
+
+        let changes = extract_hl_position_changes(None, "hypercore-mainnet", &metadata);
+        assert!(
+            changes.is_empty(),
+            "funding events should not produce position changes"
+        );
+    }
+
+    // -- P3-W4 Materializer contract tests --
+
+    #[test]
+    fn hl_fill_materializer_contract() {
+        let m = HlFillMaterializer;
+        assert_eq!(m.dataset_name(), DatasetName::HlFills);
+        assert_eq!(m.parser_version(), 1);
+        assert_eq!(m.chain_family(), ChainFamily::Hyperliquid);
+        assert!(!m.parser_hash().is_empty());
+        let desc = m.descriptor();
+        assert!(desc.validate().is_ok());
+        assert_eq!(desc.name, DatasetName::HlFills);
+        assert_eq!(desc.chain_families, vec![ChainFamily::Hyperliquid]);
+    }
+
+    #[test]
+    fn hl_funding_payment_materializer_contract() {
+        let m = HlFundingPaymentMaterializer;
+        assert_eq!(m.dataset_name(), DatasetName::HlFunding);
+        assert_eq!(m.parser_version(), 1);
+        assert_eq!(m.chain_family(), ChainFamily::Hyperliquid);
+        assert!(!m.parser_hash().is_empty());
+        let desc = m.descriptor();
+        assert!(desc.validate().is_ok());
+        assert_eq!(desc.name, DatasetName::HlFunding);
+    }
+
+    #[test]
+    fn hl_position_change_materializer_contract() {
+        let m = HlPositionChangeMaterializer;
+        assert_eq!(m.dataset_name(), DatasetName::Positions);
+        assert_eq!(m.parser_version(), 1);
+        assert_eq!(m.chain_family(), ChainFamily::Hyperliquid);
+        assert!(!m.parser_hash().is_empty());
+        let desc = m.descriptor();
+        assert!(desc.validate().is_ok());
+        assert_eq!(desc.name, DatasetName::Positions);
+    }
+
+    #[test]
+    fn hl_all_p3w4_materializers_have_distinct_hashes() {
+        use std::collections::HashSet;
+        let materializers: Vec<Box<dyn Materializer>> = vec![
+            Box::new(HlFillMaterializer),
+            Box::new(HlFundingPaymentMaterializer),
+            Box::new(HlPositionChangeMaterializer),
+        ];
+        let hashes: HashSet<&str> = materializers.iter().map(|m| m.parser_hash()).collect();
+        assert_eq!(
+            hashes.len(),
+            3,
+            "all 3 P3-W4 materializers must have distinct hashes"
+        );
+    }
+
+    #[test]
+    fn hl_all_materializers_have_distinct_hashes_across_all_hl() {
+        use std::collections::HashSet;
+        let materializers: Vec<Box<dyn Materializer>> = vec![
+            // P3-W1 / existing
+            Box::new(HyperliquidLedgerMaterializer),
+            // P3-W2
+            Box::new(HyperliquidTokenTransferMaterializer),
+            Box::new(HyperliquidNativeBalanceDeltaMaterializer),
+            // P3-W4
+            Box::new(HlFillMaterializer),
+            Box::new(HlFundingPaymentMaterializer),
+            Box::new(HlPositionChangeMaterializer),
+        ];
+        let hashes: HashSet<&str> = materializers.iter().map(|m| m.parser_hash()).collect();
+        assert_eq!(
+            hashes.len(),
+            6,
+            "all 6 HL materializers must have distinct hashes"
         );
     }
 }

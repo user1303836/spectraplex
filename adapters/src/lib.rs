@@ -212,13 +212,17 @@ mod tests {
             // Decoded event materializers (P3-W3)
             Box::new(evm_parser::EvmDecodedEventMaterializer),
             Box::new(solana_parser::SolanaDecodedEventMaterializer),
+            // Hyperliquid Silver dataset materializers (P3-W4)
+            Box::new(hyperliquid_parser::HlFillMaterializer),
+            Box::new(hyperliquid_parser::HlFundingPaymentMaterializer),
+            Box::new(hyperliquid_parser::HlPositionChangeMaterializer),
         ];
 
         let hashes: HashSet<&str> = materializers.iter().map(|m| m.parser_hash()).collect();
         assert_eq!(
             hashes.len(),
             materializers.len(),
-            "all 10 materializers must have globally distinct parser_hash values"
+            "all 13 materializers must have globally distinct parser_hash values"
         );
     }
 
@@ -234,6 +238,10 @@ mod tests {
             Box::new(hyperliquid_parser::HyperliquidNativeBalanceDeltaMaterializer),
             Box::new(evm_parser::EvmDecodedEventMaterializer),
             Box::new(solana_parser::SolanaDecodedEventMaterializer),
+            // P3-W4 materializers
+            Box::new(hyperliquid_parser::HlFillMaterializer),
+            Box::new(hyperliquid_parser::HlFundingPaymentMaterializer),
+            Box::new(hyperliquid_parser::HlPositionChangeMaterializer),
         ];
 
         for m in &materializers {
