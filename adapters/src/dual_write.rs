@@ -95,7 +95,7 @@ fn extract_block_number(chain: &Chain, metadata: &serde_json::Value) -> Option<i
 /// - Builds a JSONB cursor from the flat V1 fields
 /// - Solana cursor: `{ last_signature, last_slot }`
 /// - EVM cursor: `{ last_block }`
-/// - HyperCore cursor: `{ last_timestamp_ms }` (seconds * 1000)
+/// - HyperCore cursor: `{ last_timestamp }` (raw seconds)
 pub fn v1_checkpoint_to_v2(cp: &IndexerCheckpoint, target_id: Uuid) -> Checkpoint {
     let network = chain_to_default_network(&cp.chain).to_string();
     let source = chain_to_default_source(&cp.chain).to_string();
@@ -117,7 +117,7 @@ pub fn v1_checkpoint_to_v2(cp: &IndexerCheckpoint, target_id: Uuid) -> Checkpoin
 /// Per P0-W3 Sections 5.2–5.5 and Section 9.4:
 /// - Solana: `{ "last_signature": ..., "last_slot": ... }`
 /// - EVM: `{ "last_block": ... }`
-/// - HyperCore: `{ "last_timestamp_ms": ... }` (seconds * 1000)
+/// - HyperCore: `{ "last_timestamp": ... }` (raw seconds)
 ///
 /// Only non-None fields are included.
 fn build_v2_cursor(cp: &IndexerCheckpoint) -> serde_json::Value {
@@ -148,10 +148,9 @@ fn build_v2_cursor(cp: &IndexerCheckpoint) -> serde_json::Value {
         }
         Chain::Hyperliquid => {
             if let Some(ts) = cp.last_timestamp {
-                let ts_ms = ts * 1000;
                 cursor.insert(
-                    "last_timestamp_ms".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(ts_ms)),
+                    "last_timestamp".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(ts)),
                 );
             }
         }
@@ -525,9 +524,9 @@ mod tests {
         // Verify cursor JSONB shape per P0-W3 Section 5.2
         assert_eq!(v2.cursor["last_signature"], "5VERv8NMhzg");
         assert_eq!(v2.cursor["last_slot"], 298412345);
-        // Solana cursor should not have last_block or last_timestamp_ms
+        // Solana cursor should not have last_block or last_timestamp
         assert!(v2.cursor.get("last_block").is_none());
-        assert!(v2.cursor.get("last_timestamp_ms").is_none());
+        assert!(v2.cursor.get("last_timestamp").is_none());
     }
 
     #[test]
@@ -570,8 +569,8 @@ mod tests {
         assert_eq!(v2.source, "rest");
 
         // Verify cursor JSONB shape per P0-W3 Section 5.4
-        // last_timestamp (seconds) * 1000 = last_timestamp_ms
-        assert_eq!(v2.cursor["last_timestamp_ms"], 1700000000000_i64);
+        // last_timestamp stores raw seconds (ms conversion is post-P1-W4)
+        assert_eq!(v2.cursor["last_timestamp"], 1700000000_i64);
         // HL cursor should not have last_signature or last_slot
         assert!(v2.cursor.get("last_signature").is_none());
         assert!(v2.cursor.get("last_slot").is_none());
@@ -603,7 +602,7 @@ mod tests {
             last_timestamp: None,
         };
         let v2 = v1_checkpoint_to_v2(&cp, Uuid::new_v4());
-        assert!(v2.cursor.get("last_timestamp_ms").is_none());
+        assert!(v2.cursor.get("last_timestamp").is_none());
     }
 
     // -- Target match construction --

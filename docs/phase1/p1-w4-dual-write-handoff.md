@@ -57,7 +57,7 @@ Builds a JSONB cursor per P0-W3 Section 5:
 |---|---|
 | Solana | `{ "last_signature": ..., "last_slot": ... }` |
 | Ethereum | `{ "last_block": ... }` |
-| Hyperliquid | `{ "last_timestamp_ms": ... }` (seconds × 1000) |
+| Hyperliquid | `{ "last_timestamp": ... }` (raw seconds) |
 
 ### Target Match Construction
 
@@ -96,7 +96,7 @@ Unit tests in `adapters/src/dual_write.rs`:
 - Checkpoint conversion:
   - Solana cursor: `{ last_signature, last_slot }`
   - Ethereum cursor: `{ last_block }`
-  - Hyperliquid cursor: `{ last_timestamp_ms }` (seconds × 1000)
+  - Hyperliquid cursor: `{ last_timestamp }` (raw seconds)
   - Missing optional fields handled
 - Target match construction:
   - Correct count, unique IDs, correct linkage, "sender" reason
