@@ -1,0 +1,138 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 1: Canonical Bronze And Control Plane
+- work packet: P1-W4: Dual-Write Compatibility Layer
+- objective: Add a dual-write layer in the repository so every V1 wallet ingestion also writes canonical V2 records (raw_transactions, target_matches, checkpoints). Auto-create wallet IndexTargets via a compatibility shim. V2 writes are best-effort during early transition. All existing API and CLI behavior stays identical.
+- branch: p1-w4-dual-write-compat
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- adapters/src/dual_write.rs (NEW — conversion functions, chain-to-network mapping, ensure_wallet_target, dual-write orchestration, unit tests)
+- adapters/src/lib.rs (add pub mod dual_write export)
+- adapters/src/repo.rs (no signature changes; dual_write.rs uses existing public methods and pool() accessor)
+- cli/src/main.rs (wire dual-write repo methods into ingestion flow — replace save_transactions_and_checkpoint with dual-write variant)
+- api/src/main.rs (wire dual-write repo methods into trigger_ingest — replace save_transactions_and_checkpoint with dual-write variant)
+- docs/phase1/p1-w4-dual-write-handoff.md (NEW — tracked review artifact)
+
+Implementation steps:
+1. 1. Create adapters/src/dual_write.rs with chain-to-network mapping: chain_to_default_network (solana→solana-mainnet, ethereum→ethereum-mainnet, hyperliquid→hypercore-mainnet) and chain_to_default_source (solana→rpc, ethereum→rpc, hyperliquid→rest) per Rollout Plan Section 2.4
+2. 2. Add V1→V2 conversion functions: v1_tx_to_v2_raw (Transaction→RawTransaction: copy id/timestamp/tx_hash/raw_metadata, map chain→network, add source, strip user_id/wallet_address, set block_number from raw_metadata), v1_checkpoint_to_v2 (IndexerCheckpoint→Checkpoint: build JSONB cursor from last_signature/last_slot/last_block/last_timestamp per P0-W3 Section 6), build_target_matches (create TargetMatch rows linking target_id to raw_transaction IDs with match_reason=sender)
+3. 3. Add ensure_wallet_target Repository method: lookup IndexTarget by (kind=Wallet, network, address); if not found, create one with mode=Both, chain_family from chain, owner_id from user_id if provided; return the target
+4. 4. Add dual-write Repository methods: save_transactions_dual_write (V1 save_transactions first, then convert and save_raw_transactions + save_target_matches with V2 failures logged not fatal), save_checkpoint_dual_write (V1 save_checkpoint first, then convert and upsert_checkpoint_v2 with V2 failure logged), save_transactions_and_checkpoint_dual_write (combines both in correct order)
+5. 5. Wire CLI ingestion: before adapter.fetch_history, call ensure_wallet_target; after adapter returns, call save_transactions_and_checkpoint_dual_write instead of save_transactions_and_checkpoint
+6. 6. Wire API trigger_ingest: same pattern — ensure_wallet_target before ingestion, dual-write methods after
+7. 7. Export dual_write module from adapters/src/lib.rs
+8. 8. Write comprehensive unit tests: chain-to-network mapping, V1→V2 Transaction conversion (verify user_id/wallet_address stripped, network mapped, block_number extracted), checkpoint conversion (verify JSONB cursor shape matches P0-W3 Section 6), target match construction, ensure_wallet_target idempotency, dual-write batch construction
+9. 9. Run cargo fmt --all --check, cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace
+10. 10. Create docs/phase1/p1-w4-dual-write-handoff.md with implementation summary, conversion rules, test coverage, and known gaps
+
+Verification expectations:
+1. cargo fmt --all --check (must be clean)
+2. cargo clippy --workspace --all-targets -- -D warnings (must be clean)
+3. cargo test --workspace (262 baseline tests must pass with zero regressions, plus new dual-write unit tests)
+4. Verify no existing V1 method signature in repo.rs has been changed
+5. Verify no existing API handler signature or response shape has been changed
+6. Verify no existing CLI command flag or behavior has been changed
+7. Verify chain-to-network mapping matches Rollout Plan Section 2.4 exactly (solana→solana-mainnet, hyperliquid→hypercore-mainnet, ethereum→ethereum-mainnet)
+8. Verify V2 RawTransaction conversion strips user_id and wallet_address fields
+9. Verify checkpoint JSONB cursor structure matches P0-W3 Section 6 (last_signature, last_slot, last_block, last_timestamp)
+10. Verify V2 write failures are caught and logged without failing the V1 write path
+11. Verify ensure_wallet_target is idempotent (calling twice with same wallet returns same target)
+
+Tracked review artifacts required in the PR:
+- docs/phase1/p1-w4-dual-write-handoff.md
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p1-w4-dual-write-compat from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P1-W4: Dual-Write Compatibility Layer.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 1: Canonical Bronze And Control Plane"
+- workPacket: "P1-W4: Dual-Write Compatibility Layer"
+- branchName: "p1-w4-dual-write-compat"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
