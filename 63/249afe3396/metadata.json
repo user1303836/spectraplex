@@ -3,7 +3,7 @@
   "checkpoint_id": "63249afe3396",
   "strategy": "manual-commit",
   "branch": "p1-w4-dual-write-compat",
-  "checkpoints_count": 3,
+  "checkpoints_count": 4,
   "files_touched": [
     "adapters/src/dual_write.rs",
     "docs/phase1/p1-w4-dual-write-handoff.md"
@@ -36,13 +36,20 @@
       "context": "/63/249afe3396/3/context.md",
       "content_hash": "/63/249afe3396/3/content_hash.txt",
       "prompt": "/63/249afe3396/3/prompt.txt"
+    },
+    {
+      "metadata": "/63/249afe3396/4/metadata.json",
+      "transcript": "/63/249afe3396/4/full.jsonl",
+      "context": "/63/249afe3396/4/context.md",
+      "content_hash": "/63/249afe3396/4/content_hash.txt",
+      "prompt": "/63/249afe3396/4/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 91,
-    "cache_creation_tokens": 495172,
-    "cache_read_tokens": 6245953,
-    "output_tokens": 57521,
-    "api_call_count": 79
+    "input_tokens": 124,
+    "cache_creation_tokens": 630220,
+    "cache_read_tokens": 9212704,
+    "output_tokens": 77112,
+    "api_call_count": 108
   }
 }
