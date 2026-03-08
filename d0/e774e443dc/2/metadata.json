@@ -1,0 +1,33 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "d0e774e443dc",
+  "session_id": "54ca564e-0a53-4fc6-a730-a6d3637b1ade",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T23:56:28.12039Z",
+  "branch": "p4-w3-sink-abstraction",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "api/src/main.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "9a20b6520bd6",
+  "checkpoint_transcript_start": 124,
+  "transcript_lines_at_start": 124,
+  "token_usage": {
+    "input_tokens": 93,
+    "cache_creation_tokens": 45343,
+    "cache_read_tokens": 1060998,
+    "output_tokens": 9551,
+    "api_call_count": 30
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T23:56:28.032476Z",
+    "agent_lines": 0,
+    "human_added": 30,
+    "human_modified": 42,
+    "human_removed": 0,
+    "total_committed": 30,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/54ca564e-0a53-4fc6-a730-a6d3637b1ade.jsonl"
+}
