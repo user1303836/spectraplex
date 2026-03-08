@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "b9e9d36cc3d0",
+  "session_id": "fdf1e60d-8d27-4e5b-85cc-27ff149e1507",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T19:31:30.570938Z",
+  "branch": "p2-w3-evm-ingestion-semantics",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "adapters/src/evm.rs",
+    "docs/phase2/p2-w3-evm-ingestion-handoff.md"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "9d0ef623fe42",
+  "token_usage": {
+    "input_tokens": 29,
+    "cache_creation_tokens": 107368,
+    "cache_read_tokens": 2186291,
+    "output_tokens": 7358,
+    "api_call_count": 27
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T19:31:30.372259Z",
+    "agent_lines": 1058,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 1058,
+    "agent_percentage": 100
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/fdf1e60d-8d27-4e5b-85cc-27ff149e1507.jsonl"
+}

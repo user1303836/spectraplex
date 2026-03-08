@@ -1,0 +1,138 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 2: Target-Centric Ingestion
+- work packet: P2-W3: Fix EVM ingestion semantics
+- objective: Separate wallet activity indexing from contract event indexing in the EVM adapter. Fix the incorrect eth_getLogs address filter for wallet targets. Implement the V2 Connector trait for EvmAdapter with correct semantics for wallet, contract, and topic_filter target kinds.
+- branch: p2-w3-evm-ingestion-semantics
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- adapters/src/evm.rs — Major: implement Connector trait with wallet/contract/topic_filter paths, add topic-filtered fetch_logs variants
+- adapters/src/evm_parser.rs — Minor: may need adjustments if raw data shape changes for wallet-sourced vs contract-sourced logs
+- adapters/src/lib.rs — Export new EvmAdapter Connector impl if needed
+- adapters/src/compat.rs — Verify LegacyConnectorAdapter still routes correctly with updated EvmAdapter
+- core/src/connector.rs — No changes expected; filter specs already defined
+- core/src/v2.rs — No changes expected; types already defined
+- docs/phase2/p2-w3-evm-ingestion-handoff.md — New handoff doc
+
+Implementation steps:
+1. 1. Add fetch_logs_by_topics() to EvmAdapter — accepts optional address filter, topic array, and block range. Generalizes the existing fetch_logs() method.
+2. 2. Add fetch_wallet_erc20_logs() to EvmAdapter — two eth_getLogs calls: one with Transfer topic + wallet in topic[1] (outgoing), one with wallet in topic[2] (incoming). Deduplicates results.
+3. 3. Add fetch_wallet_native_transfers() to EvmAdapter — fetch transactions by block range where from or to matches the wallet. Use provider methods for block/tx scanning or accept the limitation that native-only transfers require block scanning.
+4. 4. Implement Connector trait for EvmAdapter with capabilities declaring support for Wallet, Contract, TopicFilter target kinds and Backfill mode.
+5. 5. Implement backfill() dispatch: match target.kind to route to wallet_backfill (topic-filtered logs + native tx enrichment), contract_backfill (address-filtered logs), or topic_filter_backfill (arbitrary topic filtering).
+6. 6. Emit RawTransaction records (target-agnostic, no wallet_address/user_id) in each path, with proper network, block_number, timestamp, and source fields.
+7. 7. Preserve existing ChainIngestor impl for backward compatibility via LegacyConnectorAdapter.
+8. 8. Add unit tests: wallet target gets ERC-20 transfers correctly, contract target gets contract logs, topic_filter target filters by topics, unsupported target kind is rejected, cursor/checkpoint roundtrip works.
+9. 9. Add regression tests for gas fee and native ETH value enrichment in both wallet and contract paths.
+10. 10. Write docs/phase2/p2-w3-evm-ingestion-handoff.md documenting the semantic changes and migration path.
+
+Verification expectations:
+1. cargo fmt --all --check
+2. cargo clippy --workspace --all-targets -- -D warnings
+3. cargo test --workspace — all existing tests must pass (136+ passing, only pre-existing flaky test_semaphore_limits_concurrent_jobs may fail)
+4. New unit tests verify wallet target uses topic-based filtering (not address filter)
+5. New unit tests verify contract target uses address-based filtering
+6. New unit tests verify topic_filter target uses arbitrary topic array
+7. New unit tests verify unsupported target kinds are rejected
+8. New regression tests verify gas fee enrichment logic is preserved
+9. New regression tests verify native ETH value detection is preserved
+10. Handoff doc in docs/phase2/ is accurate and in sync with implementation
+
+Tracked review artifacts required in the PR:
+- docs/phase2/p2-w3-evm-ingestion-handoff.md
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p2-w3-evm-ingestion-semantics from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P2-W3: Fix EVM ingestion semantics.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 2: Target-Centric Ingestion"
+- workPacket: "P2-W3: Fix EVM ingestion semantics"
+- branchName: "p2-w3-evm-ingestion-semantics"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
