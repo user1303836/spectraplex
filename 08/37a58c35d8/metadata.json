@@ -3,7 +3,7 @@
   "checkpoint_id": "0837a58c35d8",
   "strategy": "manual-commit",
   "branch": "p1-w5-migration-verification",
-  "checkpoints_count": 3,
+  "checkpoints_count": 4,
   "files_touched": [
     ".github/workflows/ci.yml",
     "adapters/tests/migration_test.rs",
@@ -37,13 +37,20 @@
       "context": "/08/37a58c35d8/3/context.md",
       "content_hash": "/08/37a58c35d8/3/content_hash.txt",
       "prompt": "/08/37a58c35d8/3/prompt.txt"
+    },
+    {
+      "metadata": "/08/37a58c35d8/4/metadata.json",
+      "transcript": "/08/37a58c35d8/4/full.jsonl",
+      "context": "/08/37a58c35d8/4/context.md",
+      "content_hash": "/08/37a58c35d8/4/content_hash.txt",
+      "prompt": "/08/37a58c35d8/4/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 91,
-    "cache_creation_tokens": 495172,
-    "cache_read_tokens": 6245953,
-    "output_tokens": 57521,
-    "api_call_count": 79
+    "input_tokens": 124,
+    "cache_creation_tokens": 630220,
+    "cache_read_tokens": 9212704,
+    "output_tokens": 77112,
+    "api_call_count": 108
   }
 }
