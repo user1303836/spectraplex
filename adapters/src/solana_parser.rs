@@ -181,7 +181,7 @@ fn spl_token_symbol(mint: &str) -> String {
 
 use chrono::Utc;
 use spectraplex_core::materializer::{
-    DatasetDescriptor, DatasetName, Materializer, NativeBalanceDelta, TokenTransfer,
+    DatasetDescriptor, DatasetName, DecodedEvent, Materializer, NativeBalanceDelta, TokenTransfer,
 };
 use spectraplex_core::v2::ChainFamily;
 use uuid::Uuid;
@@ -344,6 +344,199 @@ pub fn extract_solana_native_balance_deltas(
 }
 
 // ---------------------------------------------------------------------------
+// Decoded Event extraction (P3-W3)
+// ---------------------------------------------------------------------------
+
+/// Extract decoded events (program instructions) from a Solana raw transaction.
+///
+/// Extracts top-level and inner instructions from the parsed transaction,
+/// capturing program_id, instruction data, and account keys. Skips failed
+/// transactions.
+pub fn extract_solana_decoded_events(
+    raw_tx_id: Option<Uuid>,
+    network: &str,
+    raw_metadata: &serde_json::Value,
+) -> Vec<DecodedEvent> {
+    let sol_tx: EncodedConfirmedTransactionWithStatusMeta =
+        match serde_json::from_value(raw_metadata.clone()) {
+            Ok(tx) => tx,
+            Err(_) => return vec![],
+        };
+
+    let meta = match &sol_tx.transaction.meta {
+        Some(m) => m,
+        None => return vec![],
+    };
+
+    // Skip failed transactions
+    if meta.err.is_some() {
+        return vec![];
+    }
+
+    let mut events = Vec::new();
+    let mut log_index: i32 = 0;
+
+    let transaction = &sol_tx.transaction.transaction;
+    if let solana_transaction_status::EncodedTransaction::Json(ui_tx) = transaction {
+        if let solana_transaction_status::UiMessage::Parsed(message) = &ui_tx.message {
+            // Extract top-level instructions
+            for ix in &message.instructions {
+                match ix {
+                    solana_transaction_status::UiInstruction::Parsed(parsed_ix) => {
+                        let (program_id, decoded_fields, raw_fields) =
+                            extract_parsed_instruction(parsed_ix);
+
+                        events.push(DecodedEvent {
+                            id: Uuid::new_v4(),
+                            raw_transaction_id: raw_tx_id,
+                            network: network.to_string(),
+                            program_or_contract: program_id.clone(),
+                            event_signature: None,
+                            event_name: extract_instruction_type(parsed_ix),
+                            log_index,
+                            decoded_fields,
+                            raw_fields,
+                            dataset_version_id: None,
+                            created_at: Utc::now(),
+                        });
+                        log_index += 1;
+                    }
+                    solana_transaction_status::UiInstruction::Compiled(compiled_ix) => {
+                        let program_id = message
+                            .account_keys
+                            .get(compiled_ix.program_id_index as usize)
+                            .map(|k| k.pubkey.clone())
+                            .unwrap_or_else(|| format!("index:{}", compiled_ix.program_id_index));
+
+                        let accounts: Vec<String> = compiled_ix
+                            .accounts
+                            .iter()
+                            .map(|&idx| {
+                                message
+                                    .account_keys
+                                    .get(idx as usize)
+                                    .map(|k| k.pubkey.clone())
+                                    .unwrap_or_else(|| format!("index:{idx}"))
+                            })
+                            .collect();
+
+                        let raw_fields = serde_json::json!({
+                            "data": &compiled_ix.data,
+                            "accounts": accounts,
+                        });
+
+                        events.push(DecodedEvent {
+                            id: Uuid::new_v4(),
+                            raw_transaction_id: raw_tx_id,
+                            network: network.to_string(),
+                            program_or_contract: program_id,
+                            event_signature: None,
+                            event_name: None,
+                            log_index,
+                            decoded_fields: serde_json::json!({}),
+                            raw_fields,
+                            dataset_version_id: None,
+                            created_at: Utc::now(),
+                        });
+                        log_index += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Extract inner instructions when available
+    if let OptionSerializer::Some(inner_instructions) = &meta.inner_instructions {
+        for inner_group in inner_instructions {
+            for inner_ix in &inner_group.instructions {
+                match inner_ix {
+                    solana_transaction_status::UiInstruction::Parsed(parsed_ix) => {
+                        let (program_id, decoded_fields, raw_fields) =
+                            extract_parsed_instruction(parsed_ix);
+
+                        events.push(DecodedEvent {
+                            id: Uuid::new_v4(),
+                            raw_transaction_id: raw_tx_id,
+                            network: network.to_string(),
+                            program_or_contract: program_id,
+                            event_signature: None,
+                            event_name: extract_instruction_type(parsed_ix),
+                            log_index,
+                            decoded_fields,
+                            raw_fields,
+                            dataset_version_id: None,
+                            created_at: Utc::now(),
+                        });
+                        log_index += 1;
+                    }
+                    solana_transaction_status::UiInstruction::Compiled(compiled_ix) => {
+                        let raw_fields = serde_json::json!({
+                            "data": &compiled_ix.data,
+                            "accounts": &compiled_ix.accounts,
+                        });
+
+                        events.push(DecodedEvent {
+                            id: Uuid::new_v4(),
+                            raw_transaction_id: raw_tx_id,
+                            network: network.to_string(),
+                            program_or_contract: format!("index:{}", compiled_ix.program_id_index),
+                            event_signature: None,
+                            event_name: None,
+                            log_index,
+                            decoded_fields: serde_json::json!({}),
+                            raw_fields,
+                            dataset_version_id: None,
+                            created_at: Utc::now(),
+                        });
+                        log_index += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    events
+}
+
+/// Extract fields from a parsed Solana instruction.
+fn extract_parsed_instruction(
+    ix: &solana_transaction_status::UiParsedInstruction,
+) -> (String, serde_json::Value, serde_json::Value) {
+    match ix {
+        solana_transaction_status::UiParsedInstruction::Parsed(parsed) => {
+            let program_id = parsed.program_id.clone();
+            let decoded_fields = parsed.parsed.clone();
+            let raw_fields = serde_json::json!({
+                "program": &parsed.program,
+                "programId": &parsed.program_id,
+            });
+            (program_id, decoded_fields, raw_fields)
+        }
+        solana_transaction_status::UiParsedInstruction::PartiallyDecoded(partial) => {
+            let program_id = partial.program_id.clone();
+            let accounts: Vec<String> = partial.accounts.iter().map(|a| a.to_string()).collect();
+            let raw_fields = serde_json::json!({
+                "data": &partial.data,
+                "accounts": accounts,
+            });
+            (program_id, serde_json::json!({}), raw_fields)
+        }
+    }
+}
+
+/// Extract instruction type name from a parsed instruction (if available).
+fn extract_instruction_type(ix: &solana_transaction_status::UiParsedInstruction) -> Option<String> {
+    match ix {
+        solana_transaction_status::UiParsedInstruction::Parsed(parsed) => parsed
+            .parsed
+            .get("type")
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string()),
+        solana_transaction_status::UiParsedInstruction::PartiallyDecoded(_) => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Materializer implementations
 // ---------------------------------------------------------------------------
 
@@ -436,6 +629,38 @@ impl Materializer for SolanaNativeBalanceDeltaMaterializer {
             name: self.dataset_name(),
             description:
                 "Solana native balance deltas: SOL balance changes per account with fee payer flag"
+                    .to_string(),
+            source_bronze_tables: vec!["raw_transactions".to_string()],
+            chain_families: vec![self.chain_family()],
+        }
+    }
+}
+
+/// Materializer for Solana decoded events (program instructions).
+pub struct SolanaDecodedEventMaterializer;
+
+impl Materializer for SolanaDecodedEventMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::DecodedEvents
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:solana_decoded_events_v1_e5b7c1d9"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Solana
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description:
+                "Solana decoded events: program instructions extracted from parsed transactions"
                     .to_string(),
             source_bronze_tables: vec!["raw_transactions".to_string()],
             chain_families: vec![self.chain_family()],
@@ -553,6 +778,33 @@ mod tests {
     }
 
     #[test]
+    fn solana_decoded_event_materializer_contract() {
+        let m = SolanaDecodedEventMaterializer;
+        assert_eq!(m.dataset_name(), DatasetName::DecodedEvents);
+        assert_eq!(m.parser_version(), 1);
+        assert_eq!(m.chain_family(), ChainFamily::Solana);
+        assert!(!m.parser_hash().is_empty());
+        assert_ne!(
+            m.parser_hash(),
+            SolanaLedgerMaterializer.parser_hash(),
+            "distinct from ledger materializer"
+        );
+        assert_ne!(
+            m.parser_hash(),
+            SolanaTokenTransferMaterializer.parser_hash(),
+            "distinct from token transfer materializer"
+        );
+        assert_ne!(
+            m.parser_hash(),
+            SolanaNativeBalanceDeltaMaterializer.parser_hash(),
+            "distinct from native balance delta materializer"
+        );
+        let desc = m.descriptor();
+        assert!(desc.validate().is_ok());
+        assert_eq!(desc.name, DatasetName::DecodedEvents);
+    }
+
+    #[test]
     fn solana_all_materializers_have_distinct_hashes() {
         use std::collections::HashSet;
 
@@ -560,12 +812,85 @@ mod tests {
             Box::new(SolanaLedgerMaterializer),
             Box::new(SolanaTokenTransferMaterializer),
             Box::new(SolanaNativeBalanceDeltaMaterializer),
+            Box::new(SolanaDecodedEventMaterializer),
         ];
         let hashes: HashSet<&str> = materializers.iter().map(|m| m.parser_hash()).collect();
         assert_eq!(
             hashes.len(),
-            3,
-            "all 3 Solana materializers must have distinct hashes"
+            4,
+            "all 4 Solana materializers must have distinct hashes"
         );
+    }
+
+    // -- Decoded Event extraction tests (P3-W3) --
+
+    #[test]
+    fn test_extract_solana_decoded_events_failed_tx_skip() {
+        // A transaction with meta.err set should produce no events.
+        // We build a minimal JSON that deserializes as EncodedConfirmedTransactionWithStatusMeta
+        // with meta.err = Some(...)
+        let metadata = serde_json::json!({
+            "slot": 200,
+            "transaction": {
+                "transaction": {
+                    "message": {
+                        "accountKeys": [
+                            {"pubkey": "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy", "signer": true, "writable": true, "source": "transaction"}
+                        ],
+                        "instructions": [],
+                        "recentBlockhash": "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTKD5xD3Zi"
+                    },
+                    "signatures": ["5VERv8NMhUE4P7zKWwgHFnrKkL3gS8YvEJrDp6t8mKfDfvtVQDVMRVhkNmqwdpC9UYNYyE5LfK6rrboKpMrZGKh"]
+                },
+                "meta": {
+                    "err": {"InstructionError": [0, "Custom"]},
+                    "status": {"Err": {"InstructionError": [0, "Custom"]}},
+                    "fee": 5000,
+                    "preBalances": [10000000],
+                    "postBalances": [9995000],
+                    "preTokenBalances": [],
+                    "postTokenBalances": [],
+                    "logMessages": []
+                }
+            },
+            "blockTime": 1700000000
+        });
+
+        let events =
+            extract_solana_decoded_events(Some(Uuid::new_v4()), "solana-mainnet", &metadata);
+        assert!(
+            events.is_empty(),
+            "failed transactions should produce no decoded events"
+        );
+    }
+
+    #[test]
+    fn test_extract_solana_decoded_events_invalid_metadata() {
+        let metadata = serde_json::json!({"invalid": true});
+        let events = extract_solana_decoded_events(None, "solana-mainnet", &metadata);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_extract_solana_decoded_events_no_meta() {
+        // A transaction missing the meta field entirely
+        let metadata = serde_json::json!({
+            "slot": 200,
+            "transaction": {
+                "transaction": {
+                    "message": {
+                        "accountKeys": [],
+                        "instructions": [],
+                        "recentBlockhash": "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTKD5xD3Zi"
+                    },
+                    "signatures": ["5VERv8NMhUE4P7zKWwgHFnrKkL3gS8YvEJrDp6t8mKfDfvtVQDVMRVhkNmqwdpC9UYNYyE5LfK6rrboKpMrZGKh"]
+                },
+                "meta": null
+            },
+            "blockTime": 1700000000
+        });
+
+        let events = extract_solana_decoded_events(None, "solana-mainnet", &metadata);
+        assert!(events.is_empty(), "no meta should produce no events");
     }
 }

@@ -207,6 +207,34 @@ pub struct TokenTransfer {
     pub created_at: DateTime<Utc>,
 }
 
+/// Decoded event or instruction record across all chains.
+///
+/// Each record represents a single decoded log event (EVM) or program
+/// instruction (Solana) extracted from Bronze data. Not wallet-specific —
+/// any contract interaction or program invocation can produce decoded events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecodedEvent {
+    pub id: Uuid,
+    /// FK to raw_transactions; nullable during transition.
+    pub raw_transaction_id: Option<Uuid>,
+    pub network: String,
+    /// Contract address (EVM) or program ID (Solana).
+    pub program_or_contract: String,
+    /// Event signature hash (EVM topic0) or instruction discriminator.
+    pub event_signature: Option<String>,
+    /// Human-readable event name if decodable (e.g. "Transfer", "Approval").
+    pub event_name: Option<String>,
+    /// Position within the transaction (log index for EVM, instruction index for Solana).
+    pub log_index: i32,
+    /// Structured decoded fields (named parameters when ABI is known).
+    pub decoded_fields: serde_json::Value,
+    /// Raw field data (topics + data for EVM, instruction bytes for Solana).
+    pub raw_fields: serde_json::Value,
+    /// FK to dataset_versions; nullable during transition.
+    pub dataset_version_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Native currency balance delta per account per transaction.
 ///
 /// Each record represents the change in native token balance for a single
@@ -509,6 +537,69 @@ mod tests {
         assert!(
             !json.contains("user_id"),
             "TokenTransfer must not have user_id"
+        );
+    }
+
+    // -- DecodedEvent tests --
+
+    #[test]
+    fn decoded_event_serde_roundtrip() {
+        let de = DecodedEvent {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: Some(uuid::Uuid::new_v4()),
+            network: "ethereum-mainnet".to_string(),
+            program_or_contract: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".to_string(),
+            event_signature: Some(
+                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".to_string(),
+            ),
+            event_name: Some("Transfer".to_string()),
+            log_index: 3,
+            decoded_fields: serde_json::json!({
+                "from": "0x1111111111111111111111111111111111111111",
+                "to": "0x2222222222222222222222222222222222222222",
+                "value": "1000000"
+            }),
+            raw_fields: serde_json::json!({
+                "topics": ["0xddf252ad"],
+                "data": "0x00000f4240"
+            }),
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&de).unwrap();
+        let back: DecodedEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.network, "ethereum-mainnet");
+        assert_eq!(back.event_name, Some("Transfer".to_string()));
+        assert_eq!(back.log_index, 3);
+        assert_eq!(
+            back.program_or_contract,
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+        );
+    }
+
+    #[test]
+    fn decoded_event_no_wallet_specific_fields() {
+        let de = DecodedEvent {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: None,
+            network: "solana-mainnet".to_string(),
+            program_or_contract: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            event_signature: None,
+            event_name: None,
+            log_index: 0,
+            decoded_fields: serde_json::json!({}),
+            raw_fields: serde_json::json!({}),
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&de).unwrap();
+        assert!(
+            !json.contains("wallet_address"),
+            "DecodedEvent must not have wallet_address"
+        );
+        assert!(
+            !json.contains("user_id"),
+            "DecodedEvent must not have user_id"
         );
     }
 
