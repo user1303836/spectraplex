@@ -1,0 +1,146 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 2: Target-Centric Ingestion
+- work packet: P2-W6: End-to-end ingestion compatibility suite
+- objective: Add integration test coverage verifying the full V2 ingestion pipeline for all supported target classes (wallet, EVM contract, Solana program, Hyperliquid user, Hyperliquid market), checkpoint round-trips, target matching, and cross-adapter capability consistency.
+- branch: p2-w6-e2e-ingestion-compat-suite
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- adapters/tests/ingestion_compat_test.rs (new — main test file)
+- adapters/Cargo.toml (test dependency additions if needed)
+- core/src/connector.rs (read-only — Connector trait reference)
+- core/src/v2.rs (read-only — V2 types reference)
+- adapters/src/v2_repo.rs (read-only — repo methods under test)
+- adapters/src/solana.rs (read-only — SolanaAdapter Connector impl)
+- adapters/src/solana_grpc.rs (read-only — SolanaGrpcAdapter Connector impl)
+- adapters/src/evm.rs (read-only — EvmAdapter Connector impl)
+- adapters/src/hyperliquid.rs (read-only — HyperliquidAdapter Connector impl)
+- adapters/src/compat.rs (read-only — LegacyCompatWrapper Connector impl)
+- .github/workflows/ci.yml (read-only — verify CI includes PostgreSQL service)
+
+Implementation steps:
+1. 1. Create adapters/tests/ingestion_compat_test.rs reusing the ephemeral-DB test infrastructure from migration_test.rs (create_test_db, drop_test_db, require_pg!, run_migrations)
+2. 2. Add capability declaration tests: verify each of the 5 Connector implementations (SolanaAdapter, SolanaGrpcAdapter, EvmAdapter, HyperliquidAdapter, LegacyCompatWrapper) returns the correct supported_target_kinds, supported_modes, and chain_family
+3. 3. Add cross-adapter coverage test: verify every TargetKind in the enum is supported by at least one connector's capabilities
+4. 4. Add wallet target DB round-trip test (Solana): register wallet IndexTarget → create IngestionRun → save synthetic RawTransactions → create TargetMatches → upsert Checkpoint with Solana cursor → verify all data retrieval
+5. 5. Add EVM contract target DB round-trip test: register contract IndexTarget with ContractFilterSpec → save synthetic RawTransactions → create TargetMatches with 'contract_event' match_reason → upsert Checkpoint with EVM block cursor → verify retrieval
+6. 6. Add Solana program target DB round-trip test: register program IndexTarget with ProgramFilterSpec → save synthetic RawTransactions → create TargetMatches → upsert Checkpoint with gRPC cursor → verify retrieval
+7. 7. Add Hyperliquid wallet target DB round-trip test: register wallet IndexTarget on hypercore-mainnet → save synthetic RawTransactions → create TargetMatches → upsert Checkpoint with HL timestamp cursor → verify retrieval
+8. 8. Add Hyperliquid market target DB round-trip test: register market IndexTarget → save synthetic RawTransactions → create TargetMatches with 'trade' match_reason → verify retrieval
+9. 9. Add EVM topic_filter target DB round-trip test: register topic_filter IndexTarget with TopicFilterSpec (no address) → save synthetic RawTransactions → verify target_matches and checkpoint
+10. 10. Add multi-target linkage test: one RawTransaction linked to 3 different targets (wallet, contract, program) → verify get_matches_by_raw_tx returns all 3 with distinct match_reasons
+11. 11. Add checkpoint upsert idempotency test: upsert same (target_id, network, source) twice with different cursor values → verify second value wins
+12. 12. Add ingestion run lifecycle test: create run with status 'running' → update to 'completed' with records_written and finished_at → verify state transition
+13. 13. Add error path tests for each adapter: construct an IndexTarget with unsupported kind → verify backfill() returns clear error message
+14. 14. Add validate_target + can_service integration test: for each (TargetKind, ChainFamily) combination, verify validate_target and can_service agree
+15. 15. Run cargo fmt, clippy, and test to verify everything passes
+
+Verification expectations:
+1. cargo fmt --all --check
+2. cargo clippy --workspace --all-targets -- -D warnings
+3. cargo test --workspace (all existing + new tests pass)
+4. cargo test --test ingestion_compat_test -- --nocapture (verify new tests run with PostgreSQL)
+5. Verify new test file covers at minimum: wallet, contract, program, market, topic_filter target classes
+6. Verify multi-target linkage test confirms one raw_transaction links to 3+ targets
+7. Verify checkpoint upsert test confirms cursor update semantics
+8. Verify error path tests confirm unsupported targets produce clear errors from each adapter
+9. Verify cross-adapter coverage test confirms all 8 TargetKind variants are serviceable
+
+Tracked review artifacts required in the PR:
+- docs/phase2/p2-w6-e2e-compat-handoff.md
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p2-w6-e2e-ingestion-compat-suite from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P2-W6: End-to-end ingestion compatibility suite.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 2: Target-Centric Ingestion"
+- workPacket: "P2-W6: End-to-end ingestion compatibility suite"
+- branchName: "p2-w6-e2e-ingestion-compat-suite"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
