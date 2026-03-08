@@ -262,7 +262,9 @@ fn negate(val: BigDecimal) -> BigDecimal {
 // ---------------------------------------------------------------------------
 
 use chrono::Utc;
-use spectraplex_core::materializer::{DatasetDescriptor, DatasetName, Materializer, TokenTransfer};
+use spectraplex_core::materializer::{
+    DatasetDescriptor, DatasetName, DecodedEvent, Materializer, TokenTransfer,
+};
 use spectraplex_core::v2::ChainFamily;
 use uuid::Uuid;
 
@@ -325,6 +327,186 @@ pub fn extract_evm_token_transfers(
     });
 
     transfers
+}
+
+// ---------------------------------------------------------------------------
+// Decoded Event extraction (P3-W3)
+// ---------------------------------------------------------------------------
+
+/// ERC-20 Approval event signature: keccak256("Approval(address,address,uint256)")
+const ERC20_APPROVAL_TOPIC: &str =
+    "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+
+/// Extract decoded events from an EVM raw transaction's log metadata.
+///
+/// Decodes ALL log events, not just ERC-20 Transfer events. For well-known
+/// events (Transfer, Approval), provides named decoded_fields. For unknown
+/// events, decoded_fields mirrors raw topic/data structure.
+pub fn extract_evm_decoded_events(
+    raw_tx_id: Option<Uuid>,
+    network: &str,
+    raw_metadata: &serde_json::Value,
+) -> Vec<DecodedEvent> {
+    let mut events = Vec::new();
+
+    // Handle single-log format (topics/data/address at top level)
+    if let Some(topics) = raw_metadata.get("topics").and_then(|t| t.as_array()) {
+        let address = raw_metadata
+            .get("address")
+            .and_then(|a| a.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let data_hex = raw_metadata
+            .get("data")
+            .and_then(|d| d.as_str())
+            .unwrap_or("0x");
+
+        let log_index = raw_metadata
+            .get("logIndex")
+            .or_else(|| raw_metadata.get("log_index"))
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(hex_to_i64_opt)))
+            .unwrap_or(0) as i32;
+
+        let topic0 = topics.first().and_then(|t| t.as_str());
+
+        let (event_name, decoded_fields) = decode_evm_event_fields(topic0, topics, data_hex);
+
+        let raw_fields = serde_json::json!({
+            "topics": topics,
+            "data": data_hex,
+        });
+
+        events.push(DecodedEvent {
+            id: Uuid::new_v4(),
+            raw_transaction_id: raw_tx_id,
+            network: network.to_string(),
+            program_or_contract: address,
+            event_signature: topic0.map(|s| s.to_string()),
+            event_name,
+            log_index,
+            decoded_fields,
+            raw_fields,
+            dataset_version_id: None,
+            created_at: Utc::now(),
+        });
+    }
+
+    // Handle multi-log format (logs array)
+    if let Some(logs) = raw_metadata.get("logs").and_then(|l| l.as_array()) {
+        for (idx, log) in logs.iter().enumerate() {
+            let topics = match log.get("topics").and_then(|t| t.as_array()) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            let address = log
+                .get("address")
+                .and_then(|a| a.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            let data_hex = log.get("data").and_then(|d| d.as_str()).unwrap_or("0x");
+
+            let log_index = log
+                .get("logIndex")
+                .or_else(|| log.get("log_index"))
+                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(hex_to_i64_opt)))
+                .unwrap_or(idx as i64) as i32;
+
+            let topic0 = topics.first().and_then(|t| t.as_str());
+
+            let (event_name, decoded_fields) = decode_evm_event_fields(topic0, topics, data_hex);
+
+            let raw_fields = serde_json::json!({
+                "topics": topics,
+                "data": data_hex,
+            });
+
+            events.push(DecodedEvent {
+                id: Uuid::new_v4(),
+                raw_transaction_id: raw_tx_id,
+                network: network.to_string(),
+                program_or_contract: address,
+                event_signature: topic0.map(|s| s.to_string()),
+                event_name,
+                log_index,
+                decoded_fields,
+                raw_fields,
+                dataset_version_id: None,
+                created_at: Utc::now(),
+            });
+        }
+    }
+
+    events
+}
+
+/// Decode known EVM event fields by event signature.
+/// Returns (event_name, decoded_fields).
+fn decode_evm_event_fields(
+    topic0: Option<&str>,
+    topics: &[serde_json::Value],
+    data_hex: &str,
+) -> (Option<String>, serde_json::Value) {
+    match topic0 {
+        Some(t) if t == ERC20_TRANSFER_TOPIC && topics.len() >= 3 => {
+            let from = topic_to_address(topics[1].as_str().unwrap_or_default());
+            let to = topic_to_address(topics[2].as_str().unwrap_or_default());
+            let value = hex_to_bigdecimal(data_hex).to_string();
+            (
+                Some("Transfer".to_string()),
+                serde_json::json!({
+                    "from": from,
+                    "to": to,
+                    "value": value,
+                }),
+            )
+        }
+        Some(t) if t == ERC20_APPROVAL_TOPIC && topics.len() >= 3 => {
+            let owner = topic_to_address(topics[1].as_str().unwrap_or_default());
+            let spender = topic_to_address(topics[2].as_str().unwrap_or_default());
+            let value = hex_to_bigdecimal(data_hex).to_string();
+            (
+                Some("Approval".to_string()),
+                serde_json::json!({
+                    "owner": owner,
+                    "spender": spender,
+                    "value": value,
+                }),
+            )
+        }
+        Some(_) => {
+            // Unknown event — provide indexed topics and data
+            let indexed: Vec<String> = topics
+                .iter()
+                .skip(1) // skip topic0 (the signature)
+                .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                .collect();
+            (
+                None,
+                serde_json::json!({
+                    "indexed_topics": indexed,
+                    "data": data_hex,
+                }),
+            )
+        }
+        None => {
+            // Anonymous event (no topics)
+            (
+                None,
+                serde_json::json!({
+                    "data": data_hex,
+                }),
+            )
+        }
+    }
+}
+
+/// Parse hex string to i64 (for log index fields that may be hex-encoded).
+fn hex_to_i64_opt(hex: &str) -> Option<i64> {
+    let stripped = hex.strip_prefix("0x").unwrap_or(hex);
+    i64::from_str_radix(stripped, 16).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +589,38 @@ impl Materializer for EvmTokenTransferMaterializer {
             name: self.dataset_name(),
             description:
                 "EVM token transfers: ERC-20 Transfer events decoded from raw log topics and data"
+                    .to_string(),
+            source_bronze_tables: vec!["raw_transactions".to_string()],
+            chain_families: vec![self.chain_family()],
+        }
+    }
+}
+
+/// Materializer for EVM decoded events (all log events).
+pub struct EvmDecodedEventMaterializer;
+
+impl Materializer for EvmDecodedEventMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::DecodedEvents
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:evm_decoded_events_v1_c8d4f2a6"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Evm
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description:
+                "EVM decoded events: all log events with ABI decoding for known signatures"
                     .to_string(),
             source_bronze_tables: vec!["raw_transactions".to_string()],
             chain_families: vec![self.chain_family()],
@@ -725,16 +939,39 @@ mod tests {
     }
 
     #[test]
+    fn evm_decoded_event_materializer_contract() {
+        let m = EvmDecodedEventMaterializer;
+        assert_eq!(m.dataset_name(), DatasetName::DecodedEvents);
+        assert_eq!(m.parser_version(), 1);
+        assert_eq!(m.chain_family(), ChainFamily::Evm);
+        assert!(!m.parser_hash().is_empty());
+        assert_ne!(
+            m.parser_hash(),
+            EvmLedgerMaterializer.parser_hash(),
+            "distinct from ledger materializer"
+        );
+        assert_ne!(
+            m.parser_hash(),
+            EvmTokenTransferMaterializer.parser_hash(),
+            "distinct from token transfer materializer"
+        );
+        let desc = m.descriptor();
+        assert!(desc.validate().is_ok());
+        assert_eq!(desc.name, DatasetName::DecodedEvents);
+    }
+
+    #[test]
     fn evm_all_materializers_have_distinct_hashes() {
         use std::collections::HashSet;
         let materializers: Vec<Box<dyn Materializer>> = vec![
             Box::new(EvmLedgerMaterializer),
             Box::new(EvmTokenTransferMaterializer),
+            Box::new(EvmDecodedEventMaterializer),
         ];
         let hashes: HashSet<&str> = materializers.iter().map(|m| m.parser_hash()).collect();
         assert_eq!(
             hashes.len(),
-            2,
+            3,
             "all EVM materializers must have distinct hashes"
         );
     }
@@ -805,5 +1042,154 @@ mod tests {
         for (a, b) in entries1.iter().zip(entries2.iter()) {
             assert_eq!(a.id, b.id);
         }
+    }
+
+    // -- Decoded Event extraction tests (P3-W3) --
+
+    #[test]
+    fn test_extract_evm_decoded_events_transfer() {
+        let from_padded = format!(
+            "0x000000000000000000000000{}",
+            "1111111111111111111111111111111111111111"
+        );
+        let to_padded = format!(
+            "0x000000000000000000000000{}",
+            "2222222222222222222222222222222222222222"
+        );
+        let metadata = json!({
+            "topics": [
+                ERC20_TRANSFER_TOPIC,
+                from_padded,
+                to_padded,
+            ],
+            "data": "0x0000000000000000000000000000000000000000000000000000000005f5e100",
+            "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        });
+
+        let events =
+            extract_evm_decoded_events(Some(Uuid::new_v4()), "ethereum-mainnet", &metadata);
+
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.event_name, Some("Transfer".to_string()));
+        assert_eq!(e.event_signature, Some(ERC20_TRANSFER_TOPIC.to_string()));
+        assert_eq!(
+            e.program_or_contract,
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+        );
+        assert_eq!(e.network, "ethereum-mainnet");
+        assert!(e.decoded_fields.get("from").is_some());
+        assert!(e.decoded_fields.get("to").is_some());
+        assert!(e.decoded_fields.get("value").is_some());
+    }
+
+    #[test]
+    fn test_extract_evm_decoded_events_approval() {
+        let owner_padded = format!(
+            "0x000000000000000000000000{}",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let spender_padded = format!(
+            "0x000000000000000000000000{}",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        let metadata = json!({
+            "topics": [
+                ERC20_APPROVAL_TOPIC,
+                owner_padded,
+                spender_padded,
+            ],
+            "data": "0x00000000000000000000000000000000ffffffffffffffffffffffffffffffff",
+            "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        });
+
+        let events = extract_evm_decoded_events(None, "ethereum-mainnet", &metadata);
+
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.event_name, Some("Approval".to_string()));
+        assert!(e.decoded_fields.get("owner").is_some());
+        assert!(e.decoded_fields.get("spender").is_some());
+        assert!(e.decoded_fields.get("value").is_some());
+    }
+
+    #[test]
+    fn test_extract_evm_decoded_events_unknown_event() {
+        let unknown_topic = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let indexed_topic1 = "0x0000000000000000000000001111111111111111111111111111111111111111";
+        let metadata = json!({
+            "topics": [unknown_topic, indexed_topic1],
+            "data": "0xdeadbeef",
+            "address": "0x3333333333333333333333333333333333333333",
+        });
+
+        let events =
+            extract_evm_decoded_events(Some(Uuid::new_v4()), "ethereum-mainnet", &metadata);
+
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.event_name, None);
+        assert_eq!(e.event_signature, Some(unknown_topic.to_string()));
+        assert!(e.decoded_fields.get("indexed_topics").is_some());
+        assert!(e.decoded_fields.get("data").is_some());
+    }
+
+    #[test]
+    fn test_extract_evm_decoded_events_empty_metadata() {
+        let metadata = json!({});
+        let events = extract_evm_decoded_events(None, "ethereum-mainnet", &metadata);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_extract_evm_decoded_events_multi_log() {
+        let from_padded = format!(
+            "0x000000000000000000000000{}",
+            "1111111111111111111111111111111111111111"
+        );
+        let to_padded = format!(
+            "0x000000000000000000000000{}",
+            "2222222222222222222222222222222222222222"
+        );
+        let metadata = json!({
+            "logs": [
+                {
+                    "topics": [ERC20_TRANSFER_TOPIC, &from_padded, &to_padded],
+                    "data": "0x0000000000000000000000000000000000000000000000000000000005f5e100",
+                    "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                    "logIndex": 0
+                },
+                {
+                    "topics": ["0xabcdef"],
+                    "data": "0xdeadbeef",
+                    "address": "0x3333333333333333333333333333333333333333",
+                    "logIndex": 1
+                }
+            ]
+        });
+
+        let events =
+            extract_evm_decoded_events(Some(Uuid::new_v4()), "ethereum-mainnet", &metadata);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_name, Some("Transfer".to_string()));
+        assert_eq!(events[0].log_index, 0);
+        assert_eq!(events[1].event_name, None);
+        assert_eq!(events[1].log_index, 1);
+    }
+
+    #[test]
+    fn test_extract_evm_decoded_events_anonymous() {
+        let metadata = json!({
+            "topics": [],
+            "data": "0xdeadbeef",
+            "address": "0x4444444444444444444444444444444444444444",
+        });
+
+        let events = extract_evm_decoded_events(None, "ethereum-mainnet", &metadata);
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.event_name, None);
+        assert_eq!(e.event_signature, None);
+        assert_eq!(e.decoded_fields.get("data").unwrap(), "0xdeadbeef");
     }
 }

@@ -174,7 +174,26 @@ mod tests {
     }
 
     #[test]
-    fn all_p3w2_materializers_have_globally_distinct_hashes() {
+    fn all_decoded_event_materializers_produce_correct_dataset() {
+        use spectraplex_core::materializer::{DatasetName, Materializer};
+
+        let materializers: Vec<Box<dyn Materializer>> = vec![
+            Box::new(evm_parser::EvmDecodedEventMaterializer),
+            Box::new(solana_parser::SolanaDecodedEventMaterializer),
+        ];
+
+        for m in &materializers {
+            assert_eq!(
+                m.dataset_name(),
+                DatasetName::DecodedEvents,
+                "decoded event materializer for {:?} should produce decoded_events",
+                m.chain_family()
+            );
+        }
+    }
+
+    #[test]
+    fn all_materializers_have_globally_distinct_hashes() {
         use spectraplex_core::materializer::Materializer;
         use std::collections::HashSet;
 
@@ -190,18 +209,21 @@ mod tests {
             // Native balance delta materializers (P3-W2, EVM deferred)
             Box::new(solana_parser::SolanaNativeBalanceDeltaMaterializer),
             Box::new(hyperliquid_parser::HyperliquidNativeBalanceDeltaMaterializer),
+            // Decoded event materializers (P3-W3)
+            Box::new(evm_parser::EvmDecodedEventMaterializer),
+            Box::new(solana_parser::SolanaDecodedEventMaterializer),
         ];
 
         let hashes: HashSet<&str> = materializers.iter().map(|m| m.parser_hash()).collect();
         assert_eq!(
             hashes.len(),
             materializers.len(),
-            "all 8 materializers must have globally distinct parser_hash values"
+            "all 10 materializers must have globally distinct parser_hash values"
         );
     }
 
     #[test]
-    fn all_p3w2_materializer_descriptors_are_valid() {
+    fn all_silver_materializer_descriptors_are_valid() {
         use spectraplex_core::materializer::Materializer;
 
         let materializers: Vec<Box<dyn Materializer>> = vec![
@@ -210,6 +232,8 @@ mod tests {
             Box::new(hyperliquid_parser::HyperliquidTokenTransferMaterializer),
             Box::new(solana_parser::SolanaNativeBalanceDeltaMaterializer),
             Box::new(hyperliquid_parser::HyperliquidNativeBalanceDeltaMaterializer),
+            Box::new(evm_parser::EvmDecodedEventMaterializer),
+            Box::new(solana_parser::SolanaDecodedEventMaterializer),
         ];
 
         for m in &materializers {

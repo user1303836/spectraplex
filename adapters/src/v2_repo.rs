@@ -4,7 +4,7 @@
 //! `Repository` value they already hold for V1 wallet-scoped queries.
 
 use chrono::{DateTime, Utc};
-use spectraplex_core::materializer::{NativeBalanceDelta, TokenTransfer};
+use spectraplex_core::materializer::{DecodedEvent, NativeBalanceDelta, TokenTransfer};
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, DatasetVersion, DatasetVersionStatus, IndexTarget, IngestionRun,
     Network, RawTransaction, TargetKind, TargetMatch, TargetMode,
@@ -553,6 +553,86 @@ pub fn build_native_balance_delta_insert(
 }
 
 // ---------------------------------------------------------------------------
+// Row-mapping helpers for Silver tables (P3-W3)
+// ---------------------------------------------------------------------------
+
+fn row_to_decoded_event(row: &sqlx::postgres::PgRow) -> anyhow::Result<DecodedEvent> {
+    Ok(DecodedEvent {
+        id: row.try_get("id")?,
+        raw_transaction_id: row.try_get("raw_transaction_id")?,
+        network: row.try_get("network")?,
+        program_or_contract: row.try_get("program_or_contract")?,
+        event_signature: row.try_get("event_signature")?,
+        event_name: row.try_get("event_name")?,
+        log_index: row.try_get("log_index")?,
+        decoded_fields: row.try_get("decoded_fields")?,
+        raw_fields: row.try_get("raw_fields")?,
+        dataset_version_id: row.try_get("dataset_version_id")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Query builders for Silver tables (P3-W3)
+// ---------------------------------------------------------------------------
+
+/// Build a batch INSERT for `decoded_events` with ON CONFLICT DO NOTHING.
+pub fn build_decoded_event_insert(
+    events: &[DecodedEvent],
+) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+    let mut query = String::from(
+        "INSERT INTO decoded_events \
+         (id, raw_transaction_id, network, program_or_contract, event_signature, event_name, log_index, decoded_fields, raw_fields, dataset_version_id, created_at) \
+         VALUES ",
+    );
+    let mut args = sqlx::postgres::PgArguments::default();
+    for (i, e) in events.iter().enumerate() {
+        let base = i * 11;
+        if i > 0 {
+            query.push_str(", ");
+        }
+        query.push_str(&format!(
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+            base + 7,
+            base + 8,
+            base + 9,
+            base + 10,
+            base + 11,
+        ));
+        use sqlx::Arguments;
+        args.add(e.id).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(e.raw_transaction_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&e.network).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&e.program_or_contract)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&e.event_signature)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&e.event_name)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(e.log_index).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&e.decoded_fields)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&e.raw_fields)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(e.dataset_version_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(e.created_at).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    query.push_str(
+        " ON CONFLICT (raw_transaction_id, program_or_contract, log_index) \
+         WHERE raw_transaction_id IS NOT NULL DO NOTHING",
+    );
+    Ok((query, args))
+}
+
+// ---------------------------------------------------------------------------
 // V2 Repository impl
 // ---------------------------------------------------------------------------
 
@@ -1088,6 +1168,57 @@ impl Repository {
         .await?;
         rows.iter().map(row_to_native_balance_delta).collect()
     }
+
+    // -----------------------------------------------------------------------
+    // DecodedEvents (P3-W3)
+    // -----------------------------------------------------------------------
+
+    /// Bulk insert decoded event records.
+    pub async fn save_decoded_events(&self, events: &[DecodedEvent]) -> anyhow::Result<()> {
+        for chunk in events.chunks(Self::V2_BATCH_SIZE) {
+            let (query, args) = build_decoded_event_insert(chunk)?;
+            sqlx::query_with(&query, args).execute(self.pool()).await?;
+        }
+        Ok(())
+    }
+
+    /// Query decoded events by contract/program address.
+    pub async fn get_decoded_events_by_contract(
+        &self,
+        program_or_contract: &str,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<DecodedEvent>> {
+        let rows = sqlx::query(
+            "SELECT id, raw_transaction_id, network, program_or_contract, event_signature, \
+             event_name, log_index, decoded_fields, raw_fields, dataset_version_id, created_at \
+             FROM decoded_events \
+             WHERE program_or_contract = $1 \
+             ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(program_or_contract)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_decoded_event).collect()
+    }
+
+    /// Query decoded events by raw transaction ID.
+    pub async fn get_decoded_events_by_raw_tx(
+        &self,
+        raw_tx_id: Uuid,
+    ) -> anyhow::Result<Vec<DecodedEvent>> {
+        let rows = sqlx::query(
+            "SELECT id, raw_transaction_id, network, program_or_contract, event_signature, \
+             event_name, log_index, decoded_fields, raw_fields, dataset_version_id, created_at \
+             FROM decoded_events WHERE raw_transaction_id = $1 ORDER BY log_index",
+        )
+        .bind(raw_tx_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_decoded_event).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1531,6 +1662,87 @@ mod tests {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
             _assert_send(repo.get_native_balance_deltas_by_account("addr", 10, 0));
+        }
+        let _ = _check;
+    }
+
+    // -- decoded_event batch insert (P3-W3) --
+
+    fn make_decoded_event() -> DecodedEvent {
+        DecodedEvent {
+            id: Uuid::new_v4(),
+            raw_transaction_id: Some(Uuid::new_v4()),
+            network: "ethereum-mainnet".to_string(),
+            program_or_contract: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".to_string(),
+            event_signature: Some(
+                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".to_string(),
+            ),
+            event_name: Some("Transfer".to_string()),
+            log_index: 0,
+            decoded_fields: serde_json::json!({"from": "0x1", "to": "0x2", "value": "100"}),
+            raw_fields: serde_json::json!({"topics": [], "data": "0x"}),
+            dataset_version_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn decoded_event_insert_single() {
+        let de = make_decoded_event();
+        let (query, _) = build_decoded_event_insert(&[de]).unwrap();
+
+        assert!(query.starts_with("INSERT INTO decoded_events"));
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"));
+        assert!(query.contains("ON CONFLICT"));
+        assert!(query.contains("program_or_contract"));
+        assert!(query.contains("log_index"));
+    }
+
+    #[test]
+    fn decoded_event_insert_multiple() {
+        let events: Vec<_> = (0..3).map(|_| make_decoded_event()).collect();
+        let (query, _) = build_decoded_event_insert(&events).unwrap();
+
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"));
+        assert!(query.contains("($12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)"));
+        assert!(query.contains("($23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)"));
+    }
+
+    #[test]
+    fn decoded_event_insert_param_count() {
+        let events: Vec<_> = (0..5).map(|_| make_decoded_event()).collect();
+        let (query, _) = build_decoded_event_insert(&events).unwrap();
+        // 5 rows * 11 params = 55 => highest param is $55
+        assert!(query.contains("$55"));
+        assert!(!query.contains("$56"));
+    }
+
+    #[test]
+    fn decoded_event_insert_dedup_clause() {
+        let de = make_decoded_event();
+        let (query, _) = build_decoded_event_insert(&[de]).unwrap();
+
+        assert!(query.contains("ON CONFLICT (raw_transaction_id, program_or_contract, log_index)"));
+        assert!(query.contains("WHERE raw_transaction_id IS NOT NULL"));
+        assert!(query.contains("DO NOTHING"));
+    }
+
+    // -- Repository method signatures (P3-W3) --
+
+    #[test]
+    fn repo_save_decoded_events_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.save_decoded_events(&[]));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_get_decoded_events_by_contract_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.get_decoded_events_by_contract("0xabc", 10, 0));
         }
         let _ = _check;
     }
