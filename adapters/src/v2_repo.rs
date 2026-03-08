@@ -968,6 +968,85 @@ pub fn build_dataset_completeness_upsert(
 }
 
 // ---------------------------------------------------------------------------
+// Dataset filter query builder (P4-W1)
+// ---------------------------------------------------------------------------
+
+/// Build a filtered SELECT query for a Silver dataset table.
+///
+/// Dynamically adds JOIN and WHERE clauses based on which filters are
+/// provided, avoiding unnecessary JOINs when filters are unused.
+/// Uses `raw_transactions.timestamp` for time-window filtering so that
+/// time_start/time_end are always in the same units (seconds since epoch).
+#[allow(clippy::too_many_arguments)]
+pub fn build_dataset_filter_query(
+    select_cols: &str,
+    table_name: &str,
+    order_col: &str,
+    target_id: Option<Uuid>,
+    network: Option<&str>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
+    limit: i64,
+    offset: i64,
+) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+    let mut sql = format!("SELECT {select_cols} FROM {table_name} dt");
+    let mut args = sqlx::postgres::PgArguments::default();
+    let mut n: usize = 0;
+    let mut wheres: Vec<String> = Vec::new();
+
+    if target_id.is_some() {
+        sql.push_str(" JOIN target_matches tm ON tm.raw_transaction_id = dt.raw_transaction_id");
+    }
+    if time_start.is_some() || time_end.is_some() {
+        sql.push_str(" JOIN raw_transactions rt ON rt.id = dt.raw_transaction_id");
+    }
+
+    if let Some(tid) = target_id {
+        n += 1;
+        wheres.push(format!("tm.target_id = ${n}"));
+        use sqlx::Arguments;
+        args.add(tid).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    if let Some(net) = network {
+        n += 1;
+        wheres.push(format!("dt.network = ${n}"));
+        use sqlx::Arguments;
+        args.add(net.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    if let Some(start) = time_start {
+        n += 1;
+        wheres.push(format!("rt.timestamp >= ${n}"));
+        use sqlx::Arguments;
+        args.add(start).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    if let Some(end) = time_end {
+        n += 1;
+        wheres.push(format!("rt.timestamp <= ${n}"));
+        use sqlx::Arguments;
+        args.add(end).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    if !wheres.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&wheres.join(" AND "));
+    }
+
+    n += 1;
+    let lim_n = n;
+    n += 1;
+    let off_n = n;
+    sql.push_str(&format!(
+        " ORDER BY {order_col} DESC LIMIT ${lim_n} OFFSET ${off_n}"
+    ));
+    use sqlx::Arguments;
+    args.add(limit).map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(offset).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    Ok((sql, args))
+}
+
+// ---------------------------------------------------------------------------
 // V2 Repository impl
 // ---------------------------------------------------------------------------
 
@@ -1804,6 +1883,180 @@ impl Repository {
         .fetch_all(self.pool())
         .await?;
         rows.iter().map(row_to_dataset_completeness).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Dataset record queries with target/network/time-window filters (P4-W1)
+    // -----------------------------------------------------------------------
+
+    /// Query token transfers with optional target, network, and time-window filters.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_token_transfers(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<TokenTransfer>> {
+        let cols = "dt.id, dt.raw_transaction_id, dt.network, dt.token_address, dt.token_symbol, \
+                    dt.from_address, dt.to_address, dt.amount, dt.decimals, dt.dataset_version_id, dt.created_at";
+        let (sql, args) = build_dataset_filter_query(
+            cols,
+            "token_transfers",
+            "dt.created_at",
+            target_id,
+            network,
+            time_start,
+            time_end,
+            limit,
+            offset,
+        )?;
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_token_transfer).collect()
+    }
+
+    /// Query native balance deltas with optional target, network, and time-window filters.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_native_balance_deltas(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<NativeBalanceDelta>> {
+        let cols = "dt.id, dt.raw_transaction_id, dt.network, dt.account_address, dt.native_token, \
+                    dt.pre_balance, dt.post_balance, dt.delta, dt.is_fee_payer, dt.dataset_version_id, dt.created_at";
+        let (sql, args) = build_dataset_filter_query(
+            cols,
+            "native_balance_deltas",
+            "dt.created_at",
+            target_id,
+            network,
+            time_start,
+            time_end,
+            limit,
+            offset,
+        )?;
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_native_balance_delta).collect()
+    }
+
+    /// Query decoded events with optional target, network, and time-window filters.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_decoded_events(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<DecodedEvent>> {
+        let cols = "dt.id, dt.raw_transaction_id, dt.network, dt.program_or_contract, dt.event_signature, \
+                    dt.event_name, dt.log_index, dt.decoded_fields, dt.raw_fields, dt.dataset_version_id, dt.created_at";
+        let (sql, args) = build_dataset_filter_query(
+            cols,
+            "decoded_events",
+            "dt.created_at",
+            target_id,
+            network,
+            time_start,
+            time_end,
+            limit,
+            offset,
+        )?;
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_decoded_event).collect()
+    }
+
+    /// Query Hyperliquid fill records with optional target, network, and time-window filters.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_hl_fill_records(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<HlFillRecord>> {
+        let cols = "dt.id, dt.raw_transaction_id, dt.network, dt.coin, dt.side, dt.price, dt.size, dt.direction, \
+                    dt.closed_pnl, dt.fee, dt.fee_token, dt.fill_time, dt.order_id, dt.trade_id, dt.dataset_version_id, dt.created_at";
+        let (sql, args) = build_dataset_filter_query(
+            cols,
+            "hl_fill_records",
+            "dt.fill_time",
+            target_id,
+            network,
+            time_start,
+            time_end,
+            limit,
+            offset,
+        )?;
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_hl_fill_record).collect()
+    }
+
+    /// Query Hyperliquid funding payments with optional target, network, and time-window filters.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_hl_funding_payments(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<HlFundingPayment>> {
+        let cols =
+            "dt.id, dt.raw_transaction_id, dt.network, dt.coin, dt.amount, dt.funding_rate, \
+                    dt.payment_time, dt.dataset_version_id, dt.created_at";
+        let (sql, args) = build_dataset_filter_query(
+            cols,
+            "hl_funding_payments",
+            "dt.payment_time",
+            target_id,
+            network,
+            time_start,
+            time_end,
+            limit,
+            offset,
+        )?;
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_hl_funding_payment).collect()
+    }
+
+    /// Query Hyperliquid position changes with optional target, network, and time-window filters.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_hl_position_changes(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<HlPositionChange>> {
+        let cols =
+            "dt.id, dt.raw_transaction_id, dt.network, dt.coin, dt.side, dt.size_delta, dt.price, \
+                    dt.direction, dt.source_event, dt.dataset_version_id, dt.created_at";
+        let (sql, args) = build_dataset_filter_query(
+            cols,
+            "hl_position_changes",
+            "dt.created_at",
+            target_id,
+            network,
+            time_start,
+            time_end,
+            limit,
+            offset,
+        )?;
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_hl_position_change).collect()
     }
 
     /// Update completeness after an ingestion run completes.
@@ -2786,6 +3039,186 @@ mod tests {
                 100,
                 Uuid::new_v4(),
             ));
+        }
+        let _ = _check;
+    }
+
+    // -- Dataset filter query builder (P4-W1) --
+
+    #[test]
+    fn dataset_filter_query_no_filters() {
+        let (sql, _) = build_dataset_filter_query(
+            "dt.id, dt.network",
+            "token_transfers",
+            "dt.created_at",
+            None,
+            None,
+            None,
+            None,
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(sql.starts_with("SELECT dt.id, dt.network FROM token_transfers dt"));
+        assert!(!sql.contains("JOIN"));
+        assert!(!sql.contains("WHERE"));
+        assert!(sql.contains("ORDER BY dt.created_at DESC"));
+        assert!(sql.contains("LIMIT $1 OFFSET $2"));
+    }
+
+    #[test]
+    fn dataset_filter_query_target_only() {
+        let tid = Uuid::new_v4();
+        let (sql, _) = build_dataset_filter_query(
+            "dt.id",
+            "token_transfers",
+            "dt.created_at",
+            Some(tid),
+            None,
+            None,
+            None,
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(sql.contains("JOIN target_matches tm ON"));
+        assert!(!sql.contains("JOIN raw_transactions"));
+        assert!(sql.contains("WHERE tm.target_id = $1"));
+        assert!(sql.contains("LIMIT $2 OFFSET $3"));
+    }
+
+    #[test]
+    fn dataset_filter_query_network_only() {
+        let (sql, _) = build_dataset_filter_query(
+            "dt.id",
+            "token_transfers",
+            "dt.created_at",
+            None,
+            Some("solana-mainnet"),
+            None,
+            None,
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(!sql.contains("JOIN"));
+        assert!(sql.contains("WHERE dt.network = $1"));
+        assert!(sql.contains("LIMIT $2 OFFSET $3"));
+    }
+
+    #[test]
+    fn dataset_filter_query_time_window_only() {
+        let (sql, _) = build_dataset_filter_query(
+            "dt.id",
+            "token_transfers",
+            "dt.created_at",
+            None,
+            None,
+            Some(1700000000),
+            Some(1700100000),
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(sql.contains("JOIN raw_transactions rt ON"));
+        assert!(sql.contains("rt.timestamp >= $1"));
+        assert!(sql.contains("rt.timestamp <= $2"));
+        assert!(sql.contains("LIMIT $3 OFFSET $4"));
+    }
+
+    #[test]
+    fn dataset_filter_query_all_filters() {
+        let tid = Uuid::new_v4();
+        let (sql, _) = build_dataset_filter_query(
+            "dt.id",
+            "token_transfers",
+            "dt.created_at",
+            Some(tid),
+            Some("solana-mainnet"),
+            Some(1700000000),
+            Some(1700100000),
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(sql.contains("JOIN target_matches tm ON"));
+        assert!(sql.contains("JOIN raw_transactions rt ON"));
+        assert!(sql.contains("tm.target_id = $1"));
+        assert!(sql.contains("dt.network = $2"));
+        assert!(sql.contains("rt.timestamp >= $3"));
+        assert!(sql.contains("rt.timestamp <= $4"));
+        assert!(sql.contains("LIMIT $5 OFFSET $6"));
+    }
+
+    #[test]
+    fn dataset_filter_query_order_col_customizable() {
+        let (sql, _) = build_dataset_filter_query(
+            "dt.id",
+            "hl_fill_records",
+            "dt.fill_time",
+            None,
+            None,
+            None,
+            None,
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(sql.contains("ORDER BY dt.fill_time DESC"));
+    }
+
+    // -- Dataset query method signatures (P4-W1) --
+
+    #[test]
+    fn repo_query_token_transfers_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.query_token_transfers(None, None, None, None, 50, 0));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_query_native_balance_deltas_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.query_native_balance_deltas(None, None, None, None, 50, 0));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_query_decoded_events_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.query_decoded_events(None, None, None, None, 50, 0));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_query_hl_fill_records_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.query_hl_fill_records(None, None, None, None, 50, 0));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_query_hl_funding_payments_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.query_hl_funding_payments(None, None, None, None, 50, 0));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_query_hl_position_changes_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.query_hl_position_changes(None, None, None, None, 50, 0));
         }
         let _ = _check;
     }

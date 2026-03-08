@@ -20,10 +20,11 @@ use spectraplex_adapters::{
 };
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::connector::validate_target;
+use spectraplex_core::materializer::DatasetName;
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
 use spectraplex_core::v2::{
-    normalize_evm_address, normalize_solana_address, ChainFamily, IndexTarget, Network, TargetKind,
-    TargetMode,
+    normalize_evm_address, normalize_solana_address, ChainFamily, DatasetCompleteness,
+    DatasetVersion, IndexTarget, Network, TargetKind, TargetMode,
 };
 use sqlx::postgres::PgPoolOptions;
 use std::collections::{HashMap, HashSet};
@@ -202,6 +203,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/targets/{target_id}", get(get_target))
         .route("/v1/networks", get(list_networks))
         .route("/v1/networks/{network_id}", get(get_network))
+        .route("/v1/datasets", get(list_all_datasets))
+        .route(
+            "/v1/datasets/{name}/versions",
+            get(list_dataset_versions_handler),
+        )
+        .route("/v1/datasets/{name}/records", get(query_dataset_records))
+        .route(
+            "/v1/datasets/{name}/completeness",
+            get(get_dataset_completeness_handler),
+        )
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared_state),
             require_auth,
@@ -308,6 +319,23 @@ struct BalanceParams {
 struct AssetBalance {
     asset_symbol: String,
     balance: BigDecimal,
+}
+
+#[derive(Deserialize)]
+struct DatasetQueryParams {
+    target_id: Option<Uuid>,
+    network: Option<String>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct DatasetInfo {
+    name: String,
+    latest_version: Option<i32>,
+    latest_version_status: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1287,6 +1315,193 @@ async fn get_network(
     Ok(Json(network))
 }
 
+// ---------------------------------------------------------------------------
+// Dataset query handlers (P4-W1)
+// ---------------------------------------------------------------------------
+
+/// The six Silver datasets queryable via the /v1/datasets/{name}/records endpoint.
+const QUERYABLE_DATASETS: &[&str] = &[
+    "token_transfers",
+    "native_balance_deltas",
+    "decoded_events",
+    "hl_fills",
+    "hl_funding",
+    "positions",
+];
+
+fn validate_dataset_name(name: &str) -> Result<(), AppError> {
+    if name.is_empty() || name.len() > 64 {
+        return Err(AppError::bad_request("Invalid dataset name length"));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(AppError::bad_request(
+            "Dataset name contains invalid characters",
+        ));
+    }
+    Ok(())
+}
+
+async fn list_all_datasets(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<DatasetInfo>>, AppError> {
+    let mut datasets = Vec::new();
+    for ds in DatasetName::all() {
+        let sql_name = ds.as_sql_str();
+        let latest = state
+            .repo
+            .get_latest_dataset_version(sql_name)
+            .await
+            .map_err(AppError::internal)?;
+        datasets.push(DatasetInfo {
+            name: sql_name.to_string(),
+            latest_version: latest.as_ref().map(|v| v.version),
+            latest_version_status: latest.as_ref().map(|v| v.status.to_string()),
+        });
+    }
+    Ok(Json(datasets))
+}
+
+async fn list_dataset_versions_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<DatasetVersion>>, AppError> {
+    validate_dataset_name(&name)?;
+    let versions = state
+        .repo
+        .list_dataset_versions(&name)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(versions))
+}
+
+async fn query_dataset_records(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(params): Query<DatasetQueryParams>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    validate_dataset_name(&name)?;
+    if !QUERYABLE_DATASETS.contains(&name.as_str()) {
+        return Err(AppError::bad_request(format!(
+            "Dataset '{}' is not queryable via this endpoint. Queryable datasets: {}",
+            name,
+            QUERYABLE_DATASETS.join(", ")
+        )));
+    }
+    validate_date_range(params.time_start, params.time_end)?;
+    let limit = clamp_limit(params.limit);
+    let offset = clamp_offset(params.offset);
+    let net = params.network.as_deref();
+
+    let result = match name.as_str() {
+        "token_transfers" => {
+            let records = state
+                .repo
+                .query_token_transfers(
+                    params.target_id,
+                    net,
+                    params.time_start,
+                    params.time_end,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(AppError::internal)?;
+            serde_json::to_value(&records).map_err(AppError::internal)?
+        }
+        "native_balance_deltas" => {
+            let records = state
+                .repo
+                .query_native_balance_deltas(
+                    params.target_id,
+                    net,
+                    params.time_start,
+                    params.time_end,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(AppError::internal)?;
+            serde_json::to_value(&records).map_err(AppError::internal)?
+        }
+        "decoded_events" => {
+            let records = state
+                .repo
+                .query_decoded_events(
+                    params.target_id,
+                    net,
+                    params.time_start,
+                    params.time_end,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(AppError::internal)?;
+            serde_json::to_value(&records).map_err(AppError::internal)?
+        }
+        "hl_fills" => {
+            let records = state
+                .repo
+                .query_hl_fill_records(
+                    params.target_id,
+                    net,
+                    params.time_start,
+                    params.time_end,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(AppError::internal)?;
+            serde_json::to_value(&records).map_err(AppError::internal)?
+        }
+        "hl_funding" => {
+            let records = state
+                .repo
+                .query_hl_funding_payments(
+                    params.target_id,
+                    net,
+                    params.time_start,
+                    params.time_end,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(AppError::internal)?;
+            serde_json::to_value(&records).map_err(AppError::internal)?
+        }
+        "positions" => {
+            let records = state
+                .repo
+                .query_hl_position_changes(
+                    params.target_id,
+                    net,
+                    params.time_start,
+                    params.time_end,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(AppError::internal)?;
+            serde_json::to_value(&records).map_err(AppError::internal)?
+        }
+        _ => unreachable!("dataset name validated above"),
+    };
+
+    Ok(Json(result))
+}
+
+async fn get_dataset_completeness_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<DatasetCompleteness>>, AppError> {
+    validate_dataset_name(&name)?;
+    let records = state
+        .repo
+        .list_completeness_by_dataset(&name)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(records))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1357,6 +1572,16 @@ mod tests {
             .route("/v1/targets/{target_id}", get(get_target))
             .route("/v1/networks", get(list_networks))
             .route("/v1/networks/{network_id}", get(get_network))
+            .route("/v1/datasets", get(list_all_datasets))
+            .route(
+                "/v1/datasets/{name}/versions",
+                get(list_dataset_versions_handler),
+            )
+            .route("/v1/datasets/{name}/records", get(query_dataset_records))
+            .route(
+                "/v1/datasets/{name}/completeness",
+                get(get_dataset_completeness_handler),
+            )
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_auth,
@@ -3309,5 +3534,198 @@ mod tests {
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -- Dataset query endpoint tests (P4-W1) --
+
+    #[test]
+    fn test_validate_dataset_name_valid() {
+        assert!(validate_dataset_name("token_transfers").is_ok());
+        assert!(validate_dataset_name("hl_fills").is_ok());
+        assert!(validate_dataset_name("decoded_events").is_ok());
+    }
+
+    #[test]
+    fn test_validate_dataset_name_empty() {
+        let err = validate_dataset_name("").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_dataset_name_too_long() {
+        let long = "a".repeat(65);
+        let err = validate_dataset_name(&long).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_dataset_name_invalid_chars() {
+        let err = validate_dataset_name("bad-name").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        let err = validate_dataset_name("bad name").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        let err = validate_dataset_name("bad;name").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_queryable_datasets_count() {
+        assert_eq!(QUERYABLE_DATASETS.len(), 6);
+    }
+
+    #[test]
+    fn test_queryable_datasets_contains_expected() {
+        assert!(QUERYABLE_DATASETS.contains(&"token_transfers"));
+        assert!(QUERYABLE_DATASETS.contains(&"native_balance_deltas"));
+        assert!(QUERYABLE_DATASETS.contains(&"decoded_events"));
+        assert!(QUERYABLE_DATASETS.contains(&"hl_fills"));
+        assert!(QUERYABLE_DATASETS.contains(&"hl_funding"));
+        assert!(QUERYABLE_DATASETS.contains(&"positions"));
+    }
+
+    #[test]
+    fn test_dataset_info_serialization() {
+        let info = DatasetInfo {
+            name: "token_transfers".to_string(),
+            latest_version: Some(1),
+            latest_version_status: Some("active".to_string()),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["name"], "token_transfers");
+        assert_eq!(json["latest_version"], 1);
+        assert_eq!(json["latest_version_status"], "active");
+    }
+
+    #[test]
+    fn test_dataset_info_serialization_no_version() {
+        let info = DatasetInfo {
+            name: "positions".to_string(),
+            latest_version: None,
+            latest_version_status: None,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["name"], "positions");
+        assert!(json["latest_version"].is_null());
+        assert!(json["latest_version_status"].is_null());
+    }
+
+    #[test]
+    fn test_dataset_query_params_deserialization() {
+        let json = serde_json::json!({
+            "target_id": "550e8400-e29b-41d4-a716-446655440000",
+            "network": "solana-mainnet",
+            "time_start": 1700000000,
+            "time_end": 1700100000,
+            "limit": 100,
+            "offset": 10
+        });
+        let params: DatasetQueryParams = serde_json::from_value(json).unwrap();
+        assert!(params.target_id.is_some());
+        assert_eq!(params.network, Some("solana-mainnet".to_string()));
+        assert_eq!(params.time_start, Some(1700000000));
+        assert_eq!(params.time_end, Some(1700100000));
+        assert_eq!(params.limit, Some(100));
+        assert_eq!(params.offset, Some(10));
+    }
+
+    #[test]
+    fn test_dataset_query_params_all_optional() {
+        let json = serde_json::json!({});
+        let params: DatasetQueryParams = serde_json::from_value(json).unwrap();
+        assert!(params.target_id.is_none());
+        assert!(params.network.is_none());
+        assert!(params.time_start.is_none());
+        assert!(params.time_end.is_none());
+        assert!(params.limit.is_none());
+        assert!(params.offset.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_datasets_endpoint_requires_auth() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/datasets")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_dataset_records_invalid_dataset_name() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/datasets/nonexistent_dataset/records")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_dataset_records_invalid_name_chars() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/datasets/bad-name/records")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_dataset_records_invalid_time_range() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/datasets/token_transfers/records?time_start=2000&time_end=1000")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_dataset_versions_endpoint_routes() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/datasets/token_transfers/versions")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        // Route exists (not 404); may fail with 500 due to fake DB pool
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_dataset_completeness_endpoint_routes() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/datasets/token_transfers/completeness")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        // Route exists (not 404); may fail with 500 due to fake DB pool
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_dataset_records_endpoint_routes() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/datasets/token_transfers/records")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        // Route exists (not 404); may fail with 500 due to fake DB pool
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
