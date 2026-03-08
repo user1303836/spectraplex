@@ -50,4 +50,84 @@ mod tests {
         let id_b = deterministic_id(tx_b, 0);
         assert_ne!(id_a, id_b);
     }
+
+    #[test]
+    fn materializer_impls_all_produce_ledger_entries() {
+        use spectraplex_core::materializer::{DatasetName, Materializer};
+
+        let materializers: Vec<Box<dyn Materializer>> = vec![
+            Box::new(solana_parser::SolanaLedgerMaterializer),
+            Box::new(evm_parser::EvmLedgerMaterializer),
+            Box::new(hyperliquid_parser::HyperliquidLedgerMaterializer),
+        ];
+
+        for m in &materializers {
+            assert_eq!(
+                m.dataset_name(),
+                DatasetName::LedgerEntries,
+                "materializer for {:?} should produce ledger_entries",
+                m.chain_family()
+            );
+        }
+    }
+
+    #[test]
+    fn materializer_impls_have_distinct_hashes() {
+        use spectraplex_core::materializer::Materializer;
+        use std::collections::HashSet;
+
+        let materializers: Vec<Box<dyn Materializer>> = vec![
+            Box::new(solana_parser::SolanaLedgerMaterializer),
+            Box::new(evm_parser::EvmLedgerMaterializer),
+            Box::new(hyperliquid_parser::HyperliquidLedgerMaterializer),
+        ];
+
+        let hashes: HashSet<&str> = materializers.iter().map(|m| m.parser_hash()).collect();
+        assert_eq!(
+            hashes.len(),
+            materializers.len(),
+            "each materializer must have a distinct parser_hash"
+        );
+    }
+
+    #[test]
+    fn materializer_impls_have_distinct_chain_families() {
+        use spectraplex_core::materializer::Materializer;
+        use spectraplex_core::v2::ChainFamily;
+        use std::collections::HashSet;
+
+        let materializers: Vec<Box<dyn Materializer>> = vec![
+            Box::new(solana_parser::SolanaLedgerMaterializer),
+            Box::new(evm_parser::EvmLedgerMaterializer),
+            Box::new(hyperliquid_parser::HyperliquidLedgerMaterializer),
+        ];
+
+        let families: HashSet<ChainFamily> =
+            materializers.iter().map(|m| m.chain_family()).collect();
+        assert_eq!(families.len(), 3);
+        assert!(families.contains(&ChainFamily::Solana));
+        assert!(families.contains(&ChainFamily::Evm));
+        assert!(families.contains(&ChainFamily::Hyperliquid));
+    }
+
+    #[test]
+    fn materializer_descriptors_are_valid() {
+        use spectraplex_core::materializer::Materializer;
+
+        let materializers: Vec<Box<dyn Materializer>> = vec![
+            Box::new(solana_parser::SolanaLedgerMaterializer),
+            Box::new(evm_parser::EvmLedgerMaterializer),
+            Box::new(hyperliquid_parser::HyperliquidLedgerMaterializer),
+        ];
+
+        for m in &materializers {
+            let desc = m.descriptor();
+            assert!(
+                desc.validate().is_ok(),
+                "descriptor for {:?} should be valid",
+                m.chain_family()
+            );
+            assert_eq!(desc.name, m.dataset_name());
+        }
+    }
 }

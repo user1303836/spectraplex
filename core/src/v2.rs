@@ -233,11 +233,31 @@ pub struct Checkpoint {
 }
 
 // ---------------------------------------------------------------------------
+// Dataset Version Status
+// ---------------------------------------------------------------------------
+
+/// Status of a dataset version in the registry lifecycle.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Display, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum DatasetVersionStatus {
+    /// Currently active version used for new materializations.
+    #[default]
+    Active,
+    /// Replaced by a newer version; retained for historical queries.
+    Superseded,
+    /// Version failed during materialization and should not be used.
+    Failed,
+}
+
+// ---------------------------------------------------------------------------
 // Dataset Version
 // ---------------------------------------------------------------------------
 
 /// Tracks parser/materializer versions for safe reprocessing.
-/// Matches P0-W1 Section 3.5.
+/// Matches P0-W1 Section 3.5, extended in P3-W1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetVersion {
     pub id: Uuid,
@@ -246,6 +266,9 @@ pub struct DatasetVersion {
     pub parser_hash: Option<String>,
     pub created_at: DateTime<Utc>,
     pub notes: Option<String>,
+    /// Lifecycle status of this version.
+    #[serde(default)]
+    pub status: DatasetVersionStatus,
 }
 
 // ---------------------------------------------------------------------------
@@ -733,11 +756,74 @@ mod tests {
             parser_hash: Some("sha256:abc123".to_string()),
             created_at: Utc::now(),
             notes: Some("initial release".to_string()),
+            status: DatasetVersionStatus::Active,
         };
         let json = serde_json::to_string(&dv).unwrap();
         let back: DatasetVersion = serde_json::from_str(&json).unwrap();
         assert_eq!(back.dataset_name, "ledger_entries");
         assert_eq!(back.version, 1);
+        assert_eq!(back.status, DatasetVersionStatus::Active);
+    }
+
+    #[test]
+    fn dataset_version_status_default_is_active() {
+        assert_eq!(
+            DatasetVersionStatus::default(),
+            DatasetVersionStatus::Active
+        );
+    }
+
+    #[test]
+    fn dataset_version_status_serde_roundtrip() {
+        for (variant, expected_str) in [
+            (DatasetVersionStatus::Active, "\"active\""),
+            (DatasetVersionStatus::Superseded, "\"superseded\""),
+            (DatasetVersionStatus::Failed, "\"failed\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_str, "serialize {variant:?}");
+            let back: DatasetVersionStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "deserialize {expected_str}");
+        }
+    }
+
+    #[test]
+    fn dataset_version_status_from_str() {
+        assert_eq!(
+            DatasetVersionStatus::from_str("active").unwrap(),
+            DatasetVersionStatus::Active
+        );
+        assert_eq!(
+            DatasetVersionStatus::from_str("superseded").unwrap(),
+            DatasetVersionStatus::Superseded
+        );
+        assert_eq!(
+            DatasetVersionStatus::from_str("failed").unwrap(),
+            DatasetVersionStatus::Failed
+        );
+        assert!(DatasetVersionStatus::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn dataset_version_status_display() {
+        assert_eq!(DatasetVersionStatus::Active.to_string(), "active");
+        assert_eq!(DatasetVersionStatus::Superseded.to_string(), "superseded");
+        assert_eq!(DatasetVersionStatus::Failed.to_string(), "failed");
+    }
+
+    #[test]
+    fn dataset_version_backward_compat_missing_status() {
+        // When status is absent from JSON, it should default to Active.
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "dataset_name": "ledger_entries",
+            "version": 1,
+            "parser_hash": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "notes": null
+        }"#;
+        let dv: DatasetVersion = serde_json::from_str(json).unwrap();
+        assert_eq!(dv.status, DatasetVersionStatus::Active);
     }
 
     #[test]

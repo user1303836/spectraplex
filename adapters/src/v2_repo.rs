@@ -5,8 +5,8 @@
 
 use chrono::{DateTime, Utc};
 use spectraplex_core::v2::{
-    ChainFamily, Checkpoint, DatasetVersion, IndexTarget, IngestionRun, Network, RawTransaction,
-    TargetKind, TargetMatch, TargetMode,
+    ChainFamily, Checkpoint, DatasetVersion, DatasetVersionStatus, IndexTarget, IngestionRun,
+    Network, RawTransaction, TargetKind, TargetMatch, TargetMode,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -81,6 +81,25 @@ pub fn sql_to_target_mode(s: &str) -> anyhow::Result<TargetMode> {
         "stream" => Ok(TargetMode::Stream),
         "both" => Ok(TargetMode::Both),
         _ => Err(anyhow::anyhow!("Unknown target_mode: {s}")),
+    }
+}
+
+/// Convert a `DatasetVersionStatus` to the string used in SQL.
+pub fn dataset_version_status_to_sql(s: &DatasetVersionStatus) -> &'static str {
+    match s {
+        DatasetVersionStatus::Active => "active",
+        DatasetVersionStatus::Superseded => "superseded",
+        DatasetVersionStatus::Failed => "failed",
+    }
+}
+
+/// Parse a SQL status string back to `DatasetVersionStatus`.
+pub fn sql_to_dataset_version_status(s: &str) -> anyhow::Result<DatasetVersionStatus> {
+    match s {
+        "active" => Ok(DatasetVersionStatus::Active),
+        "superseded" => Ok(DatasetVersionStatus::Superseded),
+        "failed" => Ok(DatasetVersionStatus::Failed),
+        _ => Err(anyhow::anyhow!("Unknown dataset_version_status: {s}")),
     }
 }
 
@@ -175,6 +194,7 @@ fn row_to_checkpoint(row: &sqlx::postgres::PgRow) -> anyhow::Result<Checkpoint> 
 }
 
 fn row_to_dataset_version(row: &sqlx::postgres::PgRow) -> anyhow::Result<DatasetVersion> {
+    let status_str: String = row.try_get("status")?;
     Ok(DatasetVersion {
         id: row.try_get("id")?,
         dataset_name: row.try_get("dataset_name")?,
@@ -182,6 +202,7 @@ fn row_to_dataset_version(row: &sqlx::postgres::PgRow) -> anyhow::Result<Dataset
         parser_hash: row.try_get("parser_hash")?,
         created_at: row.try_get("created_at")?,
         notes: row.try_get("notes")?,
+        status: sql_to_dataset_version_status(&status_str)?,
     })
 }
 
@@ -358,8 +379,8 @@ pub fn build_dataset_version_insert(
     dv: &DatasetVersion,
 ) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
     let query = String::from(
-        "INSERT INTO dataset_versions (id, dataset_name, version, parser_hash, created_at, notes) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO dataset_versions (id, dataset_name, version, parser_hash, created_at, notes, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     );
     let mut args = sqlx::postgres::PgArguments::default();
     use sqlx::Arguments;
@@ -372,6 +393,8 @@ pub fn build_dataset_version_insert(
     args.add(dv.created_at)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     args.add(&dv.notes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(dataset_version_status_to_sql(&dv.status))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok((query, args))
 }
 
@@ -728,13 +751,83 @@ impl Repository {
         dataset_name: &str,
     ) -> anyhow::Result<Option<DatasetVersion>> {
         let row = sqlx::query(
-            "SELECT id, dataset_name, version, parser_hash, created_at, notes \
+            "SELECT id, dataset_name, version, parser_hash, created_at, notes, status \
              FROM dataset_versions WHERE dataset_name = $1 ORDER BY version DESC LIMIT 1",
         )
         .bind(dataset_name)
         .fetch_optional(self.pool())
         .await?;
         row.as_ref().map(row_to_dataset_version).transpose()
+    }
+
+    // -----------------------------------------------------------------------
+    // Dataset lifecycle methods (P3-W1)
+    // -----------------------------------------------------------------------
+
+    /// List distinct dataset names that have at least one version.
+    pub async fn list_datasets(&self) -> anyhow::Result<Vec<String>> {
+        let rows =
+            sqlx::query("SELECT DISTINCT dataset_name FROM dataset_versions ORDER BY dataset_name")
+                .fetch_all(self.pool())
+                .await?;
+        let mut names = Vec::with_capacity(rows.len());
+        for row in &rows {
+            names.push(row.try_get("dataset_name")?);
+        }
+        Ok(names)
+    }
+
+    /// List all versions of a given dataset, ordered by version descending.
+    pub async fn list_dataset_versions(
+        &self,
+        dataset_name: &str,
+    ) -> anyhow::Result<Vec<DatasetVersion>> {
+        let rows = sqlx::query(
+            "SELECT id, dataset_name, version, parser_hash, created_at, notes, status \
+             FROM dataset_versions WHERE dataset_name = $1 ORDER BY version DESC",
+        )
+        .bind(dataset_name)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_dataset_version).collect()
+    }
+
+    /// Get a specific dataset version by its ID.
+    pub async fn get_dataset_version_by_id(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<DatasetVersion>> {
+        let row = sqlx::query(
+            "SELECT id, dataset_name, version, parser_hash, created_at, notes, status \
+             FROM dataset_versions WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref().map(row_to_dataset_version).transpose()
+    }
+
+    /// Mark a dataset version as superseded.
+    pub async fn mark_version_superseded(&self, id: Uuid) -> anyhow::Result<()> {
+        sqlx::query("UPDATE dataset_versions SET status = $2 WHERE id = $1")
+            .bind(id)
+            .bind(dataset_version_status_to_sql(
+                &DatasetVersionStatus::Superseded,
+            ))
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Count ledger_entries rows linked to a specific dataset version.
+    pub async fn count_records_by_version(&self, dataset_version_id: Uuid) -> anyhow::Result<i64> {
+        let row =
+            sqlx::query("SELECT COUNT(*) AS cnt FROM ledger_entries WHERE dataset_version_id = $1")
+                .bind(dataset_version_id)
+                .fetch_one(self.pool())
+                .await?;
+        let count: i64 = row.try_get("cnt")?;
+        Ok(count)
     }
 }
 
@@ -884,6 +977,7 @@ mod tests {
             parser_hash: Some("sha256:abc".to_string()),
             created_at: Utc::now(),
             notes: None,
+            status: DatasetVersionStatus::Active,
         }
     }
 
@@ -998,13 +1092,34 @@ mod tests {
     // -- dataset_version insert --
 
     #[test]
-    fn dataset_version_insert_has_6_params() {
+    fn dataset_version_insert_has_7_params() {
         let dv = make_dataset_version();
         let (query, _) = build_dataset_version_insert(&dv).unwrap();
 
         assert!(query.starts_with("INSERT INTO dataset_versions"));
-        assert!(query.contains("$6"));
-        assert!(!query.contains("$7"));
+        assert!(query.contains("$7"));
+        assert!(!query.contains("$8"));
+        assert!(query.contains("status"));
+    }
+
+    // -- dataset_version_status SQL helpers --
+
+    #[test]
+    fn dataset_version_status_sql_roundtrip() {
+        for status in [
+            DatasetVersionStatus::Active,
+            DatasetVersionStatus::Superseded,
+            DatasetVersionStatus::Failed,
+        ] {
+            let s = dataset_version_status_to_sql(&status);
+            let back = sql_to_dataset_version_status(s).unwrap();
+            assert_eq!(status, back, "roundtrip failed for {status:?}");
+        }
+    }
+
+    #[test]
+    fn dataset_version_status_sql_unknown() {
+        assert!(sql_to_dataset_version_status("pending").is_err());
     }
 
     // -- list_index_targets query format --

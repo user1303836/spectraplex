@@ -175,6 +175,45 @@ fn spl_token_symbol(mint: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Materializer implementation
+// ---------------------------------------------------------------------------
+
+use spectraplex_core::materializer::{DatasetDescriptor, DatasetName, Materializer};
+use spectraplex_core::v2::ChainFamily;
+
+/// Materializer wrapper for the Solana ledger parser.
+pub struct SolanaLedgerMaterializer;
+
+impl Materializer for SolanaLedgerMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::LedgerEntries
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:solana_ledger_v1_a3f8c9d2"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Solana
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description:
+                "Solana ledger entries: SOL balance changes, SPL token transfers, and fees"
+                    .to_string(),
+            source_bronze_tables: vec!["raw_transactions".to_string()],
+            chain_families: vec![self.chain_family()],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +269,18 @@ mod tests {
 
         let change = extract_sol_change_lamports(&meta, 0);
         assert_eq!(change, 1_000_000_000i128);
+    }
+
+    #[test]
+    fn solana_materializer_contract() {
+        let m = SolanaLedgerMaterializer;
+        assert_eq!(m.dataset_name(), DatasetName::LedgerEntries);
+        assert_eq!(m.parser_version(), 1);
+        assert_eq!(m.chain_family(), ChainFamily::Solana);
+        assert!(!m.parser_hash().is_empty());
+        let desc = m.descriptor();
+        assert!(desc.validate().is_ok());
+        assert_eq!(desc.name, DatasetName::LedgerEntries);
+        assert_eq!(desc.chain_families, vec![ChainFamily::Solana]);
     }
 }

@@ -257,6 +257,45 @@ fn negate(val: BigDecimal) -> BigDecimal {
     -val
 }
 
+// ---------------------------------------------------------------------------
+// Materializer implementation
+// ---------------------------------------------------------------------------
+
+use spectraplex_core::materializer::{DatasetDescriptor, DatasetName, Materializer};
+use spectraplex_core::v2::ChainFamily;
+
+/// Materializer wrapper for the EVM ledger parser.
+pub struct EvmLedgerMaterializer;
+
+impl Materializer for EvmLedgerMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::LedgerEntries
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:evm_ledger_v1_b7e4d1f5"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Evm
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description:
+                "EVM ledger entries: ERC-20 transfers, native ETH value transfers, and gas fees"
+                    .to_string(),
+            source_bronze_tables: vec!["raw_transactions".to_string()],
+            chain_families: vec![self.chain_family()],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,6 +574,19 @@ mod tests {
         // Value larger than u128 (u128::MAX + 1)
         let over_u128 = hex_to_bigdecimal("0x100000000000000000000000000000000");
         assert!(over_u128 > BigDecimal::from(u128::MAX));
+    }
+
+    #[test]
+    fn evm_materializer_contract() {
+        let m = EvmLedgerMaterializer;
+        assert_eq!(m.dataset_name(), DatasetName::LedgerEntries);
+        assert_eq!(m.parser_version(), 1);
+        assert_eq!(m.chain_family(), ChainFamily::Evm);
+        assert!(!m.parser_hash().is_empty());
+        let desc = m.descriptor();
+        assert!(desc.validate().is_ok());
+        assert_eq!(desc.name, DatasetName::LedgerEntries);
+        assert_eq!(desc.chain_families, vec![ChainFamily::Evm]);
     }
 
     #[test]
