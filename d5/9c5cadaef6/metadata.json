@@ -3,7 +3,7 @@
   "checkpoint_id": "d59c5cadaef6",
   "strategy": "manual-commit",
   "branch": "p4-w3-sink-abstraction",
-  "checkpoints_count": 7,
+  "checkpoints_count": 8,
   "files_touched": [
     "Cargo.lock",
     "README.md",
@@ -95,13 +95,20 @@
       "context": "/d5/9c5cadaef6/11/context.md",
       "content_hash": "/d5/9c5cadaef6/11/content_hash.txt",
       "prompt": "/d5/9c5cadaef6/11/prompt.txt"
+    },
+    {
+      "metadata": "/d5/9c5cadaef6/12/metadata.json",
+      "transcript": "/d5/9c5cadaef6/12/full.jsonl",
+      "context": "/d5/9c5cadaef6/12/context.md",
+      "content_hash": "/d5/9c5cadaef6/12/content_hash.txt",
+      "prompt": "/d5/9c5cadaef6/12/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 849,
-    "cache_creation_tokens": 1265346,
-    "cache_read_tokens": 27908999,
-    "output_tokens": 200402,
-    "api_call_count": 351
+    "input_tokens": 868,
+    "cache_creation_tokens": 1350793,
+    "cache_read_tokens": 29160016,
+    "output_tokens": 221036,
+    "api_call_count": 368
   }
 }
