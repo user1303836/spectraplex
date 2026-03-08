@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "78c6c84e8775",
+  "session_id": "61eae488-9bdf-4430-91a9-bb21e118510b",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T20:31:21.566031Z",
+  "branch": "p2-w6-e2e-ingestion-compat-suite",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "adapters/tests/ingestion_compat_test.rs",
+    "docs/phase2/p2-w6-e2e-compat-handoff.md"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "ace215313ff7",
+  "token_usage": {
+    "input_tokens": 27,
+    "cache_creation_tokens": 95453,
+    "cache_read_tokens": 2092853,
+    "output_tokens": 10802,
+    "api_call_count": 25
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T20:31:21.242825Z",
+    "agent_lines": 0,
+    "human_added": 1321,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 1321,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/61eae488-9bdf-4430-91a9-bb21e118510b.jsonl"
+}
