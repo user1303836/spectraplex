@@ -27,3 +27,6 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 alloy = { version = "1", features = ["provider-http", "rpc-types", "reqwest"] }
 governor = "0.7"
+
+[dev-dependencies]
+log = "0.4"
