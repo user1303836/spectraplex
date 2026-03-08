@@ -3,7 +3,7 @@
   "checkpoint_id": "efa17550e04a",
   "strategy": "manual-commit",
   "branch": "p1-w2-bronze-control-plane-tables",
-  "checkpoints_count": 1,
+  "checkpoints_count": 2,
   "files_touched": [
     "docs/phase1/p1-w2-bronze-control-plane-tables-handoff.md",
     "migrations/20260308000000_add_v2_enums.sql",
@@ -24,13 +24,20 @@
       "context": "/ef/a17550e04a/1/context.md",
       "content_hash": "/ef/a17550e04a/1/content_hash.txt",
       "prompt": "/ef/a17550e04a/1/prompt.txt"
+    },
+    {
+      "metadata": "/ef/a17550e04a/2/metadata.json",
+      "transcript": "/ef/a17550e04a/2/full.jsonl",
+      "context": "/ef/a17550e04a/2/context.md",
+      "content_hash": "/ef/a17550e04a/2/content_hash.txt",
+      "prompt": "/ef/a17550e04a/2/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 8986,
-    "cache_creation_tokens": 241959,
-    "cache_read_tokens": 2046077,
-    "output_tokens": 20303,
-    "api_call_count": 37
+    "input_tokens": 9006,
+    "cache_creation_tokens": 358379,
+    "cache_read_tokens": 3720618,
+    "output_tokens": 36572,
+    "api_call_count": 55
   }
 }
