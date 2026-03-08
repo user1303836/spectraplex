@@ -1,0 +1,29 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "fcd1dd9930fe",
+  "strategy": "manual-commit",
+  "branch": "codex/p1-w1-v2-core-types",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "core/Cargo.toml",
+    "core/src/lib.rs",
+    "core/src/v2.rs",
+    "docs/phase1/p1-w1-v2-core-types-handoff.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/fc/d1dd9930fe/0/metadata.json",
+      "transcript": "/fc/d1dd9930fe/0/full.jsonl",
+      "context": "/fc/d1dd9930fe/0/context.md",
+      "content_hash": "/fc/d1dd9930fe/0/content_hash.txt",
+      "prompt": "/fc/d1dd9930fe/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 23,
+    "cache_creation_tokens": 69660,
+    "cache_read_tokens": 1241804,
+    "output_tokens": 13245,
+    "api_call_count": 21
+  }
+}

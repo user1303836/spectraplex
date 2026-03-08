@@ -1,0 +1,148 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 1: Canonical Bronze And Control Plane
+- work packet: P1-W1: Introduce V2 Core Types
+- objective: Add V2 domain types (ChainFamily, Network, TargetKind, IndexTarget, RawTransaction, IngestionRun, Checkpoint, TargetMatch, DatasetVersion) in core/ as a new module, keeping all existing V1 types untouched, with unit tests for serialization, parsing, and address normalization.
+- branch: codex/p1-w1-v2-core-types
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- core/src/v2.rs (new module with all V2 domain types)
+- core/src/lib.rs (add pub mod v2 export)
+- core/Cargo.toml (add strum dependency if needed for enum string conversion)
+- docs/phase1/p1-w1-v2-core-types-handoff.md (tracked review artifact)
+
+Implementation steps:
+1. 1. Create branch codex/p1-w1-v2-core-types from main at 17da70d
+2. 2. Create core/src/v2.rs with ChainFamily enum (Solana, Evm, Hyperliquid) with Serialize/Deserialize using lowercase string repr matching P0-W3 SQL enum
+3. 3. Add FinalityModel enum (ProbabilisticSlot, ProbabilisticBlock, DeterministicBlock, Instant) with string serialization matching P0-W3 Section 2
+4. 4. Add TargetKind enum (Wallet, Contract, Program, Account, TopicFilter, Market, Pool, Protocol) matching P0-W2 Section 2
+5. 5. Add TargetMode enum (Backfill, Stream, Both) matching P0-W2 Section 4
+6. 6. Add Network struct (id, chain_family, display_name, is_testnet, finality_model, block_time_ms) matching P0-W3 Section 1.1
+7. 7. Add IndexTarget struct (id, kind, network, chain_family, address, filter_spec as Option<serde_json::Value>, mode, label, owner_id, created_at, updated_at) matching P0-W1 Section 3.2
+8. 8. Add RawTransaction struct (id, network, tx_hash, timestamp, block_number, raw_metadata, source, ingestion_run_id, ingested_at) — no user_id, no wallet_address per P0-W1 Section 3.1
+9. 9. Add TargetMatch struct (id, target_id, raw_transaction_id, match_reason, matched_at) matching P0-W1 Section 3.2
+10. 10. Add IngestionRun struct (id, target_id, network, source, mode, status, started_at, finished_at, records_written, error_message, cursor_state) matching P0-W1 Section 3.4
+11. 11. Add Checkpoint struct (id, target_id, network, source, cursor as serde_json::Value, updated_at) matching P0-W1 Section 3.4 / P0-W3 Section 5
+12. 12. Add DatasetVersion struct (id, dataset_name, version, parser_hash, created_at, notes) matching P0-W1 Section 3.5
+13. 13. Add IngestionBatch struct (records: Vec<RawTransaction>, checkpoint, run_metadata) matching P0-W1 Section 4.2 Connector output
+14. 14. Add address normalization helpers: normalize_evm_address (lowercase hex), normalize_solana_address (base58 passthrough) per P0-W2 Section 6.4
+15. 15. Add From<Chain> for ChainFamily conversion (legacy interop) to map Chain::Solana→ChainFamily::Solana, Chain::Ethereum→ChainFamily::Evm, Chain::Hyperliquid→ChainFamily::Hyperliquid
+16. 16. Add TargetKind::valid_for_chain_family() method implementing the validity matrix from P0-W2 Section 3
+17. 17. Export v2 module from core/src/lib.rs
+18. 18. Write unit tests: enum serialization roundtrips, address normalization, validity matrix, Chain→ChainFamily conversion, IndexTarget construction for each target kind
+19. 19. Run cargo fmt --all --check, cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace
+20. 20. Create docs/phase1/p1-w1-v2-core-types-handoff.md with type inventory, cross-references to Phase 0 specs, and verification notes
+
+Verification expectations:
+1. cargo fmt --all --check passes
+2. cargo clippy --workspace --all-targets -- -D warnings passes
+3. cargo test --workspace passes (all existing tests plus new V2 type tests)
+4. All V2 types compile and have serde roundtrip tests
+5. ChainFamily serializes to lowercase strings matching P0-W3 SQL enum values
+6. TargetKind has 8 variants matching P0-W2 Section 2
+7. FinalityModel has 4 variants matching P0-W3 Section 2
+8. RawTransaction has no user_id or wallet_address fields (P0-W1 Section 3.1 rule 1-2)
+9. IndexTarget.filter_spec is Option<serde_json::Value> for JSONB flexibility
+10. Address normalization: EVM addresses lowercased, Solana base58 preserved
+11. Validity matrix correctly rejects invalid (kind, chain_family) pairs per P0-W2 Section 3
+12. Existing V1 types in models.rs are completely untouched
+13. No changes to migrations, adapters, api, or cli (types-only packet)
+
+Tracked review artifacts required in the PR:
+- docs/phase1/p1-w1-v2-core-types-handoff.md
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch codex/p1-w1-v2-core-types from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P1-W1: Introduce V2 Core Types.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 1: Canonical Bronze And Control Plane"
+- workPacket: "P1-W1: Introduce V2 Core Types"
+- branchName: "codex/p1-w1-v2-core-types"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
