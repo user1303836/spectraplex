@@ -9,7 +9,6 @@ CREATE TABLE IF NOT EXISTS decoded_events (
     id                    UUID PRIMARY KEY,
     raw_transaction_id    UUID REFERENCES raw_transactions(id),
     network               TEXT NOT NULL,
-    chain_family          chain_family_enum NOT NULL,
     program_or_contract   TEXT NOT NULL,
     event_signature       TEXT,
     event_name            TEXT,
