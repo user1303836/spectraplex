@@ -5,6 +5,7 @@ pub mod evm_parser;
 pub mod hyperliquid;
 pub mod hyperliquid_parser;
 pub mod hyperliquid_ws;
+pub mod ledger_derivation;
 pub mod repo;
 pub mod solana;
 pub mod solana_grpc;
@@ -216,13 +217,17 @@ mod tests {
             Box::new(hyperliquid_parser::HlFillMaterializer),
             Box::new(hyperliquid_parser::HlFundingPaymentMaterializer),
             Box::new(hyperliquid_parser::HlPositionChangeMaterializer),
+            // Derived ledger materializers (P3-W5)
+            Box::new(ledger_derivation::SolanaDerivedLedgerMaterializer),
+            Box::new(ledger_derivation::EvmDerivedLedgerMaterializer),
+            Box::new(ledger_derivation::HyperliquidDerivedLedgerMaterializer),
         ];
 
         let hashes: HashSet<&str> = materializers.iter().map(|m| m.parser_hash()).collect();
         assert_eq!(
             hashes.len(),
             materializers.len(),
-            "all 13 materializers must have globally distinct parser_hash values"
+            "all 16 materializers must have globally distinct parser_hash values"
         );
     }
 
@@ -242,6 +247,10 @@ mod tests {
             Box::new(hyperliquid_parser::HlFillMaterializer),
             Box::new(hyperliquid_parser::HlFundingPaymentMaterializer),
             Box::new(hyperliquid_parser::HlPositionChangeMaterializer),
+            // P3-W5 derived ledger materializers
+            Box::new(ledger_derivation::SolanaDerivedLedgerMaterializer),
+            Box::new(ledger_derivation::EvmDerivedLedgerMaterializer),
+            Box::new(ledger_derivation::HyperliquidDerivedLedgerMaterializer),
         ];
 
         for m in &materializers {
