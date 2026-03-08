@@ -168,6 +168,45 @@ fn parse_ledger_update(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Materializer implementation
+// ---------------------------------------------------------------------------
+
+use spectraplex_core::materializer::{DatasetDescriptor, DatasetName, Materializer};
+use spectraplex_core::v2::ChainFamily;
+
+/// Materializer wrapper for the Hyperliquid ledger parser.
+pub struct HyperliquidLedgerMaterializer;
+
+impl Materializer for HyperliquidLedgerMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::LedgerEntries
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:hl_ledger_v1_c5a2e8b3"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Hyperliquid
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description:
+                "Hyperliquid ledger entries: fills, funding payments, deposits, and withdrawals"
+                    .to_string(),
+            source_bronze_tables: vec!["raw_transactions".to_string()],
+            chain_families: vec![self.chain_family()],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +349,18 @@ mod tests {
         let tx = make_tx("unknown_type", serde_json::json!({}));
         let entries = parse_hyperliquid_transaction(&tx).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn hyperliquid_materializer_contract() {
+        let m = HyperliquidLedgerMaterializer;
+        assert_eq!(m.dataset_name(), DatasetName::LedgerEntries);
+        assert_eq!(m.parser_version(), 1);
+        assert_eq!(m.chain_family(), ChainFamily::Hyperliquid);
+        assert!(!m.parser_hash().is_empty());
+        let desc = m.descriptor();
+        assert!(desc.validate().is_ok());
+        assert_eq!(desc.name, DatasetName::LedgerEntries);
+        assert_eq!(desc.chain_families, vec![ChainFamily::Hyperliquid]);
     }
 }
