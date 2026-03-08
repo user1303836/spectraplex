@@ -130,4 +130,97 @@ mod tests {
             assert_eq!(desc.name, m.dataset_name());
         }
     }
+
+    // -- P3-W2: Token Transfer and Native Balance Delta materializer tests --
+
+    #[test]
+    fn all_token_transfer_materializers_produce_correct_dataset() {
+        use spectraplex_core::materializer::{DatasetName, Materializer};
+
+        let materializers: Vec<Box<dyn Materializer>> = vec![
+            Box::new(solana_parser::SolanaTokenTransferMaterializer),
+            Box::new(evm_parser::EvmTokenTransferMaterializer),
+            Box::new(hyperliquid_parser::HyperliquidTokenTransferMaterializer),
+        ];
+
+        for m in &materializers {
+            assert_eq!(
+                m.dataset_name(),
+                DatasetName::TokenTransfers,
+                "token transfer materializer for {:?} should produce token_transfers",
+                m.chain_family()
+            );
+        }
+    }
+
+    #[test]
+    fn all_native_balance_delta_materializers_produce_correct_dataset() {
+        use spectraplex_core::materializer::{DatasetName, Materializer};
+
+        // EVM native balance deltas are deferred — only Solana and Hyperliquid
+        let materializers: Vec<Box<dyn Materializer>> = vec![
+            Box::new(solana_parser::SolanaNativeBalanceDeltaMaterializer),
+            Box::new(hyperliquid_parser::HyperliquidNativeBalanceDeltaMaterializer),
+        ];
+
+        for m in &materializers {
+            assert_eq!(
+                m.dataset_name(),
+                DatasetName::NativeBalanceDeltas,
+                "native balance delta materializer for {:?} should produce native_balance_deltas",
+                m.chain_family()
+            );
+        }
+    }
+
+    #[test]
+    fn all_p3w2_materializers_have_globally_distinct_hashes() {
+        use spectraplex_core::materializer::Materializer;
+        use std::collections::HashSet;
+
+        let materializers: Vec<Box<dyn Materializer>> = vec![
+            // Ledger materializers (existing)
+            Box::new(solana_parser::SolanaLedgerMaterializer),
+            Box::new(evm_parser::EvmLedgerMaterializer),
+            Box::new(hyperliquid_parser::HyperliquidLedgerMaterializer),
+            // Token transfer materializers (P3-W2)
+            Box::new(solana_parser::SolanaTokenTransferMaterializer),
+            Box::new(evm_parser::EvmTokenTransferMaterializer),
+            Box::new(hyperliquid_parser::HyperliquidTokenTransferMaterializer),
+            // Native balance delta materializers (P3-W2, EVM deferred)
+            Box::new(solana_parser::SolanaNativeBalanceDeltaMaterializer),
+            Box::new(hyperliquid_parser::HyperliquidNativeBalanceDeltaMaterializer),
+        ];
+
+        let hashes: HashSet<&str> = materializers.iter().map(|m| m.parser_hash()).collect();
+        assert_eq!(
+            hashes.len(),
+            materializers.len(),
+            "all 8 materializers must have globally distinct parser_hash values"
+        );
+    }
+
+    #[test]
+    fn all_p3w2_materializer_descriptors_are_valid() {
+        use spectraplex_core::materializer::Materializer;
+
+        let materializers: Vec<Box<dyn Materializer>> = vec![
+            Box::new(solana_parser::SolanaTokenTransferMaterializer),
+            Box::new(evm_parser::EvmTokenTransferMaterializer),
+            Box::new(hyperliquid_parser::HyperliquidTokenTransferMaterializer),
+            Box::new(solana_parser::SolanaNativeBalanceDeltaMaterializer),
+            Box::new(hyperliquid_parser::HyperliquidNativeBalanceDeltaMaterializer),
+        ];
+
+        for m in &materializers {
+            let desc = m.descriptor();
+            assert!(
+                desc.validate().is_ok(),
+                "descriptor for {:?} / {:?} should be valid",
+                m.chain_family(),
+                m.dataset_name()
+            );
+            assert_eq!(desc.name, m.dataset_name());
+        }
+    }
 }
