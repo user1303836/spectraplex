@@ -9,7 +9,7 @@ use spectraplex_adapters::{
     solana_grpc::SolanaGrpcAdapter,
     solana_parser,
 };
-use spectraplex_core::models::{ChainIngestor, Transaction};
+use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
 use sqlx::postgres::PgPoolOptions;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -186,8 +186,38 @@ async fn main() -> anyhow::Result<()> {
 
                 if let Some(ref p) = pool {
                     let repo = Repository::new(p.clone());
+
+                    // Parse chain enum for ensure_wallet_target
+                    let chain_enum = match chain.as_str() {
+                        "solana" => Chain::Solana,
+                        "ethereum" => Chain::Ethereum,
+                        "hyperliquid" => Chain::Hyperliquid,
+                        _ => unreachable!("unsupported chain filtered earlier"),
+                    };
+
+                    // Ensure a V2 IndexTarget exists for this wallet (best-effort)
+                    let target_id = match repo
+                        .ensure_wallet_target(&chain_enum, wallet, Some(user_id))
+                        .await
+                    {
+                        Ok(target) => Some(target.id),
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                wallet = %wallet,
+                                "Failed to ensure V2 wallet target (V1 path unaffected)"
+                            );
+                            None
+                        }
+                    };
+
                     if let Some(cp) = build_checkpoint(&chain, wallet, &events) {
-                        repo.save_transactions_and_checkpoint(&events, &cp).await?;
+                        if let Some(tid) = target_id {
+                            repo.save_transactions_and_checkpoint_dual_write(&events, &cp, tid)
+                                .await?;
+                        } else {
+                            repo.save_transactions_and_checkpoint(&events, &cp).await?;
+                        }
                         info!(count = events.len(), wallet = %wallet, "Saved transactions to database");
                         info!(
                             chain = %chain,
@@ -199,7 +229,11 @@ async fn main() -> anyhow::Result<()> {
                             "Checkpoint saved atomically"
                         );
                     } else {
-                        repo.save_transactions(&events).await?;
+                        if let Some(tid) = target_id {
+                            repo.save_transactions_dual_write(&events, tid).await?;
+                        } else {
+                            repo.save_transactions(&events).await?;
+                        }
                         info!(
                             count = events.len(),
                             wallet = %wallet,

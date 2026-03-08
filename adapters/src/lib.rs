@@ -1,3 +1,4 @@
+pub mod dual_write;
 pub mod evm;
 pub mod evm_parser;
 pub mod hyperliquid;
