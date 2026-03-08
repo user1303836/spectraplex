@@ -3,7 +3,7 @@
   "checkpoint_id": "aa2edeae03f3",
   "strategy": "manual-commit",
   "branch": "p3-w1-dataset-registry-versioning",
-  "checkpoints_count": 5,
+  "checkpoints_count": 6,
   "files_touched": [
     "adapters/src/evm_parser.rs",
     "adapters/src/hyperliquid_parser.rs",
@@ -65,13 +65,20 @@
       "context": "/aa/2edeae03f3/6/context.md",
       "content_hash": "/aa/2edeae03f3/6/content_hash.txt",
       "prompt": "/aa/2edeae03f3/6/prompt.txt"
+    },
+    {
+      "metadata": "/aa/2edeae03f3/7/metadata.json",
+      "transcript": "/aa/2edeae03f3/7/full.jsonl",
+      "context": "/aa/2edeae03f3/7/context.md",
+      "content_hash": "/aa/2edeae03f3/7/content_hash.txt",
+      "prompt": "/aa/2edeae03f3/7/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 183,
-    "cache_creation_tokens": 825018,
-    "cache_read_tokens": 13580017,
-    "output_tokens": 105135,
-    "api_call_count": 163
+    "input_tokens": 202,
+    "cache_creation_tokens": 910465,
+    "cache_read_tokens": 14831034,
+    "output_tokens": 125769,
+    "api_call_count": 180
   }
 }
