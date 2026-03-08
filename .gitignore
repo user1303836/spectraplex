@@ -1,6 +1,7 @@
 /target
 n*.md
 p*.md
+!docs/**
 design/
 /workflow.tsx
 /.smithers/
