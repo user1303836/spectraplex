@@ -307,35 +307,64 @@ From `migrations/20260218000000_add_last_block_to_checkpoints.sql`:
 ALTER TABLE indexer_checkpoints ADD COLUMN last_block BIGINT;
 ```
 
-### 6.2 Solana: No Persisted Legacy gRPC Checkpoints
+### 6.2 Solana: Persisted Resume Cursor Semantics
 
-**Caveat (corrected from earlier draft):** The Solana gRPC adapter
+**Important correction from earlier draft:** The Solana gRPC adapter
 (`adapters/src/solana_grpc.rs`) uses an in-memory `SlotCheckpoint` (an
-`AtomicU64` at lines 51-75) for `from_slot` reconnection. This slot state
-is **not persisted** through the `IndexerCheckpoint` struct or the
-`indexer_checkpoints` table. The gRPC adapter does not call
-`repo.save_checkpoint()` with slot-based state.
+`AtomicU64` at lines 51-75) for `from_slot` reconnection. The adapter
+itself does not call `repo.save_checkpoint()` with slot-based state.
 
-Therefore:
+However, the CLI ingest path (`cli/src/main.rs`, lines 147-155) calls
+`SolanaGrpcAdapter::fetch_history()` and then passes the resulting
+transactions through `build_checkpoint()` (`adapters/src/repo.rs`,
+lines 42-78) and `save_transactions_and_checkpoint()` (lines 607-621).
+This means **gRPC-derived Solana `indexer_checkpoints` rows CAN exist**
+in the database. These rows have the same schema as RPC-derived rows:
 
-- **All legacy Solana `indexer_checkpoints` rows were created by the RPC
-  adapter** (`adapters/src/solana.rs`), which uses `last_signature` as the
-  cursor for `getSignaturesForAddress` pagination.
-- The migration should map legacy Solana rows to `source = "rpc"`, not
-  `source = "grpc"`.
-- There are **no legacy Solana gRPC checkpoints to migrate**. Any gRPC
-  streaming sessions that were running held their slot state only in memory
-  and lost it on process restart.
-- New V2 gRPC checkpoint rows will be created fresh when Phase 2 gRPC
-  connectors start persisting slot state to the `checkpoints` table.
+- `last_signature`: set to the latest transaction hash (from
+  `build_checkpoint`, line 73)
+- `last_slot`: extracted from `raw_metadata["slot"]` (lines 54-59);
+  present on BOTH RPC and gRPC-derived Solana transactions because both
+  adapter outputs include `"slot"` in their `raw_metadata`
+- `last_timestamp`: set to the latest transaction timestamp (line 76)
+
+**The legacy `indexer_checkpoints` schema cannot distinguish RPC-derived
+from gRPC-derived rows.** Both sources produce identical checkpoint
+shapes through `build_checkpoint()`.
+
+**Resume cursor semantics by adapter:**
+
+| Adapter | Persisted field used for resume | How resume works |
+|---|---|---|
+| Solana RPC (`adapters/src/solana.rs`, lines 38-40) | `last_signature` | Passed as the `until` parameter to `getSignaturesForAddress`; the RPC returns transactions newer than this signature. |
+| Solana gRPC via CLI (`cli/src/main.rs`, lines 149-152) | `last_slot` | CLI reads `checkpoint.last_slot`, calls `adapter.checkpoint().update(slot as u64)` to seed the in-memory `SlotCheckpoint`, then `fetch_history` uses `self.checkpoint.get()` as `from_slot`. |
+
+**Why `last_signature` is the only authoritative persisted resume cursor:**
+
+- `last_signature` is the **only** persisted cursor that an adapter reads
+  directly for pagination. The Solana RPC adapter reads
+  `checkpoint.last_signature` (line 38-40) and passes it to the RPC as
+  the `until` parameter.
+- `last_slot` is used by the CLI gRPC path indirectly (CLI code seeds the
+  in-memory `SlotCheckpoint`), but it is **not** a V2 gRPC checkpoint
+  equivalent: it carries no `commitment`-level metadata, may not reflect
+  the gRPC adapter's actual in-memory slot state at process exit, and is
+  present on RPC-derived rows too.
+- Because RPC and gRPC-derived rows are indistinguishable in the legacy
+  schema, the migration defaults all legacy Solana rows to
+  `source = "rpc"` with `last_signature` as the primary cursor. This is
+  safe for RPC resume.
+- Legacy gRPC users will need to create fresh V2 gRPC checkpoints when
+  Phase 2 gRPC connectors start persisting `(last_slot, commitment)` state
+  directly to the `checkpoints` table.
 
 **Migration mapping for Solana:**
 
 | Old field | V2 cursor field | Notes |
 |---|---|---|
-| `last_signature` | `cursor.last_signature` | Primary RPC resume cursor |
-| `last_slot` | `cursor.last_slot` | Present on some legacy rows (set by `build_checkpoint` from `raw_metadata["slot"]`); informational for RPC checkpoints |
-| N/A | `source` | Always `"rpc"` for legacy Solana rows |
+| `last_signature` | `cursor.last_signature` | Authoritative RPC resume cursor; present on all legacy Solana rows regardless of original adapter |
+| `last_slot` | `cursor.last_slot` | Informational only; present on all legacy Solana rows; not promoted to V2 gRPC cursor state |
+| N/A | `source` | Default `"rpc"` for all legacy Solana rows; gRPC-derived rows cannot be reliably distinguished |
 | N/A | `cursor.commitment` | Not tracked in legacy schema; omit or default to `"finalized"` (RPC `getSignaturesForAddress` returns finalized by default) |
 
 ### 6.3 HyperCore: Timestamp Precision Caveat
@@ -433,7 +462,7 @@ so it is not lost.
 
 | Legacy `chain` value | V2 `chain_family` | V2 default `network` | V2 default `source` | Rationale |
 |---|---|---|---|---|
-| `solana` | `solana` | `solana-mainnet` | `rpc` | All persisted Solana checkpoints come from the RPC adapter; gRPC uses in-memory slot state only |
+| `solana` | `solana` | `solana-mainnet` | `rpc` | Legacy Solana checkpoints may come from either the RPC or gRPC CLI path but are indistinguishable in the legacy schema; `last_signature` is the authoritative persisted resume cursor (Section 6.2) |
 | `hyperliquid` | `hyperliquid` | `hypercore-mainnet` | `rest` | All persisted HyperCore checkpoints come from the REST adapter |
 | `ethereum` | `evm` | `ethereum-mainnet` | `rpc` | All persisted EVM checkpoints come from the RPC adapter; may need network reclassification (Section 6.4) |
 
@@ -465,12 +494,32 @@ This section confirms alignment with the other Phase 0 specs.
 
 ### 8.1 V2 Architecture RFC (P0-W1) Alignment
 
+**Taxonomy and finality alignment (verified):**
+
 - `chain_family_enum` values: `solana, evm, hyperliquid` — **matches**
 - Network ID examples: `solana-mainnet`, `ethereum-mainnet`, `base-mainnet` — **matches**
-- Finality model labels: four-value set adopted from P0-W3 — **matches**
-- Checkpoint cursor shapes: extended with `commitment`, `last_log_index`, `last_timestamp_ms`, `data_types_covered` — **extension, not conflict**
+- Finality model labels: four-value set adopted from P0-W3 — **matches** (RFC Section 3.3 updated)
 - HyperEVM routing: EVM connector with HyperEVM network — **matches**
-- `networks` table schema: `rpc_url` removed, `block_time_ms` added — **matches** (RFC updated in P0-W3)
+- `networks` table schema: `rpc_url` removed, `block_time_ms` added — **matches** (RFC Section 3.3 updated)
+
+**Checkpoint cursor shapes (partial alignment — P0-W3 extends the RFC):**
+
+- The RFC Section 3.4 documents baseline cursor shapes: Solana
+  `{ last_signature, last_slot }`, EVM `{ last_block, last_block_hash }`,
+  Hyperliquid `{ last_timestamp, last_fill_tid }`.
+- P0-W3 extends these with additional fields: `commitment` (Solana),
+  `last_log_index` (EVM), `data_types_covered` (Hyperliquid).
+- P0-W3 renames the Hyperliquid field `last_timestamp` to
+  `last_timestamp_ms` to reflect that the V2 cursor stores millisecond
+  precision directly (Section 6.3 documents the legacy second-precision
+  caveat).
+- The RFC's Section 3.4 inline JSONB comment (`{ last_signature,
+  last_slot, last_block, last_timestamp, ... }`) and the Hyperliquid
+  cursor field names have **not been updated** to reflect the P0-W3
+  refinements. This is a documentation gap in `design/V2_ARCHITECTURE_RFC.md`,
+  not a semantic conflict.
+- **The authoritative cursor field definitions for Phase 1 are in this
+  handoff (Section 5), not in the RFC.**
 
 ### 8.2 Target Model Spec (P0-W2) Alignment
 
