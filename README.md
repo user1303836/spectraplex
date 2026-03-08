@@ -241,6 +241,9 @@ All `/v1/*` endpoints require authentication via `Authorization: Bearer <API_KEY
 | `GET` | `/v1/datasets/:name/versions` | List version history for a dataset |
 | `GET` | `/v1/datasets/:name/records` | Query dataset records with filters (paginated) |
 | `GET` | `/v1/datasets/:name/completeness` | Get completeness status for a dataset |
+| `POST` | `/v1/export/dataset` | Create an async export job for a Silver dataset (JSONL or CSV) |
+| `GET` | `/v1/export/jobs/:job_id` | Poll export job status |
+| `GET` | `/v1/export/jobs/:job_id/download` | Download completed export data |
 
 All wallet endpoints validate the address format and return structured JSON errors.
 
@@ -417,6 +420,43 @@ curl -H "Authorization: Bearer <API_KEY>" \
 ```
 
 Returns completeness tracking records for a dataset.
+
+### POST /v1/export/dataset
+
+```bash
+curl -X POST http://127.0.0.1:3000/v1/export/dataset \
+  -H "Authorization: Bearer <API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"dataset": "token_transfers", "format": "jsonl"}'
+
+# Response: {"id": "<JOB_UUID>", "state": "pending", "dataset": "token_transfers", "format": "jsonl", "record_count": null, "message": null}
+```
+
+Creates an async export job for a Silver dataset. Supported formats: `jsonl` (default), `csv`. Optional filters: `target_id`, `network`, `time_start`, `time_end`. Exportable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`. Maximum 100,000 records per export.
+
+### GET /v1/export/jobs/:job_id
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  http://127.0.0.1:3000/v1/export/jobs/<JOB_UUID>
+
+# Response: {"id": "...", "state": "completed", "dataset": "token_transfers", "format": "jsonl", "record_count": 1234, "message": "Exported 1234 records"}
+```
+
+Returns the status of an export job. States: `pending`, `running`, `completed`, `failed`.
+
+### GET /v1/export/jobs/:job_id/download
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  http://127.0.0.1:3000/v1/export/jobs/<JOB_UUID>/download \
+  -o export.jsonl
+
+# Returns the export data with appropriate Content-Type and Content-Disposition headers.
+# Returns 409 Conflict if the job is still running, or 400 if it failed.
+```
+
+Downloads the completed export data. The response includes a `Content-Disposition` header with the filename.
 
 ## Configuration
 

@@ -176,6 +176,25 @@ pub struct RegenerationRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Export Format
+// ---------------------------------------------------------------------------
+
+/// Supported export output formats.
+///
+/// Used by P4-W2 export jobs to specify how dataset records should be
+/// serialized. JSONL and CSV are supported now; Parquet can be added later
+/// without changing the request model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ExportFormat {
+    /// Newline-delimited JSON (one JSON object per line).
+    Jsonl,
+    /// Comma-separated values with a header row.
+    Csv,
+}
+
+// ---------------------------------------------------------------------------
 // Silver Dataset Records
 // ---------------------------------------------------------------------------
 
@@ -534,6 +553,38 @@ mod tests {
         assert_eq!(back.scope.dataset, DatasetName::TokenTransfers);
         assert!(back.supersede_current);
         assert_eq!(back.reason, "parser upgrade v1→v2");
+    }
+
+    // -- ExportFormat tests --
+
+    #[test]
+    fn export_format_serde_roundtrip() {
+        for (variant, expected) in [
+            (ExportFormat::Jsonl, "\"jsonl\""),
+            (ExportFormat::Csv, "\"csv\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected, "serialize {variant:?}");
+            let back: ExportFormat = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "deserialize {expected}");
+        }
+    }
+
+    #[test]
+    fn export_format_from_str() {
+        assert_eq!(
+            ExportFormat::from_str("jsonl").unwrap(),
+            ExportFormat::Jsonl
+        );
+        assert_eq!(ExportFormat::from_str("csv").unwrap(), ExportFormat::Csv);
+        assert!(ExportFormat::from_str("parquet").is_err());
+        assert!(ExportFormat::from_str("xml").is_err());
+    }
+
+    #[test]
+    fn export_format_display() {
+        assert_eq!(ExportFormat::Jsonl.to_string(), "jsonl");
+        assert_eq!(ExportFormat::Csv.to_string(), "csv");
     }
 
     // -- Materializer trait contract test --
