@@ -1,0 +1,123 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- mode: implement_packet
+- phase: Phase 0: Lock The V2 Architecture
+- work packet: P0-W2
+- objective: Write the missing Target Model spec that formalizes `IndexTarget` semantics, per-family validity, `filter_spec` shape, modes, and ownership rules against the V2 RFC.
+- branch: codex/p0-w2-target-model-spec
+- existing PR: (none)
+
+Repo touchpoints:
+- design/TARGET_MODEL.md
+- design/V2_ARCHITECTURE_RFC.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+- core/src/models.rs
+- adapters/src/repo.rs
+- api/src/main.rs
+- cli/src/main.rs
+
+Implementation steps:
+1. Draft `design/TARGET_MODEL.md` from RFC Section 3.2 instead of inventing new target kinds or control-plane concepts.
+2. Define target identity rules for wallet, contract, program, account, topic_filter, market, pool, and protocol targets.
+3. Specify the `filter_spec` shape and `mode` semantics (`backfill`, `stream`, `both`) for each target kind.
+4. Produce the per-chain-family validity matrix covering Solana, EVM, and Hyperliquid, including the wallet-vs-account distinction on Solana and the wallet-vs-contract distinction on EVM.
+5. Document ownership or tenancy rules and include at least one concrete example spec for every target kind.
+
+Verification expectations:
+1. Verify `design/TARGET_MODEL.md` exists and directly references the locked target model decisions in `design/V2_ARCHITECTURE_RFC.md`.
+2. Verify the validity matrix covers every target kind across every supported chain family.
+3. Verify each target kind has at least one example spec and that `filter_spec` examples are specific enough to drive Phase 1 schema work and Phase 2 connector inputs.
+4. Verify the spec preserves wallet indexing as first-class without reintroducing wallet-only assumptions into shared abstractions.
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet, create or reset the local branch codex/p0-w2-target-model-spec from the latest main branch state.
+2. If this is a fix iteration, stay on the existing branch and address the outstanding validation or review feedback first.
+3. Make only the changes needed for P0-W2.
+4. Run the relevant verification commands before finishing.
+5. Create a local commit if changes were made and verification is good.
+6. Do not push, do not open a PR, and do not merge a PR.
+
+Return JSON with:
+- phase: "Phase 0: Lock The V2 Architecture"
+- workPacket: "P0-W2"
+- branchName: "codex/p0-w2-target-model-spec"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
