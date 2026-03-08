@@ -3,7 +3,7 @@
   "checkpoint_id": "cd2456751b23",
   "strategy": "manual-commit",
   "branch": "p3-w5-ledger-derived-materialization",
-  "checkpoints_count": 6,
+  "checkpoints_count": 7,
   "files_touched": [
     "adapters/src/ledger_derivation.rs",
     "adapters/src/lib.rs"
@@ -71,13 +71,20 @@
       "context": "/cd/2456751b23/8/context.md",
       "content_hash": "/cd/2456751b23/8/content_hash.txt",
       "prompt": "/cd/2456751b23/8/prompt.txt"
+    },
+    {
+      "metadata": "/cd/2456751b23/9/metadata.json",
+      "transcript": "/cd/2456751b23/9/full.jsonl",
+      "context": "/cd/2456751b23/9/context.md",
+      "content_hash": "/cd/2456751b23/9/content_hash.txt",
+      "prompt": "/cd/2456751b23/9/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 333,
-    "cache_creation_tokens": 998017,
-    "cache_read_tokens": 20425648,
-    "output_tokens": 141347,
-    "api_call_count": 248
+    "input_tokens": 352,
+    "cache_creation_tokens": 1083464,
+    "cache_read_tokens": 21676665,
+    "output_tokens": 161981,
+    "api_call_count": 265
   }
 }
