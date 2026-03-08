@@ -1,0 +1,30 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "fd69e6297455",
+  "strategy": "manual-commit",
+  "branch": "p3-w4-hyperliquid-datasets",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "adapters/src/hyperliquid_parser.rs",
+    "adapters/src/lib.rs",
+    "adapters/src/v2_repo.rs",
+    "core/src/materializer.rs",
+    "migrations/20260310000000_add_hl_silver_datasets.sql"
+  ],
+  "sessions": [
+    {
+      "metadata": "/fd/69e6297455/0/metadata.json",
+      "transcript": "/fd/69e6297455/0/full.jsonl",
+      "context": "/fd/69e6297455/0/context.md",
+      "content_hash": "/fd/69e6297455/0/content_hash.txt",
+      "prompt": "/fd/69e6297455/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 187541,
+    "cache_read_tokens": 1448786,
+    "output_tokens": 13742,
+    "api_call_count": 22
+  }
+}

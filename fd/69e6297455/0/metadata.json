@@ -1,0 +1,35 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "fd69e6297455",
+  "session_id": "2f443725-c9ab-4c4b-bc83-5e5fd859af37",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T21:56:04.997015Z",
+  "branch": "p3-w4-hyperliquid-datasets",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "core/src/materializer.rs",
+    "migrations/20260310000000_add_hl_silver_datasets.sql",
+    "adapters/src/hyperliquid_parser.rs",
+    "adapters/src/lib.rs",
+    "adapters/src/v2_repo.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "5985739bb00f",
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 187541,
+    "cache_read_tokens": 1448786,
+    "output_tokens": 13742,
+    "api_call_count": 22
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T21:56:04.770737Z",
+    "agent_lines": 0,
+    "human_added": 1663,
+    "human_modified": 3,
+    "human_removed": 0,
+    "total_committed": 1663,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/2f443725-c9ab-4c4b-bc83-5e5fd859af37.jsonl"
+}
