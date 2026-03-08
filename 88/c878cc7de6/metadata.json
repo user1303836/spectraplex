@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "88c878cc7de6",
+  "strategy": "manual-commit",
+  "branch": "codex/p0-w3-network-model-spec",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "docs/phase0/p0-w3-network-model-handoff.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/88/c878cc7de6/0/metadata.json",
+      "transcript": "/88/c878cc7de6/0/full.jsonl",
+      "context": "/88/c878cc7de6/0/context.md",
+      "content_hash": "/88/c878cc7de6/0/content_hash.txt",
+      "prompt": "/88/c878cc7de6/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 16,
+    "cache_creation_tokens": 127573,
+    "cache_read_tokens": 1373793,
+    "output_tokens": 14934,
+    "api_call_count": 14
+  }
+}

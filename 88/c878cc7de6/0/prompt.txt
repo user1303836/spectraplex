@@ -1,0 +1,145 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- mode: fix_validation
+- phase: Phase 0
+- work packet: P0-W3
+- objective: Freeze and publish the Phase 0 network model contract with accurate network taxonomy, finality semantics, and legacy checkpoint migration guidance so Phase 1 can depend on it safely.
+- branch: codex/p0-w3-network-model-spec
+- existing PR: https://github.com/user1303836/spectraplex/pull/101
+
+Repo touchpoints:
+- .gitignore
+- docs/phase0/p0-w3-network-model-handoff.md
+- design/NETWORK_MODEL.md
+- design/V2_ARCHITECTURE_RFC.md
+- design/TARGET_MODEL.md
+- core/src/models.rs
+- adapters/src/repo.rs
+- adapters/src/solana.rs
+- adapters/src/solana_grpc.rs
+- adapters/src/hyperliquid.rs
+
+Implementation steps:
+1. Revise `docs/phase0/p0-w3-network-model-handoff.md` Section 6 so legacy Solana migration treats RPC `last_signature` as the only authoritative persisted resume cursor and does not present `last_slot` as migrated gRPC-equivalent state.
+2. Revise the RFC cross-reference in the handoff so it no longer claims full checkpoint-shape alignment that `design/V2_ARCHITECTURE_RFC.md` does not yet encode; either update the RFC wording locally or narrow the handoff claim to taxonomy/finality alignment only.
+3. Keep the tracked artifact docs-only while preserving the HyperCore second-precision timestamp caveat and the deferred EVM legacy-network reclassification requirement.
+4. Push the corrected docs commit to `origin/codex/p0-w3-network-model-spec`, update PR #101 body to remove the stale "tracked artifact still needed" note, and re-request review once the GitHub diff is present.
+
+Verification expectations:
+1. Re-read `docs/phase0/p0-w3-network-model-handoff.md` against `design/NETWORK_MODEL.md`, `design/V2_ARCHITECTURE_RFC.md`, and `design/TARGET_MODEL.md` to confirm no claimed alignment exceeds the source docs.
+2. Verify against source that Solana gRPC checkpoint state is in-memory only (`adapters/src/solana_grpc.rs`), Solana RPC resumes by `last_signature` (`adapters/src/solana.rs`), legacy checkpoints are built in `adapters/src/repo.rs`, and HyperCore timestamps are stored at second precision (`adapters/src/hyperliquid.rs`).
+3. Confirm `git diff --stat main...HEAD` remains docs-only and limited to `.gitignore` plus the tracked handoff artifact.
+4. Confirm `gh pr view 101 --json files,body,isDraft,reviewDecision` shows the corrected tracked diff and refreshed PR body on GitHub.
+
+Outstanding validation or review feedback:
+Validation failures:
+- docs/phase0/p0-w3-network-model-handoff.md says there are no persisted legacy Solana gRPC checkpoints and that all legacy Solana checkpoints came from RPC, but the CLI gRPC ingest path can persist Solana checkpoints via build_checkpoint() and save_transactions_and_checkpoint(); migrating every legacy Solana row as source='rpc' would misclassify gRPC-derived rows.
+- docs/phase0/p0-w3-network-model-handoff.md claims V2_ARCHITECTURE_RFC.md is aligned on checkpoint cursor shapes, but the RFC still documents Hyperliquid cursor fields as last_timestamp/last_fill_tid and still uses the older generic cursor comment, so the Phase 0 contract is not fully doc-synced.
+
+Validation warnings:
+- No Rust tests were run because the branch diff is docs-only plus .gitignore, which CLAUDE.md permits.
+
+Local review blockers:
+- PR #101 has no tracked diff; the P0-W3 network contract currently exists only in ignored design docs, so there is nothing mergeable freezing the Phase 1 contract.
+- The proposed checkpoint migration incorrectly defaults all legacy Solana checkpoints to source="rpc" even though the current CLI can persist gRPC-derived Solana checkpoints that resume by slot.
+- The proposed HyperCore checkpoint migration maps second-precision last_timestamp to exact millisecond last_timestamp_ms, which overstates the precision of existing data and needs explicit replay/dedupe semantics.
+
+Local review follow-ups:
+- The spec correctly documents that legacy Chain::Ethereum data may need manual network reclassification, but Phase 1 still needs to define the exact override mechanism before migration code ships.
+
+PR review blockers:
+- PR #101 is still an empty draft shell with zero tracked file changes, so there is no published packet artifact to review or approve on GitHub.
+- The packet content currently appears to live only in REDACTED.md while /Users/user1303836/Development/spectraplex/.gitignore:4 excludes design/, which blocks validation of the HyperCore vs HyperEVM routing, Phase 1 networks table contract, finality/cursor semantics, and compatibility guidance as submitted.
+
+PR review follow-ups:
+- GitHub would not allow a formal REQUEST_CHANGES review on your own PR, so I posted a blocking PR comment instead: https://github.com/user1303836/spectraplex/pull/101#issuecomment-4017837478
+
+Requirements:
+1. If this is a new packet, create or reset the local branch codex/p0-w3-network-model-spec from the latest main branch state.
+2. If this is a fix iteration, stay on the existing branch and address the outstanding validation or review feedback first.
+3. Make only the changes needed for P0-W3.
+4. Run the relevant verification commands before finishing.
+5. Create a local commit if changes were made and verification is good.
+6. Do not push, do not open a PR, and do not merge a PR.
+
+Return JSON with:
+- phase: "Phase 0"
+- workPacket: "P0-W3"
+- branchName: "codex/p0-w3-network-model-spec"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
