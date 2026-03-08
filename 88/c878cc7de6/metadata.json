@@ -3,7 +3,7 @@
   "checkpoint_id": "88c878cc7de6",
   "strategy": "manual-commit",
   "branch": "codex/p0-w3-network-model-spec",
-  "checkpoints_count": 2,
+  "checkpoints_count": 3,
   "files_touched": [
     "docs/phase0/p0-w3-network-model-handoff.md"
   ],
@@ -28,13 +28,20 @@
       "context": "/88/c878cc7de6/2/context.md",
       "content_hash": "/88/c878cc7de6/2/content_hash.txt",
       "prompt": "/88/c878cc7de6/2/prompt.txt"
+    },
+    {
+      "metadata": "/88/c878cc7de6/3/metadata.json",
+      "transcript": "/88/c878cc7de6/3/full.jsonl",
+      "context": "/88/c878cc7de6/3/context.md",
+      "content_hash": "/88/c878cc7de6/3/content_hash.txt",
+      "prompt": "/88/c878cc7de6/3/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 60,
-    "cache_creation_tokens": 410872,
-    "cache_read_tokens": 3852352,
-    "output_tokens": 45384,
-    "api_call_count": 50
+    "input_tokens": 87,
+    "cache_creation_tokens": 506325,
+    "cache_read_tokens": 5945205,
+    "output_tokens": 56186,
+    "api_call_count": 75
   }
 }
