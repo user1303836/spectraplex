@@ -3,7 +3,7 @@
   "checkpoint_id": "fac1a771d287",
   "strategy": "manual-commit",
   "branch": "p4-w2-export-jobs",
-  "checkpoints_count": 6,
+  "checkpoints_count": 7,
   "files_touched": [
     "README.md",
     "adapters/src/v2_repo.rs",
@@ -73,13 +73,20 @@
       "context": "/fa/c1a771d287/8/context.md",
       "content_hash": "/fa/c1a771d287/8/content_hash.txt",
       "prompt": "/fa/c1a771d287/8/prompt.txt"
+    },
+    {
+      "metadata": "/fa/c1a771d287/9/metadata.json",
+      "transcript": "/fa/c1a771d287/9/full.jsonl",
+      "context": "/fa/c1a771d287/9/context.md",
+      "content_hash": "/fa/c1a771d287/9/content_hash.txt",
+      "prompt": "/fa/c1a771d287/9/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 739,
-    "cache_creation_tokens": 986973,
-    "cache_read_tokens": 16826279,
-    "output_tokens": 134721,
-    "api_call_count": 245
+    "input_tokens": 770,
+    "cache_creation_tokens": 1121325,
+    "cache_read_tokens": 20045060,
+    "output_tokens": 155018,
+    "api_call_count": 274
   }
 }
