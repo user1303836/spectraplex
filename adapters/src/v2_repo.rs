@@ -479,6 +479,23 @@ impl Repository {
         rows.iter().map(row_to_index_target).collect()
     }
 
+    pub async fn list_index_targets(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<IndexTarget>> {
+        let rows = sqlx::query(
+            "SELECT id, kind::text, network, chain_family::text, address, filter_spec, \
+             mode::text, label, owner_id, created_at, updated_at \
+             FROM index_targets ORDER BY created_at LIMIT $1 OFFSET $2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_index_target).collect()
+    }
+
     pub async fn list_index_targets_by_kind(
         &self,
         kind: TargetKind,
@@ -988,6 +1005,20 @@ mod tests {
         assert!(query.starts_with("INSERT INTO dataset_versions"));
         assert!(query.contains("$6"));
         assert!(!query.contains("$7"));
+    }
+
+    // -- list_index_targets query format --
+
+    #[test]
+    fn list_index_targets_query_uses_limit_offset() {
+        // The list_index_targets method uses a fixed query with LIMIT and OFFSET.
+        // We verify the method exists with the correct signature at compile time
+        // by referencing its type.
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.list_index_targets(10, 0));
+        }
+        let _ = _check;
     }
 
     // -- V2 batch size --

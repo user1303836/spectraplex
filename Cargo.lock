@@ -7045,6 +7045,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bigdecimal",
+ "chrono",
  "dotenvy",
  "http-body-util",
  "reqwest",
@@ -7068,6 +7069,7 @@ name = "spectraplex-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "dotenvy",
  "serde",
