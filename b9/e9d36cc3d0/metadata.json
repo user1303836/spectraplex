@@ -3,7 +3,7 @@
   "checkpoint_id": "b9e9d36cc3d0",
   "strategy": "manual-commit",
   "branch": "p2-w3-evm-ingestion-semantics",
-  "checkpoints_count": 2,
+  "checkpoints_count": 3,
   "files_touched": [
     "adapters/src/evm.rs",
     "docs/phase2/p2-w3-evm-ingestion-handoff.md"
@@ -29,13 +29,20 @@
       "context": "/b9/e9d36cc3d0/2/context.md",
       "content_hash": "/b9/e9d36cc3d0/2/content_hash.txt",
       "prompt": "/b9/e9d36cc3d0/2/prompt.txt"
+    },
+    {
+      "metadata": "/b9/e9d36cc3d0/3/metadata.json",
+      "transcript": "/b9/e9d36cc3d0/3/full.jsonl",
+      "context": "/b9/e9d36cc3d0/3/context.md",
+      "content_hash": "/b9/e9d36cc3d0/3/content_hash.txt",
+      "prompt": "/b9/e9d36cc3d0/3/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 64,
-    "cache_creation_tokens": 399719,
-    "cache_read_tokens": 4153100,
-    "output_tokens": 46719,
-    "api_call_count": 54
+    "input_tokens": 91,
+    "cache_creation_tokens": 495172,
+    "cache_read_tokens": 6245953,
+    "output_tokens": 57521,
+    "api_call_count": 79
   }
 }
