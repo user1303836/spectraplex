@@ -19,7 +19,7 @@ use spectraplex_adapters::{
     solana_parser,
 };
 use spectraplex_core::config::AppConfig;
-use spectraplex_core::models::{ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
+use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -476,6 +476,31 @@ async fn trigger_ingest(
                 .await
                 .unwrap_or(None);
 
+            // Parse chain enum for ensure_wallet_target
+            let chain_enum = match chain.as_str() {
+                "solana" => Chain::Solana,
+                "ethereum" => Chain::Ethereum,
+                "hyperliquid" => Chain::Hyperliquid,
+                _ => unreachable!("chain validated before spawn"),
+            };
+
+            // Ensure a V2 IndexTarget exists for this wallet (best-effort)
+            let target_id = match state_clone
+                .repo
+                .ensure_wallet_target(&chain_enum, &wallet, Some(user_id))
+                .await
+            {
+                Ok(target) => Some(target.id),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        wallet = %wallet,
+                        "Failed to ensure V2 wallet target (V1 path unaffected)"
+                    );
+                    None
+                }
+            };
+
             let events: Vec<Transaction> = match chain.as_str() {
                 "hyperliquid" => {
                     let adapter = HyperliquidAdapter::new();
@@ -499,9 +524,21 @@ async fn trigger_ingest(
             };
             let count = events.len();
             if let Some(cp) = build_checkpoint(&chain, &wallet, &events) {
+                if let Some(tid) = target_id {
+                    state_clone
+                        .repo
+                        .save_transactions_and_checkpoint_dual_write(&events, &cp, tid)
+                        .await?;
+                } else {
+                    state_clone
+                        .repo
+                        .save_transactions_and_checkpoint(&events, &cp)
+                        .await?;
+                }
+            } else if let Some(tid) = target_id {
                 state_clone
                     .repo
-                    .save_transactions_and_checkpoint(&events, &cp)
+                    .save_transactions_dual_write(&events, tid)
                     .await?;
             } else {
                 state_clone.repo.save_transactions(&events).await?;
