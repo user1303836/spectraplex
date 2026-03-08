@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "668e2a4c95e5",
+  "strategy": "manual-commit",
+  "branch": "codex/p0-w3-network-model-spec",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "design/V2_ARCHITECTURE_RFC.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/66/8e2a4c95e5/0/metadata.json",
+      "transcript": "/66/8e2a4c95e5/0/full.jsonl",
+      "context": "/66/8e2a4c95e5/0/context.md",
+      "content_hash": "/66/8e2a4c95e5/0/content_hash.txt",
+      "prompt": "/66/8e2a4c95e5/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 187541,
+    "cache_read_tokens": 1448786,
+    "output_tokens": 13742,
+    "api_call_count": 22
+  }
+}
