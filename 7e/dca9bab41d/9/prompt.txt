@@ -1,0 +1,194 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Coordinate the next Spectraplex work packet lifecycle.
+
+Read before deciding:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+- the current repository state
+- relevant open pull requests and packet branches
+
+Preflight:
+All preflight checks pass. Worktree is clean, on main at 484a3f3 (up-to-date with origin), all required tools and GitHub auth are available with full repo permissions, and both design docs exist. Ready for autonomous packet work.
+
+Workflow input:
+- goal: (not provided)
+- startAtPacket: (not provided)
+- stopAfterPacket: (not provided)
+- maxMergedPackets: (not provided)
+
+Previous coordination:
+P1-W4 (dual-write compatibility layer) merged as PR #108 at a3b9420. 294 tests pass on main, zero regressions. Blocking review issue (Hyperliquid cursor key) was fixed before merge. All Phase 1 implementation packets (P1-W1 through P1-W4) are now merged. Selecting P1-W5 — the verification capstone for Phase 1 schema work. This packet adds migration tests for fresh and upgraded DBs, validates uniqueness constraints and foreign keys, and proves that a single raw_transaction can link to multiple targets via target_matches. No open PRs or in-flight branches exist.
+
+Previous active packet runtime:
+- stage: fix_review_feedback
+- implementation: Added 21 migration integration tests against real PostgreSQL verifying fresh-DB and upgraded-DB migration paths, all 4 uniqueness constraints, 7 foreign key relationships, multi-target linkage (1 raw_tx → 2 targets), 13 canonical network seed records, V2 enum correctness, and V1-V2 coexistence.
+- validation: P1-W5 validated. All 21 migration integration tests pass against real PostgreSQL (0 ignored). Fresh-DB and upgraded-DB paths verified. All 4 uniqueness constraints, 7 foreign key relationships, multi-target linkage (1 raw_tx → 2 targets), 13 canonical network seeds, V2 enum correctness, V1 data survival through V2 migration, and V1-V2 coexistence all confirmed. cargo fmt and clippy clean. Handoff doc is accurate and in sync with implementation. No wallet-assumption or compatibility regressions. The only test failure is a pre-existing flaky race condition in the API crate, unrelated to this packet.
+- PR state: Created PR #109 for P1-W5. Branch pushed and PR opened against main with 4 files changed: 21 migration integration tests, adapters dev-dependencies, Cargo.lock, and handoff doc. PR is open and ready for review.
+- local review: The migration test suite is well-designed: 21 real-PostgreSQL integration tests covering fresh-DB and upgraded-DB paths, all 7 FKs, 4/5 uniqueness constraints, multi-target linkage, 13 network seeds, enum validation, and V1/V2 coexistence. Code quality is high with good isolation via ephemeral databases. However, the PR is NOT mergeable because CI is confirmed broken — all 21 tests panic in GHA due to missing PostgreSQL service container (0 passed, 21 failed). Additionally, the uq_index_targets_filter_spec constraint is untested. Fix the CI integration (add PostgreSQL to the test job or add a skip guard) and the PR will be ready.
+- remote review: Two blockers prevent merge: (1) migration tests panic in CI without PostgreSQL — needs a service container or skip guard, and (2) the uq_index_targets_filter_spec uniqueness constraint has no test coverage. All other review criteria pass: real PostgreSQL testing, 7/7 FKs, multi-target linkage, upgraded-DB V1 data survival, 13 network seeds, enum correctness, and V1-V2 coexistence.
+- merge: No merge output yet.
+
+Previous merge result:
+No prior merge result.
+
+Merged packets so far:
+1. Phase 0: Lock The V2 Architecture P0-W1: V2 Architecture RFC
+2. Phase 0: Lock The V2 Architecture P0-W3: Network Model Spec
+3. Phase 0: Lock The V2 Architecture P0-W4: Rollout And Compatibility Plan
+4. Phase 1: Canonical Bronze And Control Plane P1-W1: Introduce V2 Core Types
+5. Phase 1: Canonical Bronze And Control Plane P1-W2: Add New Bronze And Control-Plane Tables
+6. Phase 1: Canonical Bronze And Control Plane P1-W3: Repository Support For Canonical Raw Data
+
+Rules:
+1. Continue exactly one in-flight packet until it is merged. In-flight means an unmerged packet already selected by this workflow, an open PR for a packet branch, or local branch work that clearly maps to a packet.
+2. Only select a new packet when there is no in-flight packet left to finish.
+3. If multiple conflicting in-flight packets exist, return state="blocked" and explain why.
+4. Select the earliest incomplete packet allowed by dependencies in design/PHASED_IMPLEMENTATION_PLAN.md and still incomplete in the current repository and tracked docs.
+5. Respect phase order. Do not skip prerequisites unless the phased plan explicitly allows it.
+6. Keep wallet indexing first-class, but do not reinforce wallet-only assumptions in shared abstractions.
+7. If a packet's primary deliverables live under gitignored paths such as design/, require at least one tracked review artifact under docs/ and list it in trackedReviewArtifacts.
+8. Remote review happens as a PR comment, not a formal GitHub approval. Do not block on missing formal approval.
+9. Admin or force merge is allowed only after validation, local review, and the remote review comment all say the remaining blockers are cleared.
+10. If stopAfterPacket is provided and that packet is already merged, return state="complete".
+11. If maxMergedPackets is provided and the limit has been reached, return state="complete".
+12. If a prior merge attempt failed for an external reason that the workflow cannot safely resolve, return state="blocked" instead of looping forever.
+
+Return JSON with:
+- workflowComplete: true only if the workflow should stop successfully
+- state: "active", "complete", or "blocked"
+- phase: string, or "" if complete or blocked
+- workPacket: string, or "" if complete or blocked
+- objective: string, or "" if complete or blocked
+- branchName: string, or "" if complete or blocked
+- prNumber: number, or 0 if none
+- prUrl: string
+- prTitle: string
+- prBody: string
+- summary: concise coordination summary
+- repoTouchpoints: array
+- implementationSteps: array
+- verificationSteps: array
+- reviewFocus: array
+- trackedReviewArtifacts: array
+- blockingIssues: array
+- warnings: array
+- nextAction: string
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "workflowComplete": {
+      "type": "boolean"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "active",
+        "complete",
+        "blocked"
+      ]
+    },
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "objective": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "prNumber": {
+      "type": "number"
+    },
+    "prUrl": {
+      "type": "string"
+    },
+    "prTitle": {
+      "type": "string"
+    },
+    "prBody": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "repoTouchpoints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "implementationSteps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "verificationSteps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reviewFocus": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "trackedReviewArtifacts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blockingIssues": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "nextAction": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workflowComplete",
+    "state",
+    "phase",
+    "workPacket",
+    "objective",
+    "branchName",
+    "prNumber",
+    "prUrl",
+    "prTitle",
+    "prBody",
+    "summary",
+    "repoTouchpoints",
+    "implementationSteps",
+    "verificationSteps",
+    "reviewFocus",
+    "trackedReviewArtifacts",
+    "blockingIssues",
+    "warnings",
+    "nextAction"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
