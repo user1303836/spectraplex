@@ -1,0 +1,140 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 3: Expand Silver Into Reusable Datasets
+- work packet: P3-W1: Dataset registry and versioning
+- objective: Define canonical dataset identifiers, add the Materializer trait for parser/materializer version tracking, add versioning constraints and FK linkage on Silver tables, define regeneration rules from Bronze, and extend repository methods for dataset lifecycle management.
+- branch: p3-w1-dataset-registry-versioning
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- core/src/materializer.rs (NEW — Materializer trait, DatasetDescriptor, DatasetName enum, regeneration types)
+- core/src/v2.rs (DatasetVersionStatus enum, extend DatasetVersion with status field)
+- core/src/lib.rs (add pub mod materializer)
+- migrations/20260309000000_add_dataset_versioning.sql (NEW — UNIQUE constraint, dataset_version_id FK on ledger_entries, status column on dataset_versions)
+- adapters/src/v2_repo.rs (add list_datasets, list_dataset_versions, get_dataset_version_by_id, mark_version_superseded, count_records_by_version)
+- adapters/src/solana_parser.rs (SolanaLedgerMaterializer wrapper implementing Materializer)
+- adapters/src/evm_parser.rs (EvmLedgerMaterializer wrapper implementing Materializer)
+- adapters/src/hyperliquid_parser.rs (HyperliquidLedgerMaterializer wrapper implementing Materializer)
+- docs/phase3/p3-w1-dataset-registry-handoff.md (NEW — tracked review artifact)
+
+Implementation steps:
+1. 1. Create core/src/materializer.rs with: DatasetName enum (LedgerEntries, TokenTransfers, NativeBalanceDeltas, DecodedEvents, HlFills, HlFunding, Positions), DatasetDescriptor struct (name, description, source_bronze_tables, chain_families), Materializer trait (dataset_name, parser_version, parser_hash, chain_family), RegenerationScope struct (dataset, target_id, time_range), RegenerationRequest struct
+2. 2. Extend core/src/v2.rs: add DatasetVersionStatus enum (Active, Superseded, Failed), add status field to DatasetVersion struct (with default Active for backward compat)
+3. 3. Update core/src/lib.rs to add pub mod materializer
+4. 4. Create migration 20260309000000_add_dataset_versioning.sql: ADD COLUMN status TEXT DEFAULT 'active' to dataset_versions, ADD UNIQUE (dataset_name, version), ADD COLUMN dataset_version_id UUID REFERENCES dataset_versions(id) to ledger_entries (nullable during transition), ADD INDEX on ledger_entries(dataset_version_id)
+5. 5. Extend adapters/src/v2_repo.rs with: list_datasets() returning distinct dataset names, list_dataset_versions(dataset_name) returning all versions ordered by version desc, get_dataset_version_by_id(id) returning a specific version, mark_version_superseded(id) updating status, count_records_by_version(dataset_version_id) counting ledger_entries rows
+6. 6. Add Materializer impl wrappers: SolanaLedgerMaterializer in solana_parser.rs, EvmLedgerMaterializer in evm_parser.rs, HyperliquidLedgerMaterializer in hyperliquid_parser.rs — each declaring dataset_name='ledger_entries', parser_version=1, a stable parser_hash, and the appropriate ChainFamily
+7. 7. Add unit tests in core for DatasetName serialization, DatasetDescriptor construction, Materializer trait contract, RegenerationScope validation, DatasetVersionStatus round-trip
+8. 8. Add unit tests in adapters for new repo methods (build queries, row mapping), materializer impl consistency
+9. 9. Write docs/phase3/p3-w1-dataset-registry-handoff.md summarizing deliverables, decisions, and open questions for P3-W2/W3/W4
+10. 10. Run cargo fmt --all --check, cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace
+
+Verification expectations:
+1. cargo fmt --all --check passes
+2. cargo clippy --workspace --all-targets -- -D warnings passes
+3. cargo test --workspace passes (all existing + new tests)
+4. New migration applies cleanly (verified via CI PostgreSQL service in existing integration test infrastructure)
+5. DatasetName enum covers all 7 Silver datasets from RFC Section 3.5
+6. Materializer trait is implemented for all 3 chain-specific parsers
+7. All 3 materializer impls return consistent dataset_name='ledger_entries' and distinct parser_hash values
+8. DatasetVersion status field defaults to Active and serializes correctly
+9. Extended repo query builders produce valid SQL with correct parameter counts
+10. Handoff doc in docs/phase3/ is present and accurate
+
+Tracked review artifacts required in the PR:
+- docs/phase3/p3-w1-dataset-registry-handoff.md
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p3-w1-dataset-registry-versioning from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P3-W1: Dataset registry and versioning.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 3: Expand Silver Into Reusable Datasets"
+- workPacket: "P3-W1: Dataset registry and versioning"
+- branchName: "p3-w1-dataset-registry-versioning"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
