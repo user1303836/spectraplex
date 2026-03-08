@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "f9fe330447c4",
+  "session_id": "5706e75a-3900-45b7-a9d0-042eca5b63e1",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T20:10:09.194419Z",
+  "branch": "p2-w5-hyperliquid-target-model",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "adapters/src/hyperliquid.rs",
+    "adapters/src/hyperliquid_ws.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "ce80dc53e263",
+  "token_usage": {
+    "input_tokens": 32,
+    "cache_creation_tokens": 96268,
+    "cache_read_tokens": 2032890,
+    "output_tokens": 22433,
+    "api_call_count": 26
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T20:10:09.025357Z",
+    "agent_lines": 1089,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 1089,
+    "agent_percentage": 100
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/5706e75a-3900-45b7-a9d0-042eca5b63e1.jsonl"
+}
