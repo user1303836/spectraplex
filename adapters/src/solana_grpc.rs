@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use futures::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -14,7 +15,11 @@ use yellowstone_grpc_proto::prelude::{
     SubscribeRequestFilterTransactions,
 };
 
+use spectraplex_core::connector::{Connector, ConnectorCapabilities};
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
+use spectraplex_core::v2::{
+    ChainFamily, IndexTarget, IngestionBatch, RawTransaction, TargetKind, TargetMode,
+};
 
 /// Default program IDs to monitor when none are specified.
 const DEFAULT_PROGRAM_IDS: &[&str] = &[
@@ -343,6 +348,356 @@ impl ChainIngestor for SolanaGrpcAdapter {
         Ok(transactions)
     }
 }
+
+// ---------------------------------------------------------------------------
+// V2 Connector implementation
+// ---------------------------------------------------------------------------
+
+/// Build a target-kind-aware gRPC subscription request.
+///
+/// - Wallet target: `account_include = [wallet_pubkey]`
+/// - Program target: `account_include = [program_id]`
+/// - Account target: `account_include = [account_pubkey]`
+///
+/// The `account_include` field on Yellowstone gRPC's transaction filter matches
+/// any transaction that references one of the listed accounts in its account
+/// keys. This is the correct semantic for all three target kinds: it captures
+/// every transaction that touches the specified address.
+fn build_target_subscribe_request(
+    target: &IndexTarget,
+    commitment: CommitmentLevel,
+    from_slot: Option<u64>,
+) -> anyhow::Result<SubscribeRequest> {
+    let address = target
+        .address
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("{:?} target must have an address", target.kind))?;
+
+    let mut transactions = HashMap::new();
+    transactions.insert(
+        "tx_filter".to_string(),
+        SubscribeRequestFilterTransactions {
+            vote: Some(false),
+            failed: Some(false),
+            account_include: vec![address.to_string()],
+            account_exclude: vec![],
+            account_required: vec![],
+            signature: None,
+        },
+    );
+
+    Ok(SubscribeRequest {
+        accounts: HashMap::new(),
+        slots: HashMap::new(),
+        transactions,
+        transactions_status: HashMap::new(),
+        blocks: HashMap::new(),
+        blocks_meta: HashMap::new(),
+        entry: HashMap::new(),
+        commitment: Some(commitment as i32),
+        accounts_data_slice: vec![],
+        ping: None,
+        from_slot,
+    })
+}
+
+/// Convert a Yellowstone gRPC transaction update into a target-agnostic
+/// V2 `RawTransaction`. No `wallet_address` or `user_id` fields.
+pub fn convert_grpc_to_raw_transaction(
+    tx_info: &yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo,
+    slot: u64,
+    network: &str,
+    source: &str,
+) -> anyhow::Result<RawTransaction> {
+    let tx_hash = bs58::encode(&tx_info.signature).into_string();
+    let raw_metadata = build_raw_metadata(tx_info, slot)?;
+    let timestamp = extract_block_time(&raw_metadata);
+
+    Ok(RawTransaction {
+        id: Uuid::new_v4(),
+        network: network.to_string(),
+        tx_hash,
+        timestamp,
+        block_number: Some(slot as i64),
+        raw_metadata,
+        source: source.to_string(),
+        ingestion_run_id: None,
+        ingested_at: Utc::now(),
+    })
+}
+
+/// Extract a from_slot value from an opaque V2 cursor JSON.
+///
+/// Cursor shape: `{"last_slot": u64, "last_signature": "..."}`.
+fn cursor_to_from_slot(cursor: Option<&serde_json::Value>) -> Option<u64> {
+    cursor
+        .and_then(|c| c.get("last_slot"))
+        .and_then(|v| v.as_u64())
+}
+
+/// Source string for V2 gRPC ingestion paths.
+fn v2_source(target_kind: TargetKind, mode: &str) -> String {
+    let kind_str = match target_kind {
+        TargetKind::Wallet => "wallet",
+        TargetKind::Program => "program",
+        TargetKind::Account => "account",
+        _ => "unknown",
+    };
+    format!("solana-grpc-{kind_str}-{mode}")
+}
+
+#[async_trait::async_trait]
+impl Connector for SolanaGrpcAdapter {
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities {
+            supported_target_kinds: vec![
+                TargetKind::Wallet,
+                TargetKind::Program,
+                TargetKind::Account,
+            ],
+            supported_modes: vec![TargetMode::Backfill, TargetMode::Stream, TargetMode::Both],
+            chain_family: ChainFamily::Solana,
+        }
+    }
+
+    async fn backfill(
+        &self,
+        target: &IndexTarget,
+        cursor: Option<&serde_json::Value>,
+        limit: usize,
+    ) -> anyhow::Result<IngestionBatch> {
+        if target.chain_family != ChainFamily::Solana {
+            anyhow::bail!(
+                "SolanaGrpcAdapter only supports Solana chain family, got {:?}",
+                target.chain_family
+            );
+        }
+
+        match target.kind {
+            TargetKind::Wallet | TargetKind::Program | TargetKind::Account => {}
+            other => anyhow::bail!(
+                "SolanaGrpcAdapter does not support target kind {:?}; supported: wallet, program, account",
+                other
+            ),
+        }
+
+        let from_slot = cursor_to_from_slot(cursor);
+        let request = build_target_subscribe_request(target, self.config.commitment, from_slot)?;
+
+        let mut client = self.connect_client().await?;
+        let mut stream = client.subscribe_once(request).await?;
+
+        let source = v2_source(target.kind, "backfill");
+        let network = &target.network;
+        let mut records = Vec::new();
+
+        info!(
+            "gRPC V2 backfill: subscribing for up to {} transactions (target: {:?}, address: {:?})",
+            limit, target.kind, target.address
+        );
+
+        while let Some(msg) = stream.next().await {
+            let update = msg?;
+
+            if let Some(UpdateOneof::Transaction(tx_update)) = update.update_oneof {
+                let slot = tx_update.slot;
+                self.checkpoint.update(slot);
+
+                if let Some(tx_info) = tx_update.transaction {
+                    match convert_grpc_to_raw_transaction(&tx_info, slot, network, &source) {
+                        Ok(raw_tx) => {
+                            records.push(raw_tx);
+                            if records.len() >= limit {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to convert gRPC transaction to RawTransaction: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("gRPC V2 backfill: collected {} records", records.len());
+
+        Ok(IngestionBatch {
+            records,
+            checkpoint: None,
+            run_metadata: None,
+        })
+    }
+
+    async fn stream(
+        &self,
+        target: &IndexTarget,
+        cursor: Option<&serde_json::Value>,
+    ) -> anyhow::Result<mpsc::Receiver<RawTransaction>> {
+        if target.chain_family != ChainFamily::Solana {
+            anyhow::bail!(
+                "SolanaGrpcAdapter only supports Solana chain family, got {:?}",
+                target.chain_family
+            );
+        }
+
+        match target.kind {
+            TargetKind::Wallet | TargetKind::Program | TargetKind::Account => {}
+            other => anyhow::bail!(
+                "SolanaGrpcAdapter does not support streaming for target kind {:?}",
+                other
+            ),
+        }
+
+        let from_slot = cursor_to_from_slot(cursor);
+        let (tx, rx) = mpsc::channel(self.config.channel_capacity);
+
+        let config_endpoint = self.config.endpoint.clone();
+        let config_x_token = self.config.x_token.clone();
+        let config_commitment = self.config.commitment;
+        let config_max_retries = self.config.max_retries;
+        let target_kind = target.kind;
+        let target_address = target
+            .address
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("{:?} target must have an address", target.kind))?;
+        let target_network = target.network.clone();
+        let checkpoint = self.checkpoint.clone();
+
+        let source = v2_source(target.kind, "stream");
+
+        tokio::spawn(async move {
+            let mut retry_count: u32 = 0;
+
+            loop {
+                let current_slot = {
+                    let last = checkpoint.get();
+                    if last > 0 {
+                        Some(last)
+                    } else {
+                        from_slot
+                    }
+                };
+
+                info!(
+                    "V2 gRPC stream connecting: endpoint={}, target_kind={:?}, address={}, from_slot={:?}, attempt={}",
+                    config_endpoint, target_kind, target_address, current_slot, retry_count + 1,
+                );
+
+                let adapter = SolanaGrpcAdapter {
+                    config: GrpcStreamConfig {
+                        endpoint: config_endpoint.clone(),
+                        x_token: config_x_token.clone(),
+                        commitment: config_commitment,
+                        max_retries: config_max_retries,
+                        ..Default::default()
+                    },
+                    checkpoint: checkpoint.clone(),
+                };
+
+                let target_for_request = IndexTarget {
+                    id: Uuid::nil(),
+                    kind: target_kind,
+                    network: target_network.clone(),
+                    chain_family: ChainFamily::Solana,
+                    address: Some(target_address.clone()),
+                    filter_spec: None,
+                    mode: TargetMode::Stream,
+                    label: None,
+                    owner_id: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                };
+
+                match adapter
+                    .run_v2_stream(&tx, &target_for_request, &source, current_slot)
+                    .await
+                {
+                    Ok(()) => {
+                        info!("V2 gRPC stream ended normally");
+                        break;
+                    }
+                    Err(e) => {
+                        error!("V2 gRPC stream error: {}", e);
+                        retry_count += 1;
+                        if retry_count > config_max_retries {
+                            error!(
+                                "Exceeded max retries ({}). Stopping V2 gRPC stream.",
+                                config_max_retries
+                            );
+                            break;
+                        }
+                        let backoff = Duration::from_secs(2u64.saturating_pow(retry_count.min(6)));
+                        warn!(
+                            "V2 stream reconnecting in {:?} (retry {}/{})",
+                            backoff, retry_count, config_max_retries
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+}
+
+impl SolanaGrpcAdapter {
+    /// Internal stream runner for V2 Connector, emitting `RawTransaction`s.
+    async fn run_v2_stream(
+        &self,
+        tx: &mpsc::Sender<RawTransaction>,
+        target: &IndexTarget,
+        source: &str,
+        from_slot: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let request = build_target_subscribe_request(target, self.config.commitment, from_slot)?;
+        let mut client = self.connect_client().await?;
+        let mut stream = client.subscribe_once(request).await?;
+
+        info!("V2 gRPC subscription established");
+
+        while let Some(msg) = stream.next().await {
+            let update = msg?;
+
+            match update.update_oneof {
+                Some(UpdateOneof::Transaction(tx_update)) => {
+                    let slot = tx_update.slot;
+                    self.checkpoint.update(slot);
+
+                    if let Some(tx_info) = tx_update.transaction {
+                        match convert_grpc_to_raw_transaction(
+                            &tx_info,
+                            slot,
+                            &target.network,
+                            source,
+                        ) {
+                            Ok(raw_tx) => {
+                                if tx.send(raw_tx).await.is_err() {
+                                    info!("V2 stream receiver dropped, stopping");
+                                    return Ok(());
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to convert gRPC transaction: {}", e);
+                            }
+                        }
+                    }
+                }
+                Some(UpdateOneof::Ping(_)) => {}
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// V1 Legacy conversion (preserved for backward compatibility)
+// ---------------------------------------------------------------------------
 
 /// Convert a Yellowstone gRPC transaction update into a Bronze-layer Transaction.
 ///
@@ -744,5 +1099,405 @@ mod tests {
         assert_eq!(adapter.config.program_ids.len(), 1);
         assert_eq!(adapter.config.max_retries, 5);
         assert_eq!(adapter.config.channel_capacity, 500);
+    }
+
+    // -----------------------------------------------------------------------
+    // V2 Connector tests
+    // -----------------------------------------------------------------------
+
+    fn make_target(kind: TargetKind, address: Option<&str>, network: &str) -> IndexTarget {
+        let now = Utc::now();
+        IndexTarget {
+            id: Uuid::new_v4(),
+            kind,
+            network: network.to_string(),
+            chain_family: ChainFamily::Solana,
+            address: address.map(|s| s.to_string()),
+            filter_spec: None,
+            mode: TargetMode::Both,
+            label: None,
+            owner_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    // -- Connector capabilities --
+
+    #[test]
+    fn test_v2_connector_capabilities() {
+        let adapter = SolanaGrpcAdapter::new("http://localhost:10000", None);
+        let caps = adapter.capabilities();
+
+        assert_eq!(caps.chain_family, ChainFamily::Solana);
+        assert_eq!(
+            caps.supported_target_kinds,
+            vec![TargetKind::Wallet, TargetKind::Program, TargetKind::Account]
+        );
+        assert_eq!(
+            caps.supported_modes,
+            vec![TargetMode::Backfill, TargetMode::Stream, TargetMode::Both]
+        );
+    }
+
+    #[test]
+    fn test_v2_connector_can_service_wallet() {
+        let adapter = SolanaGrpcAdapter::new("http://localhost:10000", None);
+        let caps = adapter.capabilities();
+        let target = make_target(
+            TargetKind::Wallet,
+            Some("DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy"),
+            "solana-mainnet",
+        );
+        assert!(caps.can_service(&target));
+    }
+
+    #[test]
+    fn test_v2_connector_can_service_program() {
+        let adapter = SolanaGrpcAdapter::new("http://localhost:10000", None);
+        let caps = adapter.capabilities();
+        let target = make_target(
+            TargetKind::Program,
+            Some("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+            "solana-mainnet",
+        );
+        assert!(caps.can_service(&target));
+    }
+
+    #[test]
+    fn test_v2_connector_can_service_account() {
+        let adapter = SolanaGrpcAdapter::new("http://localhost:10000", None);
+        let caps = adapter.capabilities();
+        let target = make_target(
+            TargetKind::Account,
+            Some("8szGkuLTAux9XMgZ2vtY39jVSowEcpBfFfD8hXSEqdGC"),
+            "solana-mainnet",
+        );
+        assert!(caps.can_service(&target));
+    }
+
+    #[test]
+    fn test_v2_connector_rejects_contract() {
+        let adapter = SolanaGrpcAdapter::new("http://localhost:10000", None);
+        let caps = adapter.capabilities();
+        let mut target = make_target(TargetKind::Contract, Some("0xabc"), "ethereum-mainnet");
+        target.chain_family = ChainFamily::Evm;
+        assert!(!caps.can_service(&target));
+    }
+
+    #[test]
+    fn test_v2_connector_rejects_market() {
+        let adapter = SolanaGrpcAdapter::new("http://localhost:10000", None);
+        let caps = adapter.capabilities();
+        let mut target = make_target(TargetKind::Market, Some("ETH"), "hypercore-mainnet");
+        target.chain_family = ChainFamily::Hyperliquid;
+        assert!(!caps.can_service(&target));
+    }
+
+    // -- Target-aware subscription request construction --
+
+    #[test]
+    fn test_build_target_subscribe_request_wallet() {
+        let target = make_target(
+            TargetKind::Wallet,
+            Some("DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy"),
+            "solana-mainnet",
+        );
+        let request =
+            build_target_subscribe_request(&target, CommitmentLevel::Confirmed, None).unwrap();
+
+        let filter = &request.transactions["tx_filter"];
+        assert_eq!(filter.account_include.len(), 1);
+        assert_eq!(
+            filter.account_include[0],
+            "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy"
+        );
+        assert_eq!(filter.vote, Some(false));
+        assert_eq!(filter.failed, Some(false));
+        assert!(filter.account_exclude.is_empty());
+        assert!(filter.account_required.is_empty());
+        assert!(request.from_slot.is_none());
+    }
+
+    #[test]
+    fn test_build_target_subscribe_request_program() {
+        let target = make_target(
+            TargetKind::Program,
+            Some("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+            "solana-mainnet",
+        );
+        let request =
+            build_target_subscribe_request(&target, CommitmentLevel::Confirmed, None).unwrap();
+
+        let filter = &request.transactions["tx_filter"];
+        assert_eq!(filter.account_include.len(), 1);
+        assert_eq!(
+            filter.account_include[0],
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        );
+    }
+
+    #[test]
+    fn test_build_target_subscribe_request_account() {
+        let target = make_target(
+            TargetKind::Account,
+            Some("8szGkuLTAux9XMgZ2vtY39jVSowEcpBfFfD8hXSEqdGC"),
+            "solana-mainnet",
+        );
+        let request =
+            build_target_subscribe_request(&target, CommitmentLevel::Confirmed, None).unwrap();
+
+        let filter = &request.transactions["tx_filter"];
+        assert_eq!(filter.account_include.len(), 1);
+        assert_eq!(
+            filter.account_include[0],
+            "8szGkuLTAux9XMgZ2vtY39jVSowEcpBfFfD8hXSEqdGC"
+        );
+    }
+
+    #[test]
+    fn test_build_target_subscribe_request_with_from_slot() {
+        let target = make_target(
+            TargetKind::Wallet,
+            Some("DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy"),
+            "solana-mainnet",
+        );
+        let request =
+            build_target_subscribe_request(&target, CommitmentLevel::Finalized, Some(99999))
+                .unwrap();
+
+        assert_eq!(request.from_slot, Some(99999));
+        assert_eq!(request.commitment, Some(CommitmentLevel::Finalized as i32));
+    }
+
+    #[test]
+    fn test_build_target_subscribe_request_no_address() {
+        let target = make_target(TargetKind::Wallet, None, "solana-mainnet");
+        let result = build_target_subscribe_request(&target, CommitmentLevel::Confirmed, None);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must have an address"));
+    }
+
+    // -- V2 RawTransaction conversion --
+
+    #[test]
+    fn test_convert_grpc_to_raw_transaction_basic() {
+        let account_keys = vec![vec![1u8; 32], vec![2u8; 32]];
+        let tx_info = make_test_tx_info(
+            vec![10_000_000_000, 0],
+            vec![9_500_000_000, 500_000_000],
+            account_keys,
+        );
+
+        let result = convert_grpc_to_raw_transaction(
+            &tx_info,
+            12345,
+            "solana-mainnet",
+            "solana-grpc-wallet-backfill",
+        );
+        assert!(result.is_ok());
+
+        let raw_tx = result.unwrap();
+        assert!(!raw_tx.tx_hash.is_empty());
+        assert_eq!(raw_tx.network, "solana-mainnet");
+        assert_eq!(raw_tx.source, "solana-grpc-wallet-backfill");
+        assert_eq!(raw_tx.block_number, Some(12345));
+        assert!(raw_tx.ingestion_run_id.is_none());
+
+        // Verify no wallet_address or user_id in serialized output
+        let serialized = serde_json::to_string(&raw_tx).unwrap();
+        assert!(!serialized.contains("wallet_address"));
+        assert!(!serialized.contains("user_id"));
+    }
+
+    #[test]
+    fn test_convert_grpc_to_raw_transaction_program_source() {
+        let tx_info = make_test_tx_info(vec![0], vec![0], vec![vec![0u8; 32]]);
+        let result = convert_grpc_to_raw_transaction(
+            &tx_info,
+            500,
+            "solana-mainnet",
+            "solana-grpc-program-backfill",
+        );
+        assert!(result.is_ok());
+
+        let raw_tx = result.unwrap();
+        assert_eq!(raw_tx.source, "solana-grpc-program-backfill");
+        assert_eq!(raw_tx.network, "solana-mainnet");
+    }
+
+    #[test]
+    fn test_convert_grpc_to_raw_transaction_account_source() {
+        let tx_info = make_test_tx_info(vec![0], vec![0], vec![vec![0u8; 32]]);
+        let result = convert_grpc_to_raw_transaction(
+            &tx_info,
+            700,
+            "solana-mainnet",
+            "solana-grpc-account-stream",
+        );
+        assert!(result.is_ok());
+
+        let raw_tx = result.unwrap();
+        assert_eq!(raw_tx.source, "solana-grpc-account-stream");
+        assert_eq!(raw_tx.block_number, Some(700));
+    }
+
+    #[test]
+    fn test_convert_grpc_to_raw_transaction_preserves_metadata() {
+        let account_keys = vec![vec![1u8; 32]];
+        let tx_info = make_test_tx_info(vec![1_000_000_000], vec![999_000_000], account_keys);
+
+        let raw_tx = convert_grpc_to_raw_transaction(
+            &tx_info,
+            42,
+            "solana-mainnet",
+            "solana-grpc-wallet-backfill",
+        )
+        .unwrap();
+
+        assert_eq!(raw_tx.raw_metadata["slot"], 42);
+        assert_eq!(raw_tx.raw_metadata["meta"]["fee"], 5000);
+    }
+
+    // -- Cursor parsing --
+
+    #[test]
+    fn test_cursor_to_from_slot_none() {
+        assert_eq!(cursor_to_from_slot(None), None);
+    }
+
+    #[test]
+    fn test_cursor_to_from_slot_with_last_slot() {
+        let cursor = json!({"last_slot": 42000u64, "last_signature": "abc123"});
+        assert_eq!(cursor_to_from_slot(Some(&cursor)), Some(42000));
+    }
+
+    #[test]
+    fn test_cursor_to_from_slot_missing_key() {
+        let cursor = json!({"other": "value"});
+        assert_eq!(cursor_to_from_slot(Some(&cursor)), None);
+    }
+
+    #[test]
+    fn test_cursor_to_from_slot_wrong_type() {
+        let cursor = json!({"last_slot": "not_a_number"});
+        assert_eq!(cursor_to_from_slot(Some(&cursor)), None);
+    }
+
+    // -- Source string construction --
+
+    #[test]
+    fn test_v2_source_strings() {
+        assert_eq!(
+            v2_source(TargetKind::Wallet, "backfill"),
+            "solana-grpc-wallet-backfill"
+        );
+        assert_eq!(
+            v2_source(TargetKind::Program, "backfill"),
+            "solana-grpc-program-backfill"
+        );
+        assert_eq!(
+            v2_source(TargetKind::Account, "backfill"),
+            "solana-grpc-account-backfill"
+        );
+        assert_eq!(
+            v2_source(TargetKind::Wallet, "stream"),
+            "solana-grpc-wallet-stream"
+        );
+        assert_eq!(
+            v2_source(TargetKind::Program, "stream"),
+            "solana-grpc-program-stream"
+        );
+        assert_eq!(
+            v2_source(TargetKind::Account, "stream"),
+            "solana-grpc-account-stream"
+        );
+    }
+
+    // -- Legacy V1 conversion preserved --
+
+    #[test]
+    fn test_legacy_v1_conversion_still_works() {
+        let tx_info = make_test_tx_info(vec![1000], vec![500], vec![vec![1u8; 32]]);
+        let v1_tx = convert_grpc_transaction(&tx_info, 100).unwrap();
+        assert!(matches!(v1_tx.chain, Chain::Solana));
+        assert_eq!(v1_tx.wallet_address, "");
+        assert_eq!(v1_tx.user_id, Uuid::nil());
+    }
+
+    // -- Subscription request correctness per target kind --
+
+    #[test]
+    fn test_wallet_target_does_not_use_program_ids() {
+        let target = make_target(
+            TargetKind::Wallet,
+            Some("DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy"),
+            "solana-mainnet",
+        );
+        let request =
+            build_target_subscribe_request(&target, CommitmentLevel::Confirmed, None).unwrap();
+        let filter = &request.transactions["tx_filter"];
+
+        // The wallet target should ONLY include the wallet pubkey,
+        // NOT the default program IDs from the legacy path.
+        assert_eq!(filter.account_include.len(), 1);
+        assert_eq!(
+            filter.account_include[0],
+            "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy"
+        );
+        for default_pid in DEFAULT_PROGRAM_IDS {
+            assert!(
+                !filter.account_include.contains(&default_pid.to_string()),
+                "wallet target should not include default program ID {}",
+                default_pid
+            );
+        }
+    }
+
+    #[test]
+    fn test_program_target_does_not_stamp_wallet_identity() {
+        // Program target subscription should not include any wallet address
+        let target = make_target(
+            TargetKind::Program,
+            Some("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+            "solana-mainnet",
+        );
+        let request =
+            build_target_subscribe_request(&target, CommitmentLevel::Confirmed, None).unwrap();
+        let filter = &request.transactions["tx_filter"];
+
+        assert_eq!(filter.account_include.len(), 1);
+        assert_eq!(
+            filter.account_include[0],
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        );
+
+        // Verify the resulting RawTransaction also has no wallet identity
+        let tx_info = make_test_tx_info(vec![0], vec![0], vec![vec![0u8; 32]]);
+        let raw_tx = convert_grpc_to_raw_transaction(
+            &tx_info,
+            100,
+            "solana-mainnet",
+            "solana-grpc-program-backfill",
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&raw_tx).unwrap();
+        assert!(!serialized.contains("wallet_address"));
+        assert!(!serialized.contains("user_id"));
+    }
+
+    #[test]
+    fn test_account_target_uses_account_pubkey() {
+        let pda = "8szGkuLTAux9XMgZ2vtY39jVSowEcpBfFfD8hXSEqdGC";
+        let target = make_target(TargetKind::Account, Some(pda), "solana-mainnet");
+        let request =
+            build_target_subscribe_request(&target, CommitmentLevel::Confirmed, None).unwrap();
+        let filter = &request.transactions["tx_filter"];
+
+        assert_eq!(filter.account_include.len(), 1);
+        assert_eq!(filter.account_include[0], pda);
     }
 }
