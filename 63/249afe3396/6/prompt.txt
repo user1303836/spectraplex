@@ -1,0 +1,133 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 0: Lock The V2 Architecture
+- work packet: P0-W4: Rollout And Compatibility Plan
+- objective: Create the rollout and compatibility plan design doc and tracked handoff artifact. Must define: compatibility window, old-to-new schema mapping, deprecation sequence for wallet-shaped Bronze assumptions, and test matrix during transition. Every Phase 1 and Phase 2 work packet must have an identified compatibility strategy.
+- branch: codex/p0-w4-rollout-compatibility-plan
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- design/ROLLOUT_AND_COMPATIBILITY_PLAN.md (new, gitignored design doc)
+- docs/phase0/p0-w4-rollout-compatibility-plan-handoff.md (new tracked artifact)
+- docs/phase0/p0-w1-v2-architecture-rfc-handoff.md (cross-reference: Sections 11-12)
+- docs/phase0/p0-w2-target-model-spec-handoff.md (cross-reference: downstream mapping)
+- docs/phase0/p0-w3-network-model-handoff.md (cross-reference: network migration)
+
+Implementation steps:
+1. 1. Read P0-W1 handoff Sections 11-12 (dual-write strategy, deprecation sequence) as the primary input
+2. 2. Read P0-W2 handoff Section 11 (downstream packet mapping) for target registration compatibility needs
+3. 3. Read P0-W3 handoff for network migration compatibility (Chain enum → chain_family + network)
+4. 4. Read current migrations, repo.rs, api/src/main.rs, and cli/src/main.rs to understand current wallet-centric surface
+5. 5. Write design/ROLLOUT_AND_COMPATIBILITY_PLAN.md covering: compatibility window, old-to-new schema mapping, deprecation sequence, per-packet compatibility strategy (P1-W1 through P2-W6), test matrix
+6. 6. Create tracked handoff artifact at docs/phase0/p0-w4-rollout-compatibility-plan-handoff.md
+7. 7. Run cargo fmt, clippy, and test to validate no code changes break anything
+8. 8. Create branch, commit, push, create PR
+9. 9. Perform local and remote review
+10. 10. Merge after all CI checks pass and review is clear
+
+Verification expectations:
+1. cargo fmt --all --check
+2. cargo clippy --workspace --all-targets -- -D warnings
+3. cargo test --workspace
+4. Verify every P1-W* and P2-W* packet has an identified compatibility strategy
+5. Verify deprecation sequence is consistent with P0-W1 Section 12
+6. Verify test matrix covers dual-write, dual-read, and migration scenarios
+7. Cross-reference P0-W1, P0-W2, P0-W3 handoffs for consistency
+
+Tracked review artifacts required in the PR:
+- docs/phase0/p0-w4-rollout-compatibility-plan-handoff.md
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch codex/p0-w4-rollout-compatibility-plan from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P0-W4: Rollout And Compatibility Plan.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 0: Lock The V2 Architecture"
+- workPacket: "P0-W4: Rollout And Compatibility Plan"
+- branchName: "codex/p0-w4-rollout-compatibility-plan"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
