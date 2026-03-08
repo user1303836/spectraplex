@@ -1,0 +1,29 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "0c4b2d47cf88",
+  "strategy": "manual-commit",
+  "branch": "p1-w3-v2-repo-layer",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "adapters/src/lib.rs",
+    "adapters/src/repo.rs",
+    "adapters/src/v2_repo.rs",
+    "docs/phase1/p1-w3-v2-repo-layer-handoff.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0c/4b2d47cf88/0/metadata.json",
+      "transcript": "/0c/4b2d47cf88/0/full.jsonl",
+      "context": "/0c/4b2d47cf88/0/context.md",
+      "content_hash": "/0c/4b2d47cf88/0/content_hash.txt",
+      "prompt": "/0c/4b2d47cf88/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 187541,
+    "cache_read_tokens": 1448786,
+    "output_tokens": 13742,
+    "api_call_count": 22
+  }
+}
