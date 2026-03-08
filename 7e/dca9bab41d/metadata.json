@@ -3,7 +3,7 @@
   "checkpoint_id": "7edca9bab41d",
   "strategy": "manual-commit",
   "branch": "p2-w4-solana-grpc-target-semantics",
-  "checkpoints_count": 1,
+  "checkpoints_count": 2,
   "files_touched": [
     "adapters/src/solana.rs",
     "adapters/src/solana_grpc.rs"
@@ -15,13 +15,20 @@
       "context": "/7e/dca9bab41d/0/context.md",
       "content_hash": "/7e/dca9bab41d/0/content_hash.txt",
       "prompt": "/7e/dca9bab41d/0/prompt.txt"
+    },
+    {
+      "metadata": "/7e/dca9bab41d/1/metadata.json",
+      "transcript": "/7e/dca9bab41d/1/full.jsonl",
+      "context": "/7e/dca9bab41d/1/context.md",
+      "content_hash": "/7e/dca9bab41d/1/content_hash.txt",
+      "prompt": "/7e/dca9bab41d/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 28,
-    "cache_creation_tokens": 187541,
-    "cache_read_tokens": 1448786,
-    "output_tokens": 13742,
-    "api_call_count": 22
+    "input_tokens": 48,
+    "cache_creation_tokens": 303961,
+    "cache_read_tokens": 3123327,
+    "output_tokens": 30011,
+    "api_call_count": 40
   }
 }
