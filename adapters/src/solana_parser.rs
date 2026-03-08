@@ -176,11 +176,176 @@ fn spl_token_symbol(mint: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Materializer implementation
+// Token Transfer extraction (P3-W2)
 // ---------------------------------------------------------------------------
 
-use spectraplex_core::materializer::{DatasetDescriptor, DatasetName, Materializer};
+use chrono::Utc;
+use spectraplex_core::materializer::{
+    DatasetDescriptor, DatasetName, Materializer, NativeBalanceDelta, TokenTransfer,
+};
 use spectraplex_core::v2::ChainFamily;
+use uuid::Uuid;
+
+/// Extract SPL token transfers from a Solana raw transaction.
+///
+/// Uses pre/post token balance arrays from the transaction metadata to compute
+/// deltas for each token account owner. Emits one `TokenTransfer` per non-zero
+/// delta, with the owner as either from_address or to_address depending on sign.
+pub fn extract_solana_token_transfers(
+    raw_tx_id: Option<Uuid>,
+    network: &str,
+    raw_metadata: &serde_json::Value,
+) -> Vec<TokenTransfer> {
+    let sol_tx: EncodedConfirmedTransactionWithStatusMeta =
+        match serde_json::from_value(raw_metadata.clone()) {
+            Ok(tx) => tx,
+            Err(_) => return vec![],
+        };
+
+    let meta = match &sol_tx.transaction.meta {
+        Some(m) => m,
+        None => return vec![],
+    };
+
+    if meta.err.is_some() {
+        return vec![];
+    }
+
+    let mut transfers = Vec::new();
+
+    if let OptionSerializer::Some(pre_token_balances) = &meta.pre_token_balances {
+        if let OptionSerializer::Some(post_token_balances) = &meta.post_token_balances {
+            for post in post_token_balances {
+                let owner = match &post.owner {
+                    OptionSerializer::Some(o) => o.clone(),
+                    _ => continue,
+                };
+
+                let mint = post.mint.clone();
+                let decimals = post.ui_token_amount.decimals as u32;
+
+                let pre_raw = pre_token_balances
+                    .iter()
+                    .find(|p| p.account_index == post.account_index)
+                    .and_then(|p| p.ui_token_amount.amount.parse::<i128>().ok())
+                    .unwrap_or(0);
+
+                let post_raw = post.ui_token_amount.amount.parse::<i128>().unwrap_or(0);
+                let delta_raw = post_raw - pre_raw;
+
+                if delta_raw == 0 {
+                    continue;
+                }
+
+                let amount = token_raw_to_decimal(delta_raw.unsigned_abs() as i128, decimals);
+                let symbol = spl_token_symbol(&mint);
+
+                let (from, to) = if delta_raw > 0 {
+                    // Incoming: unknown sender -> owner
+                    ("unknown".to_string(), owner)
+                } else {
+                    // Outgoing: owner -> unknown receiver
+                    (owner, "unknown".to_string())
+                };
+
+                transfers.push(TokenTransfer {
+                    id: Uuid::new_v4(),
+                    raw_transaction_id: raw_tx_id,
+                    network: network.to_string(),
+                    token_address: mint,
+                    token_symbol: Some(symbol),
+                    from_address: from,
+                    to_address: to,
+                    amount,
+                    decimals: decimals as i32,
+                    dataset_version_id: None,
+                    created_at: Utc::now(),
+                });
+            }
+        }
+    }
+
+    transfers
+}
+
+// ---------------------------------------------------------------------------
+// Native Balance Delta extraction (P3-W2)
+// ---------------------------------------------------------------------------
+
+/// Extract SOL native balance deltas from a Solana raw transaction.
+///
+/// Uses pre/post balance arrays and the account keys from the transaction.
+/// Flags the first signer (index 0) as the fee payer.
+pub fn extract_solana_native_balance_deltas(
+    raw_tx_id: Option<Uuid>,
+    network: &str,
+    raw_metadata: &serde_json::Value,
+) -> Vec<NativeBalanceDelta> {
+    let sol_tx: EncodedConfirmedTransactionWithStatusMeta =
+        match serde_json::from_value(raw_metadata.clone()) {
+            Ok(tx) => tx,
+            Err(_) => return vec![],
+        };
+
+    let meta = match &sol_tx.transaction.meta {
+        Some(m) => m,
+        None => return vec![],
+    };
+
+    if meta.err.is_some() {
+        return vec![];
+    }
+
+    let account_keys: Vec<String> =
+        if let solana_transaction_status::EncodedTransaction::Json(ui_tx) =
+            &sol_tx.transaction.transaction
+        {
+            match &ui_tx.message {
+                solana_transaction_status::UiMessage::Parsed(msg) => {
+                    msg.account_keys.iter().map(|k| k.pubkey.clone()).collect()
+                }
+                solana_transaction_status::UiMessage::Raw(msg) => msg.account_keys.clone(),
+            }
+        } else {
+            return vec![];
+        };
+
+    let mut deltas = Vec::new();
+
+    for (idx, account) in account_keys.iter().enumerate() {
+        let pre = meta.pre_balances.get(idx).copied().unwrap_or(0) as i128;
+        let post = meta.post_balances.get(idx).copied().unwrap_or(0) as i128;
+        let change = post - pre;
+
+        if change == 0 {
+            continue;
+        }
+
+        let pre_sol = lamports_to_sol(pre);
+        let post_sol = lamports_to_sol(post);
+        let delta_sol = lamports_to_sol(change);
+
+        deltas.push(NativeBalanceDelta {
+            id: Uuid::new_v4(),
+            raw_transaction_id: raw_tx_id,
+            network: network.to_string(),
+            account_address: account.clone(),
+            native_token: "SOL".to_string(),
+            pre_balance: pre_sol,
+            post_balance: post_sol,
+            delta: delta_sol,
+            is_fee_payer: idx == 0,
+            dataset_version_id: None,
+            created_at: Utc::now(),
+        });
+    }
+
+    deltas
+}
+
+// ---------------------------------------------------------------------------
+// Materializer implementations
+// ---------------------------------------------------------------------------
 
 /// Materializer wrapper for the Solana ledger parser.
 pub struct SolanaLedgerMaterializer;
@@ -207,6 +372,70 @@ impl Materializer for SolanaLedgerMaterializer {
             name: self.dataset_name(),
             description:
                 "Solana ledger entries: SOL balance changes, SPL token transfers, and fees"
+                    .to_string(),
+            source_bronze_tables: vec!["raw_transactions".to_string()],
+            chain_families: vec![self.chain_family()],
+        }
+    }
+}
+
+/// Materializer for Solana token transfers.
+pub struct SolanaTokenTransferMaterializer;
+
+impl Materializer for SolanaTokenTransferMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::TokenTransfers
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:solana_token_transfers_v1_d4e9f1a7"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Solana
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description:
+                "Solana token transfers: SPL token movements extracted from pre/post token balances"
+                    .to_string(),
+            source_bronze_tables: vec!["raw_transactions".to_string()],
+            chain_families: vec![self.chain_family()],
+        }
+    }
+}
+
+/// Materializer for Solana native balance deltas.
+pub struct SolanaNativeBalanceDeltaMaterializer;
+
+impl Materializer for SolanaNativeBalanceDeltaMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::NativeBalanceDeltas
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:solana_native_deltas_v1_b2c3a8f6"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Solana
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description:
+                "Solana native balance deltas: SOL balance changes per account with fee payer flag"
                     .to_string(),
             source_bronze_tables: vec!["raw_transactions".to_string()],
             chain_families: vec![self.chain_family()],
@@ -282,5 +511,61 @@ mod tests {
         assert!(desc.validate().is_ok());
         assert_eq!(desc.name, DatasetName::LedgerEntries);
         assert_eq!(desc.chain_families, vec![ChainFamily::Solana]);
+    }
+
+    #[test]
+    fn solana_token_transfer_materializer_contract() {
+        let m = SolanaTokenTransferMaterializer;
+        assert_eq!(m.dataset_name(), DatasetName::TokenTransfers);
+        assert_eq!(m.parser_version(), 1);
+        assert_eq!(m.chain_family(), ChainFamily::Solana);
+        assert!(!m.parser_hash().is_empty());
+        assert_ne!(
+            m.parser_hash(),
+            SolanaLedgerMaterializer.parser_hash(),
+            "distinct from ledger materializer"
+        );
+        let desc = m.descriptor();
+        assert!(desc.validate().is_ok());
+        assert_eq!(desc.name, DatasetName::TokenTransfers);
+    }
+
+    #[test]
+    fn solana_native_balance_delta_materializer_contract() {
+        let m = SolanaNativeBalanceDeltaMaterializer;
+        assert_eq!(m.dataset_name(), DatasetName::NativeBalanceDeltas);
+        assert_eq!(m.parser_version(), 1);
+        assert_eq!(m.chain_family(), ChainFamily::Solana);
+        assert!(!m.parser_hash().is_empty());
+        assert_ne!(
+            m.parser_hash(),
+            SolanaLedgerMaterializer.parser_hash(),
+            "distinct from ledger materializer"
+        );
+        assert_ne!(
+            m.parser_hash(),
+            SolanaTokenTransferMaterializer.parser_hash(),
+            "distinct from token transfer materializer"
+        );
+        let desc = m.descriptor();
+        assert!(desc.validate().is_ok());
+        assert_eq!(desc.name, DatasetName::NativeBalanceDeltas);
+    }
+
+    #[test]
+    fn solana_all_materializers_have_distinct_hashes() {
+        use std::collections::HashSet;
+
+        let materializers: Vec<Box<dyn Materializer>> = vec![
+            Box::new(SolanaLedgerMaterializer),
+            Box::new(SolanaTokenTransferMaterializer),
+            Box::new(SolanaNativeBalanceDeltaMaterializer),
+        ];
+        let hashes: HashSet<&str> = materializers.iter().map(|m| m.parser_hash()).collect();
+        assert_eq!(
+            hashes.len(),
+            3,
+            "all 3 Solana materializers must have distinct hashes"
+        );
     }
 }

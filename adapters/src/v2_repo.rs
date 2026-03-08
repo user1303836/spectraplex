@@ -4,6 +4,7 @@
 //! `Repository` value they already hold for V1 wallet-scoped queries.
 
 use chrono::{DateTime, Utc};
+use spectraplex_core::materializer::{NativeBalanceDelta, TokenTransfer};
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, DatasetVersion, DatasetVersionStatus, IndexTarget, IngestionRun,
     Network, RawTransaction, TargetKind, TargetMatch, TargetMode,
@@ -395,6 +396,159 @@ pub fn build_dataset_version_insert(
     args.add(&dv.notes).map_err(|e| anyhow::anyhow!("{e}"))?;
     args.add(dataset_version_status_to_sql(&dv.status))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok((query, args))
+}
+
+// ---------------------------------------------------------------------------
+// Row-mapping helpers for Silver tables (P3-W2)
+// ---------------------------------------------------------------------------
+
+fn row_to_token_transfer(row: &sqlx::postgres::PgRow) -> anyhow::Result<TokenTransfer> {
+    use bigdecimal::BigDecimal;
+    Ok(TokenTransfer {
+        id: row.try_get("id")?,
+        raw_transaction_id: row.try_get("raw_transaction_id")?,
+        network: row.try_get("network")?,
+        token_address: row.try_get("token_address")?,
+        token_symbol: row.try_get("token_symbol")?,
+        from_address: row.try_get("from_address")?,
+        to_address: row.try_get("to_address")?,
+        amount: row.try_get::<BigDecimal, _>("amount")?,
+        decimals: row.try_get("decimals")?,
+        dataset_version_id: row.try_get("dataset_version_id")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn row_to_native_balance_delta(row: &sqlx::postgres::PgRow) -> anyhow::Result<NativeBalanceDelta> {
+    use bigdecimal::BigDecimal;
+    Ok(NativeBalanceDelta {
+        id: row.try_get("id")?,
+        raw_transaction_id: row.try_get("raw_transaction_id")?,
+        network: row.try_get("network")?,
+        account_address: row.try_get("account_address")?,
+        native_token: row.try_get("native_token")?,
+        pre_balance: row.try_get::<BigDecimal, _>("pre_balance")?,
+        post_balance: row.try_get::<BigDecimal, _>("post_balance")?,
+        delta: row.try_get::<BigDecimal, _>("delta")?,
+        is_fee_payer: row.try_get("is_fee_payer")?,
+        dataset_version_id: row.try_get("dataset_version_id")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Query builders for Silver tables (P3-W2)
+// ---------------------------------------------------------------------------
+
+/// Build a batch INSERT for `token_transfers` with ON CONFLICT DO NOTHING.
+pub fn build_token_transfer_insert(
+    transfers: &[TokenTransfer],
+) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+    let mut query = String::from(
+        "INSERT INTO token_transfers \
+         (id, raw_transaction_id, network, token_address, token_symbol, from_address, to_address, amount, decimals, dataset_version_id, created_at) \
+         VALUES ",
+    );
+    let mut args = sqlx::postgres::PgArguments::default();
+    for (i, t) in transfers.iter().enumerate() {
+        let base = i * 11;
+        if i > 0 {
+            query.push_str(", ");
+        }
+        query.push_str(&format!(
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+            base + 7,
+            base + 8,
+            base + 9,
+            base + 10,
+            base + 11,
+        ));
+        use sqlx::Arguments;
+        args.add(t.id).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(t.raw_transaction_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&t.network).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&t.token_address)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&t.token_symbol)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&t.from_address)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&t.to_address)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&t.amount).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(t.decimals).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(t.dataset_version_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(t.created_at).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    query.push_str(
+        " ON CONFLICT (raw_transaction_id, from_address, to_address, token_address, amount) \
+         WHERE raw_transaction_id IS NOT NULL DO NOTHING",
+    );
+    Ok((query, args))
+}
+
+/// Build a batch INSERT for `native_balance_deltas` with ON CONFLICT DO NOTHING.
+pub fn build_native_balance_delta_insert(
+    deltas: &[NativeBalanceDelta],
+) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+    let mut query = String::from(
+        "INSERT INTO native_balance_deltas \
+         (id, raw_transaction_id, network, account_address, native_token, pre_balance, post_balance, delta, is_fee_payer, dataset_version_id, created_at) \
+         VALUES ",
+    );
+    let mut args = sqlx::postgres::PgArguments::default();
+    for (i, d) in deltas.iter().enumerate() {
+        let base = i * 11;
+        if i > 0 {
+            query.push_str(", ");
+        }
+        query.push_str(&format!(
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+            base + 7,
+            base + 8,
+            base + 9,
+            base + 10,
+            base + 11,
+        ));
+        use sqlx::Arguments;
+        args.add(d.id).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(d.raw_transaction_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&d.network).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&d.account_address)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&d.native_token)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&d.pre_balance)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&d.post_balance)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&d.delta).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(d.is_fee_payer)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(d.dataset_version_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(d.created_at).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    query.push_str(
+        " ON CONFLICT (raw_transaction_id, account_address) \
+         WHERE raw_transaction_id IS NOT NULL DO NOTHING",
+    );
     Ok((query, args))
 }
 
@@ -829,6 +983,111 @@ impl Repository {
         let count: i64 = row.try_get("cnt")?;
         Ok(count)
     }
+
+    // -----------------------------------------------------------------------
+    // TokenTransfers (P3-W2)
+    // -----------------------------------------------------------------------
+
+    /// Bulk insert token transfer records.
+    pub async fn save_token_transfers(&self, transfers: &[TokenTransfer]) -> anyhow::Result<()> {
+        for chunk in transfers.chunks(Self::V2_BATCH_SIZE) {
+            let (query, args) = build_token_transfer_insert(chunk)?;
+            sqlx::query_with(&query, args).execute(self.pool()).await?;
+        }
+        Ok(())
+    }
+
+    /// Query token transfers by address (from or to).
+    pub async fn get_token_transfers_by_address(
+        &self,
+        address: &str,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<TokenTransfer>> {
+        let rows = sqlx::query(
+            "SELECT id, raw_transaction_id, network, token_address, token_symbol, \
+             from_address, to_address, amount, decimals, dataset_version_id, created_at \
+             FROM token_transfers \
+             WHERE from_address = $1 OR to_address = $1 \
+             ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(address)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_token_transfer).collect()
+    }
+
+    /// Query token transfers by raw transaction ID.
+    pub async fn get_token_transfers_by_raw_tx(
+        &self,
+        raw_tx_id: Uuid,
+    ) -> anyhow::Result<Vec<TokenTransfer>> {
+        let rows = sqlx::query(
+            "SELECT id, raw_transaction_id, network, token_address, token_symbol, \
+             from_address, to_address, amount, decimals, dataset_version_id, created_at \
+             FROM token_transfers WHERE raw_transaction_id = $1 ORDER BY created_at",
+        )
+        .bind(raw_tx_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_token_transfer).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // NativeBalanceDeltas (P3-W2)
+    // -----------------------------------------------------------------------
+
+    /// Bulk insert native balance delta records.
+    pub async fn save_native_balance_deltas(
+        &self,
+        deltas: &[NativeBalanceDelta],
+    ) -> anyhow::Result<()> {
+        for chunk in deltas.chunks(Self::V2_BATCH_SIZE) {
+            let (query, args) = build_native_balance_delta_insert(chunk)?;
+            sqlx::query_with(&query, args).execute(self.pool()).await?;
+        }
+        Ok(())
+    }
+
+    /// Query native balance deltas by account address.
+    pub async fn get_native_balance_deltas_by_account(
+        &self,
+        account_address: &str,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<NativeBalanceDelta>> {
+        let rows = sqlx::query(
+            "SELECT id, raw_transaction_id, network, account_address, native_token, \
+             pre_balance, post_balance, delta, is_fee_payer, dataset_version_id, created_at \
+             FROM native_balance_deltas \
+             WHERE account_address = $1 \
+             ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(account_address)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_native_balance_delta).collect()
+    }
+
+    /// Query native balance deltas by raw transaction ID.
+    pub async fn get_native_balance_deltas_by_raw_tx(
+        &self,
+        raw_tx_id: Uuid,
+    ) -> anyhow::Result<Vec<NativeBalanceDelta>> {
+        let rows = sqlx::query(
+            "SELECT id, raw_transaction_id, network, account_address, native_token, \
+             pre_balance, post_balance, delta, is_fee_payer, dataset_version_id, created_at \
+             FROM native_balance_deltas WHERE raw_transaction_id = $1 ORDER BY created_at",
+        )
+        .bind(raw_tx_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_native_balance_delta).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,5 +1400,138 @@ mod tests {
     #[test]
     fn v2_batch_size_matches_v1() {
         assert_eq!(Repository::V2_BATCH_SIZE, 500);
+    }
+
+    // -- token_transfer batch insert (P3-W2) --
+
+    fn make_token_transfer() -> TokenTransfer {
+        use bigdecimal::BigDecimal;
+        TokenTransfer {
+            id: Uuid::new_v4(),
+            raw_transaction_id: Some(Uuid::new_v4()),
+            network: "ethereum-mainnet".to_string(),
+            token_address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".to_string(),
+            token_symbol: Some("USDC".to_string()),
+            from_address: "0x1111111111111111111111111111111111111111".to_string(),
+            to_address: "0x2222222222222222222222222222222222222222".to_string(),
+            amount: BigDecimal::from(100),
+            decimals: 6,
+            dataset_version_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn make_native_balance_delta() -> NativeBalanceDelta {
+        use bigdecimal::BigDecimal;
+        NativeBalanceDelta {
+            id: Uuid::new_v4(),
+            raw_transaction_id: Some(Uuid::new_v4()),
+            network: "solana-mainnet".to_string(),
+            account_address: "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy".to_string(),
+            native_token: "SOL".to_string(),
+            pre_balance: BigDecimal::from(10),
+            post_balance: BigDecimal::from(9),
+            delta: BigDecimal::from(-1),
+            is_fee_payer: true,
+            dataset_version_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn token_transfer_insert_single() {
+        let tt = make_token_transfer();
+        let (query, _) = build_token_transfer_insert(&[tt]).unwrap();
+
+        assert!(query.starts_with("INSERT INTO token_transfers"));
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"));
+        assert!(query.contains("ON CONFLICT"));
+    }
+
+    #[test]
+    fn token_transfer_insert_multiple() {
+        let transfers: Vec<_> = (0..3).map(|_| make_token_transfer()).collect();
+        let (query, _) = build_token_transfer_insert(&transfers).unwrap();
+
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"));
+        assert!(query.contains("($12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)"));
+        assert!(query.contains("($23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)"));
+    }
+
+    #[test]
+    fn token_transfer_insert_param_count() {
+        let transfers: Vec<_> = (0..5).map(|_| make_token_transfer()).collect();
+        let (query, _) = build_token_transfer_insert(&transfers).unwrap();
+        // 5 rows * 11 params = 55 => highest param is $55
+        assert!(query.contains("$55"));
+        assert!(!query.contains("$56"));
+    }
+
+    // -- native_balance_delta batch insert (P3-W2) --
+
+    #[test]
+    fn native_balance_delta_insert_single() {
+        let nbd = make_native_balance_delta();
+        let (query, _) = build_native_balance_delta_insert(&[nbd]).unwrap();
+
+        assert!(query.starts_with("INSERT INTO native_balance_deltas"));
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"));
+        assert!(query.contains("ON CONFLICT"));
+    }
+
+    #[test]
+    fn native_balance_delta_insert_multiple() {
+        let deltas: Vec<_> = (0..3).map(|_| make_native_balance_delta()).collect();
+        let (query, _) = build_native_balance_delta_insert(&deltas).unwrap();
+
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"));
+        assert!(query.contains("($12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)"));
+    }
+
+    #[test]
+    fn native_balance_delta_insert_param_count() {
+        let deltas: Vec<_> = (0..5).map(|_| make_native_balance_delta()).collect();
+        let (query, _) = build_native_balance_delta_insert(&deltas).unwrap();
+        // 5 rows * 11 params = 55 => highest param is $55
+        assert!(query.contains("$55"));
+        assert!(!query.contains("$56"));
+    }
+
+    // -- Repository method signatures (P3-W2) --
+
+    #[test]
+    fn repo_save_token_transfers_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.save_token_transfers(&[]));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_get_token_transfers_by_address_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.get_token_transfers_by_address("0x1", 10, 0));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_save_native_balance_deltas_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.save_native_balance_deltas(&[]));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_get_native_balance_deltas_by_account_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.get_native_balance_deltas_by_account("addr", 10, 0));
+        }
+        let _ = _check;
     }
 }

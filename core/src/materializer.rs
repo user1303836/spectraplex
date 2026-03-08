@@ -1,11 +1,14 @@
 //! Dataset registry, Materializer trait, and regeneration types.
 //!
 //! This module defines canonical dataset identifiers, the `Materializer` trait
-//! for parser/materializer version tracking, and the types needed for
-//! Bronze-to-Silver regeneration.
+//! for parser/materializer version tracking, the types needed for
+//! Bronze-to-Silver regeneration, and Silver dataset record structs.
 
+use bigdecimal::BigDecimal;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumIter, EnumString};
+use uuid::Uuid;
 
 use crate::v2::ChainFamily;
 
@@ -170,6 +173,66 @@ pub struct RegenerationRequest {
     pub reason: String,
     /// Whether to supersede the current version.
     pub supersede_current: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Silver Dataset Records
+// ---------------------------------------------------------------------------
+
+/// Normalized token transfer record across all chains.
+///
+/// Each record represents a single token movement extracted from Bronze data.
+/// Addresses are generic (not wallet-specific) to support contract, program,
+/// and protocol target types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenTransfer {
+    pub id: Uuid,
+    /// FK to raw_transactions; nullable during transition.
+    pub raw_transaction_id: Option<Uuid>,
+    pub network: String,
+    /// Token contract/mint address (e.g. SPL mint, ERC-20 contract).
+    pub token_address: String,
+    /// Human-readable symbol if resolvable; otherwise the token address.
+    pub token_symbol: Option<String>,
+    /// Sender address.
+    pub from_address: String,
+    /// Receiver address.
+    pub to_address: String,
+    /// Transfer amount (positive = movement from sender to receiver).
+    pub amount: BigDecimal,
+    /// Token decimals used for normalization.
+    pub decimals: i32,
+    /// FK to dataset_versions; nullable during transition.
+    pub dataset_version_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Native currency balance delta per account per transaction.
+///
+/// Each record represents the change in native token balance for a single
+/// account in a single transaction. Not wallet-specific — any account
+/// involved in a transaction can have a delta.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeBalanceDelta {
+    pub id: Uuid,
+    /// FK to raw_transactions; nullable during transition.
+    pub raw_transaction_id: Option<Uuid>,
+    pub network: String,
+    /// The account whose balance changed.
+    pub account_address: String,
+    /// Native token symbol (e.g. "SOL", "ETH", "USDC" for Hyperliquid).
+    pub native_token: String,
+    /// Balance before the transaction.
+    pub pre_balance: BigDecimal,
+    /// Balance after the transaction.
+    pub post_balance: BigDecimal,
+    /// Computed delta (post_balance - pre_balance).
+    pub delta: BigDecimal,
+    /// Whether this account was the fee payer for the transaction.
+    pub is_fee_payer: bool,
+    /// FK to dataset_versions; nullable during transition.
+    pub dataset_version_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
 }
 
 // ---------------------------------------------------------------------------
@@ -393,5 +456,131 @@ mod tests {
         let desc = m.descriptor();
         assert!(desc.validate().is_ok());
         assert_eq!(desc.name, m.dataset_name());
+    }
+
+    // -- TokenTransfer tests --
+
+    #[test]
+    fn token_transfer_serde_roundtrip() {
+        use bigdecimal::BigDecimal;
+        use std::str::FromStr;
+
+        let tt = TokenTransfer {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: Some(uuid::Uuid::new_v4()),
+            network: "solana-mainnet".to_string(),
+            token_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            token_symbol: Some("USDC".to_string()),
+            from_address: "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy".to_string(),
+            to_address: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".to_string(),
+            amount: BigDecimal::from_str("1000.50").unwrap(),
+            decimals: 6,
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&tt).unwrap();
+        let back: TokenTransfer = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.network, "solana-mainnet");
+        assert_eq!(back.token_symbol, Some("USDC".to_string()));
+        assert_eq!(back.decimals, 6);
+        assert_eq!(back.amount, BigDecimal::from_str("1000.50").unwrap());
+    }
+
+    #[test]
+    fn token_transfer_no_wallet_specific_fields() {
+        let tt = TokenTransfer {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: None,
+            network: "ethereum-mainnet".to_string(),
+            token_address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".to_string(),
+            token_symbol: Some("USDC".to_string()),
+            from_address: "0x1111111111111111111111111111111111111111".to_string(),
+            to_address: "0x2222222222222222222222222222222222222222".to_string(),
+            amount: BigDecimal::from(100),
+            decimals: 6,
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&tt).unwrap();
+        assert!(
+            !json.contains("wallet_address"),
+            "TokenTransfer must not have wallet_address"
+        );
+        assert!(
+            !json.contains("user_id"),
+            "TokenTransfer must not have user_id"
+        );
+    }
+
+    // -- NativeBalanceDelta tests --
+
+    #[test]
+    fn native_balance_delta_serde_roundtrip() {
+        use bigdecimal::BigDecimal;
+        use std::str::FromStr;
+
+        let nbd = NativeBalanceDelta {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: Some(uuid::Uuid::new_v4()),
+            network: "solana-mainnet".to_string(),
+            account_address: "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy".to_string(),
+            native_token: "SOL".to_string(),
+            pre_balance: BigDecimal::from_str("10.5").unwrap(),
+            post_balance: BigDecimal::from_str("9.5").unwrap(),
+            delta: BigDecimal::from_str("-1.0").unwrap(),
+            is_fee_payer: true,
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&nbd).unwrap();
+        let back: NativeBalanceDelta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.network, "solana-mainnet");
+        assert_eq!(back.native_token, "SOL");
+        assert!(back.is_fee_payer);
+        assert_eq!(back.delta, BigDecimal::from_str("-1.0").unwrap());
+    }
+
+    #[test]
+    fn native_balance_delta_no_wallet_specific_fields() {
+        let nbd = NativeBalanceDelta {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: None,
+            network: "ethereum-mainnet".to_string(),
+            account_address: "0x1111111111111111111111111111111111111111".to_string(),
+            native_token: "ETH".to_string(),
+            pre_balance: BigDecimal::from(100),
+            post_balance: BigDecimal::from(99),
+            delta: BigDecimal::from(-1),
+            is_fee_payer: false,
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&nbd).unwrap();
+        assert!(
+            !json.contains("wallet_address"),
+            "NativeBalanceDelta must not have wallet_address"
+        );
+        assert!(
+            !json.contains("user_id"),
+            "NativeBalanceDelta must not have user_id"
+        );
+    }
+
+    #[test]
+    fn native_balance_delta_zero_delta() {
+        let nbd = NativeBalanceDelta {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: None,
+            network: "solana-mainnet".to_string(),
+            account_address: "some_address".to_string(),
+            native_token: "SOL".to_string(),
+            pre_balance: BigDecimal::from(5),
+            post_balance: BigDecimal::from(5),
+            delta: BigDecimal::from(0),
+            is_fee_payer: false,
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        assert_eq!(nbd.delta, BigDecimal::from(0));
     }
 }

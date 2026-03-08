@@ -258,11 +258,97 @@ fn negate(val: BigDecimal) -> BigDecimal {
 }
 
 // ---------------------------------------------------------------------------
-// Materializer implementation
+// Token Transfer extraction (P3-W2)
 // ---------------------------------------------------------------------------
 
-use spectraplex_core::materializer::{DatasetDescriptor, DatasetName, Materializer};
+use chrono::Utc;
+use spectraplex_core::materializer::{DatasetDescriptor, DatasetName, Materializer, TokenTransfer};
 use spectraplex_core::v2::ChainFamily;
+use uuid::Uuid;
+
+/// Extract ERC-20 token transfers from an EVM raw transaction.
+///
+/// Decodes Transfer(address,address,uint256) events from raw log topics/data.
+/// Does not filter by wallet — emits all transfers found in the transaction.
+pub fn extract_evm_token_transfers(
+    raw_tx_id: Option<Uuid>,
+    network: &str,
+    raw_metadata: &serde_json::Value,
+) -> Vec<TokenTransfer> {
+    let mut transfers = Vec::new();
+
+    let topics = match raw_metadata.get("topics").and_then(|t| t.as_array()) {
+        Some(t) => t,
+        None => return vec![],
+    };
+
+    let topic0 = match topics.first().and_then(|t| t.as_str()) {
+        Some(t) => t,
+        None => return vec![],
+    };
+
+    if topic0 != ERC20_TRANSFER_TOPIC || topics.len() < 3 {
+        return vec![];
+    }
+
+    let from = topic_to_address(topics[1].as_str().unwrap_or_default());
+    let to = topic_to_address(topics[2].as_str().unwrap_or_default());
+
+    let data_hex = raw_metadata
+        .get("data")
+        .and_then(|d| d.as_str())
+        .unwrap_or("0x0");
+    let amount_bd = hex_to_bigdecimal(data_hex);
+
+    let token_address = raw_metadata
+        .get("address")
+        .and_then(|a| a.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let decimals = token_decimals(&token_address);
+    let symbol = token_symbol(&token_address);
+    let normalized = normalize_bigdecimal(amount_bd, decimals);
+
+    transfers.push(TokenTransfer {
+        id: Uuid::new_v4(),
+        raw_transaction_id: raw_tx_id,
+        network: network.to_string(),
+        token_address,
+        token_symbol: Some(symbol),
+        from_address: from,
+        to_address: to,
+        amount: normalized,
+        decimals: decimals as i32,
+        dataset_version_id: None,
+        created_at: Utc::now(),
+    });
+
+    transfers
+}
+
+// ---------------------------------------------------------------------------
+// EVM Native Balance Delta: DEFERRED
+// ---------------------------------------------------------------------------
+//
+// EVM native balance deltas require trace API (debug_traceTransaction or
+// trace_transaction) data which is not yet stored in Bronze raw_transactions.
+// The current Bronze model stores log-level data and transaction-level
+// metadata (value, gas_used, effective_gas_price), but this is insufficient
+// to compute accurate native balance deltas for all accounts in a transaction:
+//
+// - The "value" field only captures the direct ETH transfer.
+// - Internal transactions (contract-to-contract ETH transfers) are not
+//   visible without trace data.
+// - Gas refunds and self-destructs also affect balances.
+//
+// When Bronze gains trace API support (e.g. raw_evm_traces table), this
+// materializer should be implemented. Until then, DatasetName::NativeBalanceDeltas
+// is not supported for EVM chain family.
+
+// ---------------------------------------------------------------------------
+// Materializer implementations
+// ---------------------------------------------------------------------------
 
 /// Materializer wrapper for the EVM ledger parser.
 pub struct EvmLedgerMaterializer;
@@ -289,6 +375,38 @@ impl Materializer for EvmLedgerMaterializer {
             name: self.dataset_name(),
             description:
                 "EVM ledger entries: ERC-20 transfers, native ETH value transfers, and gas fees"
+                    .to_string(),
+            source_bronze_tables: vec!["raw_transactions".to_string()],
+            chain_families: vec![self.chain_family()],
+        }
+    }
+}
+
+/// Materializer for EVM token transfers (ERC-20 Transfer events).
+pub struct EvmTokenTransferMaterializer;
+
+impl Materializer for EvmTokenTransferMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::TokenTransfers
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:evm_token_transfers_v1_a1c5e7b9"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Evm
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description:
+                "EVM token transfers: ERC-20 Transfer events decoded from raw log topics and data"
                     .to_string(),
             source_bronze_tables: vec!["raw_transactions".to_string()],
             chain_families: vec![self.chain_family()],
@@ -587,6 +705,89 @@ mod tests {
         assert!(desc.validate().is_ok());
         assert_eq!(desc.name, DatasetName::LedgerEntries);
         assert_eq!(desc.chain_families, vec![ChainFamily::Evm]);
+    }
+
+    #[test]
+    fn evm_token_transfer_materializer_contract() {
+        let m = EvmTokenTransferMaterializer;
+        assert_eq!(m.dataset_name(), DatasetName::TokenTransfers);
+        assert_eq!(m.parser_version(), 1);
+        assert_eq!(m.chain_family(), ChainFamily::Evm);
+        assert!(!m.parser_hash().is_empty());
+        assert_ne!(
+            m.parser_hash(),
+            EvmLedgerMaterializer.parser_hash(),
+            "distinct from ledger materializer"
+        );
+        let desc = m.descriptor();
+        assert!(desc.validate().is_ok());
+        assert_eq!(desc.name, DatasetName::TokenTransfers);
+    }
+
+    #[test]
+    fn evm_all_materializers_have_distinct_hashes() {
+        use std::collections::HashSet;
+        let materializers: Vec<Box<dyn Materializer>> = vec![
+            Box::new(EvmLedgerMaterializer),
+            Box::new(EvmTokenTransferMaterializer),
+        ];
+        let hashes: HashSet<&str> = materializers.iter().map(|m| m.parser_hash()).collect();
+        assert_eq!(
+            hashes.len(),
+            2,
+            "all EVM materializers must have distinct hashes"
+        );
+    }
+
+    #[test]
+    fn test_extract_evm_token_transfer_erc20() {
+        let from_padded = format!(
+            "0x000000000000000000000000{}",
+            "1111111111111111111111111111111111111111"
+        );
+        let to_padded = format!(
+            "0x000000000000000000000000{}",
+            "2222222222222222222222222222222222222222"
+        );
+        let metadata = json!({
+            "topics": [
+                ERC20_TRANSFER_TOPIC,
+                from_padded,
+                to_padded,
+            ],
+            "data": "0x0000000000000000000000000000000000000000000000000000000005f5e100", // 100_000_000
+            "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", // USDC
+        });
+
+        let transfers =
+            extract_evm_token_transfers(Some(Uuid::new_v4()), "ethereum-mainnet", &metadata);
+
+        assert_eq!(transfers.len(), 1);
+        let t = &transfers[0];
+        assert_eq!(t.from_address, "0x1111111111111111111111111111111111111111");
+        assert_eq!(t.to_address, "0x2222222222222222222222222222222222222222");
+        assert_eq!(t.token_symbol, Some("USDC".to_string()));
+        assert_eq!(t.decimals, 6);
+        assert_eq!(t.network, "ethereum-mainnet");
+        // 100_000_000 / 10^6 = 100
+        assert_eq!(t.amount, BigDecimal::from(100));
+    }
+
+    #[test]
+    fn test_extract_evm_token_transfer_no_topics() {
+        let metadata = json!({});
+        let transfers = extract_evm_token_transfers(None, "ethereum-mainnet", &metadata);
+        assert!(transfers.is_empty());
+    }
+
+    #[test]
+    fn test_extract_evm_token_transfer_non_transfer_topic() {
+        let metadata = json!({
+            "topics": ["0xabcdef"],
+            "data": "0x0",
+        });
+        let transfers = extract_evm_token_transfers(None, "ethereum-mainnet", &metadata);
+        assert!(transfers.is_empty());
     }
 
     #[test]

@@ -169,11 +169,173 @@ fn parse_ledger_update(
 }
 
 // ---------------------------------------------------------------------------
-// Materializer implementation
+// Token Transfer extraction (P3-W2)
 // ---------------------------------------------------------------------------
 
-use spectraplex_core::materializer::{DatasetDescriptor, DatasetName, Materializer};
+use chrono::Utc;
+use spectraplex_core::materializer::{
+    DatasetDescriptor, DatasetName, Materializer, NativeBalanceDelta, TokenTransfer,
+};
 use spectraplex_core::v2::ChainFamily;
+use uuid::Uuid;
+
+/// Extract Hyperliquid token transfers from a raw transaction.
+///
+/// Deposits and withdrawals are modeled as USDC transfers between an external
+/// source/destination and the user's Hyperliquid account.
+pub fn extract_hyperliquid_token_transfers(
+    raw_tx_id: Option<Uuid>,
+    network: &str,
+    wallet_address: &str,
+    raw_metadata: &serde_json::Value,
+) -> Vec<TokenTransfer> {
+    let entry_type = raw_metadata["type"].as_str().unwrap_or("unknown");
+
+    match entry_type {
+        "ledger_update" => {
+            let data = &raw_metadata["data"];
+            let delta = &data["delta"];
+            let delta_type = delta["type"].as_str().unwrap_or("unknown");
+
+            match delta_type {
+                "deposit" => {
+                    let usdc = delta["usdc"].as_str().unwrap_or("0");
+                    let amount = BigDecimal::from_str(usdc).unwrap_or_default();
+                    if amount == BigDecimal::from(0) {
+                        return vec![];
+                    }
+                    vec![TokenTransfer {
+                        id: Uuid::new_v4(),
+                        raw_transaction_id: raw_tx_id,
+                        network: network.to_string(),
+                        token_address: "USDC".to_string(),
+                        token_symbol: Some("USDC".to_string()),
+                        from_address: "external".to_string(),
+                        to_address: wallet_address.to_string(),
+                        amount,
+                        decimals: 6,
+                        dataset_version_id: None,
+                        created_at: Utc::now(),
+                    }]
+                }
+                "withdraw" => {
+                    let usdc = delta["usdc"].as_str().unwrap_or("0");
+                    let amount = BigDecimal::from_str(usdc).unwrap_or_default().abs();
+                    if amount == BigDecimal::from(0) {
+                        return vec![];
+                    }
+                    vec![TokenTransfer {
+                        id: Uuid::new_v4(),
+                        raw_transaction_id: raw_tx_id,
+                        network: network.to_string(),
+                        token_address: "USDC".to_string(),
+                        token_symbol: Some("USDC".to_string()),
+                        from_address: wallet_address.to_string(),
+                        to_address: "external".to_string(),
+                        amount,
+                        decimals: 6,
+                        dataset_version_id: None,
+                        created_at: Utc::now(),
+                    }]
+                }
+                _ => vec![],
+            }
+        }
+        _ => vec![],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native Balance Delta extraction (P3-W2)
+// ---------------------------------------------------------------------------
+
+/// Extract Hyperliquid native balance deltas from a raw transaction.
+///
+/// On Hyperliquid, the "native" token is USDC (the settlement currency).
+/// Balance deltas are extracted from fill and funding events as changes to the
+/// account's USDC balance.
+pub fn extract_hyperliquid_native_balance_deltas(
+    raw_tx_id: Option<Uuid>,
+    network: &str,
+    wallet_address: &str,
+    raw_metadata: &serde_json::Value,
+) -> Vec<NativeBalanceDelta> {
+    let entry_type = raw_metadata["type"].as_str().unwrap_or("unknown");
+
+    match entry_type {
+        "fill" => {
+            let data = &raw_metadata["data"];
+            let fill: HlFill = match serde_json::from_value(data.clone()) {
+                Ok(f) => f,
+                Err(_) => return vec![],
+            };
+
+            // Fee and closed PnL represent USDC balance changes
+            let fee = fill
+                .fee
+                .as_deref()
+                .and_then(|f| BigDecimal::from_str(f).ok())
+                .unwrap_or_default();
+            let pnl = fill
+                .closed_pnl
+                .as_deref()
+                .and_then(|p| BigDecimal::from_str(p).ok())
+                .unwrap_or_default();
+
+            // Total USDC delta from this fill = -fee + closed_pnl
+            let delta = &pnl - &fee.abs();
+
+            if delta == BigDecimal::from(0) {
+                return vec![];
+            }
+
+            vec![NativeBalanceDelta {
+                id: Uuid::new_v4(),
+                raw_transaction_id: raw_tx_id,
+                network: network.to_string(),
+                account_address: wallet_address.to_string(),
+                native_token: "USDC".to_string(),
+                pre_balance: BigDecimal::from(0), // Not available from fill data
+                post_balance: BigDecimal::from(0), // Not available from fill data
+                delta,
+                is_fee_payer: true, // The user always pays fees on HL
+                dataset_version_id: None,
+                created_at: Utc::now(),
+            }]
+        }
+        "funding" => {
+            let data = &raw_metadata["data"];
+            let funding: HlFundingEntry = match serde_json::from_value(data.clone()) {
+                Ok(f) => f,
+                Err(_) => return vec![],
+            };
+
+            let delta = BigDecimal::from_str(&funding.usdc).unwrap_or_default();
+            if delta == BigDecimal::from(0) {
+                return vec![];
+            }
+
+            vec![NativeBalanceDelta {
+                id: Uuid::new_v4(),
+                raw_transaction_id: raw_tx_id,
+                network: network.to_string(),
+                account_address: wallet_address.to_string(),
+                native_token: "USDC".to_string(),
+                pre_balance: BigDecimal::from(0),
+                post_balance: BigDecimal::from(0),
+                delta,
+                is_fee_payer: false,
+                dataset_version_id: None,
+                created_at: Utc::now(),
+            }]
+        }
+        _ => vec![],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Materializer implementations
+// ---------------------------------------------------------------------------
 
 /// Materializer wrapper for the Hyperliquid ledger parser.
 pub struct HyperliquidLedgerMaterializer;
@@ -200,6 +362,68 @@ impl Materializer for HyperliquidLedgerMaterializer {
             name: self.dataset_name(),
             description:
                 "Hyperliquid ledger entries: fills, funding payments, deposits, and withdrawals"
+                    .to_string(),
+            source_bronze_tables: vec!["raw_transactions".to_string()],
+            chain_families: vec![self.chain_family()],
+        }
+    }
+}
+
+/// Materializer for Hyperliquid token transfers (deposits/withdrawals).
+pub struct HyperliquidTokenTransferMaterializer;
+
+impl Materializer for HyperliquidTokenTransferMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::TokenTransfers
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:hl_token_transfers_v1_e7f2a4d8"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Hyperliquid
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description: "Hyperliquid token transfers: USDC deposits and withdrawals".to_string(),
+            source_bronze_tables: vec!["raw_transactions".to_string()],
+            chain_families: vec![self.chain_family()],
+        }
+    }
+}
+
+/// Materializer for Hyperliquid native balance deltas.
+pub struct HyperliquidNativeBalanceDeltaMaterializer;
+
+impl Materializer for HyperliquidNativeBalanceDeltaMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::NativeBalanceDeltas
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:hl_native_deltas_v1_f3d6c9a2"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Hyperliquid
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description:
+                "Hyperliquid native balance deltas: USDC balance changes from fills and funding"
                     .to_string(),
             source_bronze_tables: vec!["raw_transactions".to_string()],
             chain_families: vec![self.chain_family()],
@@ -362,5 +586,197 @@ mod tests {
         assert!(desc.validate().is_ok());
         assert_eq!(desc.name, DatasetName::LedgerEntries);
         assert_eq!(desc.chain_families, vec![ChainFamily::Hyperliquid]);
+    }
+
+    #[test]
+    fn hyperliquid_token_transfer_materializer_contract() {
+        let m = HyperliquidTokenTransferMaterializer;
+        assert_eq!(m.dataset_name(), DatasetName::TokenTransfers);
+        assert_eq!(m.parser_version(), 1);
+        assert_eq!(m.chain_family(), ChainFamily::Hyperliquid);
+        assert!(!m.parser_hash().is_empty());
+        assert_ne!(m.parser_hash(), HyperliquidLedgerMaterializer.parser_hash());
+        let desc = m.descriptor();
+        assert!(desc.validate().is_ok());
+        assert_eq!(desc.name, DatasetName::TokenTransfers);
+    }
+
+    #[test]
+    fn hyperliquid_native_balance_delta_materializer_contract() {
+        let m = HyperliquidNativeBalanceDeltaMaterializer;
+        assert_eq!(m.dataset_name(), DatasetName::NativeBalanceDeltas);
+        assert_eq!(m.parser_version(), 1);
+        assert_eq!(m.chain_family(), ChainFamily::Hyperliquid);
+        assert!(!m.parser_hash().is_empty());
+        assert_ne!(m.parser_hash(), HyperliquidLedgerMaterializer.parser_hash());
+        assert_ne!(
+            m.parser_hash(),
+            HyperliquidTokenTransferMaterializer.parser_hash()
+        );
+        let desc = m.descriptor();
+        assert!(desc.validate().is_ok());
+        assert_eq!(desc.name, DatasetName::NativeBalanceDeltas);
+    }
+
+    #[test]
+    fn hyperliquid_all_materializers_have_distinct_hashes() {
+        use std::collections::HashSet;
+        let materializers: Vec<Box<dyn Materializer>> = vec![
+            Box::new(HyperliquidLedgerMaterializer),
+            Box::new(HyperliquidTokenTransferMaterializer),
+            Box::new(HyperliquidNativeBalanceDeltaMaterializer),
+        ];
+        let hashes: HashSet<&str> = materializers.iter().map(|m| m.parser_hash()).collect();
+        assert_eq!(
+            hashes.len(),
+            3,
+            "all 3 HL materializers must have distinct hashes"
+        );
+    }
+
+    #[test]
+    fn test_extract_hl_token_transfer_deposit() {
+        let metadata = serde_json::json!({
+            "type": "ledger_update",
+            "data": {
+                "time": 1700000000000u64,
+                "hash": "0xdep1",
+                "delta": { "type": "deposit", "usdc": "10000.0" }
+            }
+        });
+
+        let transfers = extract_hyperliquid_token_transfers(
+            Some(Uuid::new_v4()),
+            "hypercore-mainnet",
+            "0xtest",
+            &metadata,
+        );
+
+        assert_eq!(transfers.len(), 1);
+        let t = &transfers[0];
+        assert_eq!(t.from_address, "external");
+        assert_eq!(t.to_address, "0xtest");
+        assert_eq!(t.token_symbol, Some("USDC".to_string()));
+        assert_eq!(t.amount, BigDecimal::from_str("10000.0").unwrap());
+    }
+
+    #[test]
+    fn test_extract_hl_token_transfer_withdrawal() {
+        let metadata = serde_json::json!({
+            "type": "ledger_update",
+            "data": {
+                "time": 1700000000000u64,
+                "hash": "0xwith1",
+                "delta": { "type": "withdraw", "usdc": "5000.0" }
+            }
+        });
+
+        let transfers =
+            extract_hyperliquid_token_transfers(None, "hypercore-mainnet", "0xuser", &metadata);
+
+        assert_eq!(transfers.len(), 1);
+        let t = &transfers[0];
+        assert_eq!(t.from_address, "0xuser");
+        assert_eq!(t.to_address, "external");
+        assert_eq!(t.amount, BigDecimal::from_str("5000.0").unwrap());
+    }
+
+    #[test]
+    fn test_extract_hl_token_transfer_fill_returns_none() {
+        let metadata = serde_json::json!({
+            "type": "fill",
+            "data": {
+                "coin": "ETH",
+                "px": "3500.0",
+                "sz": "2.0",
+                "side": "B",
+                "time": 1700000000000u64,
+                "hash": "0xfill1",
+            }
+        });
+
+        let transfers =
+            extract_hyperliquid_token_transfers(None, "hypercore-mainnet", "0xtest", &metadata);
+        assert!(transfers.is_empty(), "fills are not token transfers");
+    }
+
+    #[test]
+    fn test_extract_hl_native_delta_fill() {
+        let metadata = serde_json::json!({
+            "type": "fill",
+            "data": {
+                "coin": "ETH",
+                "px": "3500.0",
+                "sz": "2.0",
+                "side": "B",
+                "time": 1700000000000u64,
+                "hash": "0xfill1",
+                "fee": "3.50",
+                "feeToken": "USDC",
+                "closedPnl": "100.0"
+            }
+        });
+
+        let deltas = extract_hyperliquid_native_balance_deltas(
+            Some(Uuid::new_v4()),
+            "hypercore-mainnet",
+            "0xuser",
+            &metadata,
+        );
+
+        assert_eq!(deltas.len(), 1);
+        let d = &deltas[0];
+        assert_eq!(d.account_address, "0xuser");
+        assert_eq!(d.native_token, "USDC");
+        // delta = pnl - |fee| = 100.0 - 3.50 = 96.50
+        assert_eq!(d.delta, BigDecimal::from_str("96.50").unwrap());
+        assert!(d.is_fee_payer);
+    }
+
+    #[test]
+    fn test_extract_hl_native_delta_funding() {
+        let metadata = serde_json::json!({
+            "type": "funding",
+            "data": {
+                "time": 1700000000000u64,
+                "coin": "ETH",
+                "usdc": "-2.50",
+                "fundingRate": "0.0001"
+            }
+        });
+
+        let deltas = extract_hyperliquid_native_balance_deltas(
+            None,
+            "hypercore-mainnet",
+            "0xuser",
+            &metadata,
+        );
+
+        assert_eq!(deltas.len(), 1);
+        let d = &deltas[0];
+        assert_eq!(d.delta, BigDecimal::from_str("-2.50").unwrap());
+        assert!(!d.is_fee_payer);
+    }
+
+    #[test]
+    fn test_extract_hl_native_delta_unknown_type() {
+        let metadata = serde_json::json!({
+            "type": "ledger_update",
+            "data": {
+                "time": 1700000000000u64,
+                "delta": { "type": "deposit", "usdc": "100.0" }
+            }
+        });
+
+        let deltas = extract_hyperliquid_native_balance_deltas(
+            None,
+            "hypercore-mainnet",
+            "0xuser",
+            &metadata,
+        );
+        assert!(
+            deltas.is_empty(),
+            "ledger_update does not produce native balance deltas"
+        );
     }
 }
