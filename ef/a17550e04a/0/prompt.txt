@@ -1,0 +1,144 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 1: Canonical Bronze And Control Plane
+- work packet: P1-W2: Add New Bronze And Control-Plane Tables
+- objective: Create additive SQL migrations for all V2 tables (networks, index_targets, raw_transactions, target_matches, ingestion_runs, checkpoints, dataset_versions) with correct enum types, indexes, uniqueness constraints, and seed data for 13 networks. Zero changes to existing V1 tables.
+- branch: p1-w2-bronze-control-plane-tables
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- migrations/20260308000000_add_v2_enums.sql (new — chain_family_enum, target_kind_enum, target_mode_enum)
+- migrations/20260308000001_add_networks.sql (new — networks table + seed data for 13 networks)
+- migrations/20260308000002_add_v2_tables.sql (new — index_targets, raw_transactions, target_matches, ingestion_runs, checkpoints, dataset_versions)
+- docs/phase1/p1-w2-bronze-control-plane-tables-handoff.md (new — tracked handoff artifact)
+
+Implementation steps:
+1. 1. Create branch p1-w2-bronze-control-plane-tables from main at 9c0c6fd
+2. 2. Write migration: CREATE TYPE chain_family_enum AS ENUM ('solana', 'evm', 'hyperliquid') — matches ChainFamily Rust enum serde format
+3. 3. Write migration: CREATE TYPE target_kind_enum AS ENUM ('wallet', 'contract', 'program', 'account', 'topic_filter', 'market', 'pool', 'protocol') — matches TargetKind Rust enum serde format
+4. 4. Write migration: CREATE TYPE target_mode_enum AS ENUM ('backfill', 'stream', 'both') — matches TargetMode Rust enum serde format
+5. 5. Write migration: CREATE TABLE networks with TEXT PK, chain_family, display_name, is_testnet, finality_model TEXT, block_time_ms INTEGER, created_at — per P0-W3 Section 3.1
+6. 6. Seed networks table with 13 rows per P0-W3 Section 3.3: solana-mainnet, solana-devnet, solana-testnet, ethereum-mainnet, ethereum-sepolia, base-mainnet, base-sepolia, arbitrum-mainnet, arbitrum-sepolia, hyperevm-mainnet, hyperevm-testnet, hypercore-mainnet, hypercore-testnet
+7. 7. Write migration: CREATE TABLE index_targets with id UUID PK, kind target_kind_enum, network TEXT NOT NULL referencing networks, chain_family chain_family_enum, address TEXT, filter_spec JSONB, filter_spec_hash TEXT, mode target_mode_enum, label TEXT, owner_id UUID, created_at, updated_at — per P0-W1 Section 3.2 and P0-W2 Section 6
+8. 8. Add uniqueness constraints on index_targets: partial unique on (kind, network, address) WHERE address IS NOT NULL, and (kind, network, filter_spec_hash) WHERE filter_spec_hash IS NOT NULL — per P0-W2 Section 6.1
+9. 9. Write migration: CREATE TABLE raw_transactions with id UUID PK, network TEXT NOT NULL referencing networks, tx_hash TEXT NOT NULL, timestamp BIGINT NOT NULL, block_number BIGINT, raw_metadata JSONB NOT NULL, source TEXT NOT NULL, ingestion_run_id UUID, ingested_at TIMESTAMPTZ — per P0-W1 Section 3.1. UNIQUE (network, tx_hash). No wallet_address, no user_id.
+10. 10. Write migration: CREATE TABLE target_matches with id UUID PK, target_id UUID NOT NULL FK index_targets, raw_transaction_id UUID NOT NULL FK raw_transactions, match_reason TEXT, matched_at TIMESTAMPTZ. UNIQUE (target_id, raw_transaction_id) — per P0-W1 Section 3.2
+11. 11. Write migration: CREATE TABLE ingestion_runs with id UUID PK, target_id UUID FK index_targets, network TEXT NOT NULL, source TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL, started_at TIMESTAMPTZ NOT NULL, finished_at TIMESTAMPTZ, records_written BIGINT DEFAULT 0, error_message TEXT, cursor_state JSONB — per P0-W1 Section 3.4
+12. 12. Write migration: CREATE TABLE checkpoints with id UUID PK, target_id UUID NOT NULL FK index_targets, network TEXT NOT NULL, source TEXT NOT NULL, cursor JSONB NOT NULL, updated_at TIMESTAMPTZ. UNIQUE (target_id, network, source) — per P0-W1 Section 3.4
+13. 13. Write migration: CREATE TABLE dataset_versions with id UUID PK, dataset_name TEXT NOT NULL, version INT NOT NULL, parser_hash TEXT, created_at TIMESTAMPTZ NOT NULL, notes TEXT — per P0-W1 Section 3.5
+14. 14. Add indexes: idx_raw_transactions_network_hash on raw_transactions(network, tx_hash), idx_raw_transactions_timestamp on raw_transactions(timestamp), idx_raw_transactions_run on raw_transactions(ingestion_run_id), idx_target_matches_target on target_matches(target_id), idx_target_matches_raw_tx on target_matches(raw_transaction_id), idx_index_targets_network on index_targets(network), idx_index_targets_kind_network on index_targets(kind, network), idx_ingestion_runs_target on ingestion_runs(target_id), idx_ingestion_runs_status on ingestion_runs(status)
+15. 15. Run cargo fmt --all --check, cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace to verify no regressions
+16. 16. Write tracked handoff artifact at docs/phase1/p1-w2-bronze-control-plane-tables-handoff.md
+
+Verification expectations:
+1. 1. cargo fmt --all --check passes
+2. 2. cargo clippy --workspace --all-targets -- -D warnings passes
+3. 3. cargo test --workspace passes (all 244+ tests, 0 failures)
+4. 4. cargo build --release --workspace succeeds
+5. 5. Migrations use correct enum values matching Rust serde serialization: chain_family_enum values match ChainFamily lowercase format, target_kind_enum values match TargetKind snake_case format, target_mode_enum values match TargetMode snake_case format
+6. 6. All 13 networks from P0-W3 Section 3.3 are seeded with correct finality_model and block_time_ms values
+7. 7. raw_transactions has NO wallet_address or user_id column (P0-W1 Section 3.1 rules 1-2)
+8. 8. raw_transactions has UNIQUE (network, tx_hash) constraint
+9. 9. target_matches has UNIQUE (target_id, raw_transaction_id) constraint
+10. 10. checkpoints has UNIQUE (target_id, network, source) constraint
+11. 11. No existing V1 tables are altered or dropped (transactions, ledger_entries, indexer_checkpoints, blocks, evm_logs, hl_fills, chain_enum, entry_type_enum all untouched)
+12. 12. index_targets has correct uniqueness constraints for both simple (address-based) and complex (filter_spec_hash-based) targets per P0-W2 Section 6
+13. 13. All FK references are correct: target_matches → index_targets, target_matches → raw_transactions, ingestion_runs → index_targets, checkpoints → index_targets, raw_transactions.network → networks, index_targets.network → networks
+
+Tracked review artifacts required in the PR:
+- docs/phase1/p1-w2-bronze-control-plane-tables-handoff.md
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p1-w2-bronze-control-plane-tables from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P1-W2: Add New Bronze And Control-Plane Tables.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 1: Canonical Bronze And Control Plane"
+- workPacket: "P1-W2: Add New Bronze And Control-Plane Tables"
+- branchName: "p1-w2-bronze-control-plane-tables"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
