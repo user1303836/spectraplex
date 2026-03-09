@@ -3,9 +3,9 @@
 [![CI](https://github.com/user1303836/spectraplex/actions/workflows/ci.yml/badge.svg)](https://github.com/user1303836/spectraplex/actions/workflows/ci.yml)
 [![Security Audit](https://github.com/user1303836/spectraplex/actions/workflows/audit.yml/badge.svg)](https://github.com/user1303836/spectraplex/actions/workflows/audit.yml)
 
-Spectraplex is a Rust multi-chain indexing and normalization system for blockchain ETL. It ingests raw chain data into canonical Bronze records, materializes reusable Silver and Gold datasets, and exposes both compatibility wallet endpoints and newer target- and dataset-oriented APIs.
+Spectraplex is a Rust multi-chain indexing and normalization system for blockchain ETL. It ingests raw chain data into canonical data tiers (Bronze records, materializes reusable Silver and Gold datasets) and exposes both compatibility wallet endpoints and newer target- and dataset-oriented APIs.
 
-The project started wallet-first for tax and forensics workflows. The current codebase still supports those flows, but the system direction is broader: wallets, contracts, programs, markets, pools, and protocol analytics should all be first-class indexing targets.
+The project treats wallets, contracts, programs, markets, pools, and protocol analytics as first-class indexing targets.
 
 ## What Exists Today
 
