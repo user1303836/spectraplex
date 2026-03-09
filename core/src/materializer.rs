@@ -16,11 +16,12 @@ use crate::v2::ChainFamily;
 // Dataset Name
 // ---------------------------------------------------------------------------
 
-/// Canonical Silver dataset identifiers.
+/// Canonical dataset identifiers.
 ///
-/// These correspond to the seven Silver datasets defined in
-/// V2_ARCHITECTURE_RFC Section 3.5. Each variant maps to a normalized
-/// table or logical dataset produced from Bronze raw data.
+/// Silver datasets correspond to the seven datasets defined in
+/// V2_ARCHITECTURE_RFC Section 3.5. Gold datasets (`WalletLedger`,
+/// `BalanceHistory`) are materialized from Silver data for downstream
+/// wallet, tax, and forensics consumers.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString, EnumIter,
 )]
@@ -41,6 +42,10 @@ pub enum DatasetName {
     HlFunding,
     /// Position state changes derived from fills, funding, liquidations.
     Positions,
+    /// Gold-tier wallet ledger with counterparty tracking (P5-W1).
+    WalletLedger,
+    /// Gold-tier per-asset balance history snapshots (P5-W1).
+    BalanceHistory,
 }
 
 impl DatasetName {
@@ -54,6 +59,8 @@ impl DatasetName {
             DatasetName::HlFills => "hl_fills",
             DatasetName::HlFunding => "hl_funding",
             DatasetName::Positions => "positions",
+            DatasetName::WalletLedger => "wallet_ledger",
+            DatasetName::BalanceHistory => "balance_history",
         }
     }
 
@@ -67,6 +74,8 @@ impl DatasetName {
             DatasetName::HlFills,
             DatasetName::HlFunding,
             DatasetName::Positions,
+            DatasetName::WalletLedger,
+            DatasetName::BalanceHistory,
         ]
     }
 }
@@ -511,6 +520,120 @@ pub struct HlPositionChange {
 }
 
 // ---------------------------------------------------------------------------
+// Gold Dataset Records (P5-W1)
+// ---------------------------------------------------------------------------
+
+/// Gold-tier wallet ledger record with counterparty tracking.
+///
+/// Materialized from Silver datasets (token_transfers, native_balance_deltas,
+/// hl_fills, hl_funding). Each record represents a single financial event
+/// for a specific wallet, enriched with counterparty address, fee breakdown,
+/// and nullable cost basis / proceeds fields for downstream tax consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletLedgerRecord {
+    pub id: Uuid,
+    /// FK to raw_transactions; nullable during transition.
+    pub raw_transaction_id: Option<Uuid>,
+    /// The wallet this record belongs to.
+    pub wallet_address: String,
+    /// Network where the transaction occurred (e.g. "solana-mainnet").
+    pub network: String,
+    /// Transaction hash for on-chain reference.
+    pub tx_hash: String,
+    /// Unix timestamp (seconds or milliseconds depending on chain).
+    pub timestamp: i64,
+    /// Entry type: "trade", "fee", "transfer", "income", "funding".
+    pub entry_type: String,
+    /// Asset symbol (e.g. "SOL", "USDC", "ETH").
+    pub asset_symbol: String,
+    /// Signed amount (positive = inflow, negative = outflow).
+    pub amount: BigDecimal,
+    /// Address of the counterparty (sender for inflows, receiver for outflows).
+    pub counterparty_address: Option<String>,
+    /// Fee amount associated with this entry (if applicable).
+    pub fee_amount: Option<BigDecimal>,
+    /// Asset used to pay the fee.
+    pub fee_asset: Option<String>,
+    /// Cost basis in fiat (nullable — for future tax lot matching).
+    pub cost_basis: Option<BigDecimal>,
+    /// Proceeds in fiat (nullable — for future tax lot matching).
+    pub proceeds: Option<BigDecimal>,
+    /// FK to dataset_versions; nullable during transition.
+    pub dataset_version_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Gold-tier balance history snapshot.
+///
+/// Derived from wallet_ledger entries or directly from Silver data.
+/// Each record represents the running balance for a specific asset
+/// in a specific wallet at a specific point in time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceSnapshot {
+    pub id: Uuid,
+    /// The wallet this snapshot belongs to.
+    pub wallet_address: String,
+    /// Asset symbol.
+    pub asset_symbol: String,
+    /// Network.
+    pub network: String,
+    /// Unix timestamp of the snapshot.
+    pub timestamp: i64,
+    /// Running balance after the referenced transaction.
+    pub balance: BigDecimal,
+    /// Transaction hash that caused this balance change.
+    pub tx_hash: String,
+    /// FK to dataset_versions; nullable during transition.
+    pub dataset_version_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Forensics activity summary for a wallet.
+///
+/// Aggregated view of wallet interactions — top counterparties,
+/// cross-chain summary, and transaction type breakdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForensicsActivity {
+    /// Wallet being analyzed.
+    pub wallet_address: String,
+    /// Top counterparties by interaction count.
+    pub top_counterparties: Vec<CounterpartySummary>,
+    /// Activity breakdown by network.
+    pub network_activity: Vec<NetworkActivity>,
+    /// Transaction type breakdown.
+    pub type_breakdown: Vec<TypeBreakdown>,
+    /// Total number of wallet_ledger records.
+    pub total_entries: usize,
+}
+
+/// Summary of interactions with a single counterparty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CounterpartySummary {
+    pub address: String,
+    pub interaction_count: usize,
+    pub total_inflow: BigDecimal,
+    pub total_outflow: BigDecimal,
+    pub networks: Vec<String>,
+}
+
+/// Activity summary for a single network.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkActivity {
+    pub network: String,
+    pub entry_count: usize,
+    pub unique_assets: usize,
+    pub unique_counterparties: usize,
+}
+
+/// Breakdown of entries by type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeBreakdown {
+    pub entry_type: String,
+    pub count: usize,
+    pub total_amount: BigDecimal,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -521,9 +644,9 @@ mod tests {
     use strum::IntoEnumIterator;
 
     #[test]
-    fn dataset_name_count_is_seven() {
-        assert_eq!(DatasetName::all().len(), 7);
-        assert_eq!(DatasetName::iter().count(), 7);
+    fn dataset_name_count_is_nine() {
+        assert_eq!(DatasetName::all().len(), 9);
+        assert_eq!(DatasetName::iter().count(), 9);
     }
 
     #[test]
@@ -539,8 +662,10 @@ mod tests {
             (DatasetName::HlFills, "\"hl_fills\""),
             (DatasetName::HlFunding, "\"hl_funding\""),
             (DatasetName::Positions, "\"positions\""),
+            (DatasetName::WalletLedger, "\"wallet_ledger\""),
+            (DatasetName::BalanceHistory, "\"balance_history\""),
         ];
-        assert_eq!(cases.len(), 7, "must cover all 7 datasets");
+        assert_eq!(cases.len(), 9, "must cover all 9 datasets");
         for (variant, expected_json) in cases {
             let json = serde_json::to_string(&variant).unwrap();
             assert_eq!(json, expected_json, "serialize {variant:?}");
@@ -561,6 +686,8 @@ mod tests {
         assert_eq!(DatasetName::HlFills.to_string(), "hl_fills");
         assert_eq!(DatasetName::HlFunding.to_string(), "hl_funding");
         assert_eq!(DatasetName::Positions.to_string(), "positions");
+        assert_eq!(DatasetName::WalletLedger.to_string(), "wallet_ledger");
+        assert_eq!(DatasetName::BalanceHistory.to_string(), "balance_history");
     }
 
     #[test]
@@ -576,6 +703,14 @@ mod tests {
         assert_eq!(
             DatasetName::from_str("hl_fills").unwrap(),
             DatasetName::HlFills
+        );
+        assert_eq!(
+            DatasetName::from_str("wallet_ledger").unwrap(),
+            DatasetName::WalletLedger
+        );
+        assert_eq!(
+            DatasetName::from_str("balance_history").unwrap(),
+            DatasetName::BalanceHistory
         );
         assert!(DatasetName::from_str("unknown_dataset").is_err());
     }
@@ -1391,5 +1526,122 @@ mod tests {
         assert_eq!(back.sink_type, SinkType::LocalFile);
         assert_eq!(back.destination, "/tmp/export.jsonl");
         assert_eq!(back.bytes_written, 1024);
+    }
+
+    // -- WalletLedgerRecord tests (P5-W1) --
+
+    #[test]
+    fn wallet_ledger_record_serde_roundtrip() {
+        let record = WalletLedgerRecord {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: Some(uuid::Uuid::new_v4()),
+            wallet_address: "0xWallet".to_string(),
+            network: "solana-mainnet".to_string(),
+            tx_hash: "abc123".to_string(),
+            timestamp: 1700000000,
+            entry_type: "transfer".to_string(),
+            asset_symbol: "USDC".to_string(),
+            amount: BigDecimal::from_str("100.5").unwrap(),
+            counterparty_address: Some("0xCounterparty".to_string()),
+            fee_amount: Some(BigDecimal::from_str("0.005").unwrap()),
+            fee_asset: Some("SOL".to_string()),
+            cost_basis: None,
+            proceeds: None,
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let back: WalletLedgerRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.wallet_address, "0xWallet");
+        assert_eq!(back.entry_type, "transfer");
+        assert_eq!(
+            back.counterparty_address,
+            Some("0xCounterparty".to_string())
+        );
+        assert_eq!(back.amount, BigDecimal::from_str("100.5").unwrap());
+    }
+
+    #[test]
+    fn wallet_ledger_record_nullable_fields() {
+        let record = WalletLedgerRecord {
+            id: uuid::Uuid::new_v4(),
+            raw_transaction_id: None,
+            wallet_address: "0xWallet".to_string(),
+            network: "ethereum-mainnet".to_string(),
+            tx_hash: "0xdeadbeef".to_string(),
+            timestamp: 1700000000,
+            entry_type: "fee".to_string(),
+            asset_symbol: "ETH".to_string(),
+            amount: BigDecimal::from_str("-0.001").unwrap(),
+            counterparty_address: None,
+            fee_amount: None,
+            fee_asset: None,
+            cost_basis: Some(BigDecimal::from_str("3500.0").unwrap()),
+            proceeds: Some(BigDecimal::from_str("3600.0").unwrap()),
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_value(&record).unwrap();
+        assert!(json["counterparty_address"].is_null());
+        assert_eq!(json["cost_basis"].as_str(), Some("3500.0"));
+        assert_eq!(json["proceeds"].as_str(), Some("3600.0"));
+    }
+
+    // -- BalanceSnapshot tests (P5-W1) --
+
+    #[test]
+    fn balance_snapshot_serde_roundtrip() {
+        let snap = BalanceSnapshot {
+            id: uuid::Uuid::new_v4(),
+            wallet_address: "0xWallet".to_string(),
+            asset_symbol: "SOL".to_string(),
+            network: "solana-mainnet".to_string(),
+            timestamp: 1700000000,
+            balance: BigDecimal::from_str("42.5").unwrap(),
+            tx_hash: "abc123".to_string(),
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: BalanceSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.wallet_address, "0xWallet");
+        assert_eq!(back.asset_symbol, "SOL");
+        assert_eq!(back.balance, BigDecimal::from_str("42.5").unwrap());
+    }
+
+    // -- ForensicsActivity tests (P5-W1) --
+
+    #[test]
+    fn forensics_activity_serde_roundtrip() {
+        let activity = ForensicsActivity {
+            wallet_address: "0xWallet".to_string(),
+            top_counterparties: vec![CounterpartySummary {
+                address: "0xCounterparty".to_string(),
+                interaction_count: 5,
+                total_inflow: BigDecimal::from(500),
+                total_outflow: BigDecimal::from(200),
+                networks: vec!["solana-mainnet".to_string()],
+            }],
+            network_activity: vec![NetworkActivity {
+                network: "solana-mainnet".to_string(),
+                entry_count: 10,
+                unique_assets: 3,
+                unique_counterparties: 2,
+            }],
+            type_breakdown: vec![TypeBreakdown {
+                entry_type: "transfer".to_string(),
+                count: 7,
+                total_amount: BigDecimal::from(1000),
+            }],
+            total_entries: 10,
+        };
+        let json = serde_json::to_string(&activity).unwrap();
+        let back: ForensicsActivity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.wallet_address, "0xWallet");
+        assert_eq!(back.top_counterparties.len(), 1);
+        assert_eq!(back.top_counterparties[0].interaction_count, 5);
+        assert_eq!(back.network_activity.len(), 1);
+        assert_eq!(back.type_breakdown.len(), 1);
+        assert_eq!(back.total_entries, 10);
     }
 }
