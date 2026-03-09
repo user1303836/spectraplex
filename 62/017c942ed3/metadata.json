@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "62017c942ed3",
+  "strategy": "manual-commit",
+  "branch": "p5-w1-wallet-tax-forensics-pack",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "api/src/main.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/62/017c942ed3/0/metadata.json",
+      "transcript": "/62/017c942ed3/0/full.jsonl",
+      "context": "/62/017c942ed3/0/context.md",
+      "content_hash": "/62/017c942ed3/0/content_hash.txt",
+      "prompt": "/62/017c942ed3/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 36,
+    "cache_creation_tokens": 51751,
+    "cache_read_tokens": 1318870,
+    "output_tokens": 12030,
+    "api_call_count": 34
+  }
+}
