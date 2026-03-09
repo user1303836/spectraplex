@@ -286,8 +286,10 @@ These endpoints are the preferred forward path for new consumers. They provide f
 | `GET` | `/v1/export/jobs/:job_id/download` | Download completed export data |
 | `GET` | `/v1/export/tax` | Export wallet_ledger as tax-software-friendly CSV |
 | `GET` | `/v1/forensics/activity` | Wallet interaction analysis (top counterparties, cross-chain summary) |
+| `GET` | `/v1/analytics/hl/trader` | Per-trader Hyperliquid PnL analytics (win rate, volume, coin breakdown) |
+| `GET` | `/v1/analytics/hl/market` | Per-coin Hyperliquid market analytics (volume, traders, PnL distribution) |
 
-The dataset records endpoint supports filtering via `?target_id=<UUID>&network=<id>&time_start=<unix_ts>&time_end=<unix_ts>&limit=N&offset=N` query parameters (all optional). Queryable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`, `wallet_ledger`, `balance_history`.
+The dataset records endpoint supports filtering via `?target_id=<UUID>&network=<id>&time_start=<unix_ts>&time_end=<unix_ts>&limit=N&offset=N` query parameters (all optional). Queryable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`, `wallet_ledger`, `balance_history`, `hl_pnl_summary`, `hl_trade_history`.
 
 ### POST /v1/ingest
 
@@ -466,7 +468,7 @@ curl -X POST http://127.0.0.1:3000/v1/export/dataset \
 # Response: {"id": "<JOB_UUID>", "state": "pending", "dataset": "token_transfers", "format": "jsonl", "record_count": null, "message": null}
 ```
 
-Creates an async export job for a dataset. Supported formats: `jsonl` (default), `csv`. Optional filters: `target_id`, `network`, `time_start`, `time_end`. Exportable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`, `wallet_ledger`, `balance_history`. Maximum 100,000 records per export.
+Creates an async export job for a dataset. Supported formats: `jsonl` (default), `csv`. Optional filters: `target_id`, `network`, `time_start`, `time_end`. Exportable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`, `wallet_ledger`, `balance_history`, `hl_pnl_summary`, `hl_trade_history`. Maximum 100,000 records per export.
 
 #### Sink delivery
 
@@ -576,15 +578,19 @@ curl -H "Authorization: Bearer <API_KEY>" \
 
 Downloads the completed export data. The response includes a `Content-Disposition` header with the filename.
 
-### Gold Datasets: wallet_ledger and balance_history
+### Gold Datasets
 
-Spectraplex includes two Gold-tier datasets materialized from Silver data:
+Spectraplex includes four Gold-tier datasets materialized from Silver data:
 
 - **`wallet_ledger`** — wallet-scoped financial records with counterparty tracking, network awareness, and nullable cost basis / proceeds fields. Derived from `token_transfers`, `native_balance_deltas`, `hl_fills`, and `hl_funding`. Queryable and exportable via the standard dataset API.
 
 - **`balance_history`** — per-wallet, per-asset running balance snapshots derived from wallet_ledger entries. Enables point-in-time balance queries for forensics and portfolio tracking.
 
-Both datasets are queryable via `/v1/datasets/{name}/records` and exportable via `/v1/export/dataset`.
+- **`hl_pnl_summary`** — per-wallet, per-coin PnL summaries aggregated from Silver `hl_fills` (closed PnL, fees) and `hl_funding` (funding payments). Includes net PnL, win/loss counts, fill count, and average trade size. Designed for trader dashboards and performance analytics.
+
+- **`hl_trade_history`** — logical trade records built by grouping Silver `hl_fills` into open→close sequences. Each record captures entry/exit price, size, realized PnL, fees, and the number of fills that composed the trade. Enables trade-by-trade performance analysis.
+
+All Gold datasets are queryable via `/v1/datasets/{name}/records` and exportable via `/v1/export/dataset`.
 
 ### GET /v1/export/tax
 
@@ -610,6 +616,28 @@ curl -H "Authorization: Bearer <API_KEY>" \
 ```
 
 Returns a forensics activity summary for wallet_ledger records: top counterparties by interaction count, cross-chain activity breakdown, and transaction type distribution. Supports `?target_id`, `?network`, `?time_start`, `?time_end` filters.
+
+### GET /v1/analytics/hl/trader
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  "http://127.0.0.1:3000/v1/analytics/hl/trader?target_id=<UUID>"
+
+# Response: {"wallet_address": "...", "total_net_pnl": "105.5", "total_volume": "50000", "total_trades": 5, "win_rate": 0.6, "coin_breakdown": [...]}
+```
+
+Returns per-trader Hyperliquid analytics computed from Gold `hl_pnl_summary` and `hl_trade_history` records: total net PnL, trading volume, win rate, and per-coin breakdown. Supports `?target_id`, `?network`, `?time_start`, `?time_end` filters.
+
+### GET /v1/analytics/hl/market
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  "http://127.0.0.1:3000/v1/analytics/hl/market"
+
+# Response: {"coins": [{"coin": "ETH", "total_volume": "100000", "unique_traders": 5, ...}], "total_volume": "100000", "total_unique_traders": 5}
+```
+
+Returns per-coin Hyperliquid market analytics: total volume, unique trader count, total trades, aggregate PnL, and average trade size per coin. Supports `?target_id`, `?network`, `?time_start`, `?time_end` filters.
 
 ## Configuration
 
@@ -718,6 +746,7 @@ All tables use UUIDs as primary keys and support idempotent batch inserts (`ON C
 - [ ] Expand Silver beyond `ledger_entries` into reusable datasets like transfers, decoded events, fills, swaps, and balance snapshots
 - [ ] Add ETL-first delivery modes such as dataset exports, sink jobs, and warehouse-friendly outputs
 - [x] Keep wallet/tax/forensics materializations first-class, but as downstream products of the broader indexing core (P5-W1: wallet_ledger, balance_history, tax export, forensics activity)
+- [x] Add Hyperliquid-specific analytics as Gold datasets proving a dashboard can consume Spectraplex outputs directly (P5-W2: hl_pnl_summary, hl_trade_history, trader and market analytics)
 
 The detailed roadmap lives in [`SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md`](SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md).
 

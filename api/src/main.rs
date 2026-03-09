@@ -22,7 +22,8 @@ use spectraplex_core::config::AppConfig;
 use spectraplex_core::connector::validate_target;
 use spectraplex_core::materializer::{
     BalanceSnapshot, DatasetName, DeliveryMetadata, DeliveryReceipt, ExportFormat, ExportSink,
-    ForensicsActivity, SinkConfig, SinkType, WalletLedgerRecord,
+    ForensicsActivity, HlPnlSummary, HlTradeHistory, MarketAnalytics, SinkConfig, SinkType,
+    TraderAnalytics, WalletLedgerRecord,
 };
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
 use spectraplex_core::v2::{
@@ -305,6 +306,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/export/jobs/{job_id}/download", get(download_export))
         .route("/v1/export/tax", get(tax_export))
         .route("/v1/forensics/activity", get(forensics_activity_handler))
+        .route("/v1/analytics/hl/trader", get(hl_trader_analytics_handler))
+        .route("/v1/analytics/hl/market", get(hl_market_analytics_handler))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared_state),
             require_auth,
@@ -1584,6 +1587,8 @@ const QUERYABLE_DATASETS: &[&str] = &[
     "positions",
     "wallet_ledger",
     "balance_history",
+    "hl_pnl_summary",
+    "hl_trade_history",
 ];
 
 fn validate_dataset_name(name: &str) -> Result<(), AppError> {
@@ -1770,6 +1775,36 @@ async fn query_dataset_records(
                 .map_err(AppError::internal)?;
             serde_json::to_value(&records).map_err(AppError::internal)?
         }
+        "hl_pnl_summary" => {
+            let records = state
+                .repo
+                .query_hl_pnl_summary(
+                    params.target_id,
+                    net,
+                    params.time_start,
+                    params.time_end,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(AppError::internal)?;
+            serde_json::to_value(&records).map_err(AppError::internal)?
+        }
+        "hl_trade_history" => {
+            let records = state
+                .repo
+                .query_hl_trade_history(
+                    params.target_id,
+                    net,
+                    params.time_start,
+                    params.time_end,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(AppError::internal)?;
+            serde_json::to_value(&records).map_err(AppError::internal)?
+        }
         _ => unreachable!("dataset name validated above"),
     };
 
@@ -1781,7 +1816,7 @@ async fn query_dataset_records(
 // ---------------------------------------------------------------------------
 
 /// Datasets that support export via the /v1/export/dataset endpoint.
-/// Includes Silver datasets plus Gold datasets (P5-W1).
+/// Includes Silver datasets plus Gold datasets (P5-W1, P5-W2).
 const EXPORTABLE_DATASETS: &[&str] = &[
     "token_transfers",
     "native_balance_deltas",
@@ -1791,6 +1826,8 @@ const EXPORTABLE_DATASETS: &[&str] = &[
     "positions",
     "wallet_ledger",
     "balance_history",
+    "hl_pnl_summary",
+    "hl_trade_history",
 ];
 
 fn content_type_for_format(format: ExportFormat) -> &'static str {
@@ -2035,6 +2072,66 @@ fn balance_history_to_csv(records: &[BalanceSnapshot]) -> Vec<u8> {
             r.timestamp,
             r.balance,
             csv_escape(&r.tx_hash),
+            r.dataset_version_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            r.created_at.to_rfc3339(),
+        ));
+    }
+    buf.into_bytes()
+}
+
+fn hl_pnl_summary_to_csv(records: &[HlPnlSummary]) -> Vec<u8> {
+    let mut buf = String::from(
+        "id,wallet_address,coin,network,period_start,period_end,total_closed_pnl,total_funding,total_fees,net_pnl,trade_count,fill_count,avg_trade_size,win_count,loss_count,dataset_version_id,created_at\n",
+    );
+    for r in records {
+        buf.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            r.id,
+            csv_escape(&r.wallet_address),
+            csv_escape(&r.coin),
+            csv_escape(&r.network),
+            r.period_start,
+            r.period_end,
+            r.total_closed_pnl,
+            r.total_funding,
+            r.total_fees,
+            r.net_pnl,
+            r.trade_count,
+            r.fill_count,
+            r.avg_trade_size,
+            r.win_count,
+            r.loss_count,
+            r.dataset_version_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            r.created_at.to_rfc3339(),
+        ));
+    }
+    buf.into_bytes()
+}
+
+fn hl_trade_history_to_csv(records: &[HlTradeHistory]) -> Vec<u8> {
+    let mut buf = String::from(
+        "id,wallet_address,coin,network,side,entry_price,exit_price,size,opened_at,closed_at,realized_pnl,fees,num_fills,dataset_version_id,created_at\n",
+    );
+    for r in records {
+        buf.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            r.id,
+            csv_escape(&r.wallet_address),
+            csv_escape(&r.coin),
+            csv_escape(&r.network),
+            csv_escape(&r.side),
+            r.entry_price,
+            r.exit_price,
+            r.size,
+            r.opened_at,
+            r.closed_at,
+            r.realized_pnl,
+            r.fees,
+            r.num_fills,
             r.dataset_version_id
                 .map(|u| u.to_string())
                 .unwrap_or_default(),
@@ -2515,6 +2612,32 @@ async fn run_export_job(
             };
             Ok((body, count, meta))
         }
+        "hl_pnl_summary" => {
+            let records = repo
+                .export_hl_pnl_summary(target_id, network, time_start, time_end)
+                .await?;
+            let count = records.len();
+            let body = match format {
+                ExportFormat::Jsonl => {
+                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
+                }
+                ExportFormat::Csv => hl_pnl_summary_to_csv(&records),
+            };
+            Ok((body, count, meta))
+        }
+        "hl_trade_history" => {
+            let records = repo
+                .export_hl_trade_history(target_id, network, time_start, time_end)
+                .await?;
+            let count = records.len();
+            let body = match format {
+                ExportFormat::Jsonl => {
+                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
+                }
+                ExportFormat::Csv => hl_trade_history_to_csv(&records),
+            };
+            Ok((body, count, meta))
+        }
         _ => Err(anyhow::anyhow!("Unknown dataset: {dataset}")),
     }
 }
@@ -2671,6 +2794,100 @@ async fn forensics_activity_handler(
         spectraplex_adapters::ledger_derivation::build_forensics_activity(&wallet, &records);
 
     Ok(Json(activity))
+}
+
+// ---------------------------------------------------------------------------
+// Hyperliquid analytics endpoints (P5-W2)
+// ---------------------------------------------------------------------------
+
+/// Query parameters for the Hyperliquid analytics endpoints.
+#[derive(Debug, Deserialize)]
+struct HlAnalyticsParams {
+    target_id: Option<Uuid>,
+    network: Option<String>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
+}
+
+/// GET /v1/analytics/hl/trader — per-trader Hyperliquid PnL analytics.
+async fn hl_trader_analytics_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HlAnalyticsParams>,
+) -> Result<Json<TraderAnalytics>, AppError> {
+    validate_date_range(params.time_start, params.time_end)?;
+
+    let pnl_summaries = state
+        .repo
+        .export_hl_pnl_summary(
+            params.target_id,
+            params.network.as_deref(),
+            params.time_start,
+            params.time_end,
+        )
+        .await
+        .map_err(AppError::internal)?;
+
+    let trade_histories = state
+        .repo
+        .export_hl_trade_history(
+            params.target_id,
+            params.network.as_deref(),
+            params.time_start,
+            params.time_end,
+        )
+        .await
+        .map_err(AppError::internal)?;
+
+    let wallet = pnl_summaries
+        .first()
+        .map(|s| s.wallet_address.as_str())
+        .or_else(|| trade_histories.first().map(|t| t.wallet_address.as_str()))
+        .unwrap_or("");
+
+    let analytics = spectraplex_adapters::hl_analytics::build_trader_analytics(
+        wallet,
+        &pnl_summaries,
+        &trade_histories,
+    );
+
+    Ok(Json(analytics))
+}
+
+/// GET /v1/analytics/hl/market — per-coin Hyperliquid market analytics.
+async fn hl_market_analytics_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HlAnalyticsParams>,
+) -> Result<Json<MarketAnalytics>, AppError> {
+    validate_date_range(params.time_start, params.time_end)?;
+
+    let pnl_summaries = state
+        .repo
+        .export_hl_pnl_summary(
+            params.target_id,
+            params.network.as_deref(),
+            params.time_start,
+            params.time_end,
+        )
+        .await
+        .map_err(AppError::internal)?;
+
+    let trade_histories = state
+        .repo
+        .export_hl_trade_history(
+            params.target_id,
+            params.network.as_deref(),
+            params.time_start,
+            params.time_end,
+        )
+        .await
+        .map_err(AppError::internal)?;
+
+    let analytics = spectraplex_adapters::hl_analytics::build_market_analytics(
+        &pnl_summaries,
+        &trade_histories,
+    );
+
+    Ok(Json(analytics))
 }
 
 async fn get_dataset_completeness_handler(
@@ -2866,6 +3083,8 @@ mod tests {
             .route("/v1/export/jobs/{job_id}/download", get(download_export))
             .route("/v1/export/tax", get(tax_export))
             .route("/v1/forensics/activity", get(forensics_activity_handler))
+            .route("/v1/analytics/hl/trader", get(hl_trader_analytics_handler))
+            .route("/v1/analytics/hl/market", get(hl_market_analytics_handler))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_auth,
@@ -4856,7 +5075,7 @@ mod tests {
 
     #[test]
     fn test_queryable_datasets_count() {
-        assert_eq!(QUERYABLE_DATASETS.len(), 8);
+        assert_eq!(QUERYABLE_DATASETS.len(), 10);
     }
 
     #[test]
@@ -4869,6 +5088,8 @@ mod tests {
         assert!(QUERYABLE_DATASETS.contains(&"positions"));
         assert!(QUERYABLE_DATASETS.contains(&"wallet_ledger"));
         assert!(QUERYABLE_DATASETS.contains(&"balance_history"));
+        assert!(QUERYABLE_DATASETS.contains(&"hl_pnl_summary"));
+        assert!(QUERYABLE_DATASETS.contains(&"hl_trade_history"));
     }
 
     #[test]
@@ -6700,9 +6921,11 @@ mod tests {
 
     #[test]
     fn test_exportable_datasets_includes_gold() {
-        assert_eq!(EXPORTABLE_DATASETS.len(), 8);
+        assert_eq!(EXPORTABLE_DATASETS.len(), 10);
         assert!(EXPORTABLE_DATASETS.contains(&"wallet_ledger"));
         assert!(EXPORTABLE_DATASETS.contains(&"balance_history"));
+        assert!(EXPORTABLE_DATASETS.contains(&"hl_pnl_summary"));
+        assert!(EXPORTABLE_DATASETS.contains(&"hl_trade_history"));
     }
 
     #[tokio::test]
@@ -6769,6 +6992,208 @@ mod tests {
     // Verify existing dataset endpoints remain functional
     #[tokio::test]
     async fn p5w1_compat_existing_dataset_endpoints_still_routed() {
+        let dataset_uris = vec![
+            "/v1/datasets",
+            "/v1/datasets/token_transfers/versions",
+            "/v1/datasets/token_transfers/records",
+            "/v1/datasets/token_transfers/completeness",
+            "/v1/datasets/token_transfers/status",
+        ];
+        for uri in dataset_uris {
+            assert_get_routed(test_router(), uri).await;
+        }
+    }
+
+    // ── P5-W2: Hyperliquid Analytics Pack tests ───────────────────────
+
+    #[test]
+    fn test_hl_pnl_summary_in_queryable_datasets() {
+        assert!(QUERYABLE_DATASETS.contains(&"hl_pnl_summary"));
+    }
+
+    #[test]
+    fn test_hl_trade_history_in_queryable_datasets() {
+        assert!(QUERYABLE_DATASETS.contains(&"hl_trade_history"));
+    }
+
+    #[test]
+    fn test_hl_pnl_summary_in_exportable_datasets() {
+        assert!(EXPORTABLE_DATASETS.contains(&"hl_pnl_summary"));
+    }
+
+    #[test]
+    fn test_hl_trade_history_in_exportable_datasets() {
+        assert!(EXPORTABLE_DATASETS.contains(&"hl_trade_history"));
+    }
+
+    #[tokio::test]
+    async fn test_hl_pnl_summary_records_endpoint_routed() {
+        assert_get_routed(test_router(), "/v1/datasets/hl_pnl_summary/records").await;
+    }
+
+    #[tokio::test]
+    async fn test_hl_trade_history_records_endpoint_routed() {
+        assert_get_routed(test_router(), "/v1/datasets/hl_trade_history/records").await;
+    }
+
+    #[tokio::test]
+    async fn test_hl_trader_analytics_endpoint_routed() {
+        assert_get_routed(test_router(), "/v1/analytics/hl/trader").await;
+    }
+
+    #[tokio::test]
+    async fn test_hl_market_analytics_endpoint_routed() {
+        assert_get_routed(test_router(), "/v1/analytics/hl/market").await;
+    }
+
+    #[tokio::test]
+    async fn test_hl_trader_analytics_requires_auth() {
+        assert_get_requires_auth(test_router(), "/v1/analytics/hl/trader").await;
+    }
+
+    #[tokio::test]
+    async fn test_hl_market_analytics_requires_auth() {
+        assert_get_requires_auth(test_router(), "/v1/analytics/hl/market").await;
+    }
+
+    #[tokio::test]
+    async fn test_hl_pnl_summary_export_accepted() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "hl_pnl_summary"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "hl_pnl_summary export should be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hl_trade_history_export_accepted() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "hl_trade_history"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "hl_trade_history export should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_hl_pnl_summary_to_csv_format() {
+        let records = vec![HlPnlSummary {
+            id: Uuid::nil(),
+            wallet_address: "0xTrader".to_string(),
+            coin: "ETH".to_string(),
+            network: "hyperliquid-mainnet".to_string(),
+            period_start: 1000,
+            period_end: 2000,
+            total_closed_pnl: bigdecimal::BigDecimal::from(100),
+            total_funding: bigdecimal::BigDecimal::from(10),
+            total_fees: bigdecimal::BigDecimal::from(5),
+            net_pnl: bigdecimal::BigDecimal::from(105),
+            trade_count: 3,
+            fill_count: 5,
+            avg_trade_size: bigdecimal::BigDecimal::from(1),
+            win_count: 2,
+            loss_count: 1,
+            dataset_version_id: None,
+            created_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
+        }];
+        let csv = hl_pnl_summary_to_csv(&records);
+        let output = String::from_utf8(csv).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2); // header + 1 row
+        assert!(lines[0].contains("net_pnl"));
+        assert!(lines[0].contains("total_closed_pnl"));
+        assert!(lines[0].contains("total_funding"));
+        assert!(lines[1].contains("ETH"));
+        assert!(lines[1].contains("105"));
+    }
+
+    #[test]
+    fn test_hl_trade_history_to_csv_format() {
+        let records = vec![HlTradeHistory {
+            id: Uuid::nil(),
+            wallet_address: "0xTrader".to_string(),
+            coin: "BTC".to_string(),
+            network: "hyperliquid-mainnet".to_string(),
+            side: "B".to_string(),
+            entry_price: bigdecimal::BigDecimal::from(50000),
+            exit_price: bigdecimal::BigDecimal::from(51000),
+            size: bigdecimal::BigDecimal::from(1),
+            opened_at: 1000,
+            closed_at: 3000,
+            realized_pnl: bigdecimal::BigDecimal::from(1000),
+            fees: bigdecimal::BigDecimal::from(10),
+            num_fills: 3,
+            dataset_version_id: None,
+            created_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
+        }];
+        let csv = hl_trade_history_to_csv(&records);
+        let output = String::from_utf8(csv).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2); // header + 1 row
+        assert!(lines[0].contains("entry_price"));
+        assert!(lines[0].contains("exit_price"));
+        assert!(lines[0].contains("realized_pnl"));
+        assert!(lines[1].contains("BTC"));
+        assert!(lines[1].contains("1000"));
+    }
+
+    // Verify P5-W1 compatibility remains
+    #[tokio::test]
+    async fn p5w2_compat_existing_wallet_endpoints_still_routed() {
+        let wallet_uris = vec![
+            "/v1/transactions/SomeWallet123",
+            "/v1/ledger/SomeWallet123",
+            "/v1/export/SomeWallet123",
+            "/v1/balances/SomeWallet123",
+            "/v1/stats/SomeWallet123",
+        ];
+        for uri in wallet_uris {
+            assert_get_routed(test_router(), uri).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn p5w2_compat_p5w1_endpoints_still_routed() {
+        let uris = vec![
+            "/v1/datasets/wallet_ledger/records",
+            "/v1/datasets/balance_history/records",
+            "/v1/export/tax",
+            "/v1/forensics/activity",
+        ];
+        for uri in uris {
+            assert_get_routed(test_router(), uri).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn p5w2_compat_existing_dataset_endpoints_still_routed() {
         let dataset_uris = vec![
             "/v1/datasets",
             "/v1/datasets/token_transfers/versions",

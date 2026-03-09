@@ -5,8 +5,8 @@
 
 use chrono::{DateTime, Utc};
 use spectraplex_core::materializer::{
-    BalanceSnapshot, DecodedEvent, HlFillRecord, HlFundingPayment, HlPositionChange,
-    NativeBalanceDelta, TokenTransfer, WalletLedgerRecord,
+    BalanceSnapshot, DecodedEvent, HlFillRecord, HlFundingPayment, HlPnlSummary, HlPositionChange,
+    HlTradeHistory, NativeBalanceDelta, TokenTransfer, WalletLedgerRecord,
 };
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
@@ -936,6 +936,48 @@ fn row_to_balance_snapshot(row: &sqlx::postgres::PgRow) -> anyhow::Result<Balanc
         timestamp: row.try_get("timestamp")?,
         balance: row.try_get("balance")?,
         tx_hash: row.try_get("tx_hash")?,
+        dataset_version_id: row.try_get("dataset_version_id")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn row_to_hl_pnl_summary(row: &sqlx::postgres::PgRow) -> anyhow::Result<HlPnlSummary> {
+    Ok(HlPnlSummary {
+        id: row.try_get("id")?,
+        wallet_address: row.try_get("wallet_address")?,
+        coin: row.try_get("coin")?,
+        network: row.try_get("network")?,
+        period_start: row.try_get("period_start")?,
+        period_end: row.try_get("period_end")?,
+        total_closed_pnl: row.try_get("total_closed_pnl")?,
+        total_funding: row.try_get("total_funding")?,
+        total_fees: row.try_get("total_fees")?,
+        net_pnl: row.try_get("net_pnl")?,
+        trade_count: row.try_get("trade_count")?,
+        fill_count: row.try_get("fill_count")?,
+        avg_trade_size: row.try_get("avg_trade_size")?,
+        win_count: row.try_get("win_count")?,
+        loss_count: row.try_get("loss_count")?,
+        dataset_version_id: row.try_get("dataset_version_id")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn row_to_hl_trade_history(row: &sqlx::postgres::PgRow) -> anyhow::Result<HlTradeHistory> {
+    Ok(HlTradeHistory {
+        id: row.try_get("id")?,
+        wallet_address: row.try_get("wallet_address")?,
+        coin: row.try_get("coin")?,
+        network: row.try_get("network")?,
+        side: row.try_get("side")?,
+        entry_price: row.try_get("entry_price")?,
+        exit_price: row.try_get("exit_price")?,
+        size: row.try_get("size")?,
+        opened_at: row.try_get("opened_at")?,
+        closed_at: row.try_get("closed_at")?,
+        realized_pnl: row.try_get("realized_pnl")?,
+        fees: row.try_get("fees")?,
+        num_fills: row.try_get("num_fills")?,
         dataset_version_id: row.try_get("dataset_version_id")?,
         created_at: row.try_get("created_at")?,
     })
@@ -2424,6 +2466,99 @@ impl Repository {
         time_end: Option<i64>,
     ) -> anyhow::Result<Vec<BalanceSnapshot>> {
         self.query_balance_snapshots(
+            target_id,
+            network,
+            time_start,
+            time_end,
+            Self::EXPORT_MAX_RECORDS,
+            0,
+        )
+        .await
+    }
+
+    // -- P5-W2: Hyperliquid Gold analytics query/export methods --
+
+    pub async fn query_hl_pnl_summary(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<HlPnlSummary>> {
+        let cols = "dt.id, dt.wallet_address, dt.coin, dt.network, dt.period_start, \
+                    dt.period_end, dt.total_closed_pnl, dt.total_funding, dt.total_fees, \
+                    dt.net_pnl, dt.trade_count, dt.fill_count, dt.avg_trade_size, \
+                    dt.win_count, dt.loss_count, dt.dataset_version_id, dt.created_at";
+        let (sql, args) = build_dataset_filter_query(
+            cols,
+            "hl_pnl_summary",
+            "dt.period_end",
+            target_id,
+            network,
+            time_start,
+            time_end,
+            limit,
+            offset,
+        )?;
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_hl_pnl_summary).collect()
+    }
+
+    pub async fn export_hl_pnl_summary(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+    ) -> anyhow::Result<Vec<HlPnlSummary>> {
+        self.query_hl_pnl_summary(
+            target_id,
+            network,
+            time_start,
+            time_end,
+            Self::EXPORT_MAX_RECORDS,
+            0,
+        )
+        .await
+    }
+
+    pub async fn query_hl_trade_history(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<HlTradeHistory>> {
+        let cols = "dt.id, dt.wallet_address, dt.coin, dt.network, dt.side, dt.entry_price, \
+                    dt.exit_price, dt.size, dt.opened_at, dt.closed_at, dt.realized_pnl, \
+                    dt.fees, dt.num_fills, dt.dataset_version_id, dt.created_at";
+        let (sql, args) = build_dataset_filter_query(
+            cols,
+            "hl_trade_history",
+            "dt.closed_at",
+            target_id,
+            network,
+            time_start,
+            time_end,
+            limit,
+            offset,
+        )?;
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_hl_trade_history).collect()
+    }
+
+    pub async fn export_hl_trade_history(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+    ) -> anyhow::Result<Vec<HlTradeHistory>> {
+        self.query_hl_trade_history(
             target_id,
             network,
             time_start,
