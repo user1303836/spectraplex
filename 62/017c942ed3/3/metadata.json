@@ -1,0 +1,37 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "62017c942ed3",
+  "session_id": "ff50ce04-109e-4ba1-a23a-1a429e8d4d2f",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-09T01:00:05.646603Z",
+  "branch": "p5-w1-wallet-tax-forensics-pack",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "migrations/20260310200000_add_wallet_ledger.sql",
+    "migrations/20260310200001_add_balance_history.sql",
+    "core/src/materializer.rs",
+    "adapters/src/ledger_derivation.rs",
+    "adapters/src/v2_repo.rs",
+    "api/src/main.rs",
+    "README.md"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "4ab504a6404d",
+  "token_usage": {
+    "input_tokens": 101,
+    "cache_creation_tokens": 147452,
+    "cache_read_tokens": 11407399,
+    "output_tokens": 44541,
+    "api_call_count": 99
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-09T01:00:03.555485Z",
+    "agent_lines": 2052,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 2052,
+    "agent_percentage": 100
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/ff50ce04-109e-4ba1-a23a-1a429e8d4d2f.jsonl"
+}
