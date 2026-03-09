@@ -28,14 +28,14 @@ fn entry_type_to_str(entry_type: &EntryType) -> &'static str {
     }
 }
 
-fn str_to_entry_type(s: &str) -> EntryType {
+fn str_to_entry_type(s: &str) -> anyhow::Result<EntryType> {
     match s {
-        "trade" => EntryType::Trade,
-        "fee" => EntryType::Fee,
-        "transfer" => EntryType::Transfer,
-        "staking" => EntryType::Staking,
-        "income" => EntryType::Income,
-        _ => EntryType::Transfer,
+        "trade" => Ok(EntryType::Trade),
+        "fee" => Ok(EntryType::Fee),
+        "transfer" => Ok(EntryType::Transfer),
+        "staking" => Ok(EntryType::Staking),
+        "income" => Ok(EntryType::Income),
+        _ => Err(anyhow::anyhow!("Unknown entry type: {}", s)),
     }
 }
 
@@ -330,7 +330,7 @@ impl Repository {
         let mut entries = Vec::new();
         for row in rows {
             let entry_type_str: String = row.try_get("entry_type")?;
-            let entry_type = str_to_entry_type(&entry_type_str);
+            let entry_type = str_to_entry_type(&entry_type_str)?;
 
             entries.push(LedgerEntry {
                 id: row.try_get("id")?,
@@ -687,12 +687,24 @@ mod tests {
 
     #[test]
     fn test_str_to_entry_type() {
-        assert!(matches!(str_to_entry_type("trade"), EntryType::Trade));
-        assert!(matches!(str_to_entry_type("fee"), EntryType::Fee));
-        assert!(matches!(str_to_entry_type("transfer"), EntryType::Transfer));
-        assert!(matches!(str_to_entry_type("staking"), EntryType::Staking));
-        assert!(matches!(str_to_entry_type("income"), EntryType::Income));
-        assert!(matches!(str_to_entry_type("unknown"), EntryType::Transfer));
+        assert!(matches!(
+            str_to_entry_type("trade").unwrap(),
+            EntryType::Trade
+        ));
+        assert!(matches!(str_to_entry_type("fee").unwrap(), EntryType::Fee));
+        assert!(matches!(
+            str_to_entry_type("transfer").unwrap(),
+            EntryType::Transfer
+        ));
+        assert!(matches!(
+            str_to_entry_type("staking").unwrap(),
+            EntryType::Staking
+        ));
+        assert!(matches!(
+            str_to_entry_type("income").unwrap(),
+            EntryType::Income
+        ));
+        assert!(str_to_entry_type("unknown").is_err());
     }
 
     #[test]
@@ -762,7 +774,7 @@ mod tests {
             EntryType::Income,
         ] {
             let s = entry_type_to_str(&et);
-            let recovered = str_to_entry_type(s);
+            let recovered = str_to_entry_type(s).unwrap();
             assert_eq!(entry_type_to_str(&recovered), s);
         }
     }

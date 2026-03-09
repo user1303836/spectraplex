@@ -26,8 +26,20 @@ fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<
     let mut entries = Vec::new();
     let mut entry_index: u32 = 0;
 
-    let size = BigDecimal::from_str(&fill.sz).unwrap_or_default();
-    let price = BigDecimal::from_str(&fill.px).unwrap_or_default();
+    let size = match BigDecimal::from_str(&fill.sz) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(tx_hash = %tx.tx_hash, field = "sz", raw = %fill.sz, "Skipping fill with malformed size: {e}");
+            return Ok(vec![]);
+        }
+    };
+    let price = match BigDecimal::from_str(&fill.px) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(tx_hash = %tx.tx_hash, field = "px", raw = %fill.px, "Skipping fill with malformed price: {e}");
+            return Ok(vec![]);
+        }
+    };
 
     // The trade itself: amount is the size, fiat_value is size * price
     let fiat_value = &size * &price;
@@ -49,7 +61,13 @@ fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<
 
     // Fee entry (if present)
     if let Some(ref fee_str) = fill.fee {
-        let fee = BigDecimal::from_str(fee_str).unwrap_or_default();
+        let fee = match BigDecimal::from_str(fee_str) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(tx_hash = %tx.tx_hash, field = "fee", raw = %fee_str, "Skipping fee with malformed amount: {e}");
+                BigDecimal::from(0)
+            }
+        };
         if fee != BigDecimal::from(0) {
             let fee_token = fill.fee_token.as_deref().unwrap_or("USDC");
             entries.push(LedgerEntry {
@@ -68,7 +86,13 @@ fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<
 
     // Closed PnL as income (if nonzero)
     if let Some(ref pnl_str) = fill.closed_pnl {
-        let pnl = BigDecimal::from_str(pnl_str).unwrap_or_default();
+        let pnl = match BigDecimal::from_str(pnl_str) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(tx_hash = %tx.tx_hash, field = "closedPnl", raw = %pnl_str, "Skipping PnL with malformed amount: {e}");
+                BigDecimal::from(0)
+            }
+        };
         if pnl != BigDecimal::from(0) {
             entries.push(LedgerEntry {
                 id: deterministic_id(tx.id, entry_index),
@@ -90,7 +114,13 @@ fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<
 
 fn parse_funding(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<LedgerEntry>> {
     let funding: HlFundingEntry = serde_json::from_value(data.clone())?;
-    let amount = BigDecimal::from_str(&funding.usdc).unwrap_or_default();
+    let amount = match BigDecimal::from_str(&funding.usdc) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(tx_hash = %tx.tx_hash, field = "usdc", raw = %funding.usdc, "Skipping funding with malformed amount: {e}");
+            return Ok(vec![]);
+        }
+    };
 
     // Funding payments: positive = received, negative = paid
     Ok(vec![LedgerEntry {
@@ -117,7 +147,13 @@ fn parse_ledger_update(
     match delta_type {
         "deposit" => {
             let usdc = delta["usdc"].as_str().unwrap_or("0");
-            let amount = BigDecimal::from_str(usdc).unwrap_or_default();
+            let amount = match BigDecimal::from_str(usdc) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(tx_hash = %tx.tx_hash, field = "usdc", raw = %usdc, "Skipping deposit with malformed amount: {e}");
+                    return Ok(vec![]);
+                }
+            };
             Ok(vec![LedgerEntry {
                 id: deterministic_id(tx.id, 0),
                 transaction_id: tx.id,
@@ -131,7 +167,13 @@ fn parse_ledger_update(
         }
         "withdraw" => {
             let usdc = delta["usdc"].as_str().unwrap_or("0");
-            let amount = BigDecimal::from_str(usdc).unwrap_or_default();
+            let amount = match BigDecimal::from_str(usdc) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(tx_hash = %tx.tx_hash, field = "usdc", raw = %usdc, "Skipping withdraw with malformed amount: {e}");
+                    return Ok(vec![]);
+                }
+            };
             Ok(vec![LedgerEntry {
                 id: deterministic_id(tx.id, 0),
                 transaction_id: tx.id,
@@ -149,7 +191,13 @@ fn parse_ledger_update(
                 .as_str()
                 .or_else(|| delta["accountValue"].as_str())
                 .unwrap_or("0");
-            let amount = BigDecimal::from_str(usdc).unwrap_or_default();
+            let amount = match BigDecimal::from_str(usdc) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(tx_hash = %tx.tx_hash, field = "usdc/accountValue", raw = %usdc, "Skipping liquidation with malformed amount: {e}");
+                    return Ok(vec![]);
+                }
+            };
             Ok(vec![LedgerEntry {
                 id: deterministic_id(tx.id, 0),
                 transaction_id: tx.id,
@@ -201,7 +249,13 @@ pub fn extract_hyperliquid_token_transfers(
             match delta_type {
                 "deposit" => {
                     let usdc = delta["usdc"].as_str().unwrap_or("0");
-                    let amount = BigDecimal::from_str(usdc).unwrap_or_default();
+                    let amount = match BigDecimal::from_str(usdc) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(field = "usdc", raw = %usdc, "Skipping HL deposit token transfer with malformed amount: {e}");
+                            return vec![];
+                        }
+                    };
                     if amount == BigDecimal::from(0) {
                         return vec![];
                     }
@@ -215,13 +269,20 @@ pub fn extract_hyperliquid_token_transfers(
                         to_address: wallet_address.to_string(),
                         amount,
                         decimals: 6,
+                        transfer_index: 0,
                         dataset_version_id: None,
                         created_at: Utc::now(),
                     }]
                 }
                 "withdraw" => {
                     let usdc = delta["usdc"].as_str().unwrap_or("0");
-                    let amount = BigDecimal::from_str(usdc).unwrap_or_default().abs();
+                    let amount = match BigDecimal::from_str(usdc) {
+                        Ok(v) => v.abs(),
+                        Err(e) => {
+                            warn!(field = "usdc", raw = %usdc, "Skipping HL withdraw token transfer with malformed amount: {e}");
+                            return vec![];
+                        }
+                    };
                     if amount == BigDecimal::from(0) {
                         return vec![];
                     }
@@ -235,6 +296,7 @@ pub fn extract_hyperliquid_token_transfers(
                         to_address: "external".to_string(),
                         amount,
                         decimals: 6,
+                        transfer_index: 0,
                         dataset_version_id: None,
                         created_at: Utc::now(),
                     }]
@@ -272,16 +334,26 @@ pub fn extract_hyperliquid_native_balance_deltas(
             };
 
             // Fee and closed PnL represent USDC balance changes
-            let fee = fill
-                .fee
-                .as_deref()
-                .and_then(|f| BigDecimal::from_str(f).ok())
-                .unwrap_or_default();
-            let pnl = fill
-                .closed_pnl
-                .as_deref()
-                .and_then(|p| BigDecimal::from_str(p).ok())
-                .unwrap_or_default();
+            let fee = match fill.fee.as_deref() {
+                Some(f) => match BigDecimal::from_str(f) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(field = "fee", raw = %f, "Skipping HL fill native delta with malformed fee: {e}");
+                        return vec![];
+                    }
+                },
+                None => BigDecimal::from(0),
+            };
+            let pnl = match fill.closed_pnl.as_deref() {
+                Some(p) => match BigDecimal::from_str(p) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(field = "closedPnl", raw = %p, "Skipping HL fill native delta with malformed PnL: {e}");
+                        return vec![];
+                    }
+                },
+                None => BigDecimal::from(0),
+            };
 
             // Total USDC delta from this fill = -fee + closed_pnl
             let delta = &pnl - &fee.abs();
@@ -311,7 +383,13 @@ pub fn extract_hyperliquid_native_balance_deltas(
                 Err(_) => return vec![],
             };
 
-            let delta = BigDecimal::from_str(&funding.usdc).unwrap_or_default();
+            let delta = match BigDecimal::from_str(&funding.usdc) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(field = "usdc", raw = %funding.usdc, "Skipping HL funding native delta with malformed amount: {e}");
+                    return vec![];
+                }
+            };
             if delta == BigDecimal::from(0) {
                 return vec![];
             }
@@ -456,8 +534,20 @@ pub fn extract_hl_fill_records(
         Err(_) => return vec![],
     };
 
-    let price = BigDecimal::from_str(&fill.px).unwrap_or_default();
-    let size = BigDecimal::from_str(&fill.sz).unwrap_or_default();
+    let price = match BigDecimal::from_str(&fill.px) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(field = "px", raw = %fill.px, "Skipping HL fill record with malformed price: {e}");
+            return vec![];
+        }
+    };
+    let size = match BigDecimal::from_str(&fill.sz) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(field = "sz", raw = %fill.sz, "Skipping HL fill record with malformed size: {e}");
+            return vec![];
+        }
+    };
 
     let closed_pnl = fill
         .closed_pnl
@@ -512,7 +602,13 @@ pub fn extract_hl_funding_payments(
         Err(_) => return vec![],
     };
 
-    let amount = BigDecimal::from_str(&funding.usdc).unwrap_or_default();
+    let amount = match BigDecimal::from_str(&funding.usdc) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(field = "usdc", raw = %funding.usdc, "Skipping HL funding payment with malformed amount: {e}");
+            return vec![];
+        }
+    };
     let funding_rate = funding
         .funding_rate
         .as_deref()
@@ -566,8 +662,20 @@ fn extract_position_change_from_fill(
         Err(_) => return vec![],
     };
 
-    let size = BigDecimal::from_str(&fill.sz).unwrap_or_default();
-    let price = BigDecimal::from_str(&fill.px).unwrap_or_default();
+    let size = match BigDecimal::from_str(&fill.sz) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(field = "sz", raw = %fill.sz, "Skipping HL position change with malformed size: {e}");
+            return vec![];
+        }
+    };
+    let price = match BigDecimal::from_str(&fill.px) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(field = "px", raw = %fill.px, "Skipping HL position change with malformed price: {e}");
+            return vec![];
+        }
+    };
 
     // Determine signed size_delta: buy = positive, sell = negative
     let size_delta = if fill.side == "B" { size } else { -size };
@@ -606,8 +714,20 @@ fn extract_position_change_from_liquidation(
     let price_str = delta["px"].as_str().unwrap_or("0");
     let side = delta["side"].as_str().unwrap_or("A");
 
-    let size = BigDecimal::from_str(size_str).unwrap_or_default();
-    let price = BigDecimal::from_str(price_str).unwrap_or_default();
+    let size = match BigDecimal::from_str(size_str) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(field = "sz", raw = %size_str, "Skipping HL liquidation position change with malformed size: {e}");
+            return vec![];
+        }
+    };
+    let price = match BigDecimal::from_str(price_str) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(field = "px", raw = %price_str, "Skipping HL liquidation position change with malformed price: {e}");
+            return vec![];
+        }
+    };
 
     if size == BigDecimal::from(0) {
         return vec![];

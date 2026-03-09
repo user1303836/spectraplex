@@ -1,5 +1,6 @@
 use bigdecimal::BigDecimal;
 use spectraplex_core::models::{EntryType, LedgerEntry, Transaction};
+use tracing::warn;
 
 use crate::deterministic_id;
 
@@ -31,7 +32,13 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
                     .get("data")
                     .and_then(|d| d.as_str())
                     .unwrap_or("0x0");
-                let amount_bd = hex_to_bigdecimal(data_hex);
+                let amount_bd = match hex_to_bigdecimal(data_hex) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(tx_hash = %tx.tx_hash, field = "data", raw = %data_hex, "Skipping ERC-20 transfer with malformed amount: {e}");
+                        return Ok(entries);
+                    }
+                };
 
                 // The contract address is the token address
                 let token_address = tx
@@ -174,10 +181,10 @@ fn topic_to_address(topic: &str) -> String {
 
 /// Parse a hex string (with optional 0x prefix) into BigDecimal.
 /// Handles full uint256 range without truncation.
-fn hex_to_bigdecimal(hex: &str) -> BigDecimal {
+fn hex_to_bigdecimal(hex: &str) -> anyhow::Result<BigDecimal> {
     let stripped = hex.strip_prefix("0x").unwrap_or(hex);
     if stripped.is_empty() {
-        return BigDecimal::from(0);
+        return Ok(BigDecimal::from(0));
     }
     // Parse hex digits in chunks to build a BigDecimal without overflow
     let mut result = BigDecimal::from(0);
@@ -186,11 +193,17 @@ fn hex_to_bigdecimal(hex: &str) -> BigDecimal {
         let digit = match ch.to_ascii_lowercase() {
             '0'..='9' => ch as u32 - '0' as u32,
             'a'..='f' => ch as u32 - 'a' as u32 + 10,
-            _ => return BigDecimal::from(0),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Invalid hex character '{}' in value: {}",
+                    ch,
+                    hex
+                ))
+            }
         };
         result = result * &base + BigDecimal::from(digit);
     }
-    result
+    Ok(result)
 }
 
 /// Parse a hex string (with optional 0x prefix) into u128.
@@ -300,7 +313,13 @@ pub fn extract_evm_token_transfers(
         .get("data")
         .and_then(|d| d.as_str())
         .unwrap_or("0x0");
-    let amount_bd = hex_to_bigdecimal(data_hex);
+    let amount_bd = match hex_to_bigdecimal(data_hex) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(field = "data", raw = %data_hex, "Skipping EVM token transfer with malformed amount: {e}");
+            return vec![];
+        }
+    };
 
     let token_address = raw_metadata
         .get("address")
@@ -322,6 +341,7 @@ pub fn extract_evm_token_transfers(
         to_address: to,
         amount: normalized,
         decimals: decimals as i32,
+        transfer_index: 0,
         dataset_version_id: None,
         created_at: Utc::now(),
     });
@@ -453,7 +473,13 @@ fn decode_evm_event_fields(
         Some(t) if t == ERC20_TRANSFER_TOPIC && topics.len() >= 3 => {
             let from = topic_to_address(topics[1].as_str().unwrap_or_default());
             let to = topic_to_address(topics[2].as_str().unwrap_or_default());
-            let value = hex_to_bigdecimal(data_hex).to_string();
+            let value = match hex_to_bigdecimal(data_hex) {
+                Ok(v) => v.to_string(),
+                Err(e) => {
+                    warn!(field = "data", raw = %data_hex, "Malformed hex in Transfer event: {e}");
+                    data_hex.to_string()
+                }
+            };
             (
                 Some("Transfer".to_string()),
                 serde_json::json!({
@@ -466,7 +492,13 @@ fn decode_evm_event_fields(
         Some(t) if t == ERC20_APPROVAL_TOPIC && topics.len() >= 3 => {
             let owner = topic_to_address(topics[1].as_str().unwrap_or_default());
             let spender = topic_to_address(topics[2].as_str().unwrap_or_default());
-            let value = hex_to_bigdecimal(data_hex).to_string();
+            let value = match hex_to_bigdecimal(data_hex) {
+                Ok(v) => v.to_string(),
+                Err(e) => {
+                    warn!(field = "data", raw = %data_hex, "Malformed hex in Approval event: {e}");
+                    data_hex.to_string()
+                }
+            };
             (
                 Some("Approval".to_string()),
                 serde_json::json!({
@@ -899,13 +931,15 @@ mod tests {
     #[test]
     fn test_hex_to_bigdecimal() {
         // Small value
-        assert_eq!(hex_to_bigdecimal("0xff"), BigDecimal::from(255));
+        assert_eq!(hex_to_bigdecimal("0xff").unwrap(), BigDecimal::from(255));
         // u128 max = 0xffffffffffffffffffffffffffffffff
-        let u128_max = hex_to_bigdecimal("0xffffffffffffffffffffffffffffffff");
+        let u128_max = hex_to_bigdecimal("0xffffffffffffffffffffffffffffffff").unwrap();
         assert_eq!(u128_max, BigDecimal::from(u128::MAX));
         // Value larger than u128 (u128::MAX + 1)
-        let over_u128 = hex_to_bigdecimal("0x100000000000000000000000000000000");
+        let over_u128 = hex_to_bigdecimal("0x100000000000000000000000000000000").unwrap();
         assert!(over_u128 > BigDecimal::from(u128::MAX));
+        // Invalid hex returns error
+        assert!(hex_to_bigdecimal("0xGG").is_err());
     }
 
     #[test]

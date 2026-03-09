@@ -212,6 +212,8 @@ pub fn extract_solana_token_transfers(
     }
 
     let mut transfers = Vec::new();
+    let mut group_counts: std::collections::HashMap<(String, String, String), i32> =
+        std::collections::HashMap::new();
 
     if let OptionSerializer::Some(pre_token_balances) = &meta.pre_token_balances {
         if let OptionSerializer::Some(post_token_balances) = &meta.post_token_balances {
@@ -248,6 +250,11 @@ pub fn extract_solana_token_transfers(
                     (owner, "unknown".to_string())
                 };
 
+                let key = (from.clone(), to.clone(), mint.clone());
+                let idx = group_counts.entry(key).or_insert(0);
+                let transfer_index = *idx;
+                *idx += 1;
+
                 transfers.push(TokenTransfer {
                     id: Uuid::new_v4(),
                     raw_transaction_id: raw_tx_id,
@@ -258,6 +265,7 @@ pub fn extract_solana_token_transfers(
                     to_address: to,
                     amount,
                     decimals: decimals as i32,
+                    transfer_index,
                     dataset_version_id: None,
                     created_at: Utc::now(),
                 });
