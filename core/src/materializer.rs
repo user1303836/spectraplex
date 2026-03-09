@@ -46,6 +46,10 @@ pub enum DatasetName {
     WalletLedger,
     /// Gold-tier per-asset balance history snapshots (P5-W1).
     BalanceHistory,
+    /// Gold-tier Hyperliquid PnL summary per coin per period (P5-W2).
+    HlPnlSummary,
+    /// Gold-tier Hyperliquid trade history with entry/exit grouping (P5-W2).
+    HlTradeHistory,
 }
 
 impl DatasetName {
@@ -61,6 +65,8 @@ impl DatasetName {
             DatasetName::Positions => "positions",
             DatasetName::WalletLedger => "wallet_ledger",
             DatasetName::BalanceHistory => "balance_history",
+            DatasetName::HlPnlSummary => "hl_pnl_summary",
+            DatasetName::HlTradeHistory => "hl_trade_history",
         }
     }
 
@@ -76,6 +82,8 @@ impl DatasetName {
             DatasetName::Positions,
             DatasetName::WalletLedger,
             DatasetName::BalanceHistory,
+            DatasetName::HlPnlSummary,
+            DatasetName::HlTradeHistory,
         ]
     }
 }
@@ -634,6 +642,107 @@ pub struct TypeBreakdown {
 }
 
 // ---------------------------------------------------------------------------
+// Gold Dataset Records (P5-W2): Hyperliquid Analytics
+// ---------------------------------------------------------------------------
+
+/// Gold-tier Hyperliquid PnL summary per wallet per coin per period.
+///
+/// Aggregated from Silver hl_fills (closed_pnl, fees) and hl_funding
+/// (funding amounts). Each record summarizes performance metrics for a
+/// single coin within a time period.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HlPnlSummary {
+    pub id: Uuid,
+    pub wallet_address: String,
+    pub coin: String,
+    pub network: String,
+    pub period_start: i64,
+    pub period_end: i64,
+    pub total_closed_pnl: BigDecimal,
+    pub total_funding: BigDecimal,
+    pub total_fees: BigDecimal,
+    pub net_pnl: BigDecimal,
+    pub trade_count: i64,
+    pub fill_count: i64,
+    pub avg_trade_size: BigDecimal,
+    pub win_count: i64,
+    pub loss_count: i64,
+    pub dataset_version_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Gold-tier Hyperliquid trade history record.
+///
+/// Groups individual fills into logical trades with entry/exit prices
+/// and realized PnL. Each record represents a single open→close trade
+/// sequence for a coin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HlTradeHistory {
+    pub id: Uuid,
+    pub wallet_address: String,
+    pub coin: String,
+    pub network: String,
+    pub side: String,
+    pub entry_price: BigDecimal,
+    pub exit_price: BigDecimal,
+    pub size: BigDecimal,
+    pub opened_at: i64,
+    pub closed_at: i64,
+    pub realized_pnl: BigDecimal,
+    pub fees: BigDecimal,
+    pub num_fills: i64,
+    pub dataset_version_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Per-trader analytics response for the Hyperliquid analytics endpoint.
+///
+/// Dashboard-ready summary of a trader's performance across coins,
+/// computed from Gold hl_pnl_summary and hl_trade_history records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraderAnalytics {
+    pub wallet_address: String,
+    pub total_net_pnl: BigDecimal,
+    pub total_volume: BigDecimal,
+    pub total_trades: i64,
+    pub win_rate: f64,
+    pub coin_breakdown: Vec<CoinPnlSummary>,
+}
+
+/// Per-coin PnL breakdown within a trader analytics response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoinPnlSummary {
+    pub coin: String,
+    pub net_pnl: BigDecimal,
+    pub volume: BigDecimal,
+    pub trade_count: i64,
+    pub win_count: i64,
+    pub loss_count: i64,
+}
+
+/// Per-coin market analytics response for the Hyperliquid analytics endpoint.
+///
+/// Aggregated view of trading activity for a single coin across all traders,
+/// computed from Gold hl_pnl_summary and hl_trade_history records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketAnalytics {
+    pub coins: Vec<CoinMarketSummary>,
+    pub total_volume: BigDecimal,
+    pub total_unique_traders: usize,
+}
+
+/// Per-coin aggregate market summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoinMarketSummary {
+    pub coin: String,
+    pub total_volume: BigDecimal,
+    pub unique_traders: usize,
+    pub total_trades: i64,
+    pub total_pnl: BigDecimal,
+    pub avg_trade_size: BigDecimal,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -644,9 +753,9 @@ mod tests {
     use strum::IntoEnumIterator;
 
     #[test]
-    fn dataset_name_count_is_nine() {
-        assert_eq!(DatasetName::all().len(), 9);
-        assert_eq!(DatasetName::iter().count(), 9);
+    fn dataset_name_count_is_eleven() {
+        assert_eq!(DatasetName::all().len(), 11);
+        assert_eq!(DatasetName::iter().count(), 11);
     }
 
     #[test]
@@ -664,8 +773,10 @@ mod tests {
             (DatasetName::Positions, "\"positions\""),
             (DatasetName::WalletLedger, "\"wallet_ledger\""),
             (DatasetName::BalanceHistory, "\"balance_history\""),
+            (DatasetName::HlPnlSummary, "\"hl_pnl_summary\""),
+            (DatasetName::HlTradeHistory, "\"hl_trade_history\""),
         ];
-        assert_eq!(cases.len(), 9, "must cover all 9 datasets");
+        assert_eq!(cases.len(), 11, "must cover all 11 datasets");
         for (variant, expected_json) in cases {
             let json = serde_json::to_string(&variant).unwrap();
             assert_eq!(json, expected_json, "serialize {variant:?}");
@@ -688,6 +799,8 @@ mod tests {
         assert_eq!(DatasetName::Positions.to_string(), "positions");
         assert_eq!(DatasetName::WalletLedger.to_string(), "wallet_ledger");
         assert_eq!(DatasetName::BalanceHistory.to_string(), "balance_history");
+        assert_eq!(DatasetName::HlPnlSummary.to_string(), "hl_pnl_summary");
+        assert_eq!(DatasetName::HlTradeHistory.to_string(), "hl_trade_history");
     }
 
     #[test]
@@ -711,6 +824,14 @@ mod tests {
         assert_eq!(
             DatasetName::from_str("balance_history").unwrap(),
             DatasetName::BalanceHistory
+        );
+        assert_eq!(
+            DatasetName::from_str("hl_pnl_summary").unwrap(),
+            DatasetName::HlPnlSummary
+        );
+        assert_eq!(
+            DatasetName::from_str("hl_trade_history").unwrap(),
+            DatasetName::HlTradeHistory
         );
         assert!(DatasetName::from_str("unknown_dataset").is_err());
     }

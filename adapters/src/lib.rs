@@ -2,6 +2,7 @@ pub mod compat;
 pub mod dual_write;
 pub mod evm;
 pub mod evm_parser;
+pub mod hl_analytics;
 pub mod hyperliquid;
 pub mod hyperliquid_parser;
 pub mod hyperliquid_ws;
