@@ -1,0 +1,130 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 4: ETL-First Delivery
+- work packet: P4-W5: Compatibility pass
+- objective: Verify all wallet-focused API paths still function after Phase 3-4 changes, reorganize documentation to prefer dataset-centric API as the forward path, and add compatibility verification tests confirming both API surfaces coexist correctly.
+- branch: p4-w5-compatibility-pass
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- README.md
+- CLAUDE.md
+- api/src/main.rs
+- core/src/models.rs
+- adapters/src/repo.rs
+- adapters/src/v2_repo.rs
+
+Implementation steps:
+1. 1. Reorganize README.md API Reference section: split the flat endpoint table into three subsections — 'Ingestion and Job Control', 'Wallet-Scoped Query Endpoints (Stable)', and 'Dataset Query and Export Endpoints (Preferred)' — with guidance text explaining that new consumers should prefer the dataset API.
+2. 2. Add a 'Which API Should I Use?' or 'API Philosophy' paragraph in README.md before the endpoint reference, explaining that wallet endpoints remain stable for backward compatibility while dataset endpoints are the forward path for flexible querying and ETL integration.
+3. 3. Update CLAUDE.md API surface listing (lines ~201-224) to organize endpoints into two groups with clear annotations: wallet-scoped (stable, maintained for compatibility) and dataset-centric (preferred for new development).
+4. 4. Add compatibility tests in api/src/main.rs that verify: (a) all wallet endpoints are routed and return expected response shapes, (b) all dataset endpoints are routed and return expected response shapes, (c) both API surfaces share authentication/authorization behavior.
+5. 5. Run cargo fmt, clippy, and test --workspace to verify no regressions. Confirm 780+ tests pass.
+6. 6. Verify README.md endpoint list matches actual route registrations in api/src/main.rs — no undocumented or phantom endpoints.
+
+Verification expectations:
+1. cargo fmt --all --check
+2. cargo clippy --workspace --all-targets -- -D warnings
+3. cargo test --workspace (must pass 780+ tests with 0 failures)
+4. Confirm every wallet endpoint listed in README.md has a matching route in api/src/main.rs
+5. Confirm every dataset endpoint listed in README.md has a matching route in api/src/main.rs
+6. Confirm README.md and CLAUDE.md API listings are mutually consistent and match the implementation
+
+Tracked review artifacts required in the PR:
+- README.md
+- CLAUDE.md
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p4-w5-compatibility-pass from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P4-W5: Compatibility pass.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 4: ETL-First Delivery"
+- workPacket: "P4-W5: Compatibility pass"
+- branchName: "p4-w5-compatibility-pass"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
