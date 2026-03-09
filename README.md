@@ -221,6 +221,18 @@ The API server runs on `127.0.0.1:3000` and requires `DATABASE_URL` to be set.
 
 All `/v1/*` endpoints require authentication via `Authorization: Bearer <API_KEY>` header. The API key is configured server-side via `SPECTRAPLEX_API_KEY`. If no API key is configured, all requests are rejected (fail-closed).
 
+### Which API Should I Use?
+
+Spectraplex exposes two complementary API surfaces:
+
+- **Wallet-scoped endpoints** (`/v1/transactions/:wallet`, `/v1/ledger/:wallet`, etc.) provide familiar, wallet-centric access to raw and normalized data. These endpoints are **stable** and will continue to be maintained for backward compatibility. They are well suited for tax, portfolio, and forensics use cases where the primary query axis is a single wallet address.
+
+- **Dataset endpoints** (`/v1/datasets/...`, `/v1/export/dataset`, etc.) are the **preferred forward path** for new consumers. They offer flexible, target-agnostic querying across Silver datasets, support richer filtering (by target, network, and time range), and integrate cleanly with ETL and data warehouse pipelines. New integrations should prefer dataset endpoints unless the use case is strictly single-wallet.
+
+Both API surfaces share the same authentication and authorization model, and both remain fully supported.
+
+### Ingestion and Job Control
+
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Health check, returns `"OK"` (no auth required) |
@@ -228,15 +240,42 @@ All `/v1/*` endpoints require authentication via `Authorization: Bearer <API_KEY
 | `POST` | `/v1/ingest/batch` | Trigger batch ingestion for multiple wallets (max 50) |
 | `POST` | `/v1/normalize` | Trigger async normalization for a wallet (returns job ID) |
 | `GET` | `/v1/jobs/:job_id` | Poll job status (pending/running/completed/failed) |
+| `POST` | `/v1/stream/start` | Start real-time Solana gRPC streaming (returns stream ID) |
+| `POST` | `/v1/stream/:stream_id/stop` | Stop an active stream |
+| `GET` | `/v1/streams` | List all active streams with stats |
+
+The ingest and normalize endpoints accept an optional `callback_url` field. When provided, the server will POST a JSON payload to that URL when the job completes or fails. Only HTTP(S) URLs targeting public addresses are accepted.
+
+### Wallet-Scoped Query Endpoints (Stable)
+
+These endpoints query data by wallet address. They are stable and maintained for backward compatibility.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
 | `GET` | `/v1/transactions/:wallet` | Get raw transactions by wallet (paginated) |
 | `GET` | `/v1/transactions/:wallet/:tx_hash` | Get a single transaction by hash |
 | `GET` | `/v1/ledger/:wallet` | Get normalized ledger entries by wallet (paginated) |
 | `GET` | `/v1/export/:wallet` | Export ledger entries as CSV or JSON |
 | `GET` | `/v1/balances/:wallet` | Get current asset balances (aggregated from ledger) |
 | `GET` | `/v1/stats/:wallet` | Get wallet statistics (tx count, chains, date range) |
-| `POST` | `/v1/stream/start` | Start real-time Solana gRPC streaming (returns stream ID) |
-| `POST` | `/v1/stream/:stream_id/stop` | Stop an active stream |
-| `GET` | `/v1/streams` | List all active streams with stats |
+
+All wallet endpoints validate the address format and return structured JSON errors.
+
+Query endpoints support `?limit=N&offset=N` parameters (default limit: 50, max: 1000).
+
+The transactions, ledger, and export endpoints support date range filtering via `?from=<unix_ts>&to=<unix_ts>` query parameters (both optional).
+
+### Dataset Query and Export Endpoints (Preferred)
+
+These endpoints are the preferred forward path for new consumers. They provide flexible, target-agnostic querying across Silver datasets and integrate with ETL workflows.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/v1/targets` | Register an index target (wallet, contract, program, etc.) |
+| `GET` | `/v1/targets` | List all registered index targets |
+| `GET` | `/v1/targets/:target_id` | Get a specific index target by ID |
+| `GET` | `/v1/networks` | List all known networks |
+| `GET` | `/v1/networks/:network_id` | Get a specific network by ID |
 | `GET` | `/v1/datasets` | List all Silver datasets with latest version info |
 | `GET` | `/v1/datasets/:name/versions` | List version history for a dataset |
 | `GET` | `/v1/datasets/:name/records` | Query dataset records with filters (paginated) |
@@ -246,15 +285,7 @@ All `/v1/*` endpoints require authentication via `Authorization: Bearer <API_KEY
 | `GET` | `/v1/export/jobs/:job_id` | Poll export job status |
 | `GET` | `/v1/export/jobs/:job_id/download` | Download completed export data |
 
-All wallet endpoints validate the address format and return structured JSON errors.
-
-Query endpoints support `?limit=N&offset=N` parameters (default limit: 50, max: 1000).
-
-The transactions, ledger, and export endpoints support date range filtering via `?from=<unix_ts>&to=<unix_ts>` query parameters (both optional).
-
 The dataset records endpoint supports filtering via `?target_id=<UUID>&network=<id>&time_start=<unix_ts>&time_end=<unix_ts>&limit=N&offset=N` query parameters (all optional). Queryable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`.
-
-The ingest and normalize endpoints accept an optional `callback_url` field. When provided, the server will POST a JSON payload to that URL when the job completes or fails. Only HTTP(S) URLs targeting public addresses are accepted.
 
 ### POST /v1/ingest
 
