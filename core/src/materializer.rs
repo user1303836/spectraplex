@@ -277,6 +277,12 @@ pub struct DeliveryMetadata {
     pub format: String,
     /// Number of records in the export.
     pub record_count: usize,
+    /// ID of the dataset version used to produce the export (provenance).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dataset_version_id: Option<Uuid>,
+    /// Completeness status of the dataset at export time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completeness_status: Option<String>,
 }
 
 /// Receipt returned after successful sink delivery.
@@ -1327,11 +1333,47 @@ mod tests {
             dataset: "token_transfers".to_string(),
             format: "jsonl".to_string(),
             record_count: 42,
+            dataset_version_id: None,
+            completeness_status: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: DeliveryMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(back.dataset, "token_transfers");
         assert_eq!(back.record_count, 42);
+        // Optional fields absent when None
+        assert!(back.dataset_version_id.is_none());
+        assert!(back.completeness_status.is_none());
+    }
+
+    #[test]
+    fn delivery_metadata_with_provenance_fields() {
+        let version_id = uuid::Uuid::new_v4();
+        let meta = DeliveryMetadata {
+            job_id: uuid::Uuid::new_v4(),
+            dataset: "hl_fills".to_string(),
+            format: "csv".to_string(),
+            record_count: 100,
+            dataset_version_id: Some(version_id),
+            completeness_status: Some("complete".to_string()),
+        };
+        let json = serde_json::to_value(&meta).unwrap();
+        assert_eq!(json["dataset_version_id"], version_id.to_string());
+        assert_eq!(json["completeness_status"], "complete");
+    }
+
+    #[test]
+    fn delivery_metadata_skip_none_provenance_fields() {
+        let meta = DeliveryMetadata {
+            job_id: uuid::Uuid::new_v4(),
+            dataset: "token_transfers".to_string(),
+            format: "jsonl".to_string(),
+            record_count: 0,
+            dataset_version_id: None,
+            completeness_status: None,
+        };
+        let json = serde_json::to_value(&meta).unwrap();
+        assert!(json.get("dataset_version_id").is_none());
+        assert!(json.get("completeness_status").is_none());
     }
 
     // -- DeliveryReceipt tests --

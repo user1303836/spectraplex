@@ -1408,6 +1408,25 @@ impl Repository {
         row.as_ref().map(row_to_dataset_version).transpose()
     }
 
+    /// Get the active dataset version for a given dataset name.
+    /// Returns the latest version with status = Active, or None if no active version exists.
+    pub async fn get_active_dataset_version(
+        &self,
+        dataset_name: &str,
+    ) -> anyhow::Result<Option<DatasetVersion>> {
+        let row = sqlx::query(
+            "SELECT id, dataset_name, version, parser_hash, created_at, notes, status \
+             FROM dataset_versions \
+             WHERE dataset_name = $1 AND status = $2 \
+             ORDER BY version DESC LIMIT 1",
+        )
+        .bind(dataset_name)
+        .bind(dataset_version_status_to_sql(&DatasetVersionStatus::Active))
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref().map(row_to_dataset_version).transpose()
+    }
+
     // -----------------------------------------------------------------------
     // Dataset lifecycle methods (P3-W1)
     // -----------------------------------------------------------------------
@@ -1864,6 +1883,40 @@ impl Repository {
         .bind(dataset_name)
         .fetch_all(self.pool())
         .await?;
+        rows.iter().map(row_to_dataset_completeness).collect()
+    }
+
+    /// List completeness records for a dataset with optional target and network filters.
+    pub async fn list_completeness_filtered(
+        &self,
+        dataset_name: &str,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+    ) -> anyhow::Result<Vec<DatasetCompleteness>> {
+        let cols = "id, target_id, dataset_name, dataset_version_id, network, status, \
+                    coverage_start, coverage_end, block_start, block_end, \
+                    last_ingestion_run_id, records_count, gap_ranges, notes, created_at, updated_at";
+        let mut sql = format!("SELECT {cols} FROM dataset_completeness WHERE dataset_name = $1");
+        let mut param_idx = 2u32;
+
+        if target_id.is_some() {
+            sql.push_str(&format!(" AND target_id = ${param_idx}"));
+            param_idx += 1;
+        }
+        if network.is_some() {
+            sql.push_str(&format!(" AND network = ${param_idx}"));
+        }
+        sql.push_str(" ORDER BY target_id, network");
+
+        let mut query = sqlx::query(&sql).bind(dataset_name);
+        if let Some(tid) = target_id {
+            query = query.bind(tid);
+        }
+        if let Some(net) = network {
+            query = query.bind(net);
+        }
+
+        let rows = query.fetch_all(self.pool()).await?;
         rows.iter().map(row_to_dataset_completeness).collect()
     }
 

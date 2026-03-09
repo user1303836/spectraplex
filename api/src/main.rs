@@ -93,6 +93,19 @@ impl IntoResponse for AppError {
     }
 }
 
+fn serialize_optional_datetime<S>(
+    dt: &Option<chrono::DateTime<chrono::Utc>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match dt {
+        Some(d) => serializer.serialize_str(&d.to_rfc3339()),
+        None => serializer.serialize_none(),
+    }
+}
+
 const MAX_CONCURRENT_JOBS: usize = 10;
 const MAX_CONCURRENT_STREAMS: usize = 5;
 
@@ -175,6 +188,33 @@ struct ExportJobStatus {
     /// Delivery status: "pending", "delivered", "failed", or null if no sink.
     #[serde(skip_serializing_if = "Option::is_none")]
     delivery_status: Option<String>,
+    /// ID of the dataset version used for this export.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dataset_version_id: Option<Uuid>,
+    /// Dataset version number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dataset_version: Option<i32>,
+    /// Completeness status for the dataset at export time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completeness_status: Option<String>,
+    /// Completeness coverage bounds (time/block ranges).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completeness_coverage: Option<serde_json::Value>,
+    /// When the export job started.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_datetime"
+    )]
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the export job completed.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_datetime"
+    )]
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// ID of the last ingestion run that contributed to the exported data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_ingestion_run_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -254,6 +294,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/datasets/{name}/completeness",
             get(get_dataset_completeness_handler),
+        )
+        .route(
+            "/v1/datasets/{name}/status",
+            get(get_dataset_status_handler),
         )
         .route("/v1/export/dataset", post(create_export_job))
         .route("/v1/export/jobs/{job_id}", get(get_export_job_status))
@@ -1942,6 +1986,13 @@ async fn create_export_job(
         message: None,
         delivered_to: None,
         delivery_status: req.sink.as_ref().map(|_| "pending".to_string()),
+        dataset_version_id: None,
+        dataset_version: None,
+        completeness_status: None,
+        completeness_coverage: None,
+        started_at: None,
+        completed_at: None,
+        last_ingestion_run_id: None,
     };
 
     state.export_jobs.write().await.insert(
@@ -1964,11 +2015,13 @@ async fn create_export_job(
     tokio::spawn(async move {
         let _permit = permit;
 
-        // Mark as running
+        // Mark as running with wall-clock start time
+        let start_time = chrono::Utc::now();
         {
             let mut exports = state_clone.export_jobs.write().await;
             if let Some(entry) = exports.get_mut(&job_id) {
                 entry.status.state = JobState::Running;
+                entry.status.started_at = Some(start_time);
             }
         }
 
@@ -1986,13 +2039,15 @@ async fn create_export_job(
         // Separate the export result handling from sink delivery to avoid
         // holding the write lock during potentially slow async I/O.
         match result {
-            Ok((body, record_count)) => {
+            Ok((body, record_count, export_meta)) => {
                 // Only clone body when a sink needs it after storage
                 let sink_body = if sink_config.is_some() {
                     Some(body.clone())
                 } else {
                     None
                 };
+
+                let completed_time = chrono::Utc::now();
 
                 // Mark completed and store data (short lock scope)
                 {
@@ -2001,6 +2056,14 @@ async fn create_export_job(
                         entry.status.state = JobState::Completed;
                         entry.status.record_count = Some(record_count);
                         entry.status.message = Some(format!("Exported {record_count} records"));
+                        entry.status.completed_at = Some(completed_time);
+                        // Populate provenance metadata from export
+                        entry.status.dataset_version_id = export_meta.dataset_version_id;
+                        entry.status.dataset_version = export_meta.dataset_version;
+                        entry.status.completeness_status = export_meta.completeness_status.clone();
+                        entry.status.completeness_coverage =
+                            export_meta.completeness_coverage.clone();
+                        entry.status.last_ingestion_run_id = export_meta.last_ingestion_run_id;
                         // Always store in-memory for download (backward compatibility)
                         entry.data = Some(ExportData {
                             content_type: content_type_for_format(format),
@@ -2014,13 +2077,15 @@ async fn create_export_job(
                     let body = sink_body.expect("sink_body set when sink_config is Some");
                     let delivery_result = match build_sink(sc) {
                         Ok(sink) => {
-                            let meta = DeliveryMetadata {
+                            let delivery_meta = DeliveryMetadata {
                                 job_id,
                                 dataset: dataset.clone(),
                                 format: format.to_string(),
                                 record_count,
+                                dataset_version_id: export_meta.dataset_version_id,
+                                completeness_status: export_meta.completeness_status,
                             };
-                            match sink.deliver(&body, &meta).await {
+                            match sink.deliver(&body, &delivery_meta).await {
                                 Ok(receipt) => Ok(receipt.destination),
                                 Err(e) => {
                                     warn!(error = %e, "Sink delivery failed");
@@ -2065,6 +2130,7 @@ async fn create_export_job(
                 if let Some(entry) = exports.get_mut(&job_id) {
                     entry.status.state = JobState::Failed;
                     entry.status.message = Some(format!("Export failed: {e}"));
+                    entry.status.completed_at = Some(chrono::Utc::now());
                     if sink_config.is_some() {
                         entry.status.delivery_status = Some("failed".to_string());
                     }
@@ -2077,6 +2143,16 @@ async fn create_export_job(
     Ok(Json(status))
 }
 
+/// Metadata gathered during an export job for provenance and observability.
+#[derive(Debug, Clone, Default)]
+struct ExportMetadata {
+    dataset_version_id: Option<Uuid>,
+    dataset_version: Option<i32>,
+    completeness_status: Option<String>,
+    completeness_coverage: Option<serde_json::Value>,
+    last_ingestion_run_id: Option<Uuid>,
+}
+
 async fn run_export_job(
     repo: &Repository,
     dataset: &str,
@@ -2085,7 +2161,80 @@ async fn run_export_job(
     network: Option<&str>,
     time_start: Option<i64>,
     time_end: Option<i64>,
-) -> anyhow::Result<(Vec<u8>, usize)> {
+) -> anyhow::Result<(Vec<u8>, usize, ExportMetadata)> {
+    // Look up active dataset version for provenance
+    let active_version = repo
+        .get_active_dataset_version(dataset)
+        .await
+        .ok()
+        .flatten();
+
+    // Look up completeness records for the dataset (optionally filtered by target and network)
+    let completeness_records = repo
+        .list_completeness_filtered(dataset, target_id, network)
+        .await
+        .unwrap_or_default();
+
+    let mut meta = ExportMetadata::default();
+    if let Some(ref dv) = active_version {
+        meta.dataset_version_id = Some(dv.id);
+        meta.dataset_version = Some(dv.version);
+    }
+
+    if !completeness_records.is_empty() {
+        // Aggregate completeness: use worst status across matching records
+        let statuses: Vec<&str> = completeness_records
+            .iter()
+            .map(|c| match c.status {
+                spectraplex_core::v2::CompletenessStatus::Complete => "complete",
+                spectraplex_core::v2::CompletenessStatus::Partial => "partial",
+                spectraplex_core::v2::CompletenessStatus::Backfilling => "backfilling",
+                spectraplex_core::v2::CompletenessStatus::Gap => "gap",
+            })
+            .collect();
+
+        // Pick the most conservative status
+        let status = if statuses.contains(&"gap") {
+            "gap"
+        } else if statuses.contains(&"backfilling") {
+            "backfilling"
+        } else if statuses.contains(&"partial") {
+            "partial"
+        } else {
+            "complete"
+        };
+        meta.completeness_status = Some(status.to_string());
+
+        // Aggregate coverage bounds
+        let coverage_start = completeness_records
+            .iter()
+            .filter_map(|c| c.coverage_start)
+            .min();
+        let coverage_end = completeness_records
+            .iter()
+            .filter_map(|c| c.coverage_end)
+            .max();
+        let block_start = completeness_records
+            .iter()
+            .filter_map(|c| c.block_start)
+            .min();
+        let block_end = completeness_records
+            .iter()
+            .filter_map(|c| c.block_end)
+            .max();
+        meta.completeness_coverage = Some(serde_json::json!({
+            "coverage_start": coverage_start,
+            "coverage_end": coverage_end,
+            "block_start": block_start,
+            "block_end": block_end,
+        }));
+
+        // Use the most recent ingestion run ID from completeness records
+        meta.last_ingestion_run_id = completeness_records
+            .iter()
+            .rev()
+            .find_map(|c| c.last_ingestion_run_id);
+    }
     match dataset {
         "token_transfers" => {
             let records = repo
@@ -2098,7 +2247,7 @@ async fn run_export_job(
                 }
                 ExportFormat::Csv => token_transfers_to_csv(&records),
             };
-            Ok((body, count))
+            Ok((body, count, meta))
         }
         "native_balance_deltas" => {
             let records = repo
@@ -2111,7 +2260,7 @@ async fn run_export_job(
                 }
                 ExportFormat::Csv => native_balance_deltas_to_csv(&records),
             };
-            Ok((body, count))
+            Ok((body, count, meta))
         }
         "decoded_events" => {
             let records = repo
@@ -2124,7 +2273,7 @@ async fn run_export_job(
                 }
                 ExportFormat::Csv => decoded_events_to_csv(&records),
             };
-            Ok((body, count))
+            Ok((body, count, meta))
         }
         "hl_fills" => {
             let records = repo
@@ -2137,7 +2286,7 @@ async fn run_export_job(
                 }
                 ExportFormat::Csv => hl_fills_to_csv(&records),
             };
-            Ok((body, count))
+            Ok((body, count, meta))
         }
         "hl_funding" => {
             let records = repo
@@ -2150,7 +2299,7 @@ async fn run_export_job(
                 }
                 ExportFormat::Csv => hl_funding_to_csv(&records),
             };
-            Ok((body, count))
+            Ok((body, count, meta))
         }
         "positions" => {
             let records = repo
@@ -2163,7 +2312,7 @@ async fn run_export_job(
                 }
                 ExportFormat::Csv => hl_positions_to_csv(&records),
             };
-            Ok((body, count))
+            Ok((body, count, meta))
         }
         _ => Err(anyhow::anyhow!("Unknown dataset: {dataset}")),
     }
@@ -2243,6 +2392,96 @@ async fn get_dataset_completeness_handler(
         .await
         .map_err(AppError::internal)?;
     Ok(Json(records))
+}
+
+/// Response body for the `/v1/datasets/{name}/status` materialization status endpoint.
+#[derive(Debug, Clone, Serialize)]
+struct DatasetStatus {
+    /// Dataset name.
+    name: String,
+    /// Active version details (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_version: Option<DatasetVersionInfo>,
+    /// All known versions ordered by version number descending.
+    versions: Vec<DatasetVersionInfo>,
+    /// Aggregated completeness across all targets.
+    completeness: Vec<DatasetCompletenessInfo>,
+}
+
+/// Summary of a dataset version for the status endpoint.
+#[derive(Debug, Clone, Serialize)]
+struct DatasetVersionInfo {
+    id: Uuid,
+    version: i32,
+    status: String,
+    parser_hash: Option<String>,
+    created_at: String,
+    notes: Option<String>,
+}
+
+/// Summary of a completeness record for the status endpoint.
+#[derive(Debug, Clone, Serialize)]
+struct DatasetCompletenessInfo {
+    target_id: Uuid,
+    network: String,
+    status: String,
+    coverage_start: Option<i64>,
+    coverage_end: Option<i64>,
+    records_count: i64,
+    last_ingestion_run_id: Option<Uuid>,
+}
+
+async fn get_dataset_status_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<DatasetStatus>, AppError> {
+    validate_dataset_name(&name)?;
+
+    let versions = state
+        .repo
+        .list_dataset_versions(&name)
+        .await
+        .map_err(AppError::internal)?;
+
+    let completeness_records = state
+        .repo
+        .list_completeness_by_dataset(&name)
+        .await
+        .map_err(AppError::internal)?;
+
+    let version_infos: Vec<DatasetVersionInfo> = versions
+        .iter()
+        .map(|v| DatasetVersionInfo {
+            id: v.id,
+            version: v.version,
+            status: v.status.to_string(),
+            parser_hash: v.parser_hash.clone(),
+            created_at: v.created_at.to_rfc3339(),
+            notes: v.notes.clone(),
+        })
+        .collect();
+
+    let active_version = version_infos.iter().find(|v| v.status == "active").cloned();
+
+    let completeness_infos: Vec<DatasetCompletenessInfo> = completeness_records
+        .iter()
+        .map(|c| DatasetCompletenessInfo {
+            target_id: c.target_id,
+            network: c.network.clone(),
+            status: c.status.to_string(),
+            coverage_start: c.coverage_start,
+            coverage_end: c.coverage_end,
+            records_count: c.records_count,
+            last_ingestion_run_id: c.last_ingestion_run_id,
+        })
+        .collect();
+
+    Ok(Json(DatasetStatus {
+        name,
+        active_version,
+        versions: version_infos,
+        completeness: completeness_infos,
+    }))
 }
 
 #[cfg(test)]
@@ -2325,6 +2564,10 @@ mod tests {
             .route(
                 "/v1/datasets/{name}/completeness",
                 get(get_dataset_completeness_handler),
+            )
+            .route(
+                "/v1/datasets/{name}/status",
+                get(get_dataset_status_handler),
             )
             .route("/v1/export/dataset", post(create_export_job))
             .route("/v1/export/jobs/{job_id}", get(get_export_job_status))
@@ -4706,6 +4949,13 @@ mod tests {
                     message: Some("Exported 2 records".to_string()),
                     delivered_to: None,
                     delivery_status: None,
+                    dataset_version_id: None,
+                    dataset_version: None,
+                    completeness_status: None,
+                    completeness_coverage: None,
+                    started_at: None,
+                    completed_at: None,
+                    last_ingestion_run_id: None,
                 },
                 finished_at: Some(Instant::now()),
                 data: Some(ExportData {
@@ -4761,6 +5011,13 @@ mod tests {
                     message: None,
                     delivered_to: None,
                     delivery_status: None,
+                    dataset_version_id: None,
+                    dataset_version: None,
+                    completeness_status: None,
+                    completeness_coverage: None,
+                    started_at: None,
+                    completed_at: None,
+                    last_ingestion_run_id: None,
                 },
                 finished_at: None,
                 data: None,
@@ -4793,6 +5050,13 @@ mod tests {
                     message: Some("DB connection refused".to_string()),
                     delivered_to: None,
                     delivery_status: None,
+                    dataset_version_id: None,
+                    dataset_version: None,
+                    completeness_status: None,
+                    completeness_coverage: None,
+                    started_at: None,
+                    completed_at: None,
+                    last_ingestion_run_id: None,
                 },
                 finished_at: Some(Instant::now()),
                 data: None,
@@ -4825,6 +5089,13 @@ mod tests {
                     message: Some("Exported 42 records".to_string()),
                     delivered_to: None,
                     delivery_status: None,
+                    dataset_version_id: None,
+                    dataset_version: None,
+                    completeness_status: None,
+                    completeness_coverage: None,
+                    started_at: None,
+                    completed_at: None,
+                    last_ingestion_run_id: None,
                 },
                 finished_at: Some(Instant::now()),
                 data: None,
@@ -4859,6 +5130,13 @@ mod tests {
             message: None,
             delivered_to: None,
             delivery_status: None,
+            dataset_version_id: None,
+            dataset_version: None,
+            completeness_status: None,
+            completeness_coverage: None,
+            started_at: None,
+            completed_at: None,
+            last_ingestion_run_id: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["state"], "pending");
@@ -4885,6 +5163,13 @@ mod tests {
                     message: None,
                     delivered_to: None,
                     delivery_status: None,
+                    dataset_version_id: None,
+                    dataset_version: None,
+                    completeness_status: None,
+                    completeness_coverage: None,
+                    started_at: None,
+                    completed_at: None,
+                    last_ingestion_run_id: None,
                 },
                 finished_at: Some(
                     Instant::now() - std::time::Duration::from_secs(JOB_TTL_SECS + 1),
@@ -4904,6 +5189,13 @@ mod tests {
                     message: None,
                     delivered_to: None,
                     delivery_status: None,
+                    dataset_version_id: None,
+                    dataset_version: None,
+                    completeness_status: None,
+                    completeness_coverage: None,
+                    started_at: None,
+                    completed_at: None,
+                    last_ingestion_run_id: None,
                 },
                 finished_at: None,
                 data: None,
@@ -5162,6 +5454,8 @@ mod tests {
             dataset: "token_transfers".to_string(),
             format: "jsonl".to_string(),
             record_count: 2,
+            dataset_version_id: None,
+            completeness_status: None,
         };
 
         let receipt = sink.deliver(data, &meta).await.unwrap();
@@ -5188,6 +5482,8 @@ mod tests {
             dataset: "test".to_string(),
             format: "jsonl".to_string(),
             record_count: 1,
+            dataset_version_id: None,
+            completeness_status: None,
         };
         let result = sink.deliver(data, &meta).await;
         assert!(result.is_err());
@@ -5330,6 +5626,13 @@ mod tests {
             message: Some("Exported 10 records".to_string()),
             delivered_to: Some("/tmp/export.jsonl".to_string()),
             delivery_status: Some("delivered".to_string()),
+            dataset_version_id: None,
+            dataset_version: None,
+            completeness_status: None,
+            completeness_coverage: None,
+            started_at: None,
+            completed_at: None,
+            last_ingestion_run_id: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["delivered_to"], "/tmp/export.jsonl");
@@ -5347,6 +5650,13 @@ mod tests {
             message: None,
             delivered_to: None,
             delivery_status: None,
+            dataset_version_id: None,
+            dataset_version: None,
+            completeness_status: None,
+            completeness_coverage: None,
+            started_at: None,
+            completed_at: None,
+            last_ingestion_run_id: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         // These fields should be absent when None (skip_serializing_if)
@@ -5375,5 +5685,196 @@ mod tests {
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // Metadata and observability tests (P4-W4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_export_job_status_metadata_fields_present_when_populated() {
+        let version_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let status = ExportJobStatus {
+            id: Uuid::nil(),
+            state: JobState::Completed,
+            dataset: "token_transfers".to_string(),
+            format: "jsonl".to_string(),
+            record_count: Some(100),
+            message: Some("Exported 100 records".to_string()),
+            delivered_to: None,
+            delivery_status: None,
+            dataset_version_id: Some(version_id),
+            dataset_version: Some(3),
+            completeness_status: Some("complete".to_string()),
+            completeness_coverage: Some(serde_json::json!({
+                "coverage_start": 1700000000,
+                "coverage_end": 1700100000,
+                "block_start": null,
+                "block_end": null,
+            })),
+            started_at: Some(now),
+            completed_at: Some(now),
+            last_ingestion_run_id: Some(run_id),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["dataset_version_id"], version_id.to_string());
+        assert_eq!(json["dataset_version"], 3);
+        assert_eq!(json["completeness_status"], "complete");
+        assert!(json["completeness_coverage"]["coverage_start"].is_number());
+        assert!(json["started_at"].is_string());
+        assert!(json["completed_at"].is_string());
+        assert_eq!(json["last_ingestion_run_id"], run_id.to_string());
+    }
+
+    #[test]
+    fn test_export_job_status_metadata_fields_omitted_when_none() {
+        let status = ExportJobStatus {
+            id: Uuid::nil(),
+            state: JobState::Pending,
+            dataset: "hl_fills".to_string(),
+            format: "csv".to_string(),
+            record_count: None,
+            message: None,
+            delivered_to: None,
+            delivery_status: None,
+            dataset_version_id: None,
+            dataset_version: None,
+            completeness_status: None,
+            completeness_coverage: None,
+            started_at: None,
+            completed_at: None,
+            last_ingestion_run_id: None,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        // All new metadata fields should be absent (skip_serializing_if)
+        assert!(json.get("dataset_version_id").is_none());
+        assert!(json.get("dataset_version").is_none());
+        assert!(json.get("completeness_status").is_none());
+        assert!(json.get("completeness_coverage").is_none());
+        assert!(json.get("started_at").is_none());
+        assert!(json.get("completed_at").is_none());
+        assert!(json.get("last_ingestion_run_id").is_none());
+        // Core fields still present
+        assert_eq!(json["state"], "pending");
+        assert_eq!(json["dataset"], "hl_fills");
+    }
+
+    #[test]
+    fn test_export_job_status_backward_compat_no_metadata() {
+        // Verify that a status with no metadata fields serializes to the same
+        // shape as the pre-P4-W4 response (no extra keys).
+        let status = ExportJobStatus {
+            id: Uuid::nil(),
+            state: JobState::Completed,
+            dataset: "positions".to_string(),
+            format: "jsonl".to_string(),
+            record_count: Some(42),
+            message: Some("Exported 42 records".to_string()),
+            delivered_to: None,
+            delivery_status: None,
+            dataset_version_id: None,
+            dataset_version: None,
+            completeness_status: None,
+            completeness_coverage: None,
+            started_at: None,
+            completed_at: None,
+            last_ingestion_run_id: None,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        let keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        // Should only have the original fields
+        assert!(keys.contains(&"id"));
+        assert!(keys.contains(&"state"));
+        assert!(keys.contains(&"dataset"));
+        assert!(keys.contains(&"format"));
+        assert!(keys.contains(&"record_count"));
+        assert!(keys.contains(&"message"));
+        // Metadata fields absent
+        assert!(!keys.contains(&"dataset_version_id"));
+        assert!(!keys.contains(&"started_at"));
+    }
+
+    #[test]
+    fn test_export_metadata_default() {
+        let meta = ExportMetadata::default();
+        assert!(meta.dataset_version_id.is_none());
+        assert!(meta.dataset_version.is_none());
+        assert!(meta.completeness_status.is_none());
+        assert!(meta.completeness_coverage.is_none());
+        assert!(meta.last_ingestion_run_id.is_none());
+    }
+
+    #[test]
+    fn test_dataset_status_response_shape() {
+        let version_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let status = DatasetStatus {
+            name: "token_transfers".to_string(),
+            active_version: Some(DatasetVersionInfo {
+                id: version_id,
+                version: 2,
+                status: "active".to_string(),
+                parser_hash: Some("sha256:abc".to_string()),
+                created_at: "2026-01-01T00:00:00+00:00".to_string(),
+                notes: None,
+            }),
+            versions: vec![
+                DatasetVersionInfo {
+                    id: version_id,
+                    version: 2,
+                    status: "active".to_string(),
+                    parser_hash: Some("sha256:abc".to_string()),
+                    created_at: "2026-01-01T00:00:00+00:00".to_string(),
+                    notes: None,
+                },
+                DatasetVersionInfo {
+                    id: Uuid::new_v4(),
+                    version: 1,
+                    status: "superseded".to_string(),
+                    parser_hash: Some("sha256:old".to_string()),
+                    created_at: "2025-06-01T00:00:00+00:00".to_string(),
+                    notes: Some("initial release".to_string()),
+                },
+            ],
+            completeness: vec![DatasetCompletenessInfo {
+                target_id,
+                network: "solana-mainnet".to_string(),
+                status: "partial".to_string(),
+                coverage_start: Some(1700000000),
+                coverage_end: Some(1700100000),
+                records_count: 42,
+                last_ingestion_run_id: Some(run_id),
+            }],
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["name"], "token_transfers");
+        assert_eq!(json["active_version"]["version"], 2);
+        assert_eq!(json["active_version"]["status"], "active");
+        assert_eq!(json["versions"].as_array().unwrap().len(), 2);
+        assert_eq!(json["completeness"].as_array().unwrap().len(), 1);
+        assert_eq!(json["completeness"][0]["status"], "partial");
+        assert_eq!(json["completeness"][0]["records_count"], 42);
+    }
+
+    #[test]
+    fn test_dataset_status_no_active_version() {
+        let status = DatasetStatus {
+            name: "positions".to_string(),
+            active_version: None,
+            versions: vec![],
+            completeness: vec![],
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert!(json.get("active_version").is_none());
+        assert_eq!(json["versions"].as_array().unwrap().len(), 0);
+        assert_eq!(json["completeness"].as_array().unwrap().len(), 0);
     }
 }
