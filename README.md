@@ -241,6 +241,7 @@ All `/v1/*` endpoints require authentication via `Authorization: Bearer <API_KEY
 | `GET` | `/v1/datasets/:name/versions` | List version history for a dataset |
 | `GET` | `/v1/datasets/:name/records` | Query dataset records with filters (paginated) |
 | `GET` | `/v1/datasets/:name/completeness` | Get completeness status for a dataset |
+| `GET` | `/v1/datasets/:name/status` | Materialization status: active version, all versions, completeness |
 | `POST` | `/v1/export/dataset` | Create an async export job for a Silver dataset (JSONL or CSV) |
 | `GET` | `/v1/export/jobs/:job_id` | Poll export job status |
 | `GET` | `/v1/export/jobs/:job_id/download` | Download completed export data |
@@ -486,16 +487,48 @@ When a sink is configured, the export job status response includes additional fi
 
 Webhook URLs are validated against the same rules as `callback_url` (HTTPS/HTTP only, no private/loopback addresses). Local file paths must not contain `..` path traversal. The `database` sink type is reserved but not yet implemented at runtime.
 
+### GET /v1/datasets/:name/status
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  http://127.0.0.1:3000/v1/datasets/token_transfers/status
+```
+
+Returns materialization status for a dataset: the active version, all known versions, and completeness records across targets. Useful for downstream consumers to determine which Materializer version produced the current data and whether coverage is complete.
+
+Response fields:
+
+| Field | Description |
+|-------|-------------|
+| `name` | Dataset name |
+| `active_version` | Active version details (null if no active version) |
+| `versions` | All versions ordered by version number descending |
+| `completeness` | Completeness records across all targets |
+
 ### GET /v1/export/jobs/:job_id
 
 ```bash
 curl -H "Authorization: Bearer <API_KEY>" \
   http://127.0.0.1:3000/v1/export/jobs/<JOB_UUID>
 
-# Response: {"id": "...", "state": "completed", "dataset": "token_transfers", "format": "jsonl", "record_count": 1234, "message": "Exported 1234 records"}
+# Response: {"id": "...", "state": "completed", "dataset": "token_transfers", "format": "jsonl", "record_count": 1234, "message": "Exported 1234 records", "dataset_version_id": "...", "dataset_version": 2, "completeness_status": "complete", ...}
 ```
 
 Returns the status of an export job. States: `pending`, `running`, `completed`, `failed`.
+
+When the job completes, the response includes enriched metadata fields for provenance and observability:
+
+| Field | Description |
+|-------|-------------|
+| `dataset_version_id` | UUID of the active dataset version used for the export |
+| `dataset_version` | Version number of the active dataset version |
+| `completeness_status` | Aggregated completeness: `complete`, `partial`, `backfilling`, or `gap` |
+| `completeness_coverage` | JSON object with `coverage_start`, `coverage_end`, `block_start`, `block_end` |
+| `started_at` | ISO 8601 wall-clock timestamp when the export started |
+| `completed_at` | ISO 8601 wall-clock timestamp when the export finished |
+| `last_ingestion_run_id` | UUID of the most recent ingestion run that contributed to the data |
+
+All metadata fields use `skip_serializing_if` so they are omitted from the response when not available (backward compatible).
 
 ### GET /v1/export/jobs/:job_id/download
 
