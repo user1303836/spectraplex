@@ -558,6 +558,33 @@ fn validate_callback_url(url: &str) -> Result<(), AppError> {
 // Sink implementations
 // ---------------------------------------------------------------------------
 
+/// Header names that must not be set by user-supplied sink configuration.
+const FORBIDDEN_HEADER_NAMES: &[&str] = &[
+    "authorization",
+    "cookie",
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "set-cookie",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+];
+
+/// Validate that a header name contains only allowed characters: `[a-zA-Z0-9\-_]`.
+fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Validate that a header value contains no control characters
+/// (except horizontal tab, which is allowed in HTTP header values).
+fn is_valid_header_value(value: &str) -> bool {
+    value.chars().all(|c| !c.is_control() || c == '\t')
+}
+
 /// Validates a SinkConfig at job creation time.
 fn validate_sink_config(config: &SinkConfig) -> Result<(), AppError> {
     config
@@ -568,6 +595,26 @@ fn validate_sink_config(config: &SinkConfig) -> Result<(), AppError> {
         SinkType::Webhook => {
             if let Some(ref url) = config.url {
                 validate_callback_url(url)?;
+            }
+            if let Some(ref headers) = config.headers {
+                for (name, value) in headers {
+                    let lower = name.to_lowercase();
+                    if FORBIDDEN_HEADER_NAMES.contains(&lower.as_str()) {
+                        return Err(AppError::bad_request(format!(
+                            "Forbidden webhook header: {name}"
+                        )));
+                    }
+                    if !is_valid_header_name(name) {
+                        return Err(AppError::bad_request(format!(
+                            "Invalid header name: {name}. Header names must contain only [a-zA-Z0-9-_]"
+                        )));
+                    }
+                    if !is_valid_header_value(value) {
+                        return Err(AppError::bad_request(format!(
+                            "Invalid header value for {name}: header values must not contain control characters"
+                        )));
+                    }
+                }
             }
         }
         SinkType::LocalFile => {
@@ -1888,11 +1935,11 @@ fn serialize_to_jsonl<T: Serialize>(records: &[T]) -> Result<Vec<u8>, AppError> 
 
 fn token_transfers_to_csv(records: &[spectraplex_core::materializer::TokenTransfer]) -> Vec<u8> {
     let mut buf = String::from(
-        "id,raw_transaction_id,network,token_address,token_symbol,from_address,to_address,amount,decimals,dataset_version_id,created_at\n",
+        "id,raw_transaction_id,network,token_address,token_symbol,from_address,to_address,amount,decimals,transfer_index,dataset_version_id,created_at\n",
     );
     for r in records {
         buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{}\n",
             r.id,
             r.raw_transaction_id
                 .map(|u| u.to_string())
@@ -1904,6 +1951,7 @@ fn token_transfers_to_csv(records: &[spectraplex_core::materializer::TokenTransf
             csv_escape(&r.to_address),
             r.amount,
             r.decimals,
+            r.transfer_index,
             r.dataset_version_id
                 .map(|u| u.to_string())
                 .unwrap_or_default(),
@@ -5982,6 +6030,7 @@ mod tests {
             to_address: "receiver".to_string(),
             amount: bigdecimal::BigDecimal::from(100),
             decimals: 6,
+            transfer_index: 0,
             dataset_version_id: None,
             created_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
         }];
@@ -6007,6 +6056,7 @@ mod tests {
             to_address: "0xto".to_string(),
             amount: bigdecimal::BigDecimal::from(50),
             decimals: 6,
+            transfer_index: 0,
             dataset_version_id: None,
             created_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
         }];
@@ -6113,6 +6163,85 @@ mod tests {
         };
         let err = validate_sink_config(&config).unwrap_err();
         assert!(err.message.contains("not yet implemented"));
+    }
+
+    #[test]
+    fn test_validate_sink_config_webhook_forbidden_header() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer secret".to_string());
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: Some("https://example.com/hook".to_string()),
+            headers: Some(headers),
+            connection_string: None,
+            table: None,
+        };
+        let err = validate_sink_config(&config).unwrap_err();
+        assert!(err.message.contains("Forbidden webhook header"));
+    }
+
+    #[test]
+    fn test_validate_sink_config_webhook_invalid_header_name() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Bad Header\r\n".to_string(), "value".to_string());
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: Some("https://example.com/hook".to_string()),
+            headers: Some(headers),
+            connection_string: None,
+            table: None,
+        };
+        let err = validate_sink_config(&config).unwrap_err();
+        assert!(err.message.contains("Invalid header name"));
+    }
+
+    #[test]
+    fn test_validate_sink_config_webhook_control_char_in_value() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Custom".to_string(), "val\r\nInjected: true".to_string());
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: Some("https://example.com/hook".to_string()),
+            headers: Some(headers),
+            connection_string: None,
+            table: None,
+        };
+        let err = validate_sink_config(&config).unwrap_err();
+        assert!(err.message.contains("control characters"));
+    }
+
+    #[test]
+    fn test_validate_sink_config_webhook_valid_custom_headers() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Custom-Header".to_string(), "some-value".to_string());
+        headers.insert("X-Api_Key".to_string(), "key123".to_string());
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: Some("https://example.com/hook".to_string()),
+            headers: Some(headers),
+            connection_string: None,
+            table: None,
+        };
+        assert!(validate_sink_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_sink_config_webhook_tab_in_value_allowed() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Custom".to_string(), "value\twith\ttabs".to_string());
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: Some("https://example.com/hook".to_string()),
+            headers: Some(headers),
+            connection_string: None,
+            table: None,
+        };
+        assert!(validate_sink_config(&config).is_ok());
     }
 
     #[test]

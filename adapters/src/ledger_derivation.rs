@@ -1046,6 +1046,7 @@ mod tests {
             to_address: to.to_string(),
             amount: BigDecimal::from_str(amount).unwrap(),
             decimals: 6,
+            transfer_index: 0,
             dataset_version_id: None,
             created_at: Utc::now(),
         }

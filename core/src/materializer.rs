@@ -384,6 +384,8 @@ pub struct TokenTransfer {
     pub amount: BigDecimal,
     /// Token decimals used for normalization.
     pub decimals: i32,
+    /// Ordinal position within the same (raw_transaction_id, from, to, token) group.
+    pub transfer_index: i32,
     /// FK to dataset_versions; nullable during transition.
     pub dataset_version_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
@@ -1190,6 +1192,7 @@ mod tests {
             to_address: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".to_string(),
             amount: BigDecimal::from_str("1000.50").unwrap(),
             decimals: 6,
+            transfer_index: 0,
             dataset_version_id: None,
             created_at: chrono::Utc::now(),
         };
@@ -1213,6 +1216,7 @@ mod tests {
             to_address: "0x2222222222222222222222222222222222222222".to_string(),
             amount: BigDecimal::from(100),
             decimals: 6,
+            transfer_index: 0,
             dataset_version_id: None,
             created_at: chrono::Utc::now(),
         };

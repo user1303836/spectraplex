@@ -441,6 +441,7 @@ fn row_to_token_transfer(row: &sqlx::postgres::PgRow) -> anyhow::Result<TokenTra
         to_address: row.try_get("to_address")?,
         amount: row.try_get::<BigDecimal, _>("amount")?,
         decimals: row.try_get("decimals")?,
+        transfer_index: row.try_get("transfer_index")?,
         dataset_version_id: row.try_get("dataset_version_id")?,
         created_at: row.try_get("created_at")?,
     })
@@ -473,17 +474,17 @@ pub fn build_token_transfer_insert(
 ) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
     let mut query = String::from(
         "INSERT INTO token_transfers \
-         (id, raw_transaction_id, network, token_address, token_symbol, from_address, to_address, amount, decimals, dataset_version_id, created_at) \
+         (id, raw_transaction_id, network, token_address, token_symbol, from_address, to_address, amount, decimals, transfer_index, dataset_version_id, created_at) \
          VALUES ",
     );
     let mut args = sqlx::postgres::PgArguments::default();
     for (i, t) in transfers.iter().enumerate() {
-        let base = i * 11;
+        let base = i * 12;
         if i > 0 {
             query.push_str(", ");
         }
         query.push_str(&format!(
-            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
             base + 1,
             base + 2,
             base + 3,
@@ -495,6 +496,7 @@ pub fn build_token_transfer_insert(
             base + 9,
             base + 10,
             base + 11,
+            base + 12,
         ));
         use sqlx::Arguments;
         args.add(t.id).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -511,12 +513,14 @@ pub fn build_token_transfer_insert(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         args.add(&t.amount).map_err(|e| anyhow::anyhow!("{e}"))?;
         args.add(t.decimals).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(t.transfer_index)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         args.add(t.dataset_version_id)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         args.add(t.created_at).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     query.push_str(
-        " ON CONFLICT (raw_transaction_id, from_address, to_address, token_address, amount) \
+        " ON CONFLICT (raw_transaction_id, from_address, to_address, token_address, transfer_index) \
          WHERE raw_transaction_id IS NOT NULL DO NOTHING",
     );
     Ok((query, args))
@@ -572,7 +576,7 @@ pub fn build_native_balance_delta_insert(
         args.add(d.created_at).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     query.push_str(
-        " ON CONFLICT (raw_transaction_id, account_address) \
+        " ON CONFLICT (raw_transaction_id, account_address, native_token) \
          WHERE raw_transaction_id IS NOT NULL DO NOTHING",
     );
     Ok((query, args))
@@ -1634,7 +1638,7 @@ impl Repository {
     ) -> anyhow::Result<Vec<TokenTransfer>> {
         let rows = sqlx::query(
             "SELECT id, raw_transaction_id, network, token_address, token_symbol, \
-             from_address, to_address, amount, decimals, dataset_version_id, created_at \
+             from_address, to_address, amount, decimals, transfer_index, dataset_version_id, created_at \
              FROM token_transfers \
              WHERE from_address = $1 OR to_address = $1 \
              ORDER BY created_at DESC LIMIT $2 OFFSET $3",
@@ -1654,7 +1658,7 @@ impl Repository {
     ) -> anyhow::Result<Vec<TokenTransfer>> {
         let rows = sqlx::query(
             "SELECT id, raw_transaction_id, network, token_address, token_symbol, \
-             from_address, to_address, amount, decimals, dataset_version_id, created_at \
+             from_address, to_address, amount, decimals, transfer_index, dataset_version_id, created_at \
              FROM token_transfers WHERE raw_transaction_id = $1 ORDER BY created_at",
         )
         .bind(raw_tx_id)
@@ -2069,7 +2073,7 @@ impl Repository {
         offset: i64,
     ) -> anyhow::Result<Vec<TokenTransfer>> {
         let cols = "dt.id, dt.raw_transaction_id, dt.network, dt.token_address, dt.token_symbol, \
-                    dt.from_address, dt.to_address, dt.amount, dt.decimals, dt.dataset_version_id, dt.created_at";
+                    dt.from_address, dt.to_address, dt.amount, dt.decimals, dt.transfer_index, dt.dataset_version_id, dt.created_at";
         let (sql, args) = build_dataset_filter_query(
             cols,
             "token_transfers",
@@ -3027,6 +3031,7 @@ mod tests {
             to_address: "0x2222222222222222222222222222222222222222".to_string(),
             amount: BigDecimal::from(100),
             decimals: 6,
+            transfer_index: 0,
             dataset_version_id: None,
             created_at: Utc::now(),
         }
@@ -3055,7 +3060,7 @@ mod tests {
         let (query, _) = build_token_transfer_insert(&[tt]).unwrap();
 
         assert!(query.starts_with("INSERT INTO token_transfers"));
-        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"));
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"));
         assert!(query.contains("ON CONFLICT"));
     }
 
@@ -3064,18 +3069,18 @@ mod tests {
         let transfers: Vec<_> = (0..3).map(|_| make_token_transfer()).collect();
         let (query, _) = build_token_transfer_insert(&transfers).unwrap();
 
-        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"));
-        assert!(query.contains("($12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)"));
-        assert!(query.contains("($23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)"));
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"));
+        assert!(query.contains("($13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)"));
+        assert!(query.contains("($25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36)"));
     }
 
     #[test]
     fn token_transfer_insert_param_count() {
         let transfers: Vec<_> = (0..5).map(|_| make_token_transfer()).collect();
         let (query, _) = build_token_transfer_insert(&transfers).unwrap();
-        // 5 rows * 11 params = 55 => highest param is $55
-        assert!(query.contains("$55"));
-        assert!(!query.contains("$56"));
+        // 5 rows * 12 params = 60 => highest param is $60
+        assert!(query.contains("$60"));
+        assert!(!query.contains("$61"));
     }
 
     // -- native_balance_delta batch insert (P3-W2) --
