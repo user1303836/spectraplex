@@ -276,16 +276,18 @@ These endpoints are the preferred forward path for new consumers. They provide f
 | `GET` | `/v1/targets/:target_id` | Get a specific index target by ID |
 | `GET` | `/v1/networks` | List all known networks |
 | `GET` | `/v1/networks/:network_id` | Get a specific network by ID |
-| `GET` | `/v1/datasets` | List all Silver datasets with latest version info |
+| `GET` | `/v1/datasets` | List all datasets with latest version info |
 | `GET` | `/v1/datasets/:name/versions` | List version history for a dataset |
 | `GET` | `/v1/datasets/:name/records` | Query dataset records with filters (paginated) |
 | `GET` | `/v1/datasets/:name/completeness` | Get completeness status for a dataset |
 | `GET` | `/v1/datasets/:name/status` | Materialization status: active version, all versions, completeness |
-| `POST` | `/v1/export/dataset` | Create an async export job for a Silver dataset (JSONL or CSV) |
+| `POST` | `/v1/export/dataset` | Create an async export job for a dataset (JSONL or CSV) |
 | `GET` | `/v1/export/jobs/:job_id` | Poll export job status |
 | `GET` | `/v1/export/jobs/:job_id/download` | Download completed export data |
+| `GET` | `/v1/export/tax` | Export wallet_ledger as tax-software-friendly CSV |
+| `GET` | `/v1/forensics/activity` | Wallet interaction analysis (top counterparties, cross-chain summary) |
 
-The dataset records endpoint supports filtering via `?target_id=<UUID>&network=<id>&time_start=<unix_ts>&time_end=<unix_ts>&limit=N&offset=N` query parameters (all optional). Queryable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`.
+The dataset records endpoint supports filtering via `?target_id=<UUID>&network=<id>&time_start=<unix_ts>&time_end=<unix_ts>&limit=N&offset=N` query parameters (all optional). Queryable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`, `wallet_ledger`, `balance_history`.
 
 ### POST /v1/ingest
 
@@ -464,7 +466,7 @@ curl -X POST http://127.0.0.1:3000/v1/export/dataset \
 # Response: {"id": "<JOB_UUID>", "state": "pending", "dataset": "token_transfers", "format": "jsonl", "record_count": null, "message": null}
 ```
 
-Creates an async export job for a Silver dataset. Supported formats: `jsonl` (default), `csv`. Optional filters: `target_id`, `network`, `time_start`, `time_end`. Exportable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`. Maximum 100,000 records per export.
+Creates an async export job for a dataset. Supported formats: `jsonl` (default), `csv`. Optional filters: `target_id`, `network`, `time_start`, `time_end`. Exportable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`, `wallet_ledger`, `balance_history`. Maximum 100,000 records per export.
 
 #### Sink delivery
 
@@ -574,6 +576,41 @@ curl -H "Authorization: Bearer <API_KEY>" \
 
 Downloads the completed export data. The response includes a `Content-Disposition` header with the filename.
 
+### Gold Datasets: wallet_ledger and balance_history
+
+Spectraplex includes two Gold-tier datasets materialized from Silver data:
+
+- **`wallet_ledger`** — wallet-scoped financial records with counterparty tracking, network awareness, and nullable cost basis / proceeds fields. Derived from `token_transfers`, `native_balance_deltas`, `hl_fills`, and `hl_funding`. Queryable and exportable via the standard dataset API.
+
+- **`balance_history`** — per-wallet, per-asset running balance snapshots derived from wallet_ledger entries. Enables point-in-time balance queries for forensics and portfolio tracking.
+
+Both datasets are queryable via `/v1/datasets/{name}/records` and exportable via `/v1/export/dataset`.
+
+### GET /v1/export/tax
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  "http://127.0.0.1:3000/v1/export/tax?target_id=<UUID>" \
+  -o tax-export.csv
+```
+
+Exports wallet_ledger records as a tax-software-friendly CSV with columns:
+
+`Date, Type, Sent_Asset, Sent_Amount, Received_Asset, Received_Amount, Fee_Asset, Fee_Amount, Cost_Basis, Proceeds, Gain_Loss, Tx_Hash, Network`
+
+Cost_Basis, Proceeds, and Gain_Loss are nullable — they are populated when future tax lot matching is available. Supports `?target_id`, `?network`, `?time_start`, `?time_end` filters.
+
+### GET /v1/forensics/activity
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  "http://127.0.0.1:3000/v1/forensics/activity?target_id=<UUID>"
+
+# Response: {"wallet_address": "...", "top_counterparties": [...], "network_activity": [...], "type_breakdown": [...], "total_entries": 42}
+```
+
+Returns a forensics activity summary for wallet_ledger records: top counterparties by interaction count, cross-chain activity breakdown, and transaction type distribution. Supports `?target_id`, `?network`, `?time_start`, `?time_end` filters.
+
 ## Configuration
 
 Spectraplex uses a layered configuration system powered by [figment](https://crates.io/crates/figment). Settings are loaded in order of priority:
@@ -680,7 +717,7 @@ All tables use UUIDs as primary keys and support idempotent batch inserts (`ON C
 - [ ] Split chain family from network identity so EVM-compatible networks are modeled correctly
 - [ ] Expand Silver beyond `ledger_entries` into reusable datasets like transfers, decoded events, fills, swaps, and balance snapshots
 - [ ] Add ETL-first delivery modes such as dataset exports, sink jobs, and warehouse-friendly outputs
-- [ ] Keep wallet/tax/forensics materializations first-class, but as downstream products of the broader indexing core
+- [x] Keep wallet/tax/forensics materializations first-class, but as downstream products of the broader indexing core (P5-W1: wallet_ledger, balance_history, tax export, forensics activity)
 
 The detailed roadmap lives in [`SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md`](SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md).
 

@@ -421,13 +421,616 @@ impl Materializer for HyperliquidDerivedLedgerMaterializer {
 }
 
 // ---------------------------------------------------------------------------
+// Gold-tier: WalletLedger derivation (P5-W1)
+// ---------------------------------------------------------------------------
+
+use chrono::Utc;
+use spectraplex_core::materializer::{BalanceSnapshot, WalletLedgerRecord};
+use std::collections::HashMap;
+
+/// Derive wallet_ledger records from Silver `TokenTransfer` records.
+///
+/// Extracts counterparty addresses: if the wallet is the sender, counterparty
+/// is the receiver; if the wallet is the receiver, counterparty is the sender.
+pub fn derive_wallet_ledger_from_token_transfers(
+    wallet: &str,
+    network: &str,
+    tx_hash: &str,
+    timestamp: i64,
+    transfers: &[TokenTransfer],
+    entry_offset: &mut u32,
+) -> Vec<WalletLedgerRecord> {
+    let wallet_lower = wallet.to_lowercase();
+    let mut records = Vec::new();
+    let now = Utc::now();
+
+    for transfer in transfers {
+        let from_match = transfer.from_address.to_lowercase() == wallet_lower;
+        let to_match = transfer.to_address.to_lowercase() == wallet_lower;
+
+        if !from_match && !to_match {
+            continue;
+        }
+
+        let symbol = transfer
+            .token_symbol
+            .clone()
+            .unwrap_or_else(|| transfer.token_address.clone());
+
+        if from_match {
+            records.push(WalletLedgerRecord {
+                id: deterministic_id(
+                    transfer.raw_transaction_id.unwrap_or(Uuid::nil()),
+                    *entry_offset,
+                ),
+                raw_transaction_id: transfer.raw_transaction_id,
+                wallet_address: wallet.to_string(),
+                network: network.to_string(),
+                tx_hash: tx_hash.to_string(),
+                timestamp,
+                entry_type: "transfer".to_string(),
+                asset_symbol: symbol.clone(),
+                amount: -transfer.amount.clone(),
+                counterparty_address: Some(transfer.to_address.clone()),
+                fee_amount: None,
+                fee_asset: None,
+                cost_basis: None,
+                proceeds: None,
+                dataset_version_id: transfer.dataset_version_id,
+                created_at: now,
+            });
+            *entry_offset += 1;
+        }
+
+        if to_match {
+            records.push(WalletLedgerRecord {
+                id: deterministic_id(
+                    transfer.raw_transaction_id.unwrap_or(Uuid::nil()),
+                    *entry_offset,
+                ),
+                raw_transaction_id: transfer.raw_transaction_id,
+                wallet_address: wallet.to_string(),
+                network: network.to_string(),
+                tx_hash: tx_hash.to_string(),
+                timestamp,
+                entry_type: "transfer".to_string(),
+                asset_symbol: symbol,
+                amount: transfer.amount.clone(),
+                counterparty_address: Some(transfer.from_address.clone()),
+                fee_amount: None,
+                fee_asset: None,
+                cost_basis: None,
+                proceeds: None,
+                dataset_version_id: transfer.dataset_version_id,
+                created_at: now,
+            });
+            *entry_offset += 1;
+        }
+    }
+
+    records
+}
+
+/// Derive wallet_ledger records from Silver `NativeBalanceDelta` records.
+pub fn derive_wallet_ledger_from_native_balance_deltas(
+    wallet: &str,
+    network: &str,
+    tx_hash: &str,
+    timestamp: i64,
+    deltas: &[NativeBalanceDelta],
+    entry_offset: &mut u32,
+) -> Vec<WalletLedgerRecord> {
+    let wallet_lower = wallet.to_lowercase();
+    let mut records = Vec::new();
+    let now = Utc::now();
+
+    for delta in deltas {
+        if delta.account_address.to_lowercase() != wallet_lower {
+            continue;
+        }
+
+        if delta.delta == BigDecimal::from(0) {
+            continue;
+        }
+
+        let entry_type = if delta.is_fee_payer {
+            "fee"
+        } else {
+            "transfer"
+        };
+
+        let fee_amount = if delta.is_fee_payer {
+            Some(delta.delta.abs())
+        } else {
+            None
+        };
+
+        records.push(WalletLedgerRecord {
+            id: deterministic_id(
+                delta.raw_transaction_id.unwrap_or(Uuid::nil()),
+                *entry_offset,
+            ),
+            raw_transaction_id: delta.raw_transaction_id,
+            wallet_address: wallet.to_string(),
+            network: network.to_string(),
+            tx_hash: tx_hash.to_string(),
+            timestamp,
+            entry_type: entry_type.to_string(),
+            asset_symbol: delta.native_token.clone(),
+            amount: delta.delta.clone(),
+            counterparty_address: None,
+            fee_amount,
+            fee_asset: if delta.is_fee_payer {
+                Some(delta.native_token.clone())
+            } else {
+                None
+            },
+            cost_basis: None,
+            proceeds: None,
+            dataset_version_id: delta.dataset_version_id,
+            created_at: now,
+        });
+        *entry_offset += 1;
+    }
+
+    records
+}
+
+/// Derive wallet_ledger records from Silver `HlFillRecord` records.
+pub fn derive_wallet_ledger_from_hl_fills(
+    wallet: &str,
+    network: &str,
+    tx_hash: &str,
+    timestamp: i64,
+    fills: &[HlFillRecord],
+    entry_offset: &mut u32,
+) -> Vec<WalletLedgerRecord> {
+    let mut records = Vec::new();
+    let now = Utc::now();
+
+    for fill in fills {
+        let signed_size = if fill.side == "B" {
+            fill.size.clone()
+        } else {
+            -fill.size.clone()
+        };
+
+        let fiat_value = &fill.size * &fill.price;
+
+        records.push(WalletLedgerRecord {
+            id: deterministic_id(
+                fill.raw_transaction_id.unwrap_or(Uuid::nil()),
+                *entry_offset,
+            ),
+            raw_transaction_id: fill.raw_transaction_id,
+            wallet_address: wallet.to_string(),
+            network: network.to_string(),
+            tx_hash: tx_hash.to_string(),
+            timestamp,
+            entry_type: "trade".to_string(),
+            asset_symbol: fill.coin.clone(),
+            amount: signed_size,
+            counterparty_address: None,
+            fee_amount: fill.fee.clone(),
+            fee_asset: fill.fee_token.clone(),
+            cost_basis: None,
+            proceeds: Some(fiat_value),
+            dataset_version_id: fill.dataset_version_id,
+            created_at: now,
+        });
+        *entry_offset += 1;
+
+        if let Some(ref fee) = fill.fee {
+            if *fee != BigDecimal::from(0) {
+                let fee_token = fill.fee_token.as_deref().unwrap_or("USDC");
+                records.push(WalletLedgerRecord {
+                    id: deterministic_id(
+                        fill.raw_transaction_id.unwrap_or(Uuid::nil()),
+                        *entry_offset,
+                    ),
+                    raw_transaction_id: fill.raw_transaction_id,
+                    wallet_address: wallet.to_string(),
+                    network: network.to_string(),
+                    tx_hash: tx_hash.to_string(),
+                    timestamp,
+                    entry_type: "fee".to_string(),
+                    asset_symbol: fee_token.to_string(),
+                    amount: -fee.abs(),
+                    counterparty_address: None,
+                    fee_amount: Some(fee.abs()),
+                    fee_asset: Some(fee_token.to_string()),
+                    cost_basis: None,
+                    proceeds: None,
+                    dataset_version_id: fill.dataset_version_id,
+                    created_at: now,
+                });
+                *entry_offset += 1;
+            }
+        }
+
+        if let Some(ref pnl) = fill.closed_pnl {
+            if *pnl != BigDecimal::from(0) {
+                records.push(WalletLedgerRecord {
+                    id: deterministic_id(
+                        fill.raw_transaction_id.unwrap_or(Uuid::nil()),
+                        *entry_offset,
+                    ),
+                    raw_transaction_id: fill.raw_transaction_id,
+                    wallet_address: wallet.to_string(),
+                    network: network.to_string(),
+                    tx_hash: tx_hash.to_string(),
+                    timestamp,
+                    entry_type: "income".to_string(),
+                    asset_symbol: "USDC".to_string(),
+                    amount: pnl.clone(),
+                    counterparty_address: None,
+                    fee_amount: None,
+                    fee_asset: None,
+                    cost_basis: None,
+                    proceeds: None,
+                    dataset_version_id: fill.dataset_version_id,
+                    created_at: now,
+                });
+                *entry_offset += 1;
+            }
+        }
+    }
+
+    records
+}
+
+/// Derive wallet_ledger records from Silver `HlFundingPayment` records.
+pub fn derive_wallet_ledger_from_hl_funding(
+    wallet: &str,
+    network: &str,
+    tx_hash: &str,
+    timestamp: i64,
+    payments: &[HlFundingPayment],
+    entry_offset: &mut u32,
+) -> Vec<WalletLedgerRecord> {
+    let mut records = Vec::new();
+    let now = Utc::now();
+
+    for payment in payments {
+        records.push(WalletLedgerRecord {
+            id: deterministic_id(
+                payment.raw_transaction_id.unwrap_or(Uuid::nil()),
+                *entry_offset,
+            ),
+            raw_transaction_id: payment.raw_transaction_id,
+            wallet_address: wallet.to_string(),
+            network: network.to_string(),
+            tx_hash: tx_hash.to_string(),
+            timestamp,
+            entry_type: "funding".to_string(),
+            asset_symbol: "USDC".to_string(),
+            amount: payment.amount.clone(),
+            counterparty_address: None,
+            fee_amount: None,
+            fee_asset: None,
+            cost_basis: None,
+            proceeds: None,
+            dataset_version_id: payment.dataset_version_id,
+            created_at: now,
+        });
+        *entry_offset += 1;
+    }
+
+    records
+}
+
+/// Orchestrate derivation of all wallet_ledger records from Silver datasets.
+pub fn derive_all_wallet_ledger_entries(
+    chain: Chain,
+    wallet: &str,
+    network: &str,
+    tx_hash: &str,
+    timestamp: i64,
+    records: &SilverRecords,
+) -> Vec<WalletLedgerRecord> {
+    let family = ChainFamily::from(chain);
+    let mut entry_offset: u32 = 0;
+    let mut all = Vec::new();
+
+    match family {
+        ChainFamily::Solana => {
+            all.extend(derive_wallet_ledger_from_native_balance_deltas(
+                wallet,
+                network,
+                tx_hash,
+                timestamp,
+                &records.native_balance_deltas,
+                &mut entry_offset,
+            ));
+            all.extend(derive_wallet_ledger_from_token_transfers(
+                wallet,
+                network,
+                tx_hash,
+                timestamp,
+                &records.token_transfers,
+                &mut entry_offset,
+            ));
+        }
+        ChainFamily::Evm => {
+            all.extend(derive_wallet_ledger_from_token_transfers(
+                wallet,
+                network,
+                tx_hash,
+                timestamp,
+                &records.token_transfers,
+                &mut entry_offset,
+            ));
+        }
+        ChainFamily::Hyperliquid => {
+            all.extend(derive_wallet_ledger_from_hl_fills(
+                wallet,
+                network,
+                tx_hash,
+                timestamp,
+                &records.hl_fills,
+                &mut entry_offset,
+            ));
+            all.extend(derive_wallet_ledger_from_hl_funding(
+                wallet,
+                network,
+                tx_hash,
+                timestamp,
+                &records.hl_funding,
+                &mut entry_offset,
+            ));
+        }
+    }
+
+    all
+}
+
+/// Compute balance history snapshots from wallet_ledger records.
+///
+/// Groups records by (asset_symbol, network), sorts by timestamp,
+/// and computes running balances.
+pub fn derive_balance_history(
+    wallet: &str,
+    ledger_records: &[WalletLedgerRecord],
+) -> Vec<BalanceSnapshot> {
+    let mut grouped: HashMap<(String, String), Vec<&WalletLedgerRecord>> = HashMap::new();
+
+    for record in ledger_records {
+        let key = (record.asset_symbol.clone(), record.network.clone());
+        grouped.entry(key).or_default().push(record);
+    }
+
+    let mut snapshots = Vec::new();
+    let now = Utc::now();
+
+    for ((asset, network), mut entries) in grouped {
+        entries.sort_by_key(|e| e.timestamp);
+
+        let mut balance = BigDecimal::from(0);
+        for (i, entry) in entries.iter().enumerate() {
+            balance += &entry.amount;
+            snapshots.push(BalanceSnapshot {
+                id: deterministic_id(
+                    entry.raw_transaction_id.unwrap_or(Uuid::nil()),
+                    i as u32 + 10000,
+                ),
+                wallet_address: wallet.to_string(),
+                asset_symbol: asset.clone(),
+                network: network.clone(),
+                timestamp: entry.timestamp,
+                balance: balance.clone(),
+                tx_hash: entry.tx_hash.clone(),
+                dataset_version_id: entry.dataset_version_id,
+                created_at: now,
+            });
+        }
+    }
+
+    snapshots.sort_by_key(|s| s.timestamp);
+    snapshots
+}
+
+/// Build a `ForensicsActivity` summary from wallet_ledger records.
+pub fn build_forensics_activity(
+    wallet: &str,
+    ledger_records: &[WalletLedgerRecord],
+) -> spectraplex_core::materializer::ForensicsActivity {
+    use spectraplex_core::materializer::{
+        CounterpartySummary, ForensicsActivity, NetworkActivity, TypeBreakdown,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    let total_entries = ledger_records.len();
+
+    // Counterparty aggregation
+    struct CpAgg {
+        count: usize,
+        inflow: BigDecimal,
+        outflow: BigDecimal,
+        networks: HashSet<String>,
+    }
+    let mut cp_map: HashMap<String, CpAgg> = HashMap::new();
+    for record in ledger_records {
+        if let Some(ref cp) = record.counterparty_address {
+            let agg = cp_map.entry(cp.clone()).or_insert_with(|| CpAgg {
+                count: 0,
+                inflow: BigDecimal::from(0),
+                outflow: BigDecimal::from(0),
+                networks: HashSet::new(),
+            });
+            agg.count += 1;
+            if record.amount > BigDecimal::from(0) {
+                agg.inflow += &record.amount;
+            } else {
+                agg.outflow += record.amount.abs();
+            }
+            agg.networks.insert(record.network.clone());
+        }
+    }
+
+    let mut top_counterparties: Vec<CounterpartySummary> = cp_map
+        .into_iter()
+        .map(|(addr, agg)| CounterpartySummary {
+            address: addr,
+            interaction_count: agg.count,
+            total_inflow: agg.inflow,
+            total_outflow: agg.outflow,
+            networks: agg.networks.into_iter().collect(),
+        })
+        .collect();
+    top_counterparties.sort_by(|a, b| b.interaction_count.cmp(&a.interaction_count));
+    top_counterparties.truncate(20);
+
+    // Network activity
+    struct NetAgg {
+        count: usize,
+        assets: HashSet<String>,
+        counterparties: HashSet<String>,
+    }
+    let mut net_map: HashMap<String, NetAgg> = HashMap::new();
+    for record in ledger_records {
+        let agg = net_map
+            .entry(record.network.clone())
+            .or_insert_with(|| NetAgg {
+                count: 0,
+                assets: HashSet::new(),
+                counterparties: HashSet::new(),
+            });
+        agg.count += 1;
+        agg.assets.insert(record.asset_symbol.clone());
+        if let Some(ref cp) = record.counterparty_address {
+            agg.counterparties.insert(cp.clone());
+        }
+    }
+
+    let network_activity: Vec<NetworkActivity> = net_map
+        .into_iter()
+        .map(|(net, agg)| NetworkActivity {
+            network: net,
+            entry_count: agg.count,
+            unique_assets: agg.assets.len(),
+            unique_counterparties: agg.counterparties.len(),
+        })
+        .collect();
+
+    // Type breakdown
+    struct TypeAgg {
+        count: usize,
+        total: BigDecimal,
+    }
+    let mut type_map: HashMap<String, TypeAgg> = HashMap::new();
+    for record in ledger_records {
+        let agg = type_map
+            .entry(record.entry_type.clone())
+            .or_insert_with(|| TypeAgg {
+                count: 0,
+                total: BigDecimal::from(0),
+            });
+        agg.count += 1;
+        agg.total += record.amount.abs();
+    }
+
+    let type_breakdown: Vec<TypeBreakdown> = type_map
+        .into_iter()
+        .map(|(et, agg)| TypeBreakdown {
+            entry_type: et,
+            count: agg.count,
+            total_amount: agg.total,
+        })
+        .collect();
+
+    ForensicsActivity {
+        wallet_address: wallet.to_string(),
+        top_counterparties,
+        network_activity,
+        type_breakdown,
+        total_entries,
+    }
+}
+
+/// Wallet ledger materializer (cross-chain).
+pub struct WalletLedgerMaterializer;
+
+impl Materializer for WalletLedgerMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::WalletLedger
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:wallet_ledger_v1_e2a9c7b4"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Solana // primary, but works cross-chain
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description:
+                "Gold-tier wallet ledger with counterparty tracking, derived from Silver datasets"
+                    .to_string(),
+            source_bronze_tables: vec![
+                "token_transfers".to_string(),
+                "native_balance_deltas".to_string(),
+                "hl_fills".to_string(),
+                "hl_funding".to_string(),
+            ],
+            chain_families: vec![
+                ChainFamily::Solana,
+                ChainFamily::Evm,
+                ChainFamily::Hyperliquid,
+            ],
+        }
+    }
+}
+
+/// Balance history materializer (cross-chain).
+pub struct BalanceHistoryMaterializer;
+
+impl Materializer for BalanceHistoryMaterializer {
+    fn dataset_name(&self) -> DatasetName {
+        DatasetName::BalanceHistory
+    }
+
+    fn parser_version(&self) -> i32 {
+        1
+    }
+
+    fn parser_hash(&self) -> &str {
+        "sha256:balance_history_v1_f3b8d6a5"
+    }
+
+    fn chain_family(&self) -> ChainFamily {
+        ChainFamily::Solana
+    }
+
+    fn descriptor(&self) -> DatasetDescriptor {
+        DatasetDescriptor {
+            name: self.dataset_name(),
+            description:
+                "Gold-tier per-asset balance history snapshots derived from wallet_ledger records"
+                    .to_string(),
+            source_bronze_tables: vec!["wallet_ledger".to_string()],
+            chain_families: vec![
+                ChainFamily::Solana,
+                ChainFamily::Evm,
+                ChainFamily::Hyperliquid,
+            ],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use std::str::FromStr;
 
     // -- Test helpers --
@@ -1355,5 +1958,329 @@ mod tests {
             assert_eq!(v1.asset_symbol, v2.asset_symbol, "same asset_symbol");
             assert_eq!(v1.amount, v2.amount, "same amount");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // P5-W1: wallet_ledger derivation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wallet_ledger_from_token_transfer_incoming_has_counterparty() {
+        let wallet = "0xWallet1";
+        let transfers = vec![make_token_transfer("0xOther", "0xWallet1", "USDC", "100.5")];
+        let mut offset = 0;
+        let records = derive_wallet_ledger_from_token_transfers(
+            wallet,
+            "solana-mainnet",
+            "txhash1",
+            1700000000,
+            &transfers,
+            &mut offset,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].entry_type, "transfer");
+        assert_eq!(records[0].amount, BigDecimal::from_str("100.5").unwrap());
+        assert_eq!(records[0].counterparty_address, Some("0xOther".to_string()));
+        assert_eq!(records[0].network, "solana-mainnet");
+        assert_eq!(records[0].tx_hash, "txhash1");
+    }
+
+    #[test]
+    fn wallet_ledger_from_token_transfer_outgoing_has_counterparty() {
+        let wallet = "0xWallet1";
+        let transfers = vec![make_token_transfer(
+            "0xWallet1",
+            "0xReceiver",
+            "USDT",
+            "50.0",
+        )];
+        let mut offset = 0;
+        let records = derive_wallet_ledger_from_token_transfers(
+            wallet,
+            "ethereum-mainnet",
+            "txhash2",
+            1700000001,
+            &transfers,
+            &mut offset,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].amount, BigDecimal::from_str("-50.0").unwrap());
+        assert_eq!(
+            records[0].counterparty_address,
+            Some("0xReceiver".to_string())
+        );
+    }
+
+    #[test]
+    fn wallet_ledger_from_native_delta_fee() {
+        let wallet = "TestWallet";
+        let deltas = vec![make_native_delta(wallet, "SOL", "-0.005", true)];
+        let mut offset = 0;
+        let records = derive_wallet_ledger_from_native_balance_deltas(
+            wallet,
+            "solana-mainnet",
+            "txhash3",
+            1700000002,
+            &deltas,
+            &mut offset,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].entry_type, "fee");
+        assert_eq!(records[0].fee_asset, Some("SOL".to_string()));
+        assert!(records[0].fee_amount.is_some());
+    }
+
+    #[test]
+    fn wallet_ledger_from_hl_fill_with_fee_and_pnl() {
+        let wallet = "0xtest";
+        let fills = vec![make_hl_fill(
+            "ETH",
+            "A",
+            "3500.0",
+            "1.0",
+            Some("5.0"),
+            Some("100.0"),
+        )];
+        let mut offset = 0;
+        let records = derive_wallet_ledger_from_hl_fills(
+            wallet,
+            "hypercore-mainnet",
+            "txhash4",
+            1700000003,
+            &fills,
+            &mut offset,
+        );
+        // trade + fee + income
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].entry_type, "trade");
+        assert_eq!(records[0].amount, BigDecimal::from_str("-1.0").unwrap());
+        assert_eq!(records[1].entry_type, "fee");
+        assert_eq!(records[2].entry_type, "income");
+        assert_eq!(records[2].amount, BigDecimal::from_str("100.0").unwrap());
+    }
+
+    #[test]
+    fn wallet_ledger_from_hl_funding() {
+        let wallet = "0xtest";
+        let payments = vec![make_hl_funding("ETH", "-0.50")];
+        let mut offset = 0;
+        let records = derive_wallet_ledger_from_hl_funding(
+            wallet,
+            "hypercore-mainnet",
+            "txhash5",
+            1700000004,
+            &payments,
+            &mut offset,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].entry_type, "funding");
+        assert_eq!(records[0].amount, BigDecimal::from_str("-0.50").unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // P5-W1: balance_history derivation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn balance_history_computes_running_balance() {
+        let wallet = "0xWallet";
+        let records = vec![
+            WalletLedgerRecord {
+                id: Uuid::new_v4(),
+                raw_transaction_id: Some(Uuid::new_v4()),
+                wallet_address: wallet.to_string(),
+                network: "solana-mainnet".to_string(),
+                tx_hash: "tx1".to_string(),
+                timestamp: 1700000000,
+                entry_type: "transfer".to_string(),
+                asset_symbol: "SOL".to_string(),
+                amount: BigDecimal::from_str("10.0").unwrap(),
+                counterparty_address: None,
+                fee_amount: None,
+                fee_asset: None,
+                cost_basis: None,
+                proceeds: None,
+                dataset_version_id: None,
+                created_at: Utc::now(),
+            },
+            WalletLedgerRecord {
+                id: Uuid::new_v4(),
+                raw_transaction_id: Some(Uuid::new_v4()),
+                wallet_address: wallet.to_string(),
+                network: "solana-mainnet".to_string(),
+                tx_hash: "tx2".to_string(),
+                timestamp: 1700000001,
+                entry_type: "transfer".to_string(),
+                asset_symbol: "SOL".to_string(),
+                amount: BigDecimal::from_str("-3.0").unwrap(),
+                counterparty_address: None,
+                fee_amount: None,
+                fee_asset: None,
+                cost_basis: None,
+                proceeds: None,
+                dataset_version_id: None,
+                created_at: Utc::now(),
+            },
+        ];
+
+        let snapshots = derive_balance_history(wallet, &records);
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].balance, BigDecimal::from_str("10.0").unwrap());
+        assert_eq!(snapshots[1].balance, BigDecimal::from_str("7.0").unwrap());
+    }
+
+    #[test]
+    fn balance_history_multiple_assets() {
+        let wallet = "0xWallet";
+        let records = vec![
+            WalletLedgerRecord {
+                id: Uuid::new_v4(),
+                raw_transaction_id: Some(Uuid::new_v4()),
+                wallet_address: wallet.to_string(),
+                network: "solana-mainnet".to_string(),
+                tx_hash: "tx1".to_string(),
+                timestamp: 1700000000,
+                entry_type: "transfer".to_string(),
+                asset_symbol: "SOL".to_string(),
+                amount: BigDecimal::from_str("10.0").unwrap(),
+                counterparty_address: None,
+                fee_amount: None,
+                fee_asset: None,
+                cost_basis: None,
+                proceeds: None,
+                dataset_version_id: None,
+                created_at: Utc::now(),
+            },
+            WalletLedgerRecord {
+                id: Uuid::new_v4(),
+                raw_transaction_id: Some(Uuid::new_v4()),
+                wallet_address: wallet.to_string(),
+                network: "solana-mainnet".to_string(),
+                tx_hash: "tx2".to_string(),
+                timestamp: 1700000001,
+                entry_type: "transfer".to_string(),
+                asset_symbol: "USDC".to_string(),
+                amount: BigDecimal::from_str("500.0").unwrap(),
+                counterparty_address: None,
+                fee_amount: None,
+                fee_asset: None,
+                cost_basis: None,
+                proceeds: None,
+                dataset_version_id: None,
+                created_at: Utc::now(),
+            },
+        ];
+
+        let snapshots = derive_balance_history(wallet, &records);
+        assert_eq!(snapshots.len(), 2);
+        let sol_snap: Vec<_> = snapshots
+            .iter()
+            .filter(|s| s.asset_symbol == "SOL")
+            .collect();
+        let usdc_snap: Vec<_> = snapshots
+            .iter()
+            .filter(|s| s.asset_symbol == "USDC")
+            .collect();
+        assert_eq!(sol_snap.len(), 1);
+        assert_eq!(usdc_snap.len(), 1);
+        assert_eq!(sol_snap[0].balance, BigDecimal::from_str("10.0").unwrap());
+        assert_eq!(usdc_snap[0].balance, BigDecimal::from_str("500.0").unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // P5-W1: forensics activity tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn forensics_activity_top_counterparties() {
+        let wallet = "0xWallet";
+        let records = vec![
+            WalletLedgerRecord {
+                id: Uuid::new_v4(),
+                raw_transaction_id: Some(Uuid::new_v4()),
+                wallet_address: wallet.to_string(),
+                network: "solana-mainnet".to_string(),
+                tx_hash: "tx1".to_string(),
+                timestamp: 1700000000,
+                entry_type: "transfer".to_string(),
+                asset_symbol: "USDC".to_string(),
+                amount: BigDecimal::from_str("100.0").unwrap(),
+                counterparty_address: Some("0xAlice".to_string()),
+                fee_amount: None,
+                fee_asset: None,
+                cost_basis: None,
+                proceeds: None,
+                dataset_version_id: None,
+                created_at: Utc::now(),
+            },
+            WalletLedgerRecord {
+                id: Uuid::new_v4(),
+                raw_transaction_id: Some(Uuid::new_v4()),
+                wallet_address: wallet.to_string(),
+                network: "solana-mainnet".to_string(),
+                tx_hash: "tx2".to_string(),
+                timestamp: 1700000001,
+                entry_type: "transfer".to_string(),
+                asset_symbol: "USDC".to_string(),
+                amount: BigDecimal::from_str("-50.0").unwrap(),
+                counterparty_address: Some("0xAlice".to_string()),
+                fee_amount: None,
+                fee_asset: None,
+                cost_basis: None,
+                proceeds: None,
+                dataset_version_id: None,
+                created_at: Utc::now(),
+            },
+            WalletLedgerRecord {
+                id: Uuid::new_v4(),
+                raw_transaction_id: Some(Uuid::new_v4()),
+                wallet_address: wallet.to_string(),
+                network: "ethereum-mainnet".to_string(),
+                tx_hash: "tx3".to_string(),
+                timestamp: 1700000002,
+                entry_type: "transfer".to_string(),
+                asset_symbol: "ETH".to_string(),
+                amount: BigDecimal::from_str("1.0").unwrap(),
+                counterparty_address: Some("0xBob".to_string()),
+                fee_amount: None,
+                fee_asset: None,
+                cost_basis: None,
+                proceeds: None,
+                dataset_version_id: None,
+                created_at: Utc::now(),
+            },
+        ];
+
+        let activity = build_forensics_activity(wallet, &records);
+        assert_eq!(activity.total_entries, 3);
+        assert_eq!(activity.top_counterparties.len(), 2);
+        // Alice has 2 interactions, Bob has 1
+        assert_eq!(activity.top_counterparties[0].address, "0xAlice");
+        assert_eq!(activity.top_counterparties[0].interaction_count, 2);
+        assert_eq!(activity.network_activity.len(), 2);
+        assert_eq!(activity.type_breakdown.len(), 1);
+        assert_eq!(activity.type_breakdown[0].entry_type, "transfer");
+    }
+
+    #[test]
+    fn derive_all_wallet_ledger_solana() {
+        let wallet = "0xWallet";
+        let records = SilverRecords {
+            token_transfers: vec![make_token_transfer("0xOther", "0xWallet", "USDC", "100.0")],
+            native_balance_deltas: vec![make_native_delta("0xWallet", "SOL", "-0.005", true)],
+            ..Default::default()
+        };
+        let entries = derive_all_wallet_ledger_entries(
+            Chain::Solana,
+            wallet,
+            "solana-mainnet",
+            "txhash",
+            1700000000,
+            &records,
+        );
+        // 1 native delta (fee) + 1 token transfer
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| e.entry_type == "fee"));
+        assert!(entries.iter().any(|e| e.entry_type == "transfer"));
     }
 }

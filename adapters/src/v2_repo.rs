@@ -5,8 +5,8 @@
 
 use chrono::{DateTime, Utc};
 use spectraplex_core::materializer::{
-    DecodedEvent, HlFillRecord, HlFundingPayment, HlPositionChange, NativeBalanceDelta,
-    TokenTransfer,
+    BalanceSnapshot, DecodedEvent, HlFillRecord, HlFundingPayment, HlPositionChange,
+    NativeBalanceDelta, TokenTransfer, WalletLedgerRecord,
 };
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
@@ -903,6 +903,41 @@ fn row_to_dataset_completeness(row: &sqlx::postgres::PgRow) -> anyhow::Result<Da
         notes: row.try_get("notes")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn row_to_wallet_ledger_record(row: &sqlx::postgres::PgRow) -> anyhow::Result<WalletLedgerRecord> {
+    Ok(WalletLedgerRecord {
+        id: row.try_get("id")?,
+        raw_transaction_id: row.try_get("raw_transaction_id")?,
+        wallet_address: row.try_get("wallet_address")?,
+        network: row.try_get("network")?,
+        tx_hash: row.try_get("tx_hash")?,
+        timestamp: row.try_get("timestamp")?,
+        entry_type: row.try_get("entry_type")?,
+        asset_symbol: row.try_get("asset_symbol")?,
+        amount: row.try_get("amount")?,
+        counterparty_address: row.try_get("counterparty_address")?,
+        fee_amount: row.try_get("fee_amount")?,
+        fee_asset: row.try_get("fee_asset")?,
+        cost_basis: row.try_get("cost_basis")?,
+        proceeds: row.try_get("proceeds")?,
+        dataset_version_id: row.try_get("dataset_version_id")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn row_to_balance_snapshot(row: &sqlx::postgres::PgRow) -> anyhow::Result<BalanceSnapshot> {
+    Ok(BalanceSnapshot {
+        id: row.try_get("id")?,
+        wallet_address: row.try_get("wallet_address")?,
+        asset_symbol: row.try_get("asset_symbol")?,
+        network: row.try_get("network")?,
+        timestamp: row.try_get("timestamp")?,
+        balance: row.try_get("balance")?,
+        tx_hash: row.try_get("tx_hash")?,
+        dataset_version_id: row.try_get("dataset_version_id")?,
+        created_at: row.try_get("created_at")?,
     })
 }
 
@@ -2299,6 +2334,105 @@ impl Repository {
         .await?;
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Gold-tier: wallet_ledger and balance_history (P5-W1)
+    // -----------------------------------------------------------------------
+
+    /// Query wallet_ledger records with optional wallet, network, and time-window filters.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_wallet_ledger_records(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<WalletLedgerRecord>> {
+        let cols = "dt.id, dt.raw_transaction_id, dt.wallet_address, dt.network, dt.tx_hash, \
+                    dt.timestamp, dt.entry_type, dt.asset_symbol, dt.amount, dt.counterparty_address, \
+                    dt.fee_amount, dt.fee_asset, dt.cost_basis, dt.proceeds, dt.dataset_version_id, dt.created_at";
+        let (sql, args) = build_dataset_filter_query(
+            cols,
+            "wallet_ledger",
+            "dt.timestamp",
+            target_id,
+            network,
+            time_start,
+            time_end,
+            limit,
+            offset,
+        )?;
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_wallet_ledger_record).collect()
+    }
+
+    /// Query wallet_ledger for export with a high record limit.
+    pub async fn export_wallet_ledger_records(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+    ) -> anyhow::Result<Vec<WalletLedgerRecord>> {
+        self.query_wallet_ledger_records(
+            target_id,
+            network,
+            time_start,
+            time_end,
+            Self::EXPORT_MAX_RECORDS,
+            0,
+        )
+        .await
+    }
+
+    /// Query balance_history records with optional wallet, network, and time-window filters.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_balance_snapshots(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<BalanceSnapshot>> {
+        let cols = "dt.id, dt.wallet_address, dt.asset_symbol, dt.network, dt.timestamp, \
+                    dt.balance, dt.tx_hash, dt.dataset_version_id, dt.created_at";
+        let (sql, args) = build_dataset_filter_query(
+            cols,
+            "balance_history",
+            "dt.timestamp",
+            target_id,
+            network,
+            time_start,
+            time_end,
+            limit,
+            offset,
+        )?;
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_balance_snapshot).collect()
+    }
+
+    /// Query balance_history for export with a high record limit.
+    pub async fn export_balance_snapshots(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+    ) -> anyhow::Result<Vec<BalanceSnapshot>> {
+        self.query_balance_snapshots(
+            target_id,
+            network,
+            time_start,
+            time_end,
+            Self::EXPORT_MAX_RECORDS,
+            0,
+        )
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3400,6 +3534,97 @@ mod tests {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
             _assert_send(repo.query_hl_position_changes(None, None, None, None, 50, 0));
+        }
+        let _ = _check;
+    }
+
+    // -- P5-W1: wallet_ledger and balance_history query builders --
+
+    #[test]
+    fn wallet_ledger_query_builder_basic() {
+        let (sql, _) = build_dataset_filter_query(
+            "dt.*",
+            "wallet_ledger",
+            "dt.timestamp",
+            None,
+            None,
+            None,
+            None,
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(sql.contains("wallet_ledger"));
+        assert!(sql.contains("ORDER BY dt.timestamp DESC"));
+    }
+
+    #[test]
+    fn wallet_ledger_query_builder_with_target() {
+        let tid = Uuid::new_v4();
+        let (sql, _) = build_dataset_filter_query(
+            "dt.*",
+            "wallet_ledger",
+            "dt.timestamp",
+            Some(tid),
+            None,
+            None,
+            None,
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(sql.contains("JOIN target_matches"));
+        assert!(sql.contains("tm.target_id"));
+    }
+
+    #[test]
+    fn balance_history_query_builder_basic() {
+        let (sql, _) = build_dataset_filter_query(
+            "dt.*",
+            "balance_history",
+            "dt.timestamp",
+            None,
+            None,
+            None,
+            None,
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(sql.contains("balance_history"));
+    }
+
+    #[test]
+    fn balance_history_query_builder_with_network() {
+        let (sql, _) = build_dataset_filter_query(
+            "dt.*",
+            "balance_history",
+            "dt.timestamp",
+            None,
+            Some("solana-mainnet"),
+            None,
+            None,
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(sql.contains("dt.network"));
+    }
+
+    #[test]
+    fn repo_query_wallet_ledger_records_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.query_wallet_ledger_records(None, None, None, None, 50, 0));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_query_balance_snapshots_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.query_balance_snapshots(None, None, None, None, 50, 0));
         }
         let _ = _check;
     }

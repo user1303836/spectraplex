@@ -21,7 +21,8 @@ use spectraplex_adapters::{
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::connector::validate_target;
 use spectraplex_core::materializer::{
-    DatasetName, DeliveryMetadata, DeliveryReceipt, ExportFormat, ExportSink, SinkConfig, SinkType,
+    BalanceSnapshot, DatasetName, DeliveryMetadata, DeliveryReceipt, ExportFormat, ExportSink,
+    ForensicsActivity, SinkConfig, SinkType, WalletLedgerRecord,
 };
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
 use spectraplex_core::v2::{
@@ -302,6 +303,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/export/dataset", post(create_export_job))
         .route("/v1/export/jobs/{job_id}", get(get_export_job_status))
         .route("/v1/export/jobs/{job_id}/download", get(download_export))
+        .route("/v1/export/tax", get(tax_export))
+        .route("/v1/forensics/activity", get(forensics_activity_handler))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared_state),
             require_auth,
@@ -1570,7 +1573,8 @@ async fn get_network(
 // Dataset query handlers (P4-W1)
 // ---------------------------------------------------------------------------
 
-/// The six Silver datasets queryable via the /v1/datasets/{name}/records endpoint.
+/// Datasets queryable via the /v1/datasets/{name}/records endpoint.
+/// Includes the six Silver datasets plus two Gold datasets (P5-W1).
 const QUERYABLE_DATASETS: &[&str] = &[
     "token_transfers",
     "native_balance_deltas",
@@ -1578,6 +1582,8 @@ const QUERYABLE_DATASETS: &[&str] = &[
     "hl_fills",
     "hl_funding",
     "positions",
+    "wallet_ledger",
+    "balance_history",
 ];
 
 fn validate_dataset_name(name: &str) -> Result<(), AppError> {
@@ -1734,6 +1740,36 @@ async fn query_dataset_records(
                 .map_err(AppError::internal)?;
             serde_json::to_value(&records).map_err(AppError::internal)?
         }
+        "wallet_ledger" => {
+            let records = state
+                .repo
+                .query_wallet_ledger_records(
+                    params.target_id,
+                    net,
+                    params.time_start,
+                    params.time_end,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(AppError::internal)?;
+            serde_json::to_value(&records).map_err(AppError::internal)?
+        }
+        "balance_history" => {
+            let records = state
+                .repo
+                .query_balance_snapshots(
+                    params.target_id,
+                    net,
+                    params.time_start,
+                    params.time_end,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(AppError::internal)?;
+            serde_json::to_value(&records).map_err(AppError::internal)?
+        }
         _ => unreachable!("dataset name validated above"),
     };
 
@@ -1745,6 +1781,7 @@ async fn query_dataset_records(
 // ---------------------------------------------------------------------------
 
 /// Datasets that support export via the /v1/export/dataset endpoint.
+/// Includes Silver datasets plus Gold datasets (P5-W1).
 const EXPORTABLE_DATASETS: &[&str] = &[
     "token_transfers",
     "native_balance_deltas",
@@ -1752,6 +1789,8 @@ const EXPORTABLE_DATASETS: &[&str] = &[
     "hl_fills",
     "hl_funding",
     "positions",
+    "wallet_ledger",
+    "balance_history",
 ];
 
 fn content_type_for_format(format: ExportFormat) -> &'static str {
@@ -1936,6 +1975,142 @@ fn hl_positions_to_csv(records: &[spectraplex_core::materializer::HlPositionChan
                 .map(|u| u.to_string())
                 .unwrap_or_default(),
             r.created_at.to_rfc3339(),
+        ));
+    }
+    buf.into_bytes()
+}
+
+fn wallet_ledger_to_csv(records: &[WalletLedgerRecord]) -> Vec<u8> {
+    let mut buf = String::from(
+        "id,raw_transaction_id,wallet_address,network,tx_hash,timestamp,entry_type,asset_symbol,amount,counterparty_address,fee_amount,fee_asset,cost_basis,proceeds,dataset_version_id,created_at\n",
+    );
+    for r in records {
+        buf.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            r.id,
+            r.raw_transaction_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            csv_escape(&r.wallet_address),
+            csv_escape(&r.network),
+            csv_escape(&r.tx_hash),
+            r.timestamp,
+            csv_escape(&r.entry_type),
+            csv_escape(&r.asset_symbol),
+            r.amount,
+            r.counterparty_address.as_deref().unwrap_or(""),
+            r.fee_amount
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            r.fee_asset.as_deref().unwrap_or(""),
+            r.cost_basis
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            r.proceeds
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            r.dataset_version_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            r.created_at.to_rfc3339(),
+        ));
+    }
+    buf.into_bytes()
+}
+
+fn balance_history_to_csv(records: &[BalanceSnapshot]) -> Vec<u8> {
+    let mut buf = String::from(
+        "id,wallet_address,asset_symbol,network,timestamp,balance,tx_hash,dataset_version_id,created_at\n",
+    );
+    for r in records {
+        buf.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{}\n",
+            r.id,
+            csv_escape(&r.wallet_address),
+            csv_escape(&r.asset_symbol),
+            csv_escape(&r.network),
+            r.timestamp,
+            r.balance,
+            csv_escape(&r.tx_hash),
+            r.dataset_version_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            r.created_at.to_rfc3339(),
+        ));
+    }
+    buf.into_bytes()
+}
+
+/// Generate tax-export-friendly CSV from wallet_ledger records.
+///
+/// Columns: Date,Type,Sent_Asset,Sent_Amount,Received_Asset,Received_Amount,
+///          Fee_Asset,Fee_Amount,Cost_Basis,Proceeds,Gain_Loss,Tx_Hash,Network
+fn wallet_ledger_to_tax_csv(records: &[WalletLedgerRecord]) -> Vec<u8> {
+    let mut buf = String::from(
+        "Date,Type,Sent_Asset,Sent_Amount,Received_Asset,Received_Amount,Fee_Asset,Fee_Amount,Cost_Basis,Proceeds,Gain_Loss,Tx_Hash,Network\n",
+    );
+    for r in records {
+        let date = chrono::DateTime::from_timestamp(r.timestamp, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| r.timestamp.to_string());
+
+        let (sent_asset, sent_amount, recv_asset, recv_amount) = if r.amount < BigDecimal::from(0) {
+            (
+                r.asset_symbol.as_str(),
+                r.amount.abs().to_string(),
+                "",
+                String::new(),
+            )
+        } else {
+            (
+                "",
+                String::new(),
+                r.asset_symbol.as_str(),
+                r.amount.to_string(),
+            )
+        };
+
+        let fee_asset = r.fee_asset.as_deref().unwrap_or("");
+        let fee_amount = r
+            .fee_amount
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let cost_basis = r
+            .cost_basis
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let proceeds = r
+            .proceeds
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+
+        // Gain/Loss computed from cost_basis and proceeds when both available
+        let gain_loss = match (&r.proceeds, &r.cost_basis) {
+            (Some(p), Some(c)) => (p - c).to_string(),
+            _ => String::new(),
+        };
+
+        buf.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            csv_escape(&date),
+            csv_escape(&r.entry_type),
+            csv_escape(sent_asset),
+            sent_amount,
+            csv_escape(recv_asset),
+            recv_amount,
+            csv_escape(fee_asset),
+            fee_amount,
+            cost_basis,
+            proceeds,
+            gain_loss,
+            csv_escape(&r.tx_hash),
+            csv_escape(&r.network),
         ));
     }
     buf.into_bytes()
@@ -2314,6 +2489,32 @@ async fn run_export_job(
             };
             Ok((body, count, meta))
         }
+        "wallet_ledger" => {
+            let records = repo
+                .export_wallet_ledger_records(target_id, network, time_start, time_end)
+                .await?;
+            let count = records.len();
+            let body = match format {
+                ExportFormat::Jsonl => {
+                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
+                }
+                ExportFormat::Csv => wallet_ledger_to_csv(&records),
+            };
+            Ok((body, count, meta))
+        }
+        "balance_history" => {
+            let records = repo
+                .export_balance_snapshots(target_id, network, time_start, time_end)
+                .await?;
+            let count = records.len();
+            let body = match format {
+                ExportFormat::Jsonl => {
+                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
+                }
+                ExportFormat::Csv => balance_history_to_csv(&records),
+            };
+            Ok((body, count, meta))
+        }
         _ => Err(anyhow::anyhow!("Unknown dataset: {dataset}")),
     }
 }
@@ -2379,6 +2580,97 @@ async fn download_export(
             entry.status.message.as_deref().unwrap_or("unknown error")
         ))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tax export and forensics endpoints (P5-W1)
+// ---------------------------------------------------------------------------
+
+/// Query parameters for the tax export endpoint.
+#[derive(Debug, Deserialize)]
+struct TaxExportParams {
+    target_id: Option<Uuid>,
+    network: Option<String>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
+}
+
+/// GET /v1/export/tax — export wallet_ledger in tax-software-friendly CSV.
+async fn tax_export(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<TaxExportParams>,
+) -> Result<Response, AppError> {
+    validate_date_range(params.time_start, params.time_end)?;
+
+    let records = state
+        .repo
+        .export_wallet_ledger_records(
+            params.target_id,
+            params.network.as_deref(),
+            params.time_start,
+            params.time_end,
+        )
+        .await
+        .map_err(AppError::internal)?;
+
+    let csv_bytes = wallet_ledger_to_tax_csv(&records);
+    let disposition = "attachment; filename=\"spectraplex-tax-export.csv\"";
+
+    let mut response = (StatusCode::OK, csv_bytes).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::header::HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        axum::http::header::HeaderValue::from_static(disposition),
+    );
+    Ok(response)
+}
+
+/// Query parameters for the forensics activity endpoint.
+#[derive(Debug, Deserialize)]
+struct ForensicsParams {
+    target_id: Option<Uuid>,
+    network: Option<String>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
+}
+
+/// GET /v1/forensics/activity — wallet interaction analysis from wallet_ledger.
+async fn forensics_activity_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ForensicsParams>,
+) -> Result<Json<ForensicsActivity>, AppError> {
+    validate_date_range(params.time_start, params.time_end)?;
+
+    let records = state
+        .repo
+        .export_wallet_ledger_records(
+            params.target_id,
+            params.network.as_deref(),
+            params.time_start,
+            params.time_end,
+        )
+        .await
+        .map_err(AppError::internal)?;
+
+    if records.is_empty() {
+        return Ok(Json(ForensicsActivity {
+            wallet_address: String::new(),
+            top_counterparties: vec![],
+            network_activity: vec![],
+            type_breakdown: vec![],
+            total_entries: 0,
+        }));
+    }
+
+    let wallet = records[0].wallet_address.clone();
+    let activity =
+        spectraplex_adapters::ledger_derivation::build_forensics_activity(&wallet, &records);
+
+    Ok(Json(activity))
 }
 
 async fn get_dataset_completeness_handler(
@@ -2572,6 +2864,8 @@ mod tests {
             .route("/v1/export/dataset", post(create_export_job))
             .route("/v1/export/jobs/{job_id}", get(get_export_job_status))
             .route("/v1/export/jobs/{job_id}/download", get(download_export))
+            .route("/v1/export/tax", get(tax_export))
+            .route("/v1/forensics/activity", get(forensics_activity_handler))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_auth,
@@ -4562,7 +4856,7 @@ mod tests {
 
     #[test]
     fn test_queryable_datasets_count() {
-        assert_eq!(QUERYABLE_DATASETS.len(), 6);
+        assert_eq!(QUERYABLE_DATASETS.len(), 8);
     }
 
     #[test]
@@ -4573,6 +4867,8 @@ mod tests {
         assert!(QUERYABLE_DATASETS.contains(&"hl_fills"));
         assert!(QUERYABLE_DATASETS.contains(&"hl_funding"));
         assert!(QUERYABLE_DATASETS.contains(&"positions"));
+        assert!(QUERYABLE_DATASETS.contains(&"wallet_ledger"));
+        assert!(QUERYABLE_DATASETS.contains(&"balance_history"));
     }
 
     #[test]
@@ -5210,7 +5506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_export_all_six_datasets_accepted() {
+    async fn test_export_all_datasets_accepted() {
         for dataset in EXPORTABLE_DATASETS {
             let app = test_router();
             let req = axum::http::Request::builder()
@@ -6237,5 +6533,251 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── P5-W1: Wallet / Tax / Forensics Pack tests ─────────────────────
+
+    #[test]
+    fn test_wallet_ledger_in_queryable_datasets() {
+        assert!(QUERYABLE_DATASETS.contains(&"wallet_ledger"));
+    }
+
+    #[test]
+    fn test_balance_history_in_queryable_datasets() {
+        assert!(QUERYABLE_DATASETS.contains(&"balance_history"));
+    }
+
+    #[test]
+    fn test_wallet_ledger_in_exportable_datasets() {
+        assert!(EXPORTABLE_DATASETS.contains(&"wallet_ledger"));
+    }
+
+    #[test]
+    fn test_balance_history_in_exportable_datasets() {
+        assert!(EXPORTABLE_DATASETS.contains(&"balance_history"));
+    }
+
+    #[tokio::test]
+    async fn test_wallet_ledger_records_endpoint_routed() {
+        assert_get_routed(test_router(), "/v1/datasets/wallet_ledger/records").await;
+    }
+
+    #[tokio::test]
+    async fn test_balance_history_records_endpoint_routed() {
+        assert_get_routed(test_router(), "/v1/datasets/balance_history/records").await;
+    }
+
+    #[tokio::test]
+    async fn test_tax_export_endpoint_routed() {
+        assert_get_routed(test_router(), "/v1/export/tax").await;
+    }
+
+    #[tokio::test]
+    async fn test_forensics_activity_endpoint_routed() {
+        assert_get_routed(test_router(), "/v1/export/tax").await;
+    }
+
+    #[tokio::test]
+    async fn test_tax_export_requires_auth() {
+        assert_get_requires_auth(test_router(), "/v1/export/tax").await;
+    }
+
+    #[tokio::test]
+    async fn test_forensics_activity_requires_auth() {
+        assert_get_requires_auth(test_router(), "/v1/forensics/activity").await;
+    }
+
+    #[test]
+    fn test_wallet_ledger_to_csv_format() {
+        let records = vec![WalletLedgerRecord {
+            id: Uuid::nil(),
+            raw_transaction_id: None,
+            wallet_address: "0xWallet".to_string(),
+            network: "solana-mainnet".to_string(),
+            tx_hash: "abc123".to_string(),
+            timestamp: 1700000000,
+            entry_type: "transfer".to_string(),
+            asset_symbol: "USDC".to_string(),
+            amount: bigdecimal::BigDecimal::from(100),
+            counterparty_address: Some("0xOther".to_string()),
+            fee_amount: None,
+            fee_asset: None,
+            cost_basis: None,
+            proceeds: None,
+            dataset_version_id: None,
+            created_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
+        }];
+        let csv = wallet_ledger_to_csv(&records);
+        let output = String::from_utf8(csv).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2); // header + 1 row
+        assert!(lines[0].contains("counterparty_address"));
+        assert!(lines[1].contains("0xOther"));
+    }
+
+    #[test]
+    fn test_wallet_ledger_to_tax_csv_format() {
+        let records = vec![WalletLedgerRecord {
+            id: Uuid::nil(),
+            raw_transaction_id: None,
+            wallet_address: "0xWallet".to_string(),
+            network: "solana-mainnet".to_string(),
+            tx_hash: "abc123".to_string(),
+            timestamp: 1700000000,
+            entry_type: "transfer".to_string(),
+            asset_symbol: "USDC".to_string(),
+            amount: bigdecimal::BigDecimal::from(-50),
+            counterparty_address: Some("0xOther".to_string()),
+            fee_amount: Some(bigdecimal::BigDecimal::from(1)),
+            fee_asset: Some("SOL".to_string()),
+            cost_basis: None,
+            proceeds: None,
+            dataset_version_id: None,
+            created_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
+        }];
+        let csv = wallet_ledger_to_tax_csv(&records);
+        let output = String::from_utf8(csv).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2); // header + 1 row
+                                    // Check expected tax CSV columns
+        let header = lines[0];
+        assert!(header.starts_with("Date,Type,Sent_Asset,Sent_Amount,Received_Asset,Received_Amount,Fee_Asset,Fee_Amount,Cost_Basis,Proceeds,Gain_Loss,Tx_Hash,Network"));
+        // Check that outgoing amounts go into Sent columns
+        let row = lines[1];
+        assert!(row.contains("USDC")); // sent asset
+        assert!(row.contains("50")); // sent amount (absolute)
+        assert!(row.contains("SOL")); // fee asset
+        assert!(row.contains("abc123")); // tx hash
+    }
+
+    #[test]
+    fn test_tax_csv_gain_loss_computed() {
+        let records = vec![WalletLedgerRecord {
+            id: Uuid::nil(),
+            raw_transaction_id: None,
+            wallet_address: "0xWallet".to_string(),
+            network: "ethereum-mainnet".to_string(),
+            tx_hash: "0xdeadbeef".to_string(),
+            timestamp: 1700000000,
+            entry_type: "trade".to_string(),
+            asset_symbol: "ETH".to_string(),
+            amount: bigdecimal::BigDecimal::from(-1),
+            counterparty_address: None,
+            fee_amount: None,
+            fee_asset: None,
+            cost_basis: Some(bigdecimal::BigDecimal::from(3000)),
+            proceeds: Some(bigdecimal::BigDecimal::from(3500)),
+            dataset_version_id: None,
+            created_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
+        }];
+        let csv = wallet_ledger_to_tax_csv(&records);
+        let output = String::from_utf8(csv).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        // Gain/Loss should be proceeds - cost_basis = 500
+        assert!(lines[1].contains("500"));
+    }
+
+    #[test]
+    fn test_balance_history_to_csv_format() {
+        let records = vec![BalanceSnapshot {
+            id: Uuid::nil(),
+            wallet_address: "0xWallet".to_string(),
+            asset_symbol: "SOL".to_string(),
+            network: "solana-mainnet".to_string(),
+            timestamp: 1700000000,
+            balance: bigdecimal::BigDecimal::from(42),
+            tx_hash: "txhash1".to_string(),
+            dataset_version_id: None,
+            created_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
+        }];
+        let csv = balance_history_to_csv(&records);
+        let output = String::from_utf8(csv).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("balance"));
+        assert!(lines[1].contains("42"));
+    }
+
+    #[test]
+    fn test_exportable_datasets_includes_gold() {
+        assert_eq!(EXPORTABLE_DATASETS.len(), 8);
+        assert!(EXPORTABLE_DATASETS.contains(&"wallet_ledger"));
+        assert!(EXPORTABLE_DATASETS.contains(&"balance_history"));
+    }
+
+    #[tokio::test]
+    async fn test_wallet_ledger_export_accepted() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "wallet_ledger"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "wallet_ledger export should be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_balance_history_export_accepted() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "balance_history"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "balance_history export should be accepted"
+        );
+    }
+
+    // Verify P4-W5 compatibility — existing wallet endpoints still routed
+    #[tokio::test]
+    async fn p5w1_compat_existing_wallet_endpoints_still_routed() {
+        let wallet_uris = vec![
+            "/v1/transactions/SomeWallet123",
+            "/v1/ledger/SomeWallet123",
+            "/v1/export/SomeWallet123",
+            "/v1/balances/SomeWallet123",
+            "/v1/stats/SomeWallet123",
+        ];
+        for uri in wallet_uris {
+            assert_get_routed(test_router(), uri).await;
+        }
+    }
+
+    // Verify existing dataset endpoints remain functional
+    #[tokio::test]
+    async fn p5w1_compat_existing_dataset_endpoints_still_routed() {
+        let dataset_uris = vec![
+            "/v1/datasets",
+            "/v1/datasets/token_transfers/versions",
+            "/v1/datasets/token_transfers/records",
+            "/v1/datasets/token_transfers/completeness",
+            "/v1/datasets/token_transfers/status",
+        ];
+        for uri in dataset_uris {
+            assert_get_routed(test_router(), uri).await;
+        }
     }
 }
