@@ -5877,4 +5877,365 @@ mod tests {
         assert_eq!(json["versions"].as_array().unwrap().len(), 0);
         assert_eq!(json["completeness"].as_array().unwrap().len(), 0);
     }
+
+    // ── Compatibility verification tests ──────────────────────────────
+    //
+    // These tests verify that all wallet-scoped and dataset-centric API
+    // endpoints are routed, return expected response shapes, and share
+    // the same authentication/authorization behavior.
+
+    /// Helper: send a GET request without auth and assert 401.
+    async fn assert_get_requires_auth(app: Router, uri: &str) {
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "GET {} should require auth",
+            uri
+        );
+    }
+
+    /// Helper: send a POST request without auth and assert 401.
+    async fn assert_post_requires_auth(app: Router, uri: &str) {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "POST {} should require auth",
+            uri
+        );
+    }
+
+    /// Helper: send an authenticated GET and assert it does NOT return 401 or 404.
+    async fn assert_get_routed(app: Router, uri: &str) {
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        // The route must exist (not 404 from router-level mismatch) and must
+        // have passed auth (not 401). DB-dependent endpoints will return 500
+        // because the test DB is not real, which is expected.
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "GET {} should be routed (got 404)",
+            uri
+        );
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "GET {} should pass auth (got 401)",
+            uri
+        );
+    }
+
+    /// Helper: send an authenticated POST and assert it does NOT return 401 or 404.
+    async fn assert_post_routed(app: Router, uri: &str, body: &str) {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "POST {} should be routed (got 404)",
+            uri
+        );
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "POST {} should pass auth (got 401)",
+            uri
+        );
+    }
+
+    // ── Wallet endpoint routing verification ──────────────────────────
+
+    #[tokio::test]
+    async fn compat_wallet_transactions_routed() {
+        assert_get_routed(test_router(), "/v1/transactions/SomeWallet123").await;
+    }
+
+    #[tokio::test]
+    async fn compat_wallet_single_transaction_routed() {
+        assert_get_routed(test_router(), "/v1/transactions/SomeWallet123/0xdeadbeef").await;
+    }
+
+    #[tokio::test]
+    async fn compat_wallet_ledger_routed() {
+        assert_get_routed(test_router(), "/v1/ledger/SomeWallet123").await;
+    }
+
+    #[tokio::test]
+    async fn compat_wallet_export_routed() {
+        assert_get_routed(test_router(), "/v1/export/SomeWallet123").await;
+    }
+
+    #[tokio::test]
+    async fn compat_wallet_balances_routed() {
+        assert_get_routed(test_router(), "/v1/balances/SomeWallet123").await;
+    }
+
+    #[tokio::test]
+    async fn compat_wallet_stats_routed() {
+        assert_get_routed(test_router(), "/v1/stats/SomeWallet123").await;
+    }
+
+    // ── Dataset endpoint routing verification ─────────────────────────
+
+    #[tokio::test]
+    async fn compat_datasets_list_routed() {
+        assert_get_routed(test_router(), "/v1/datasets").await;
+    }
+
+    #[tokio::test]
+    async fn compat_datasets_versions_routed() {
+        assert_get_routed(test_router(), "/v1/datasets/token_transfers/versions").await;
+    }
+
+    #[tokio::test]
+    async fn compat_datasets_records_routed() {
+        assert_get_routed(test_router(), "/v1/datasets/token_transfers/records").await;
+    }
+
+    #[tokio::test]
+    async fn compat_datasets_completeness_routed() {
+        assert_get_routed(test_router(), "/v1/datasets/token_transfers/completeness").await;
+    }
+
+    #[tokio::test]
+    async fn compat_datasets_status_routed() {
+        assert_get_routed(test_router(), "/v1/datasets/token_transfers/status").await;
+    }
+
+    #[tokio::test]
+    async fn compat_export_dataset_routed() {
+        assert_post_routed(
+            test_router(),
+            "/v1/export/dataset",
+            r#"{"dataset":"token_transfers","format":"jsonl"}"#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn compat_export_job_status_routed() {
+        let job_id = Uuid::new_v4();
+        // Export job not found returns 404 from handler logic, but the route
+        // exists and auth passes. Use the status endpoint which returns 404
+        // for missing jobs — we check only that auth is not the blocker.
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/export/jobs/{}", job_id))
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // 404 here is from the handler (job not found), not from the router.
+        // Auth passed (not 401).
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn compat_export_job_download_routed() {
+        let job_id = Uuid::new_v4();
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/export/jobs/{}/download", job_id))
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn compat_targets_list_routed() {
+        assert_get_routed(test_router(), "/v1/targets").await;
+    }
+
+    #[tokio::test]
+    async fn compat_targets_get_routed() {
+        let id = Uuid::new_v4();
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/targets/{}", id))
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn compat_networks_list_routed() {
+        assert_get_routed(test_router(), "/v1/networks").await;
+    }
+
+    #[tokio::test]
+    async fn compat_networks_get_routed() {
+        assert_get_routed(test_router(), "/v1/networks/solana-mainnet").await;
+    }
+
+    // ── Ingestion/job control endpoint routing verification ───────────
+
+    #[tokio::test]
+    async fn compat_ingest_routed() {
+        assert_post_routed(
+            test_router(),
+            "/v1/ingest",
+            r#"{"chain":"solana","wallet":"SomeWallet123"}"#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn compat_ingest_batch_routed() {
+        assert_post_routed(
+            test_router(),
+            "/v1/ingest/batch",
+            r#"{"wallets":[{"chain":"solana","wallet":"SomeWallet123"}]}"#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn compat_normalize_routed() {
+        assert_post_routed(
+            test_router(),
+            "/v1/normalize",
+            r#"{"wallet":"SomeWallet123"}"#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn compat_stream_start_routed() {
+        assert_post_routed(test_router(), "/v1/stream/start", r#"{"chain":"solana"}"#).await;
+    }
+
+    #[tokio::test]
+    async fn compat_streams_list_routed() {
+        assert_get_routed(test_router(), "/v1/streams").await;
+    }
+
+    // ── Shared auth behavior across both API surfaces ─────────────────
+
+    #[tokio::test]
+    async fn compat_wallet_endpoints_require_auth() {
+        let wallet_gets = vec![
+            "/v1/transactions/SomeWallet123",
+            "/v1/transactions/SomeWallet123/0xdeadbeef",
+            "/v1/ledger/SomeWallet123",
+            "/v1/export/SomeWallet123",
+            "/v1/balances/SomeWallet123",
+            "/v1/stats/SomeWallet123",
+        ];
+        for uri in wallet_gets {
+            assert_get_requires_auth(test_router(), uri).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn compat_dataset_endpoints_require_auth() {
+        let dataset_gets = vec![
+            "/v1/datasets",
+            "/v1/datasets/token_transfers/versions",
+            "/v1/datasets/token_transfers/records",
+            "/v1/datasets/token_transfers/completeness",
+            "/v1/datasets/token_transfers/status",
+            "/v1/targets",
+            "/v1/networks",
+        ];
+        for uri in dataset_gets {
+            assert_get_requires_auth(test_router(), uri).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn compat_dataset_post_endpoints_require_auth() {
+        let dataset_posts = vec!["/v1/export/dataset", "/v1/targets"];
+        for uri in dataset_posts {
+            assert_post_requires_auth(test_router(), uri).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn compat_ingestion_endpoints_require_auth() {
+        let ingestion_posts = vec!["/v1/ingest", "/v1/ingest/batch", "/v1/normalize"];
+        for uri in ingestion_posts {
+            assert_post_requires_auth(test_router(), uri).await;
+        }
+    }
+
+    // ── Response shape verification ───────────────────────────────────
+
+    #[tokio::test]
+    async fn compat_wallet_endpoints_return_json_errors() {
+        // Wallet endpoints should return JSON error bodies for invalid wallets
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/transactions/bad%20wallet")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("error").is_some(),
+            "wallet error should be JSON with 'error' field"
+        );
+    }
+
+    #[tokio::test]
+    async fn compat_dataset_endpoints_return_json_errors() {
+        // Invalid dataset name should return JSON error
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/v1/datasets/nonexistent_dataset/records")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // Should be 400 for unknown dataset, not 404 from missing route
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("error").is_some(),
+            "dataset error should be JSON with 'error' field"
+        );
+    }
+
+    #[tokio::test]
+    async fn compat_health_does_not_require_auth() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }
