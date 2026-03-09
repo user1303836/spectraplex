@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "75d3c1909062",
+  "strategy": "manual-commit",
+  "branch": "p4-w5-compatibility-pass",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "api/src/main.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/75/d3c1909062/0/metadata.json",
+      "transcript": "/75/d3c1909062/0/full.jsonl",
+      "context": "/75/d3c1909062/0/context.md",
+      "content_hash": "/75/d3c1909062/0/content_hash.txt",
+      "prompt": "/75/d3c1909062/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 36,
+    "cache_creation_tokens": 51751,
+    "cache_read_tokens": 1318870,
+    "output_tokens": 12030,
+    "api_call_count": 34
+  }
+}
