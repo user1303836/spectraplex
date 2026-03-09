@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "e7b6f974cd94",
+  "strategy": "manual-commit",
+  "branch": "p5-w3-protocol-tvl-pack",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "api/src/main.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/e7/b6f974cd94/0/metadata.json",
+      "transcript": "/e7/b6f974cd94/0/full.jsonl",
+      "context": "/e7/b6f974cd94/0/context.md",
+      "content_hash": "/e7/b6f974cd94/0/content_hash.txt",
+      "prompt": "/e7/b6f974cd94/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 36,
+    "cache_creation_tokens": 51751,
+    "cache_read_tokens": 1318870,
+    "output_tokens": 12030,
+    "api_call_count": 34
+  }
+}

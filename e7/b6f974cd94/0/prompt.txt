@@ -1,0 +1,206 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Coordinate the next Spectraplex work packet lifecycle.
+
+Read before deciding:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+- the current repository state
+- relevant open pull requests and packet branches
+
+Preflight:
+All preflight checks pass. Worktree is clean, on main at 484a3f3 (up-to-date with origin), all required tools and GitHub auth are available with full repo permissions, and both design docs exist. Ready for autonomous packet work.
+
+Workflow input:
+- goal: (not provided)
+- startAtPacket: (not provided)
+- stopAfterPacket: (not provided)
+- maxMergedPackets: (not provided)
+
+Previous coordination:
+P4-W2 merged. No in-flight packets. Selected P4-W3: Sink abstraction as the next sequential Phase 4 packet. The current export job system (P4-W2) serializes data in-memory and serves it via download endpoint. P4-W3 adds a SinkConfig to route completed exports to local files, webhooks, or database targets. The existing fire_callback/validate_callback_url pattern and the Materializer trait provide proven patterns to follow. Object storage is designed as a future sink type but not implemented yet.
+
+Previous active packet runtime:
+- stage: fix_review_feedback
+- implementation: Added sink abstraction for export job delivery. Core types: SinkType enum (LocalFile, Webhook, Database with ObjectStorage reserved), SinkConfig struct with per-type validation, async ExportSink trait, DeliveryReceipt and DeliveryMetadata. Implemented LocalFileSink (writes to disk via tokio::fs) and WebhookSink (POSTs with configurable headers, content-type, and metadata headers). DatabaseSink is a config-parseable stub rejected at runtime with a clear message. ExportJobRequest accepts optional sink config; ExportJobStatus gains delivered_to and delivery_status fields. Sink delivery runs after serialization completes in the spawned task, alongside in-memory storage for backward-compatible download. Comprehensive tests: 35 new tests covering sink type serde, config validation, LocalFileSink write+readback, WebhookSink URL validation, API integration with sink config, path traversal rejection, database sink rejection, and backward compatibility without sink.
+- validation: P4-W3 validated. All 772 tests pass (fmt, clippy, test all green). Core sink types (SinkType, SinkConfig, ExportSink trait, DeliveryReceipt, DeliveryMetadata) are well-defined in core/src/materializer.rs. LocalFileSink and WebhookSink are implemented and exercised by dedicated tests. DatabaseSink is config-parseable but cleanly rejected at runtime. ExportJobRequest accepts optional sink config; ExportJobStatus gains delivered_to and delivery_status fields that are omitted when no sink is used (backward compatible). The download endpoint is unchanged. README.md documents the new sink configuration. No wallet-assumption, migration, or compatibility regressions.
+- PR state: Created PR #124 for P4-W3 sink abstraction. Branch pushed and PR opened against main with 994 lines across 5 files (core sink types, LocalFileSink, WebhookSink, API integration, README docs). All 772 tests passing. PR is open and ready for review.
+- local review: Solid sink abstraction with clean trait design, proper backward compatibility (skip_serializing_if for new fields, optional sink in request), correct error handling for delivery failures, and no wallet-only assumptions. 35 new tests cover serde, validation, path traversal, SSRF, backward compat, and integration. One blocking issue: sink delivery holds the export_jobs write lock during potentially slow async I/O (up to 30s for webhooks), which will cause concurrency bottlenecks. The delivery must be moved outside the lock scope.
+- remote review: Remote review pass is clear. All six focus areas are satisfied: SinkConfig validation rejects path traversal and SSRF, backward compatibility is preserved via optional fields, error handling keeps job lifecycle consistent without corruption, the ExportSink trait is generic enough for future ObjectStorage implementations, and sinks deliver dataset exports with no wallet-only assumptions. CI green. Ready to merge from the PR-comment review perspective.
+- merge: No merge output yet.
+
+Previous merge result:
+No prior merge result.
+
+Merged packets so far:
+1. Phase 0: Lock The V2 Architecture P0-W1: V2 Architecture RFC
+2. Phase 0: Lock The V2 Architecture P0-W3: Network Model Spec
+3. Phase 0: Lock The V2 Architecture P0-W4: Rollout And Compatibility Plan
+4. Phase 1: Canonical Bronze And Control Plane P1-W1: Introduce V2 Core Types
+5. Phase 1: Canonical Bronze And Control Plane P1-W2: Add New Bronze And Control-Plane Tables
+6. Phase 1: Canonical Bronze And Control Plane P1-W3: Repository Support For Canonical Raw Data
+7. Phase 2: Target-Centric Ingestion P2-W1: Connector interface redesign
+8. Phase 2: Target-Centric Ingestion P2-W2: CLI and API target registration flow
+9. Phase 2: Target-Centric Ingestion P2-W3: Fix EVM ingestion semantics
+10. Phase 2: Target-Centric Ingestion P2-W4: Fix Solana gRPC target semantics
+11. Phase 2: Target-Centric Ingestion P2-W5: Hyperliquid target model
+12. Phase 2: Target-Centric Ingestion P2-W6: End-to-end ingestion compatibility suite
+13. Phase 3: Expand Silver Into Reusable Datasets P3-W2: Transfer and balance-delta datasets
+14. Phase 3: Expand Silver Into Reusable Datasets P3-W4: Hyperliquid reusable datasets
+15. Phase 3: Expand Silver Into Reusable Datasets P3-W5: Ledger as a derived materialization
+16. Phase 3: Expand Silver Into Reusable Datasets P3-W6: Completeness metadata
+17. Phase 4: ETL-First Delivery P4-W1: Dataset query API
+18. Phase 4: ETL-First Delivery P4-W2: Export jobs
+
+Rules:
+1. Continue exactly one in-flight packet until it is merged. In-flight means an unmerged packet already selected by this workflow, an open PR for a packet branch, or local branch work that clearly maps to a packet.
+2. Only select a new packet when there is no in-flight packet left to finish.
+3. If multiple conflicting in-flight packets exist, return state="blocked" and explain why.
+4. Select the earliest incomplete packet allowed by dependencies in design/PHASED_IMPLEMENTATION_PLAN.md and still incomplete in the current repository and tracked docs.
+5. Respect phase order. Do not skip prerequisites unless the phased plan explicitly allows it.
+6. Keep wallet indexing first-class, but do not reinforce wallet-only assumptions in shared abstractions.
+7. If a packet's primary deliverables live under gitignored paths such as design/, require at least one tracked review artifact under docs/ and list it in trackedReviewArtifacts.
+8. Remote review happens as a PR comment, not a formal GitHub approval. Do not block on missing formal approval.
+9. Admin or force merge is allowed only after validation, local review, and the remote review comment all say the remaining blockers are cleared.
+10. If stopAfterPacket is provided and that packet is already merged, return state="complete".
+11. If maxMergedPackets is provided and the limit has been reached, return state="complete".
+12. If a prior merge attempt failed for an external reason that the workflow cannot safely resolve, return state="blocked" instead of looping forever.
+
+Return JSON with:
+- workflowComplete: true only if the workflow should stop successfully
+- state: "active", "complete", or "blocked"
+- phase: string, or "" if complete or blocked
+- workPacket: string, or "" if complete or blocked
+- objective: string, or "" if complete or blocked
+- branchName: string, or "" if complete or blocked
+- prNumber: number, or 0 if none
+- prUrl: string
+- prTitle: string
+- prBody: string
+- summary: concise coordination summary
+- repoTouchpoints: array
+- implementationSteps: array
+- verificationSteps: array
+- reviewFocus: array
+- trackedReviewArtifacts: array
+- blockingIssues: array
+- warnings: array
+- nextAction: string
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "workflowComplete": {
+      "type": "boolean"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "active",
+        "complete",
+        "blocked"
+      ]
+    },
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "objective": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "prNumber": {
+      "type": "number"
+    },
+    "prUrl": {
+      "type": "string"
+    },
+    "prTitle": {
+      "type": "string"
+    },
+    "prBody": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "repoTouchpoints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "implementationSteps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "verificationSteps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reviewFocus": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "trackedReviewArtifacts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blockingIssues": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "nextAction": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workflowComplete",
+    "state",
+    "phase",
+    "workPacket",
+    "objective",
+    "branchName",
+    "prNumber",
+    "prUrl",
+    "prTitle",
+    "prBody",
+    "summary",
+    "repoTouchpoints",
+    "implementationSteps",
+    "verificationSteps",
+    "reviewFocus",
+    "trackedReviewArtifacts",
+    "blockingIssues",
+    "warnings",
+    "nextAction"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.
