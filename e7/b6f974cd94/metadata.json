@@ -3,7 +3,7 @@
   "checkpoint_id": "e7b6f974cd94",
   "strategy": "manual-commit",
   "branch": "p5-w3-protocol-tvl-pack",
-  "checkpoints_count": 2,
+  "checkpoints_count": 3,
   "files_touched": [
     "README.md",
     "adapters/src/lib.rs",
@@ -34,13 +34,20 @@
       "context": "/e7/b6f974cd94/2/context.md",
       "content_hash": "/e7/b6f974cd94/2/content_hash.txt",
       "prompt": "/e7/b6f974cd94/2/prompt.txt"
+    },
+    {
+      "metadata": "/e7/b6f974cd94/3/metadata.json",
+      "transcript": "/e7/b6f974cd94/3/full.jsonl",
+      "context": "/e7/b6f974cd94/3/context.md",
+      "content_hash": "/e7/b6f974cd94/3/content_hash.txt",
+      "prompt": "/e7/b6f974cd94/3/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 3607,
-    "cache_creation_tokens": 265409,
-    "cache_read_tokens": 17513737,
-    "output_tokens": 67455,
-    "api_call_count": 190
+    "input_tokens": 3609,
+    "cache_creation_tokens": 265870,
+    "cache_read_tokens": 17805380,
+    "output_tokens": 68645,
+    "api_call_count": 192
   }
 }
