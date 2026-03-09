@@ -22,8 +22,9 @@ use spectraplex_core::config::AppConfig;
 use spectraplex_core::connector::validate_target;
 use spectraplex_core::materializer::{
     BalanceSnapshot, DatasetName, DeliveryMetadata, DeliveryReceipt, ExportFormat, ExportSink,
-    ForensicsActivity, HlPnlSummary, HlTradeHistory, MarketAnalytics, SinkConfig, SinkType,
-    TraderAnalytics, WalletLedgerRecord,
+    ForensicsActivity, HlPnlSummary, HlTradeHistory, MarketAnalytics, PoolSnapshot,
+    ProtocolActivity, ProtocolEvent, SinkConfig, SinkType, TraderAnalytics, TvlAnalytics,
+    WalletLedgerRecord,
 };
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
 use spectraplex_core::v2::{
@@ -308,6 +309,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/forensics/activity", get(forensics_activity_handler))
         .route("/v1/analytics/hl/trader", get(hl_trader_analytics_handler))
         .route("/v1/analytics/hl/market", get(hl_market_analytics_handler))
+        .route(
+            "/v1/analytics/protocol/activity",
+            get(protocol_activity_handler),
+        )
+        .route("/v1/analytics/protocol/tvl", get(protocol_tvl_handler))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared_state),
             require_auth,
@@ -1589,6 +1595,8 @@ const QUERYABLE_DATASETS: &[&str] = &[
     "balance_history",
     "hl_pnl_summary",
     "hl_trade_history",
+    "protocol_events",
+    "pool_snapshots",
 ];
 
 fn validate_dataset_name(name: &str) -> Result<(), AppError> {
@@ -1805,6 +1813,36 @@ async fn query_dataset_records(
                 .map_err(AppError::internal)?;
             serde_json::to_value(&records).map_err(AppError::internal)?
         }
+        "protocol_events" => {
+            let records = state
+                .repo
+                .query_protocol_events(
+                    params.target_id,
+                    net,
+                    params.time_start,
+                    params.time_end,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(AppError::internal)?;
+            serde_json::to_value(&records).map_err(AppError::internal)?
+        }
+        "pool_snapshots" => {
+            let records = state
+                .repo
+                .query_pool_snapshots(
+                    params.target_id,
+                    net,
+                    params.time_start,
+                    params.time_end,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(AppError::internal)?;
+            serde_json::to_value(&records).map_err(AppError::internal)?
+        }
         _ => unreachable!("dataset name validated above"),
     };
 
@@ -1828,6 +1866,8 @@ const EXPORTABLE_DATASETS: &[&str] = &[
     "balance_history",
     "hl_pnl_summary",
     "hl_trade_history",
+    "protocol_events",
+    "pool_snapshots",
 ];
 
 fn content_type_for_format(format: ExportFormat) -> &'static str {
@@ -2132,6 +2172,64 @@ fn hl_trade_history_to_csv(records: &[HlTradeHistory]) -> Vec<u8> {
             r.realized_pnl,
             r.fees,
             r.num_fills,
+            r.dataset_version_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            r.created_at.to_rfc3339(),
+        ));
+    }
+    buf.into_bytes()
+}
+
+fn protocol_events_to_csv(records: &[ProtocolEvent]) -> Vec<u8> {
+    let mut buf = String::from(
+        "id,network,protocol_address,protocol_name,event_type,event_details,pool_address,raw_event_id,timestamp,dataset_version_id,created_at\n",
+    );
+    for r in records {
+        buf.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            r.id,
+            csv_escape(&r.network),
+            csv_escape(&r.protocol_address),
+            r.protocol_name.as_deref().unwrap_or(""),
+            csv_escape(&r.event_type),
+            csv_escape(&r.event_details.to_string()),
+            r.pool_address.as_deref().unwrap_or(""),
+            r.raw_event_id.map(|u| u.to_string()).unwrap_or_default(),
+            r.timestamp,
+            r.dataset_version_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+            r.created_at.to_rfc3339(),
+        ));
+    }
+    buf.into_bytes()
+}
+
+fn pool_snapshots_to_csv(records: &[PoolSnapshot]) -> Vec<u8> {
+    let mut buf = String::from(
+        "id,network,pool_address,protocol_address,protocol_name,token0_address,token0_symbol,token1_address,token1_symbol,reserve0,reserve1,tvl_usd,snapshot_timestamp,block_number,dataset_version_id,created_at\n",
+    );
+    for r in records {
+        buf.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            r.id,
+            csv_escape(&r.network),
+            csv_escape(&r.pool_address),
+            csv_escape(&r.protocol_address),
+            r.protocol_name.as_deref().unwrap_or(""),
+            csv_escape(&r.token0_address),
+            r.token0_symbol.as_deref().unwrap_or(""),
+            csv_escape(&r.token1_address),
+            r.token1_symbol.as_deref().unwrap_or(""),
+            r.reserve0,
+            r.reserve1,
+            r.tvl_usd
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            r.snapshot_timestamp,
+            r.block_number.map(|v| v.to_string()).unwrap_or_default(),
             r.dataset_version_id
                 .map(|u| u.to_string())
                 .unwrap_or_default(),
@@ -2638,6 +2736,32 @@ async fn run_export_job(
             };
             Ok((body, count, meta))
         }
+        "protocol_events" => {
+            let records = repo
+                .export_protocol_events(target_id, network, time_start, time_end)
+                .await?;
+            let count = records.len();
+            let body = match format {
+                ExportFormat::Jsonl => {
+                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
+                }
+                ExportFormat::Csv => protocol_events_to_csv(&records),
+            };
+            Ok((body, count, meta))
+        }
+        "pool_snapshots" => {
+            let records = repo
+                .export_pool_snapshots(target_id, network, time_start, time_end)
+                .await?;
+            let count = records.len();
+            let body = match format {
+                ExportFormat::Jsonl => {
+                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
+                }
+                ExportFormat::Csv => pool_snapshots_to_csv(&records),
+            };
+            Ok((body, count, meta))
+        }
         _ => Err(anyhow::anyhow!("Unknown dataset: {dataset}")),
     }
 }
@@ -2890,6 +3014,74 @@ async fn hl_market_analytics_handler(
     Ok(Json(analytics))
 }
 
+// ---------------------------------------------------------------------------
+// Protocol analytics endpoints (P5-W3)
+// ---------------------------------------------------------------------------
+
+/// Query parameters for the protocol analytics endpoints.
+#[derive(Debug, Deserialize)]
+struct ProtocolAnalyticsParams {
+    target_id: Option<Uuid>,
+    network: Option<String>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
+    protocol_address: Option<String>,
+}
+
+/// GET /v1/analytics/protocol/activity — per-protocol event activity analytics.
+async fn protocol_activity_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ProtocolAnalyticsParams>,
+) -> Result<Json<ProtocolActivity>, AppError> {
+    validate_date_range(params.time_start, params.time_end)?;
+
+    let events = state
+        .repo
+        .export_protocol_events(
+            params.target_id,
+            params.network.as_deref(),
+            params.time_start,
+            params.time_end,
+        )
+        .await
+        .map_err(AppError::internal)?;
+
+    let protocol_addr = params.protocol_address.as_deref().unwrap_or_else(|| {
+        events
+            .first()
+            .map(|e| e.protocol_address.as_str())
+            .unwrap_or("")
+    });
+
+    let activity =
+        spectraplex_adapters::protocol_analytics::build_protocol_activity(protocol_addr, &events);
+
+    Ok(Json(activity))
+}
+
+/// GET /v1/analytics/protocol/tvl — TVL analytics from pool snapshots.
+async fn protocol_tvl_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ProtocolAnalyticsParams>,
+) -> Result<Json<TvlAnalytics>, AppError> {
+    validate_date_range(params.time_start, params.time_end)?;
+
+    let snapshots = state
+        .repo
+        .export_pool_snapshots(
+            params.target_id,
+            params.network.as_deref(),
+            params.time_start,
+            params.time_end,
+        )
+        .await
+        .map_err(AppError::internal)?;
+
+    let analytics = spectraplex_adapters::protocol_analytics::build_tvl_analytics(&snapshots);
+
+    Ok(Json(analytics))
+}
+
 async fn get_dataset_completeness_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -3085,6 +3277,11 @@ mod tests {
             .route("/v1/forensics/activity", get(forensics_activity_handler))
             .route("/v1/analytics/hl/trader", get(hl_trader_analytics_handler))
             .route("/v1/analytics/hl/market", get(hl_market_analytics_handler))
+            .route(
+                "/v1/analytics/protocol/activity",
+                get(protocol_activity_handler),
+            )
+            .route("/v1/analytics/protocol/tvl", get(protocol_tvl_handler))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_auth,
@@ -5075,7 +5272,7 @@ mod tests {
 
     #[test]
     fn test_queryable_datasets_count() {
-        assert_eq!(QUERYABLE_DATASETS.len(), 10);
+        assert_eq!(QUERYABLE_DATASETS.len(), 12);
     }
 
     #[test]
@@ -5090,6 +5287,8 @@ mod tests {
         assert!(QUERYABLE_DATASETS.contains(&"balance_history"));
         assert!(QUERYABLE_DATASETS.contains(&"hl_pnl_summary"));
         assert!(QUERYABLE_DATASETS.contains(&"hl_trade_history"));
+        assert!(QUERYABLE_DATASETS.contains(&"protocol_events"));
+        assert!(QUERYABLE_DATASETS.contains(&"pool_snapshots"));
     }
 
     #[test]
@@ -6921,11 +7120,13 @@ mod tests {
 
     #[test]
     fn test_exportable_datasets_includes_gold() {
-        assert_eq!(EXPORTABLE_DATASETS.len(), 10);
+        assert_eq!(EXPORTABLE_DATASETS.len(), 12);
         assert!(EXPORTABLE_DATASETS.contains(&"wallet_ledger"));
         assert!(EXPORTABLE_DATASETS.contains(&"balance_history"));
         assert!(EXPORTABLE_DATASETS.contains(&"hl_pnl_summary"));
         assert!(EXPORTABLE_DATASETS.contains(&"hl_trade_history"));
+        assert!(EXPORTABLE_DATASETS.contains(&"protocol_events"));
+        assert!(EXPORTABLE_DATASETS.contains(&"pool_snapshots"));
     }
 
     #[tokio::test]
@@ -7202,6 +7403,193 @@ mod tests {
             "/v1/datasets/token_transfers/status",
         ];
         for uri in dataset_uris {
+            assert_get_routed(test_router(), uri).await;
+        }
+    }
+
+    // -- P5-W3: Protocol / TVL Pack tests --
+
+    #[test]
+    fn test_protocol_events_in_queryable_datasets() {
+        assert!(QUERYABLE_DATASETS.contains(&"protocol_events"));
+    }
+
+    #[test]
+    fn test_pool_snapshots_in_queryable_datasets() {
+        assert!(QUERYABLE_DATASETS.contains(&"pool_snapshots"));
+    }
+
+    #[test]
+    fn test_protocol_events_in_exportable_datasets() {
+        assert!(EXPORTABLE_DATASETS.contains(&"protocol_events"));
+    }
+
+    #[test]
+    fn test_pool_snapshots_in_exportable_datasets() {
+        assert!(EXPORTABLE_DATASETS.contains(&"pool_snapshots"));
+    }
+
+    #[tokio::test]
+    async fn test_protocol_events_records_endpoint_routed() {
+        assert_get_routed(test_router(), "/v1/datasets/protocol_events/records").await;
+    }
+
+    #[tokio::test]
+    async fn test_pool_snapshots_records_endpoint_routed() {
+        assert_get_routed(test_router(), "/v1/datasets/pool_snapshots/records").await;
+    }
+
+    #[tokio::test]
+    async fn test_protocol_activity_endpoint_routed() {
+        assert_get_routed(test_router(), "/v1/analytics/protocol/activity").await;
+    }
+
+    #[tokio::test]
+    async fn test_protocol_tvl_endpoint_routed() {
+        assert_get_routed(test_router(), "/v1/analytics/protocol/tvl").await;
+    }
+
+    #[tokio::test]
+    async fn test_protocol_activity_requires_auth() {
+        assert_get_requires_auth(test_router(), "/v1/analytics/protocol/activity").await;
+    }
+
+    #[tokio::test]
+    async fn test_protocol_tvl_requires_auth() {
+        assert_get_requires_auth(test_router(), "/v1/analytics/protocol/tvl").await;
+    }
+
+    #[tokio::test]
+    async fn test_protocol_events_export_accepted() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "protocol_events"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "protocol_events export should be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pool_snapshots_export_accepted() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/export/dataset")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "dataset": "pool_snapshots"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "pool_snapshots export should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_protocol_events_to_csv_format() {
+        let records = vec![ProtocolEvent {
+            id: Uuid::nil(),
+            network: "ethereum-mainnet".to_string(),
+            protocol_address: "0xUniswap".to_string(),
+            protocol_name: Some("Uniswap V3".to_string()),
+            event_type: "swap".to_string(),
+            event_details: serde_json::json!({"amount0": "100"}),
+            pool_address: Some("0xPool".to_string()),
+            raw_event_id: None,
+            timestamp: 1700000000,
+            dataset_version_id: None,
+            created_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
+        }];
+        let csv = protocol_events_to_csv(&records);
+        let output = String::from_utf8(csv).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2); // header + 1 row
+        assert!(lines[0].contains("protocol_address"));
+        assert!(lines[0].contains("event_type"));
+        assert!(lines[0].contains("event_details"));
+        assert!(lines[1].contains("0xUniswap"));
+        assert!(lines[1].contains("swap"));
+    }
+
+    #[test]
+    fn test_pool_snapshots_to_csv_format() {
+        let records = vec![PoolSnapshot {
+            id: Uuid::nil(),
+            network: "ethereum-mainnet".to_string(),
+            pool_address: "0xPool".to_string(),
+            protocol_address: "0xProto".to_string(),
+            protocol_name: Some("Uniswap".to_string()),
+            token0_address: "0xWETH".to_string(),
+            token0_symbol: Some("WETH".to_string()),
+            token1_address: "0xUSDC".to_string(),
+            token1_symbol: Some("USDC".to_string()),
+            reserve0: bigdecimal::BigDecimal::from(1000),
+            reserve1: bigdecimal::BigDecimal::from(2000000),
+            tvl_usd: Some(bigdecimal::BigDecimal::from(4000000)),
+            snapshot_timestamp: 1700000000,
+            block_number: Some(18000000),
+            dataset_version_id: None,
+            created_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
+        }];
+        let csv = pool_snapshots_to_csv(&records);
+        let output = String::from_utf8(csv).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2); // header + 1 row
+        assert!(lines[0].contains("pool_address"));
+        assert!(lines[0].contains("reserve0"));
+        assert!(lines[0].contains("tvl_usd"));
+        assert!(lines[1].contains("0xPool"));
+        assert!(lines[1].contains("4000000"));
+    }
+
+    // Verify P5-W2 and P5-W1 compatibility remains
+    #[tokio::test]
+    async fn p5w3_compat_existing_wallet_endpoints_still_routed() {
+        let wallet_uris = vec![
+            "/v1/transactions/SomeWallet123",
+            "/v1/ledger/SomeWallet123",
+            "/v1/export/SomeWallet123",
+            "/v1/balances/SomeWallet123",
+            "/v1/stats/SomeWallet123",
+        ];
+        for uri in wallet_uris {
+            assert_get_routed(test_router(), uri).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn p5w3_compat_p5w1_and_p5w2_endpoints_still_routed() {
+        let uris = vec![
+            "/v1/datasets/wallet_ledger/records",
+            "/v1/datasets/balance_history/records",
+            "/v1/export/tax",
+            "/v1/forensics/activity",
+            "/v1/analytics/hl/trader",
+            "/v1/analytics/hl/market",
+            "/v1/datasets/hl_pnl_summary/records",
+            "/v1/datasets/hl_trade_history/records",
+        ];
+        for uri in uris {
             assert_get_routed(test_router(), uri).await;
         }
     }

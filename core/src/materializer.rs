@@ -50,6 +50,10 @@ pub enum DatasetName {
     HlPnlSummary,
     /// Gold-tier Hyperliquid trade history with entry/exit grouping (P5-W2).
     HlTradeHistory,
+    /// Gold-tier protocol event records derived from decoded_events (P5-W3).
+    ProtocolEvents,
+    /// Gold-tier pool snapshot records derived from decoded_events + token_transfers (P5-W3).
+    PoolSnapshots,
 }
 
 impl DatasetName {
@@ -67,6 +71,8 @@ impl DatasetName {
             DatasetName::BalanceHistory => "balance_history",
             DatasetName::HlPnlSummary => "hl_pnl_summary",
             DatasetName::HlTradeHistory => "hl_trade_history",
+            DatasetName::ProtocolEvents => "protocol_events",
+            DatasetName::PoolSnapshots => "pool_snapshots",
         }
     }
 
@@ -84,6 +90,8 @@ impl DatasetName {
             DatasetName::BalanceHistory,
             DatasetName::HlPnlSummary,
             DatasetName::HlTradeHistory,
+            DatasetName::ProtocolEvents,
+            DatasetName::PoolSnapshots,
         ]
     }
 }
@@ -743,6 +751,138 @@ pub struct CoinMarketSummary {
 }
 
 // ---------------------------------------------------------------------------
+// Gold Dataset Records (P5-W3): Protocol / TVL
+// ---------------------------------------------------------------------------
+
+/// Gold-tier protocol event record.
+///
+/// Derived from Silver `decoded_events` by grouping events by their
+/// `program_or_contract` as the protocol_address. Each record represents
+/// a significant protocol-level event (swap, mint, burn, liquidity change).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolEvent {
+    pub id: Uuid,
+    pub network: String,
+    /// Contract or program address acting as the protocol identifier.
+    pub protocol_address: String,
+    /// Human-readable protocol name (if resolvable).
+    pub protocol_name: Option<String>,
+    /// Event classification: "swap", "mint", "burn", "liquidity_added",
+    /// "liquidity_removed", "transfer", "other".
+    pub event_type: String,
+    /// Structured event details (decoded fields snapshot).
+    pub event_details: serde_json::Value,
+    /// Pool or pair address involved in the event (if applicable).
+    pub pool_address: Option<String>,
+    /// FK to the source decoded_events record.
+    pub raw_event_id: Option<Uuid>,
+    /// Unix timestamp of the event.
+    pub timestamp: i64,
+    /// FK to dataset_versions.
+    pub dataset_version_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Gold-tier pool snapshot record.
+///
+/// Derived from Silver `decoded_events` (swap / liquidity events) and
+/// `token_transfers` to capture per-pool reserve state at a point in time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolSnapshot {
+    pub id: Uuid,
+    pub network: String,
+    /// Pool or pair contract address.
+    pub pool_address: String,
+    /// Protocol address the pool belongs to.
+    pub protocol_address: String,
+    /// Human-readable protocol name (if resolvable).
+    pub protocol_name: Option<String>,
+    /// Address of the first token in the pair.
+    pub token0_address: String,
+    /// Symbol of the first token.
+    pub token0_symbol: Option<String>,
+    /// Address of the second token in the pair.
+    pub token1_address: String,
+    /// Symbol of the second token.
+    pub token1_symbol: Option<String>,
+    /// Reserve amount for token0.
+    pub reserve0: BigDecimal,
+    /// Reserve amount for token1.
+    pub reserve1: BigDecimal,
+    /// USD-denominated total value locked (nullable — requires price feed).
+    pub tvl_usd: Option<BigDecimal>,
+    /// Unix timestamp of the snapshot.
+    pub snapshot_timestamp: i64,
+    /// Block number at snapshot time.
+    pub block_number: Option<i64>,
+    /// FK to dataset_versions.
+    pub dataset_version_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Per-protocol activity analytics response.
+///
+/// Aggregated view of protocol interactions — event counts by type,
+/// unique participant count, and time range.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolActivity {
+    /// Protocol contract or program address.
+    pub protocol_address: String,
+    /// Event counts grouped by event_type.
+    pub event_counts_by_type: Vec<EventTypeCount>,
+    /// Number of unique participant addresses.
+    pub unique_participants: usize,
+    /// Total number of protocol events.
+    pub total_events: usize,
+    /// Earliest event timestamp.
+    pub time_start: Option<i64>,
+    /// Latest event timestamp.
+    pub time_end: Option<i64>,
+}
+
+/// Event count for a single event type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventTypeCount {
+    pub event_type: String,
+    pub count: usize,
+}
+
+/// TVL analytics response.
+///
+/// Per-pool and aggregate TVL computed from pool_snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TvlAnalytics {
+    /// Per-pool TVL snapshots.
+    pub pools: Vec<PoolTvlSummary>,
+    /// Aggregate TVL across all pools (sum of tvl_usd where available).
+    pub total_tvl: Option<BigDecimal>,
+    /// Protocol-level aggregation (grouped by protocol_address).
+    pub protocols: Vec<ProtocolTvlSummary>,
+}
+
+/// TVL summary for a single pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolTvlSummary {
+    pub pool_address: String,
+    pub protocol_address: String,
+    pub token0_symbol: Option<String>,
+    pub token1_symbol: Option<String>,
+    pub reserve0: BigDecimal,
+    pub reserve1: BigDecimal,
+    pub tvl_usd: Option<BigDecimal>,
+    pub snapshot_timestamp: i64,
+}
+
+/// TVL summary for a protocol (sum across its pools).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolTvlSummary {
+    pub protocol_address: String,
+    pub protocol_name: Option<String>,
+    pub pool_count: usize,
+    pub total_tvl: Option<BigDecimal>,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -753,9 +893,9 @@ mod tests {
     use strum::IntoEnumIterator;
 
     #[test]
-    fn dataset_name_count_is_eleven() {
-        assert_eq!(DatasetName::all().len(), 11);
-        assert_eq!(DatasetName::iter().count(), 11);
+    fn dataset_name_count_is_thirteen() {
+        assert_eq!(DatasetName::all().len(), 13);
+        assert_eq!(DatasetName::iter().count(), 13);
     }
 
     #[test]
@@ -775,8 +915,10 @@ mod tests {
             (DatasetName::BalanceHistory, "\"balance_history\""),
             (DatasetName::HlPnlSummary, "\"hl_pnl_summary\""),
             (DatasetName::HlTradeHistory, "\"hl_trade_history\""),
+            (DatasetName::ProtocolEvents, "\"protocol_events\""),
+            (DatasetName::PoolSnapshots, "\"pool_snapshots\""),
         ];
-        assert_eq!(cases.len(), 11, "must cover all 11 datasets");
+        assert_eq!(cases.len(), 13, "must cover all 13 datasets");
         for (variant, expected_json) in cases {
             let json = serde_json::to_string(&variant).unwrap();
             assert_eq!(json, expected_json, "serialize {variant:?}");
@@ -801,6 +943,8 @@ mod tests {
         assert_eq!(DatasetName::BalanceHistory.to_string(), "balance_history");
         assert_eq!(DatasetName::HlPnlSummary.to_string(), "hl_pnl_summary");
         assert_eq!(DatasetName::HlTradeHistory.to_string(), "hl_trade_history");
+        assert_eq!(DatasetName::ProtocolEvents.to_string(), "protocol_events");
+        assert_eq!(DatasetName::PoolSnapshots.to_string(), "pool_snapshots");
     }
 
     #[test]
@@ -832,6 +976,14 @@ mod tests {
         assert_eq!(
             DatasetName::from_str("hl_trade_history").unwrap(),
             DatasetName::HlTradeHistory
+        );
+        assert_eq!(
+            DatasetName::from_str("protocol_events").unwrap(),
+            DatasetName::ProtocolEvents
+        );
+        assert_eq!(
+            DatasetName::from_str("pool_snapshots").unwrap(),
+            DatasetName::PoolSnapshots
         );
         assert!(DatasetName::from_str("unknown_dataset").is_err());
     }
@@ -1764,5 +1916,111 @@ mod tests {
         assert_eq!(back.network_activity.len(), 1);
         assert_eq!(back.type_breakdown.len(), 1);
         assert_eq!(back.total_entries, 10);
+    }
+
+    // -- P5-W3: Protocol / TVL record and analytics serde tests --
+
+    #[test]
+    fn protocol_event_serde_roundtrip() {
+        let pe = ProtocolEvent {
+            id: Uuid::nil(),
+            network: "ethereum-mainnet".to_string(),
+            protocol_address: "0xUniswapV3".to_string(),
+            protocol_name: Some("Uniswap V3".to_string()),
+            event_type: "swap".to_string(),
+            event_details: serde_json::json!({"amount0": "100", "amount1": "-50"}),
+            pool_address: Some("0xPool123".to_string()),
+            raw_event_id: Some(Uuid::nil()),
+            timestamp: 1700000000,
+            dataset_version_id: None,
+            created_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
+        };
+        let json = serde_json::to_string(&pe).unwrap();
+        let back: ProtocolEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.protocol_address, "0xUniswapV3");
+        assert_eq!(back.event_type, "swap");
+        assert_eq!(back.pool_address.as_deref(), Some("0xPool123"));
+    }
+
+    #[test]
+    fn pool_snapshot_serde_roundtrip() {
+        let ps = PoolSnapshot {
+            id: Uuid::nil(),
+            network: "ethereum-mainnet".to_string(),
+            pool_address: "0xPool123".to_string(),
+            protocol_address: "0xUniswapV3".to_string(),
+            protocol_name: Some("Uniswap V3".to_string()),
+            token0_address: "0xTokenA".to_string(),
+            token0_symbol: Some("WETH".to_string()),
+            token1_address: "0xTokenB".to_string(),
+            token1_symbol: Some("USDC".to_string()),
+            reserve0: BigDecimal::from_str("1000.5").unwrap(),
+            reserve1: BigDecimal::from_str("2000000").unwrap(),
+            tvl_usd: Some(BigDecimal::from(4000000)),
+            snapshot_timestamp: 1700000000,
+            block_number: Some(18000000),
+            dataset_version_id: None,
+            created_at: chrono::DateTime::from_timestamp(1700000000, 0).unwrap(),
+        };
+        let json = serde_json::to_string(&ps).unwrap();
+        let back: PoolSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pool_address, "0xPool123");
+        assert_eq!(back.reserve0, BigDecimal::from_str("1000.5").unwrap());
+        assert_eq!(back.tvl_usd, Some(BigDecimal::from(4000000)));
+    }
+
+    #[test]
+    fn protocol_activity_serde_roundtrip() {
+        let pa = ProtocolActivity {
+            protocol_address: "0xUniswapV3".to_string(),
+            event_counts_by_type: vec![
+                EventTypeCount {
+                    event_type: "swap".to_string(),
+                    count: 100,
+                },
+                EventTypeCount {
+                    event_type: "mint".to_string(),
+                    count: 10,
+                },
+            ],
+            unique_participants: 50,
+            total_events: 110,
+            time_start: Some(1700000000),
+            time_end: Some(1700100000),
+        };
+        let json = serde_json::to_string(&pa).unwrap();
+        let back: ProtocolActivity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.protocol_address, "0xUniswapV3");
+        assert_eq!(back.event_counts_by_type.len(), 2);
+        assert_eq!(back.unique_participants, 50);
+        assert_eq!(back.total_events, 110);
+    }
+
+    #[test]
+    fn tvl_analytics_serde_roundtrip() {
+        let tvl = TvlAnalytics {
+            pools: vec![PoolTvlSummary {
+                pool_address: "0xPool".to_string(),
+                protocol_address: "0xProto".to_string(),
+                token0_symbol: Some("WETH".to_string()),
+                token1_symbol: Some("USDC".to_string()),
+                reserve0: BigDecimal::from(1000),
+                reserve1: BigDecimal::from(2000000),
+                tvl_usd: Some(BigDecimal::from(4000000)),
+                snapshot_timestamp: 1700000000,
+            }],
+            total_tvl: Some(BigDecimal::from(4000000)),
+            protocols: vec![ProtocolTvlSummary {
+                protocol_address: "0xProto".to_string(),
+                protocol_name: Some("Uniswap".to_string()),
+                pool_count: 1,
+                total_tvl: Some(BigDecimal::from(4000000)),
+            }],
+        };
+        let json = serde_json::to_string(&tvl).unwrap();
+        let back: TvlAnalytics = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pools.len(), 1);
+        assert_eq!(back.protocols.len(), 1);
+        assert_eq!(back.total_tvl, Some(BigDecimal::from(4000000)));
     }
 }

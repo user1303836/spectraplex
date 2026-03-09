@@ -6,7 +6,8 @@
 use chrono::{DateTime, Utc};
 use spectraplex_core::materializer::{
     BalanceSnapshot, DecodedEvent, HlFillRecord, HlFundingPayment, HlPnlSummary, HlPositionChange,
-    HlTradeHistory, NativeBalanceDelta, TokenTransfer, WalletLedgerRecord,
+    HlTradeHistory, NativeBalanceDelta, PoolSnapshot, ProtocolEvent, TokenTransfer,
+    WalletLedgerRecord,
 };
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
@@ -978,6 +979,43 @@ fn row_to_hl_trade_history(row: &sqlx::postgres::PgRow) -> anyhow::Result<HlTrad
         realized_pnl: row.try_get("realized_pnl")?,
         fees: row.try_get("fees")?,
         num_fills: row.try_get("num_fills")?,
+        dataset_version_id: row.try_get("dataset_version_id")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn row_to_protocol_event(row: &sqlx::postgres::PgRow) -> anyhow::Result<ProtocolEvent> {
+    Ok(ProtocolEvent {
+        id: row.try_get("id")?,
+        network: row.try_get("network")?,
+        protocol_address: row.try_get("protocol_address")?,
+        protocol_name: row.try_get("protocol_name")?,
+        event_type: row.try_get("event_type")?,
+        event_details: row.try_get("event_details")?,
+        pool_address: row.try_get("pool_address")?,
+        raw_event_id: row.try_get("raw_event_id")?,
+        timestamp: row.try_get("timestamp")?,
+        dataset_version_id: row.try_get("dataset_version_id")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn row_to_pool_snapshot(row: &sqlx::postgres::PgRow) -> anyhow::Result<PoolSnapshot> {
+    Ok(PoolSnapshot {
+        id: row.try_get("id")?,
+        network: row.try_get("network")?,
+        pool_address: row.try_get("pool_address")?,
+        protocol_address: row.try_get("protocol_address")?,
+        protocol_name: row.try_get("protocol_name")?,
+        token0_address: row.try_get("token0_address")?,
+        token0_symbol: row.try_get("token0_symbol")?,
+        token1_address: row.try_get("token1_address")?,
+        token1_symbol: row.try_get("token1_symbol")?,
+        reserve0: row.try_get("reserve0")?,
+        reserve1: row.try_get("reserve1")?,
+        tvl_usd: row.try_get("tvl_usd")?,
+        snapshot_timestamp: row.try_get("snapshot_timestamp")?,
+        block_number: row.try_get("block_number")?,
         dataset_version_id: row.try_get("dataset_version_id")?,
         created_at: row.try_get("created_at")?,
     })
@@ -2568,6 +2606,99 @@ impl Repository {
         )
         .await
     }
+
+    // -- P5-W3: Protocol / TVL Gold dataset query/export methods --
+
+    pub async fn query_protocol_events(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<ProtocolEvent>> {
+        let cols = "dt.id, dt.network, dt.protocol_address, dt.protocol_name, dt.event_type, \
+                    dt.event_details, dt.pool_address, dt.raw_event_id, dt.timestamp, \
+                    dt.dataset_version_id, dt.created_at";
+        let (sql, args) = build_dataset_filter_query(
+            cols,
+            "protocol_events",
+            "dt.timestamp",
+            target_id,
+            network,
+            time_start,
+            time_end,
+            limit,
+            offset,
+        )?;
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_protocol_event).collect()
+    }
+
+    pub async fn export_protocol_events(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+    ) -> anyhow::Result<Vec<ProtocolEvent>> {
+        self.query_protocol_events(
+            target_id,
+            network,
+            time_start,
+            time_end,
+            Self::EXPORT_MAX_RECORDS,
+            0,
+        )
+        .await
+    }
+
+    pub async fn query_pool_snapshots(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<PoolSnapshot>> {
+        let cols = "dt.id, dt.network, dt.pool_address, dt.protocol_address, dt.protocol_name, \
+                    dt.token0_address, dt.token0_symbol, dt.token1_address, dt.token1_symbol, \
+                    dt.reserve0, dt.reserve1, dt.tvl_usd, dt.snapshot_timestamp, dt.block_number, \
+                    dt.dataset_version_id, dt.created_at";
+        let (sql, args) = build_dataset_filter_query(
+            cols,
+            "pool_snapshots",
+            "dt.snapshot_timestamp",
+            target_id,
+            network,
+            time_start,
+            time_end,
+            limit,
+            offset,
+        )?;
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_pool_snapshot).collect()
+    }
+
+    pub async fn export_pool_snapshots(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+    ) -> anyhow::Result<Vec<PoolSnapshot>> {
+        self.query_pool_snapshots(
+            target_id,
+            network,
+            time_start,
+            time_end,
+            Self::EXPORT_MAX_RECORDS,
+            0,
+        )
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3760,6 +3891,98 @@ mod tests {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
             _assert_send(repo.query_balance_snapshots(None, None, None, None, 50, 0));
+        }
+        let _ = _check;
+    }
+
+    // -- P5-W3: protocol_events and pool_snapshots query builders --
+
+    #[test]
+    fn protocol_events_query_builder_basic() {
+        let (sql, _) = build_dataset_filter_query(
+            "dt.*",
+            "protocol_events",
+            "dt.timestamp",
+            None,
+            None,
+            None,
+            None,
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(sql.contains("protocol_events"));
+        assert!(sql.contains("LIMIT"));
+    }
+
+    #[test]
+    fn protocol_events_query_builder_with_network() {
+        let (sql, _) = build_dataset_filter_query(
+            "dt.*",
+            "protocol_events",
+            "dt.timestamp",
+            None,
+            Some("ethereum-mainnet"),
+            None,
+            None,
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(sql.contains("dt.network"));
+    }
+
+    #[test]
+    fn pool_snapshots_query_builder_basic() {
+        let (sql, _) = build_dataset_filter_query(
+            "dt.*",
+            "pool_snapshots",
+            "dt.snapshot_timestamp",
+            None,
+            None,
+            None,
+            None,
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(sql.contains("pool_snapshots"));
+        assert!(sql.contains("LIMIT"));
+    }
+
+    #[test]
+    fn pool_snapshots_query_builder_with_time_range() {
+        let (sql, _) = build_dataset_filter_query(
+            "dt.*",
+            "pool_snapshots",
+            "dt.snapshot_timestamp",
+            None,
+            None,
+            Some(1000),
+            Some(2000),
+            50,
+            0,
+        )
+        .unwrap();
+        // Time filtering joins raw_transactions and uses rt.timestamp
+        assert!(sql.contains("rt.timestamp >="));
+        assert!(sql.contains("rt.timestamp <="));
+    }
+
+    #[test]
+    fn repo_query_protocol_events_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.query_protocol_events(None, None, None, None, 50, 0));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_query_pool_snapshots_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.query_pool_snapshots(None, None, None, None, 50, 0));
         }
         let _ = _check;
     }

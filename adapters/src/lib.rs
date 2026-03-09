@@ -7,6 +7,7 @@ pub mod hyperliquid;
 pub mod hyperliquid_parser;
 pub mod hyperliquid_ws;
 pub mod ledger_derivation;
+pub mod protocol_analytics;
 pub mod repo;
 pub mod solana;
 pub mod solana_grpc;

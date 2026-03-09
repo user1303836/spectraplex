@@ -288,8 +288,10 @@ These endpoints are the preferred forward path for new consumers. They provide f
 | `GET` | `/v1/forensics/activity` | Wallet interaction analysis (top counterparties, cross-chain summary) |
 | `GET` | `/v1/analytics/hl/trader` | Per-trader Hyperliquid PnL analytics (win rate, volume, coin breakdown) |
 | `GET` | `/v1/analytics/hl/market` | Per-coin Hyperliquid market analytics (volume, traders, PnL distribution) |
+| `GET` | `/v1/analytics/protocol/activity` | Per-protocol event activity (event counts, unique participants, time range) |
+| `GET` | `/v1/analytics/protocol/tvl` | TVL analytics from pool snapshots (per-pool, per-protocol, aggregate) |
 
-The dataset records endpoint supports filtering via `?target_id=<UUID>&network=<id>&time_start=<unix_ts>&time_end=<unix_ts>&limit=N&offset=N` query parameters (all optional). Queryable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`, `wallet_ledger`, `balance_history`, `hl_pnl_summary`, `hl_trade_history`.
+The dataset records endpoint supports filtering via `?target_id=<UUID>&network=<id>&time_start=<unix_ts>&time_end=<unix_ts>&limit=N&offset=N` query parameters (all optional). Queryable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`, `wallet_ledger`, `balance_history`, `hl_pnl_summary`, `hl_trade_history`, `protocol_events`, `pool_snapshots`.
 
 ### POST /v1/ingest
 
@@ -468,7 +470,7 @@ curl -X POST http://127.0.0.1:3000/v1/export/dataset \
 # Response: {"id": "<JOB_UUID>", "state": "pending", "dataset": "token_transfers", "format": "jsonl", "record_count": null, "message": null}
 ```
 
-Creates an async export job for a dataset. Supported formats: `jsonl` (default), `csv`. Optional filters: `target_id`, `network`, `time_start`, `time_end`. Exportable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`, `wallet_ledger`, `balance_history`, `hl_pnl_summary`, `hl_trade_history`. Maximum 100,000 records per export.
+Creates an async export job for a dataset. Supported formats: `jsonl` (default), `csv`. Optional filters: `target_id`, `network`, `time_start`, `time_end`. Exportable datasets: `token_transfers`, `native_balance_deltas`, `decoded_events`, `hl_fills`, `hl_funding`, `positions`, `wallet_ledger`, `balance_history`, `hl_pnl_summary`, `hl_trade_history`, `protocol_events`, `pool_snapshots`. Maximum 100,000 records per export.
 
 #### Sink delivery
 
@@ -580,7 +582,7 @@ Downloads the completed export data. The response includes a `Content-Dispositio
 
 ### Gold Datasets
 
-Spectraplex includes four Gold-tier datasets materialized from Silver data:
+Spectraplex includes six Gold-tier datasets materialized from Silver data:
 
 - **`wallet_ledger`** — wallet-scoped financial records with counterparty tracking, network awareness, and nullable cost basis / proceeds fields. Derived from `token_transfers`, `native_balance_deltas`, `hl_fills`, and `hl_funding`. Queryable and exportable via the standard dataset API.
 
@@ -589,6 +591,10 @@ Spectraplex includes four Gold-tier datasets materialized from Silver data:
 - **`hl_pnl_summary`** — per-wallet, per-coin PnL summaries aggregated from Silver `hl_fills` (closed PnL, fees) and `hl_funding` (funding payments). Includes net PnL, win/loss counts, fill count, and average trade size. Designed for trader dashboards and performance analytics.
 
 - **`hl_trade_history`** — logical trade records built by grouping Silver `hl_fills` into open→close sequences. Each record captures entry/exit price, size, realized PnL, fees, and the number of fills that composed the trade. Enables trade-by-trade performance analysis.
+
+- **`protocol_events`** — protocol-level event records derived from Silver `decoded_events`. Each record captures a significant protocol interaction (swap, mint, burn, liquidity change) classified by event type, with a link to the originating decoded event. Supports per-protocol activity analytics.
+
+- **`pool_snapshots`** — per-pool reserve state snapshots derived from Silver `decoded_events` and `token_transfers`. Each record captures token pair reserves, optional USD-denominated TVL, and protocol association. Supports TVL tracking and pool-level analytics.
 
 All Gold datasets are queryable via `/v1/datasets/{name}/records` and exportable via `/v1/export/dataset`.
 
@@ -638,6 +644,28 @@ curl -H "Authorization: Bearer <API_KEY>" \
 ```
 
 Returns per-coin Hyperliquid market analytics: total volume, unique trader count, total trades, aggregate PnL, and average trade size per coin. Supports `?target_id`, `?network`, `?time_start`, `?time_end` filters.
+
+### GET /v1/analytics/protocol/activity
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  "http://127.0.0.1:3000/v1/analytics/protocol/activity?protocol_address=0xUniswap"
+
+# Response: {"protocol_address": "0xUniswap", "event_counts_by_type": [{"event_type": "swap", "count": 100}], "unique_participants": 50, "total_events": 110, "time_start": 1700000000, "time_end": 1700100000}
+```
+
+Returns per-protocol event activity analytics: event counts grouped by type, unique participant count, and time range. Supports `?target_id`, `?network`, `?time_start`, `?time_end`, `?protocol_address` filters.
+
+### GET /v1/analytics/protocol/tvl
+
+```bash
+curl -H "Authorization: Bearer <API_KEY>" \
+  "http://127.0.0.1:3000/v1/analytics/protocol/tvl"
+
+# Response: {"pools": [{"pool_address": "0xPool", "protocol_address": "0xProto", "reserve0": "1000", "reserve1": "2000000", "tvl_usd": "4000000", ...}], "total_tvl": "4000000", "protocols": [...]}
+```
+
+Returns TVL analytics from pool snapshots: per-pool reserves and TVL, per-protocol aggregate TVL, and overall total TVL. Supports `?target_id`, `?network`, `?time_start`, `?time_end` filters.
 
 ## Configuration
 
@@ -747,6 +775,7 @@ All tables use UUIDs as primary keys and support idempotent batch inserts (`ON C
 - [ ] Add ETL-first delivery modes such as dataset exports, sink jobs, and warehouse-friendly outputs
 - [x] Keep wallet/tax/forensics materializations first-class, but as downstream products of the broader indexing core (P5-W1: wallet_ledger, balance_history, tax export, forensics activity)
 - [x] Add Hyperliquid-specific analytics as Gold datasets proving a dashboard can consume Spectraplex outputs directly (P5-W2: hl_pnl_summary, hl_trade_history, trader and market analytics)
+- [x] Add protocol/TVL analytics as Gold datasets enabling protocol dashboards from Spectraplex outputs (P5-W3: protocol_events, pool_snapshots, protocol activity and TVL analytics)
 
 The detailed roadmap lives in [`SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md`](SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md).
 
