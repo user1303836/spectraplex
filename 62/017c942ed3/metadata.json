@@ -3,9 +3,15 @@
   "checkpoint_id": "62017c942ed3",
   "strategy": "manual-commit",
   "branch": "p5-w1-wallet-tax-forensics-pack",
-  "checkpoints_count": 1,
+  "checkpoints_count": 3,
   "files_touched": [
-    "api/src/main.rs"
+    "README.md",
+    "adapters/src/ledger_derivation.rs",
+    "adapters/src/v2_repo.rs",
+    "api/src/main.rs",
+    "core/src/materializer.rs",
+    "migrations/20260310200000_add_wallet_ledger.sql",
+    "migrations/20260310200001_add_balance_history.sql"
   ],
   "sessions": [
     {
@@ -14,13 +20,20 @@
       "context": "/62/017c942ed3/0/context.md",
       "content_hash": "/62/017c942ed3/0/content_hash.txt",
       "prompt": "/62/017c942ed3/0/prompt.txt"
+    },
+    {
+      "metadata": "/62/017c942ed3/1/metadata.json",
+      "transcript": "/62/017c942ed3/1/full.jsonl",
+      "context": "/62/017c942ed3/1/context.md",
+      "content_hash": "/62/017c942ed3/1/content_hash.txt",
+      "prompt": "/62/017c942ed3/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 36,
-    "cache_creation_tokens": 51751,
-    "cache_read_tokens": 1318870,
-    "output_tokens": 12030,
-    "api_call_count": 34
+    "input_tokens": 3495,
+    "cache_creation_tokens": 112257,
+    "cache_read_tokens": 3925619,
+    "output_tokens": 28057,
+    "api_call_count": 80
   }
 }
