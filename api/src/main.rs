@@ -752,7 +752,14 @@ fn build_sink(config: &SinkConfig) -> Result<Box<dyn ExportSink>, String> {
 
 fn check_wallet_allowed(wallet: &str, allowed: &Option<HashSet<String>>) -> Result<(), AppError> {
     if let Some(set) = allowed {
-        if !set.contains(&wallet.to_lowercase()) {
+        // Normalize the lookup key the same way allowed_wallets_set() does:
+        // lowercase only EVM (0x-prefixed) addresses; preserve others as-is.
+        let key = if wallet.starts_with("0x") || wallet.starts_with("0X") {
+            wallet.to_lowercase()
+        } else {
+            wallet.to_string()
+        };
+        if !set.contains(&key) {
             return Err(AppError::forbidden("Wallet not in allowed set"));
         }
     }
@@ -4035,9 +4042,20 @@ mod tests {
     }
 
     #[test]
-    fn test_check_wallet_allowed_case_insensitive() {
-        let allowed: Option<HashSet<String>> = Some(["abc123".to_string()].into_iter().collect());
-        assert!(check_wallet_allowed("ABC123", &allowed).is_ok());
+    fn test_check_wallet_allowed_evm_case_insensitive() {
+        // EVM addresses (0x-prefixed) should be compared case-insensitively
+        let allowed: Option<HashSet<String>> = Some(["0xabc123".to_string()].into_iter().collect());
+        assert!(check_wallet_allowed("0xABC123", &allowed).is_ok());
+    }
+
+    #[test]
+    fn test_check_wallet_allowed_solana_case_sensitive() {
+        // Solana base58 addresses are case-sensitive; different case = different address
+        let allowed: Option<HashSet<String>> = Some(["DRpbCBMx".to_string()].into_iter().collect());
+        let err = check_wallet_allowed("drpbcbmx", &allowed).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        // Exact case should still match
+        assert!(check_wallet_allowed("DRpbCBMx", &allowed).is_ok());
     }
 
     #[test]

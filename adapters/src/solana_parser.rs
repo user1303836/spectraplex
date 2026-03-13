@@ -20,10 +20,7 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
         None => return Ok(vec![]),
     };
 
-    // Skip failed transactions
-    if meta.err.is_some() {
-        return Ok(vec![]);
-    }
+    let is_failed = meta.err.is_some();
 
     let transaction = &sol_tx.transaction.transaction;
     if let solana_transaction_status::EncodedTransaction::Json(ui_tx) = transaction {
@@ -33,13 +30,11 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
                 .iter()
                 .position(|k| k.pubkey == tx.wallet_address)
             {
-                let lamport_change = extract_sol_change_lamports(meta, idx);
                 let fee_lamports = meta.fee;
                 let is_fee_payer = idx == 0;
 
-                // If this wallet is the fee payer, separate fee from the net transfer
+                // Fee payer always pays the fee, even when the transaction fails
                 if is_fee_payer && fee_lamports > 0 {
-                    // Fee entry (always negative)
                     let fee_amount = lamports_to_sol(-(fee_lamports as i128));
                     entries.push(LedgerEntry {
                         id: deterministic_id(tx.id, entry_index),
@@ -52,40 +47,55 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
                         fiat_value: None,
                     });
                     entry_index += 1;
+                }
 
-                    // Net transfer amount = total balance change + fee (since fee is included in the balance change)
-                    let transfer_lamports = lamport_change + fee_lamports as i128;
-                    if transfer_lamports != 0 {
-                        let transfer_amount = lamports_to_sol(transfer_lamports);
+                // For failed transactions, only the fee is charged; skip
+                // balance-delta and transfer extraction.
+                if !is_failed {
+                    let lamport_change = extract_sol_change_lamports(meta, idx);
+
+                    if is_fee_payer {
+                        // Net transfer amount = total balance change + fee
+                        // (since fee is included in the balance change)
+                        let transfer_lamports = lamport_change + fee_lamports as i128;
+                        if transfer_lamports != 0 {
+                            let transfer_amount = lamports_to_sol(transfer_lamports);
+                            entries.push(LedgerEntry {
+                                id: deterministic_id(tx.id, entry_index),
+                                transaction_id: tx.id,
+                                user_id: tx.user_id,
+                                wallet_address: tx.wallet_address.clone(),
+                                asset_symbol: "SOL".to_string(),
+                                amount: transfer_amount,
+                                entry_type: EntryType::Transfer,
+                                fiat_value: None,
+                            });
+                            entry_index += 1;
+                        }
+                    } else if lamport_change != 0 {
+                        // Non-fee-payer: entire balance change is a transfer
+                        let amount = lamports_to_sol(lamport_change);
                         entries.push(LedgerEntry {
                             id: deterministic_id(tx.id, entry_index),
                             transaction_id: tx.id,
                             user_id: tx.user_id,
                             wallet_address: tx.wallet_address.clone(),
                             asset_symbol: "SOL".to_string(),
-                            amount: transfer_amount,
+                            amount,
                             entry_type: EntryType::Transfer,
                             fiat_value: None,
                         });
                         entry_index += 1;
                     }
-                } else if lamport_change != 0 {
-                    // Non-fee-payer: entire balance change is a transfer
-                    let amount = lamports_to_sol(lamport_change);
-                    entries.push(LedgerEntry {
-                        id: deterministic_id(tx.id, entry_index),
-                        transaction_id: tx.id,
-                        user_id: tx.user_id,
-                        wallet_address: tx.wallet_address.clone(),
-                        asset_symbol: "SOL".to_string(),
-                        amount,
-                        entry_type: EntryType::Transfer,
-                        fiat_value: None,
-                    });
-                    entry_index += 1;
                 }
             }
         }
+    }
+
+    // Skip SPL token extraction for failed transactions (no token state changes)
+    if is_failed {
+        let _ = entry_index;
+        return Ok(entries);
     }
 
     // Extract SPL Token Changes
@@ -300,9 +310,8 @@ pub fn extract_solana_native_balance_deltas(
         None => return vec![],
     };
 
-    if meta.err.is_some() {
-        return vec![];
-    }
+    // Do NOT skip failed transactions here. The fee payer's SOL balance
+    // still changes (fee deduction) even when a transaction fails.
 
     let account_keys: Vec<String> =
         if let solana_transaction_status::EncodedTransaction::Json(ui_tx) =
@@ -827,6 +836,143 @@ mod tests {
             hashes.len(),
             4,
             "all 4 Solana materializers must have distinct hashes"
+        );
+    }
+
+    // -- Failed transaction fee extraction tests (issue #145) --
+
+    #[test]
+    fn test_parse_failed_tx_emits_fee_entry() {
+        // A failed transaction where the fee payer is the tracked wallet.
+        // The fee should still be recorded as a ledger entry.
+        // Note: EncodedConfirmedTransactionWithStatusMeta uses #[serde(flatten)]
+        // for the inner EncodedTransactionWithStatusMeta, so `transaction` and
+        // `meta` sit at the same level as `slot` and `blockTime`.
+        let metadata = serde_json::json!({
+            "slot": 200,
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        {"pubkey": "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy", "signer": true, "writable": true, "source": "transaction"}
+                    ],
+                    "instructions": [],
+                    "recentBlockhash": "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTKD5xD3Zi"
+                },
+                "signatures": ["5VERv8NMhUE4P7zKWwgHFnrKkL3gS8YvEJrDp6t8mKfDfvtVQDVMRVhkNmqwdpC9UYNYyE5LfK6rrboKpMrZGKh"]
+            },
+            "meta": {
+                "err": {"InstructionError": [0, {"Custom": 1}]},
+                "status": {"Err": {"InstructionError": [0, {"Custom": 1}]}},
+                "fee": 5000,
+                "preBalances": [10000000],
+                "postBalances": [9995000],
+                "preTokenBalances": [],
+                "postTokenBalances": [],
+                "logMessages": []
+            },
+            "blockTime": 1700000000
+        });
+
+        let tx_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let tx = Transaction {
+            id: tx_id,
+            user_id,
+            wallet_address: "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy".to_string(),
+            timestamp: 1700000000,
+            tx_hash: "5VERv8NMhUE4P7zKWwgHFnrKkL3gS8YvEJrDp6t8mKfDfvtVQDVMRVhkNmqwdpC9UYNYyE5LfK6rrboKpMrZGKh".to_string(),
+            chain: spectraplex_core::models::Chain::Solana,
+            raw_metadata: metadata,
+        };
+
+        let entries = parse_solana_transaction(&tx).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "failed tx should produce exactly one fee entry"
+        );
+        assert!(
+            matches!(entries[0].entry_type, EntryType::Fee),
+            "entry should be a Fee"
+        );
+        let expected_fee = lamports_to_sol(-5000i128);
+        assert_eq!(entries[0].amount, expected_fee);
+        assert_eq!(entries[0].asset_symbol, "SOL");
+    }
+
+    #[test]
+    fn test_extract_native_balance_deltas_failed_tx() {
+        // A failed transaction should still emit a balance delta for the
+        // fee payer (the fee is still deducted).
+        let metadata = serde_json::json!({
+            "slot": 200,
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        {"pubkey": "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy", "signer": true, "writable": true, "source": "transaction"}
+                    ],
+                    "instructions": [],
+                    "recentBlockhash": "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTKD5xD3Zi"
+                },
+                "signatures": ["5VERv8NMhUE4P7zKWwgHFnrKkL3gS8YvEJrDp6t8mKfDfvtVQDVMRVhkNmqwdpC9UYNYyE5LfK6rrboKpMrZGKh"]
+            },
+            "meta": {
+                "err": {"InstructionError": [0, {"Custom": 1}]},
+                "status": {"Err": {"InstructionError": [0, {"Custom": 1}]}},
+                "fee": 5000,
+                "preBalances": [10000000],
+                "postBalances": [9995000],
+                "preTokenBalances": [],
+                "postTokenBalances": [],
+                "logMessages": []
+            },
+            "blockTime": 1700000000
+        });
+
+        let deltas =
+            extract_solana_native_balance_deltas(Some(Uuid::new_v4()), "solana-mainnet", &metadata);
+        assert_eq!(
+            deltas.len(),
+            1,
+            "failed tx should still emit fee payer balance delta"
+        );
+        assert!(deltas[0].is_fee_payer);
+        assert_eq!(deltas[0].delta, lamports_to_sol(-5000i128));
+    }
+
+    #[test]
+    fn test_extract_token_transfers_failed_tx_skip() {
+        // Failed transactions should still produce no token transfers.
+        let metadata = serde_json::json!({
+            "slot": 200,
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        {"pubkey": "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy", "signer": true, "writable": true, "source": "transaction"}
+                    ],
+                    "instructions": [],
+                    "recentBlockhash": "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTKD5xD3Zi"
+                },
+                "signatures": ["5VERv8NMhUE4P7zKWwgHFnrKkL3gS8YvEJrDp6t8mKfDfvtVQDVMRVhkNmqwdpC9UYNYyE5LfK6rrboKpMrZGKh"]
+            },
+            "meta": {
+                "err": {"InstructionError": [0, {"Custom": 1}]},
+                "status": {"Err": {"InstructionError": [0, {"Custom": 1}]}},
+                "fee": 5000,
+                "preBalances": [10000000],
+                "postBalances": [9995000],
+                "preTokenBalances": [],
+                "postTokenBalances": [],
+                "logMessages": []
+            },
+            "blockTime": 1700000000
+        });
+
+        let transfers =
+            extract_solana_token_transfers(Some(Uuid::new_v4()), "solana-mainnet", &metadata);
+        assert!(
+            transfers.is_empty(),
+            "failed transactions should produce no token transfers"
         );
     }
 

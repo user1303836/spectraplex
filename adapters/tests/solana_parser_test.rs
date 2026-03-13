@@ -167,10 +167,10 @@ fn test_fee_only_transaction() {
 }
 
 // -----------------------------------------------------------------------
-// 4. Failed transaction (should be skipped)
+// 4. Failed transaction (fee payer still pays the fee)
 // -----------------------------------------------------------------------
 #[test]
-fn test_failed_transaction_skipped() {
+fn test_failed_transaction_emits_fee() {
     let wallet = "WalletAddress111111111111111111111111111111";
 
     let meta = json!({
@@ -205,9 +205,12 @@ fn test_failed_transaction_skipped() {
 
     assert_eq!(
         entries.len(),
-        0,
-        "Failed transactions should produce no entries"
+        1,
+        "Failed transactions should produce exactly one fee entry"
     );
+    assert!(matches!(entries[0].entry_type, EntryType::Fee));
+    assert_eq!(entries[0].amount, bd("-0.000005"));
+    assert_eq!(entries[0].asset_symbol, "SOL");
 }
 
 // -----------------------------------------------------------------------
