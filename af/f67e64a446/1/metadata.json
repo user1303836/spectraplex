@@ -1,0 +1,33 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "aff67e64a446",
+  "session_id": "705f7f05-679e-46ca-9681-e8343a30bc27",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-13T17:29:38.627751Z",
+  "branch": "fix/medium-issues-152-146-148",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "api/src/main.rs",
+    "core/src/config.rs",
+    "migrations/20260313100000_add_enum_check_constraints.sql"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "20d0e27e9fd1",
+  "token_usage": {
+    "input_tokens": 3459,
+    "cache_creation_tokens": 60506,
+    "cache_read_tokens": 2606749,
+    "output_tokens": 16027,
+    "api_call_count": 46
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-13T17:29:38.372493Z",
+    "agent_lines": 0,
+    "human_added": 390,
+    "human_modified": 11,
+    "human_removed": 0,
+    "total_committed": 390,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/705f7f05-679e-46ca-9681-e8343a30bc27.jsonl"
+}
