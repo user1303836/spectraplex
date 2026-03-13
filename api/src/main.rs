@@ -37,7 +37,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex as TokioMutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
@@ -112,6 +112,56 @@ where
 const MAX_CONCURRENT_JOBS: usize = 10;
 const MAX_CONCURRENT_STREAMS: usize = 5;
 
+/// Default requests allowed per key before throttling.
+const RATE_LIMIT_CAPACITY: u32 = 60;
+/// Tokens restored per second.
+const RATE_LIMIT_REFILL_RATE: f64 = 10.0;
+
+/// In-memory token-bucket rate limiter keyed by API key.
+struct RateLimiter {
+    buckets: TokioMutex<HashMap<String, TokenBucket>>,
+    capacity: u32,
+    refill_rate: f64,
+}
+
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl RateLimiter {
+    fn new(capacity: u32, refill_rate: f64) -> Self {
+        Self {
+            buckets: TokioMutex::new(HashMap::new()),
+            capacity,
+            refill_rate,
+        }
+    }
+
+    /// Try to consume one token for the given key. Returns `true` if allowed.
+    async fn try_acquire(&self, key: &str) -> bool {
+        let mut buckets = self.buckets.lock().await;
+        let now = Instant::now();
+        let cap = self.capacity as f64;
+        let bucket = buckets.entry(key.to_string()).or_insert(TokenBucket {
+            tokens: cap,
+            last_refill: now,
+        });
+
+        // Refill tokens based on elapsed time.
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * self.refill_rate).min(cap);
+        bucket.last_refill = now;
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 struct AppState {
     repo: Repository,
     config: AppConfig,
@@ -121,6 +171,7 @@ struct AppState {
     streams: RwLock<HashMap<Uuid, StreamEntry>>,
     stream_semaphore: Arc<Semaphore>,
     export_jobs: RwLock<HashMap<Uuid, ExportJobEntry>>,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 struct StreamEntry {
@@ -264,6 +315,10 @@ async fn main() -> anyhow::Result<()> {
         streams: RwLock::new(HashMap::new()),
         stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
         export_jobs: RwLock::new(HashMap::new()),
+        rate_limiter: Arc::new(RateLimiter::new(
+            RATE_LIMIT_CAPACITY,
+            RATE_LIMIT_REFILL_RATE,
+        )),
     });
 
     let protected = Router::new()
@@ -314,6 +369,10 @@ async fn main() -> anyhow::Result<()> {
             get(protocol_activity_handler),
         )
         .route("/v1/analytics/protocol/tvl", get(protocol_tvl_handler))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&shared_state),
+            rate_limit_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared_state),
             require_auth,
@@ -372,6 +431,32 @@ async fn require_auth(
             message: "Missing or invalid API key".to_string(),
         }),
     }
+}
+
+/// Per-key rate limiting middleware. Runs after auth so the key is already
+/// validated. Extracts the Bearer token from the Authorization header and
+/// uses it as the bucket key.
+async fn rate_limit_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let key = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("anonymous")
+        .to_string();
+
+    if !state.rate_limiter.try_acquire(&key).await {
+        return Err(AppError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "Rate limit exceeded. Try again shortly.".to_string(),
+        });
+    }
+
+    Ok(next.run(req).await)
 }
 
 #[derive(Deserialize)]
@@ -3305,6 +3390,10 @@ mod tests {
             streams: RwLock::new(HashMap::new()),
             stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
             export_jobs: RwLock::new(HashMap::new()),
+            rate_limiter: Arc::new(RateLimiter::new(
+                RATE_LIMIT_CAPACITY,
+                RATE_LIMIT_REFILL_RATE,
+            )),
         })
     }
 
@@ -3362,6 +3451,10 @@ mod tests {
                 get(protocol_activity_handler),
             )
             .route("/v1/analytics/protocol/tvl", get(protocol_tvl_handler))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                rate_limit_middleware,
+            ))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_auth,
@@ -3881,6 +3974,10 @@ mod tests {
             streams: RwLock::new(HashMap::new()),
             stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
             export_jobs: RwLock::new(HashMap::new()),
+            rate_limiter: Arc::new(RateLimiter::new(
+                RATE_LIMIT_CAPACITY,
+                RATE_LIMIT_REFILL_RATE,
+            )),
         });
         let app = test_router_with_state(Arc::clone(&state));
 
@@ -5012,6 +5109,10 @@ mod tests {
             streams: RwLock::new(HashMap::new()),
             stream_semaphore: Arc::new(Semaphore::new(0)),
             export_jobs: RwLock::new(HashMap::new()),
+            rate_limiter: Arc::new(RateLimiter::new(
+                RATE_LIMIT_CAPACITY,
+                RATE_LIMIT_REFILL_RATE,
+            )),
         });
 
         let app = test_router_with_state(state);
