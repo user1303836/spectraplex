@@ -528,7 +528,25 @@ fn is_private_ip(host: &str) -> bool {
                     || v4.is_broadcast()
                     || v4.is_unspecified()
             }
-            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+            IpAddr::V6(v6) => {
+                let seg0 = v6.segments()[0];
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    // ULA (fc00::/7): private network addresses
+                    || (seg0 & 0xfe00) == 0xfc00
+                    // Link-local (fe80::/10): local network, metadata services
+                    || (seg0 & 0xffc0) == 0xfe80
+                    // Multicast (ff00::/8)
+                    || (seg0 & 0xff00) == 0xff00
+                    // IPv4-mapped (::ffff:0:0/96) — delegate to v4 rules
+                    || v6.to_ipv4_mapped().is_some_and(|v4| {
+                        v4.is_loopback()
+                            || v4.is_private()
+                            || v4.is_link_local()
+                            || v4.is_broadcast()
+                            || v4.is_unspecified()
+                    })
+            }
         }
     } else {
         host == "localhost"
@@ -2840,9 +2858,16 @@ async fn download_export(
                 .data
                 .as_ref()
                 .ok_or_else(|| AppError::internal("Export data missing"))?;
+            let sanitize = |s: &str| -> String {
+                s.chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                    .collect()
+            };
+            let safe_dataset = sanitize(&entry.status.dataset);
+            let safe_format = sanitize(&entry.status.format);
             let disposition = format!(
                 "attachment; filename=\"{}-{}.{}\"",
-                entry.status.dataset, job_id, entry.status.format,
+                safe_dataset, job_id, safe_format,
             );
             let mut response = (StatusCode::OK, data.body.clone()).into_response();
             let headers = response.headers_mut();
@@ -4291,6 +4316,43 @@ mod tests {
         assert!(is_private_ip("::1"));
         assert!(!is_private_ip("8.8.8.8"));
         assert!(!is_private_ip("example.com"));
+    }
+
+    #[test]
+    fn test_is_private_ip_ipv6_ula() {
+        // ULA range fc00::/7
+        assert!(is_private_ip("fc00::1"));
+        assert!(is_private_ip("fd12:3456:789a::1"));
+    }
+
+    #[test]
+    fn test_is_private_ip_ipv6_link_local() {
+        // Link-local fe80::/10
+        assert!(is_private_ip("fe80::1"));
+        assert!(is_private_ip("fe80::a1:b2c3"));
+    }
+
+    #[test]
+    fn test_is_private_ip_ipv6_multicast() {
+        // Multicast ff00::/8
+        assert!(is_private_ip("ff02::1"));
+        assert!(is_private_ip("ff05::2"));
+    }
+
+    #[test]
+    fn test_is_private_ip_ipv4_mapped_ipv6() {
+        // IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
+        assert!(is_private_ip("::ffff:127.0.0.1"));
+        assert!(is_private_ip("::ffff:10.0.0.1"));
+        assert!(is_private_ip("::ffff:192.168.1.1"));
+        assert!(!is_private_ip("::ffff:8.8.8.8"));
+    }
+
+    #[test]
+    fn test_is_private_ip_ipv6_public() {
+        // Public IPv6 addresses should NOT be flagged
+        assert!(!is_private_ip("2001:4860:4860::8888"));
+        assert!(!is_private_ip("2606:4700::1111"));
     }
 
     #[tokio::test]
@@ -5835,6 +5897,73 @@ mod tests {
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_export_download_sanitizes_content_disposition() {
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        // Simulate an entry with characters that would be stripped by sanitization
+        state.export_jobs.write().await.insert(
+            job_id,
+            ExportJobEntry {
+                status: ExportJobStatus {
+                    id: job_id,
+                    state: JobState::Completed,
+                    dataset: "hl_fills\r\nX-Injected: true".to_string(),
+                    format: "csv\r\n\r\n<html>".to_string(),
+                    record_count: Some(1),
+                    message: None,
+                    delivered_to: None,
+                    delivery_status: None,
+                    dataset_version_id: None,
+                    dataset_version: None,
+                    completeness_status: None,
+                    completeness_coverage: None,
+                    started_at: None,
+                    completed_at: None,
+                    last_ingestion_run_id: None,
+                },
+                finished_at: Some(Instant::now()),
+                data: Some(ExportData {
+                    content_type: "text/csv; charset=utf-8",
+                    body: b"a,b\n1,2\n".to_vec(),
+                }),
+            },
+        );
+
+        let app = test_router_with_state(Arc::clone(&state));
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/export/jobs/{}/download", job_id))
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let disposition = response
+            .headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        // CRLF and special characters must be stripped; only [a-zA-Z0-9_-] kept
+        assert!(
+            !disposition.contains('\r'),
+            "Content-Disposition must not contain CR"
+        );
+        assert!(
+            !disposition.contains('\n'),
+            "Content-Disposition must not contain LF"
+        );
+        assert!(
+            disposition.contains("hl_fillsX-Injectedtrue"),
+            "dataset should be sanitized to alphanumeric/underscore/hyphen: {disposition}"
+        );
+        assert!(
+            disposition.contains("csvhtml"),
+            "format should be sanitized to alphanumeric/underscore/hyphen: {disposition}"
+        );
     }
 
     #[tokio::test]
