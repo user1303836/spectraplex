@@ -94,7 +94,6 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
 
     // Skip SPL token extraction for failed transactions (no token state changes)
     if is_failed {
-        let _ = entry_index;
         return Ok(entries);
     }
 
@@ -898,6 +897,98 @@ mod tests {
         let expected_fee = lamports_to_sol(-5000i128);
         assert_eq!(entries[0].amount, expected_fee);
         assert_eq!(entries[0].asset_symbol, "SOL");
+    }
+
+    #[test]
+    fn test_parse_failed_tx_non_fee_payer_produces_no_entries() {
+        let metadata = serde_json::json!({
+            "slot": 200,
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        {"pubkey": "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy", "signer": true, "writable": true, "source": "transaction"},
+                        {"pubkey": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", "signer": false, "writable": true, "source": "transaction"}
+                    ],
+                    "instructions": [],
+                    "recentBlockhash": "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTKD5xD3Zi"
+                },
+                "signatures": ["5VERv8NMhUE4P7zKWwgHFnrKkL3gS8YvEJrDp6t8mKfDfvtVQDVMRVhkNmqwdpC9UYNYyE5LfK6rrboKpMrZGKh"]
+            },
+            "meta": {
+                "err": {"InstructionError": [0, {"Custom": 1}]},
+                "status": {"Err": {"InstructionError": [0, {"Custom": 1}]}},
+                "fee": 5000,
+                "preBalances": [10000000, 5000000],
+                "postBalances": [9995000, 5000000],
+                "preTokenBalances": [],
+                "postTokenBalances": [],
+                "logMessages": []
+            },
+            "blockTime": 1700000000
+        });
+
+        let tx_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let tx = Transaction {
+            id: tx_id,
+            user_id,
+            wallet_address: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
+            timestamp: 1700000000,
+            tx_hash: "5VERv8NMhUE4P7zKWwgHFnrKkL3gS8YvEJrDp6t8mKfDfvtVQDVMRVhkNmqwdpC9UYNYyE5LfK6rrboKpMrZGKh"
+                .to_string(),
+            chain: spectraplex_core::models::Chain::Solana,
+            raw_metadata: metadata,
+        };
+
+        let entries = parse_solana_transaction(&tx).unwrap();
+        assert!(
+            entries.is_empty(),
+            "non-fee-payer on a failed tx should produce zero entries"
+        );
+    }
+
+    #[test]
+    fn test_extract_native_balance_deltas_failed_tx_multi_account() {
+        let metadata = serde_json::json!({
+            "slot": 200,
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        {"pubkey": "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy", "signer": true, "writable": true, "source": "transaction"},
+                        {"pubkey": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", "signer": false, "writable": true, "source": "transaction"},
+                        {"pubkey": "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM", "signer": false, "writable": false, "source": "transaction"}
+                    ],
+                    "instructions": [],
+                    "recentBlockhash": "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTKD5xD3Zi"
+                },
+                "signatures": ["5VERv8NMhUE4P7zKWwgHFnrKkL3gS8YvEJrDp6t8mKfDfvtVQDVMRVhkNmqwdpC9UYNYyE5LfK6rrboKpMrZGKh"]
+            },
+            "meta": {
+                "err": {"InstructionError": [0, {"Custom": 1}]},
+                "status": {"Err": {"InstructionError": [0, {"Custom": 1}]}},
+                "fee": 5000,
+                "preBalances": [10000000, 5000000, 2000000],
+                "postBalances": [9995000, 5000000, 2000000],
+                "preTokenBalances": [],
+                "postTokenBalances": [],
+                "logMessages": []
+            },
+            "blockTime": 1700000000
+        });
+
+        let deltas =
+            extract_solana_native_balance_deltas(Some(Uuid::new_v4()), "solana-mainnet", &metadata);
+        assert_eq!(
+            deltas.len(),
+            1,
+            "only the fee payer should have a non-zero delta in a failed tx"
+        );
+        assert!(deltas[0].is_fee_payer);
+        assert_eq!(
+            deltas[0].account_address,
+            "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy"
+        );
+        assert_eq!(deltas[0].delta, lamports_to_sol(-5000i128));
     }
 
     #[test]
