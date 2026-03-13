@@ -351,7 +351,7 @@ async fn require_auth(
         Some(key) => key,
         None => {
             return Err(AppError {
-                status: StatusCode::UNAUTHORIZED,
+                status: StatusCode::INTERNAL_SERVER_ERROR,
                 message: "API key not configured".to_string(),
             })
         }
@@ -529,17 +529,13 @@ fn is_private_ip(host: &str) -> bool {
                     || v4.is_unspecified()
             }
             IpAddr::V6(v6) => {
-                let seg0 = v6.segments()[0];
                 v6.is_loopback()
                     || v6.is_unspecified()
-                    // ULA (fc00::/7): private network addresses
-                    || (seg0 & 0xfe00) == 0xfc00
-                    // Link-local (fe80::/10): local network, metadata services
-                    || (seg0 & 0xffc0) == 0xfe80
-                    // Multicast (ff00::/8)
-                    || (seg0 & 0xff00) == 0xff00
-                    // IPv4-mapped (::ffff:0:0/96) — delegate to v4 rules
-                    || v6.to_ipv4_mapped().is_some_and(|v4| {
+                    || v6.is_unique_local()
+                    || v6.is_unicast_link_local()
+                    || v6.is_multicast()
+                    // IPv4-mapped and IPv4-compatible — delegate to v4 rules
+                    || v6.to_ipv4().is_some_and(|v4| {
                         v4.is_loopback()
                             || v4.is_private()
                             || v4.is_link_local()
@@ -2387,7 +2383,7 @@ fn wallet_ledger_to_tax_csv(records: &[WalletLedgerRecord]) -> Vec<u8> {
 async fn create_export_job(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ExportJobRequest>,
-) -> Result<Json<ExportJobStatus>, AppError> {
+) -> Result<(StatusCode, Json<ExportJobStatus>), AppError> {
     validate_dataset_name(&req.dataset)?;
     if !EXPORTABLE_DATASETS.contains(&req.dataset.as_str()) {
         return Err(AppError::bad_request(format!(
@@ -2583,7 +2579,7 @@ async fn create_export_job(
         }
     });
 
-    Ok(Json(status))
+    Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
 /// Metadata gathered during an export job for provenance and observability.
@@ -3774,7 +3770,8 @@ mod tests {
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // Unconfigured API key is a server misconfiguration, not a client auth failure
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
@@ -4364,6 +4361,14 @@ mod tests {
         assert!(is_private_ip("::ffff:10.0.0.1"));
         assert!(is_private_ip("::ffff:192.168.1.1"));
         assert!(!is_private_ip("::ffff:8.8.8.8"));
+    }
+
+    #[test]
+    fn test_is_private_ip_ipv4_compatible_ipv6() {
+        // IPv4-compatible addresses (::x.x.x.x) must also be blocked
+        assert!(is_private_ip("::10.0.0.1"));
+        assert!(is_private_ip("::127.0.0.1"));
+        assert!(!is_private_ip("::8.8.8.8"));
     }
 
     #[test]
@@ -5670,8 +5675,8 @@ mod tests {
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
-        // Job is accepted (200), background task will fail due to fake DB pool
-        assert_eq!(response.status(), StatusCode::OK);
+        // Async job creation returns 202 Accepted
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(job["state"], "pending");
@@ -5696,7 +5701,7 @@ mod tests {
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(job["state"], "pending");
@@ -5720,7 +5725,7 @@ mod tests {
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(job["format"], "jsonl");
@@ -5748,7 +5753,7 @@ mod tests {
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
@@ -6139,7 +6144,7 @@ mod tests {
             let response = app.oneshot(req).await.unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::OK,
+                StatusCode::ACCEPTED,
                 "dataset {dataset} should be accepted"
             );
         }
@@ -6518,7 +6523,7 @@ mod tests {
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(job["state"], "pending");
@@ -6598,7 +6603,7 @@ mod tests {
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(job["state"], "pending");
@@ -7423,7 +7428,7 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::OK,
+            StatusCode::ACCEPTED,
             "wallet_ledger export should be accepted"
         );
     }
@@ -7446,7 +7451,7 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::OK,
+            StatusCode::ACCEPTED,
             "balance_history export should be accepted"
         );
     }
@@ -7551,7 +7556,7 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::OK,
+            StatusCode::ACCEPTED,
             "hl_pnl_summary export should be accepted"
         );
     }
@@ -7574,7 +7579,7 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::OK,
+            StatusCode::ACCEPTED,
             "hl_trade_history export should be accepted"
         );
     }
@@ -7753,7 +7758,7 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::OK,
+            StatusCode::ACCEPTED,
             "protocol_events export should be accepted"
         );
     }
@@ -7776,7 +7781,7 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::OK,
+            StatusCode::ACCEPTED,
             "pool_snapshots export should be accepted"
         );
     }
