@@ -1,0 +1,31 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "cccef61a79a6",
+  "session_id": "b1f5d2ae-9b63-4a62-b72c-1498a6fe382a",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-13T17:41:52.302546Z",
+  "branch": "fix/medium-issues-152-146-148",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "api/src/main.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "f2de5192baf8",
+  "token_usage": {
+    "input_tokens": 56,
+    "cache_creation_tokens": 54146,
+    "cache_read_tokens": 1110727,
+    "output_tokens": 14774,
+    "api_call_count": 26
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-13T17:41:52.143635Z",
+    "agent_lines": 0,
+    "human_added": 394,
+    "human_modified": 33,
+    "human_removed": 0,
+    "total_committed": 394,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/b1f5d2ae-9b63-4a62-b72c-1498a6fe382a.jsonl"
+}

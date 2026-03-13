@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "cccef61a79a6",
+  "strategy": "manual-commit",
+  "branch": "fix/medium-issues-152-146-148",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "api/src/main.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/cc/cef61a79a6/0/metadata.json",
+      "transcript": "/cc/cef61a79a6/0/full.jsonl",
+      "context": "/cc/cef61a79a6/0/context.md",
+      "content_hash": "/cc/cef61a79a6/0/content_hash.txt",
+      "prompt": "/cc/cef61a79a6/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 56,
+    "cache_creation_tokens": 54146,
+    "cache_read_tokens": 1110727,
+    "output_tokens": 14774,
+    "api_call_count": 26
+  }
+}
