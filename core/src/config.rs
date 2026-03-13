@@ -60,7 +60,18 @@ impl AppConfig {
     pub fn allowed_wallets_set(&self) -> Option<HashSet<String>> {
         self.allowed_wallets.as_ref().map(|s| {
             s.split(',')
-                .map(|w| w.trim().to_lowercase())
+                .map(|w| {
+                    let trimmed = w.trim();
+                    // EVM addresses (0x-prefixed hex) are case-insensitive;
+                    // normalize them to lowercase. All other address formats
+                    // (Solana base58, etc.) are case-sensitive and must be
+                    // preserved as-is.
+                    if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+                        trimmed.to_lowercase()
+                    } else {
+                        trimmed.to_string()
+                    }
+                })
                 .filter(|w| !w.is_empty())
                 .collect()
         })
@@ -106,16 +117,21 @@ mod tests {
     }
 
     #[test]
-    fn test_allowed_wallets_set_parses_csv() {
+    fn test_allowed_wallets_set_lowercases_evm_only() {
         let config = AppConfig {
-            allowed_wallets: Some("Wallet1, wallet2 ,WALLET3".to_string()),
+            allowed_wallets: Some(
+                "0xAbC123, DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy ,0XdeF456".to_string(),
+            ),
             ..AppConfig::default()
         };
         let set = config.allowed_wallets_set().unwrap();
         assert_eq!(set.len(), 3);
-        assert!(set.contains("wallet1"));
-        assert!(set.contains("wallet2"));
-        assert!(set.contains("wallet3"));
+        // EVM addresses are lowercased
+        assert!(set.contains("0xabc123"));
+        assert!(set.contains("0xdef456"));
+        // Solana base58 addresses are preserved as-is
+        assert!(set.contains("DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy"));
+        assert!(!set.contains("drpbcbmxvndk7mapm5tgv6mvb3v1srmc86pz8okm21hy"));
     }
 
     #[test]

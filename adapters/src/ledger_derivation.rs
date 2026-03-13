@@ -16,6 +16,23 @@ use uuid::Uuid;
 use crate::deterministic_id;
 
 // ---------------------------------------------------------------------------
+// Address normalization helper
+// ---------------------------------------------------------------------------
+
+/// Normalize an address for case-insensitive comparison on EVM chains only.
+///
+/// EVM addresses (`0x`/`0X`-prefixed hex) are case-insensitive, so we lowercase
+/// them. All other address formats (Solana base58, etc.) are case-sensitive and
+/// must be preserved as-is.
+fn normalize_address_for_comparison(addr: &str) -> String {
+    if addr.starts_with("0x") || addr.starts_with("0X") {
+        addr.to_lowercase()
+    } else {
+        addr.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Silver record container
 // ---------------------------------------------------------------------------
 
@@ -48,12 +65,12 @@ pub fn derive_ledger_from_token_transfers(
     transfers: &[TokenTransfer],
     entry_offset: &mut u32,
 ) -> Vec<LedgerEntry> {
-    let wallet_lower = wallet.to_lowercase();
+    let wallet_norm = normalize_address_for_comparison(wallet);
     let mut entries = Vec::new();
 
     for transfer in transfers {
-        let from_match = transfer.from_address.to_lowercase() == wallet_lower;
-        let to_match = transfer.to_address.to_lowercase() == wallet_lower;
+        let from_match = normalize_address_for_comparison(&transfer.from_address) == wallet_norm;
+        let to_match = normalize_address_for_comparison(&transfer.to_address) == wallet_norm;
 
         if !from_match && !to_match {
             continue;
@@ -108,11 +125,11 @@ pub fn derive_ledger_from_native_balance_deltas(
     deltas: &[NativeBalanceDelta],
     entry_offset: &mut u32,
 ) -> Vec<LedgerEntry> {
-    let wallet_lower = wallet.to_lowercase();
+    let wallet_norm = normalize_address_for_comparison(wallet);
     let mut entries = Vec::new();
 
     for delta in deltas {
-        if delta.account_address.to_lowercase() != wallet_lower {
+        if normalize_address_for_comparison(&delta.account_address) != wallet_norm {
             continue;
         }
 
@@ -440,13 +457,13 @@ pub fn derive_wallet_ledger_from_token_transfers(
     transfers: &[TokenTransfer],
     entry_offset: &mut u32,
 ) -> Vec<WalletLedgerRecord> {
-    let wallet_lower = wallet.to_lowercase();
+    let wallet_norm = normalize_address_for_comparison(wallet);
     let mut records = Vec::new();
     let now = Utc::now();
 
     for transfer in transfers {
-        let from_match = transfer.from_address.to_lowercase() == wallet_lower;
-        let to_match = transfer.to_address.to_lowercase() == wallet_lower;
+        let from_match = normalize_address_for_comparison(&transfer.from_address) == wallet_norm;
+        let to_match = normalize_address_for_comparison(&transfer.to_address) == wallet_norm;
 
         if !from_match && !to_match {
             continue;
@@ -520,12 +537,12 @@ pub fn derive_wallet_ledger_from_native_balance_deltas(
     deltas: &[NativeBalanceDelta],
     entry_offset: &mut u32,
 ) -> Vec<WalletLedgerRecord> {
-    let wallet_lower = wallet.to_lowercase();
+    let wallet_norm = normalize_address_for_comparison(wallet);
     let mut records = Vec::new();
     let now = Utc::now();
 
     for delta in deltas {
-        if delta.account_address.to_lowercase() != wallet_lower {
+        if normalize_address_for_comparison(&delta.account_address) != wallet_norm {
             continue;
         }
 
