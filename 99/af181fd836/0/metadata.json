@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "99af181fd836",
+  "session_id": "6811e06b-0599-4616-885a-62d0bc68fe68",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-13T17:03:26.632637Z",
+  "branch": "fix/solana-parser-wallet-filter-bugs-145-143",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "adapters/src/ledger_derivation.rs",
+    "adapters/src/solana_parser.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "92e73c52b48a",
+  "token_usage": {
+    "input_tokens": 36,
+    "cache_creation_tokens": 51751,
+    "cache_read_tokens": 1318870,
+    "output_tokens": 12030,
+    "api_call_count": 34
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-13T17:03:26.253015Z",
+    "agent_lines": 0,
+    "human_added": 865,
+    "human_modified": 39,
+    "human_removed": 0,
+    "total_committed": 865,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/6811e06b-0599-4616-885a-62d0bc68fe68.jsonl"
+}
