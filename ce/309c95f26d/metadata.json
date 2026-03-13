@@ -3,7 +3,7 @@
   "checkpoint_id": "ce309c95f26d",
   "strategy": "manual-commit",
   "branch": "fix/medium-issues-149-150-153-160",
-  "checkpoints_count": 2,
+  "checkpoints_count": 3,
   "files_touched": [
     "migrations/20260313200000_add_ledger_entries_transaction_id_index.sql"
   ],
@@ -35,13 +35,20 @@
       "context": "/ce/309c95f26d/3/context.md",
       "content_hash": "/ce/309c95f26d/3/content_hash.txt",
       "prompt": "/ce/309c95f26d/3/prompt.txt"
+    },
+    {
+      "metadata": "/ce/309c95f26d/4/metadata.json",
+      "transcript": "/ce/309c95f26d/4/full.jsonl",
+      "context": "/ce/309c95f26d/4/context.md",
+      "content_hash": "/ce/309c95f26d/4/content_hash.txt",
+      "prompt": "/ce/309c95f26d/4/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 3705,
-    "cache_creation_tokens": 402739,
-    "cache_read_tokens": 27590870,
-    "output_tokens": 100634,
-    "api_call_count": 286
+    "input_tokens": 3758,
+    "cache_creation_tokens": 456223,
+    "cache_read_tokens": 28641416,
+    "output_tokens": 115210,
+    "api_call_count": 311
   }
 }
