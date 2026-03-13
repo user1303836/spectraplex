@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "ce309c95f26d",
+  "strategy": "manual-commit",
+  "branch": "fix/medium-issues-149-150-153-160",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "migrations/20260313200000_add_ledger_entries_transaction_id_index.sql"
+  ],
+  "sessions": [
+    {
+      "metadata": "/ce/309c95f26d/0/metadata.json",
+      "transcript": "/ce/309c95f26d/0/full.jsonl",
+      "context": "/ce/309c95f26d/0/context.md",
+      "content_hash": "/ce/309c95f26d/0/content_hash.txt",
+      "prompt": "/ce/309c95f26d/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 36,
+    "cache_creation_tokens": 51751,
+    "cache_read_tokens": 1318870,
+    "output_tokens": 12030,
+    "api_call_count": 34
+  }
+}
