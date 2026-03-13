@@ -21,6 +21,32 @@ pub struct AppConfig {
     pub solana_grpc_token: Option<String>,
 }
 
+/// Errors from config validation.
+#[derive(Debug)]
+pub enum ConfigError {
+    /// Figment extraction failed.
+    Figment(Box<figment::Error>),
+    /// A validated field has an invalid value.
+    Validation(String),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::Figment(e) => write!(f, "config load error: {e}"),
+            ConfigError::Validation(msg) => write!(f, "config validation error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+impl From<Box<figment::Error>> for ConfigError {
+    fn from(e: Box<figment::Error>) -> Self {
+        ConfigError::Figment(e)
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -41,6 +67,30 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Validate config fields that have semantic constraints.
+    ///
+    /// - `database_url` must not be empty (required for all database operations)
+    /// - `port` must be non-zero (0 means OS-assigned, unusual and likely misconfiguration)
+    /// - `pool_size` must be between 1 and 1000
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.database_url.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "database_url must not be empty".to_string(),
+            ));
+        }
+        if self.port == 0 {
+            return Err(ConfigError::Validation(
+                "port must be between 1 and 65535".to_string(),
+            ));
+        }
+        if self.pool_size == 0 || self.pool_size > 1000 {
+            return Err(ConfigError::Validation(
+                "pool_size must be between 1 and 1000".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn load() -> Result<Self, Box<figment::Error>> {
         Figment::new()
             .merge(Serialized::defaults(AppConfig::default()))
@@ -62,10 +112,6 @@ impl AppConfig {
             s.split(',')
                 .map(|w| {
                     let trimmed = w.trim();
-                    // EVM addresses (0x-prefixed hex) are case-insensitive;
-                    // normalize them to lowercase. All other address formats
-                    // (Solana base58, etc.) are case-sensitive and must be
-                    // preserved as-is.
                     if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
                         trimmed.to_lowercase()
                     } else {
@@ -94,7 +140,6 @@ mod tests {
 
     #[test]
     fn test_load_from_defaults_and_env() {
-        // Clear any pre-existing env vars that might interfere
         std::env::remove_var("SPECTRAPLEX_PORT");
         std::env::remove_var("SPECTRAPLEX_HOST");
 
@@ -104,7 +149,7 @@ mod tests {
         let config = AppConfig::load().unwrap();
         assert_eq!(config.port, 8080);
         assert_eq!(config.database_url, "postgres://test:test@localhost/test");
-        assert_eq!(config.pool_size, 10); // default
+        assert_eq!(config.pool_size, 10);
 
         std::env::remove_var("DATABASE_URL");
         std::env::remove_var("SPECTRAPLEX_PORT");
@@ -126,10 +171,8 @@ mod tests {
         };
         let set = config.allowed_wallets_set().unwrap();
         assert_eq!(set.len(), 3);
-        // EVM addresses are lowercased
         assert!(set.contains("0xabc123"));
         assert!(set.contains("0xdef456"));
-        // Solana base58 addresses are preserved as-is
         assert!(set.contains("DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy"));
         assert!(!set.contains("drpbcbmxvndk7mapm5tgv6mvb3v1srmc86pz8okm21hy"));
     }
@@ -142,5 +185,84 @@ mod tests {
         };
         let set = config.allowed_wallets_set().unwrap();
         assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_validate_empty_database_url() {
+        let config = AppConfig::default();
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation(ref msg) if msg.contains("database_url")),
+            "expected database_url validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_whitespace_database_url() {
+        let config = AppConfig {
+            database_url: "   ".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_zero_port() {
+        let config = AppConfig {
+            database_url: "postgres://localhost/test".to_string(),
+            port: 0,
+            ..AppConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation(ref msg) if msg.contains("port")),
+            "expected port validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_zero_pool_size() {
+        let config = AppConfig {
+            database_url: "postgres://localhost/test".to_string(),
+            pool_size: 0,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_pool_size_too_large() {
+        let config = AppConfig {
+            database_url: "postgres://localhost/test".to_string(),
+            pool_size: 1001,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_valid_config() {
+        let config = AppConfig {
+            database_url: "postgres://localhost/test".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_pool_size_boundary() {
+        let config = AppConfig {
+            database_url: "postgres://localhost/test".to_string(),
+            pool_size: 1,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_ok());
+
+        let config = AppConfig {
+            database_url: "postgres://localhost/test".to_string(),
+            pool_size: 1000,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_ok());
     }
 }
