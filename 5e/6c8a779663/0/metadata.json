@@ -1,0 +1,31 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "5e6c8a779663",
+  "session_id": "b1f5d2ae-9b63-4a62-b72c-1498a6fe382a",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-14T11:34:56.474107Z",
+  "branch": "fix/audit-workflow-permissions",
+  "checkpoints_count": 2,
+  "files_touched": [
+    ".github/workflows/audit.yml"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "ecca31e70e18",
+  "token_usage": {
+    "input_tokens": 70,
+    "cache_creation_tokens": 112924,
+    "cache_read_tokens": 1556871,
+    "output_tokens": 16177,
+    "api_call_count": 34
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-14T11:34:56.31316Z",
+    "agent_lines": 1,
+    "human_added": 36,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 37,
+    "agent_percentage": 2.7027027027027026
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/b1f5d2ae-9b63-4a62-b72c-1498a6fe382a.jsonl"
+}
