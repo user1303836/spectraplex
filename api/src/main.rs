@@ -1687,28 +1687,21 @@ async fn list_targets(
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
 
-    let targets = if let Some(ref network) = params.network {
-        state
-            .repo
-            .list_index_targets_by_network(network)
-            .await
-            .map_err(AppError::internal)?
-    } else if let Some(ref kind_str) = params.kind {
-        let kind: TargetKind = kind_str
-            .parse()
-            .map_err(|_| AppError::bad_request(format!("Invalid target kind: {kind_str}")))?;
-        state
-            .repo
-            .list_index_targets_by_kind(kind)
-            .await
-            .map_err(AppError::internal)?
-    } else {
-        state
-            .repo
-            .list_index_targets(limit, offset)
-            .await
-            .map_err(AppError::internal)?
-    };
+    // Parse kind filter (if provided) before calling the repository.
+    let kind: Option<TargetKind> = params
+        .kind
+        .as_deref()
+        .map(|k| {
+            k.parse()
+                .map_err(|_| AppError::bad_request(format!("Invalid target kind: {k}")))
+        })
+        .transpose()?;
+
+    let targets = state
+        .repo
+        .list_index_targets_filtered(params.network.as_deref(), kind, limit, offset)
+        .await
+        .map_err(AppError::internal)?;
 
     Ok(Json(targets))
 }

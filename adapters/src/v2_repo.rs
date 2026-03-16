@@ -1301,6 +1301,54 @@ impl Repository {
         rows.iter().map(row_to_index_target).collect()
     }
 
+    /// Unified target listing with optional filters and pagination.
+    /// Both `network` and `kind` can be applied simultaneously.
+    pub async fn list_index_targets_filtered(
+        &self,
+        network: Option<&str>,
+        kind: Option<TargetKind>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<IndexTarget>> {
+        // Build query dynamically based on which filters are present.
+        // Parameter positions are always: $1 = limit, $2 = offset, then
+        // optional filter params starting at $3.
+        let mut sql = String::from(
+            "SELECT id, kind::text, network, chain_family::text, address, filter_spec, \
+             mode::text, label, owner_id, created_at, updated_at \
+             FROM index_targets",
+        );
+
+        let mut conditions: Vec<String> = Vec::new();
+        let mut param_idx = 3_usize; // $1 and $2 are limit and offset
+
+        if network.is_some() {
+            conditions.push(format!("network = ${param_idx}"));
+            param_idx += 1;
+        }
+        if kind.is_some() {
+            conditions.push(format!("kind = ${param_idx}::target_kind_enum"));
+        }
+
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+
+        sql.push_str(" ORDER BY created_at LIMIT $1 OFFSET $2");
+
+        let mut query = sqlx::query(&sql).bind(limit).bind(offset);
+        if let Some(n) = network {
+            query = query.bind(n.to_string());
+        }
+        if let Some(ref k) = kind {
+            query = query.bind(target_kind_to_sql(k).to_string());
+        }
+
+        let rows = query.fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_index_target).collect()
+    }
+
     // -----------------------------------------------------------------------
     // RawTransactions
     // -----------------------------------------------------------------------
@@ -3006,6 +3054,27 @@ mod tests {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
             _assert_send(repo.list_index_targets(10, 0));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn list_index_targets_filtered_compiles_all_combos() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            // no filters
+            _assert_send(repo.list_index_targets_filtered(None, None, 10, 0));
+            // network only
+            _assert_send(repo.list_index_targets_filtered(Some("solana-mainnet"), None, 10, 0));
+            // kind only
+            _assert_send(repo.list_index_targets_filtered(None, Some(TargetKind::Wallet), 10, 0));
+            // both filters
+            _assert_send(repo.list_index_targets_filtered(
+                Some("solana-mainnet"),
+                Some(TargetKind::Contract),
+                10,
+                0,
+            ));
         }
         let _ = _check;
     }
