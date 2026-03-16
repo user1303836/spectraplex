@@ -11,6 +11,7 @@ use spectraplex_core::materializer::{
 };
 use spectraplex_core::models::{Chain, EntryType, LedgerEntry};
 use spectraplex_core::v2::ChainFamily;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::deterministic_id;
@@ -198,7 +199,13 @@ pub fn derive_ledger_from_hl_fills(
 
         if let Some(ref fee) = fill.fee {
             if *fee != BigDecimal::from(0) {
-                let fee_token = fill.fee_token.as_deref().unwrap_or("USDC");
+                let fee_token = match fill.fee_token.as_deref() {
+                    Some(t) => t,
+                    None => {
+                        warn!(coin = %fill.coin, fill_time = fill.fill_time, "fee_token missing from HL fill record, defaulting to USDC");
+                        "USDC"
+                    }
+                };
                 entries.push(LedgerEntry {
                     id: deterministic_id(tx_id, *entry_offset),
                     transaction_id: tx_id,
@@ -639,7 +646,13 @@ pub fn derive_wallet_ledger_from_hl_fills(
 
         if let Some(ref fee) = fill.fee {
             if *fee != BigDecimal::from(0) {
-                let fee_token = fill.fee_token.as_deref().unwrap_or("USDC");
+                let fee_token = match fill.fee_token.as_deref() {
+                    Some(t) => t,
+                    None => {
+                        warn!(coin = %fill.coin, fill_time = fill.fill_time, "fee_token missing from HL fill record, defaulting to USDC");
+                        "USDC"
+                    }
+                };
                 records.push(WalletLedgerRecord {
                     id: deterministic_id(
                         fill.raw_transaction_id.unwrap_or(Uuid::nil()),
