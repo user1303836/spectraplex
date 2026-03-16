@@ -323,6 +323,10 @@ async fn main() -> anyhow::Result<()> {
         .connect(&config.database_url)
         .await?;
 
+    info!("Running database migrations...");
+    sqlx::migrate!("../migrations").run(&pool).await?;
+    info!("Database migrations complete");
+
     let allowed_wallets = config.allowed_wallets_set();
     let shared_state = Arc::new(AppState {
         repo: Repository::new(pool),

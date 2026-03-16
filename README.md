@@ -16,16 +16,13 @@ cargo build --workspace
 # Start PostgreSQL
 docker-compose up -d
 
-# Initialize the database
-cargo run --bin spectraplex-cli -- --db-url postgresql://localhost/spectraplex init-db
+# Start the API server (auto-runs migrations on first start)
+cargo run --bin spectraplex-api
+# → http://127.0.0.1:3000/health
 
 # Ingest some Solana transactions
 cargo run --bin spectraplex-cli -- --db-url postgresql://localhost/spectraplex ingest \
   --chain solana --wallet <WALLET_ADDRESS> --rpc https://api.mainnet-beta.solana.com --limit 10
-
-# Start the API server
-cargo run --bin spectraplex-api
-# → http://127.0.0.1:3000/health
 ```
 
 Requires Rust (stable) and PostgreSQL 14+. Docker handles Postgres if you don't have one running.
