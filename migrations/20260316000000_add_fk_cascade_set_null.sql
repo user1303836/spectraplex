@@ -43,9 +43,96 @@ ALTER TABLE dataset_completeness
         FOREIGN KEY (target_id) REFERENCES index_targets(id) ON DELETE CASCADE;
 
 -- ---------------------------------------------------------------------------
--- 5. dataset_version_id references  (SET NULL)
---    These are optional FK columns; if the version is deleted the child
---    record remains valid with a NULL version pointer.
+-- 5. index_targets -> target_matches  (CASCADE)
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE target_matches
+    DROP CONSTRAINT IF EXISTS target_matches_target_id_fkey,
+    ADD CONSTRAINT target_matches_target_id_fkey
+        FOREIGN KEY (target_id) REFERENCES index_targets(id) ON DELETE CASCADE;
+
+-- ---------------------------------------------------------------------------
+-- 6. raw_transactions -> target_matches  (CASCADE)
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE target_matches
+    DROP CONSTRAINT IF EXISTS target_matches_raw_transaction_id_fkey,
+    ADD CONSTRAINT target_matches_raw_transaction_id_fkey
+        FOREIGN KEY (raw_transaction_id) REFERENCES raw_transactions(id) ON DELETE CASCADE;
+
+-- ---------------------------------------------------------------------------
+-- 7. index_targets -> checkpoints  (CASCADE)
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE checkpoints
+    DROP CONSTRAINT IF EXISTS checkpoints_target_id_fkey,
+    ADD CONSTRAINT checkpoints_target_id_fkey
+        FOREIGN KEY (target_id) REFERENCES index_targets(id) ON DELETE CASCADE;
+
+-- ---------------------------------------------------------------------------
+-- 8. index_targets -> ingestion_runs  (SET NULL)
+--    Ingestion run records are control-plane logs; they remain useful after
+--    the target is removed.
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE ingestion_runs
+    DROP CONSTRAINT IF EXISTS ingestion_runs_target_id_fkey,
+    ADD CONSTRAINT ingestion_runs_target_id_fkey
+        FOREIGN KEY (target_id) REFERENCES index_targets(id) ON DELETE SET NULL;
+
+-- ---------------------------------------------------------------------------
+-- 9. raw_transactions -> Silver tables  (CASCADE)
+--    Derived Silver data is meaningless without its source raw transaction.
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE token_transfers
+    DROP CONSTRAINT IF EXISTS token_transfers_raw_transaction_id_fkey,
+    ADD CONSTRAINT token_transfers_raw_transaction_id_fkey
+        FOREIGN KEY (raw_transaction_id) REFERENCES raw_transactions(id) ON DELETE CASCADE;
+
+ALTER TABLE native_balance_deltas
+    DROP CONSTRAINT IF EXISTS native_balance_deltas_raw_transaction_id_fkey,
+    ADD CONSTRAINT native_balance_deltas_raw_transaction_id_fkey
+        FOREIGN KEY (raw_transaction_id) REFERENCES raw_transactions(id) ON DELETE CASCADE;
+
+ALTER TABLE decoded_events
+    DROP CONSTRAINT IF EXISTS decoded_events_raw_transaction_id_fkey,
+    ADD CONSTRAINT decoded_events_raw_transaction_id_fkey
+        FOREIGN KEY (raw_transaction_id) REFERENCES raw_transactions(id) ON DELETE CASCADE;
+
+ALTER TABLE hl_fill_records
+    DROP CONSTRAINT IF EXISTS hl_fill_records_raw_transaction_id_fkey,
+    ADD CONSTRAINT hl_fill_records_raw_transaction_id_fkey
+        FOREIGN KEY (raw_transaction_id) REFERENCES raw_transactions(id) ON DELETE CASCADE;
+
+ALTER TABLE hl_funding_payments
+    DROP CONSTRAINT IF EXISTS hl_funding_payments_raw_transaction_id_fkey,
+    ADD CONSTRAINT hl_funding_payments_raw_transaction_id_fkey
+        FOREIGN KEY (raw_transaction_id) REFERENCES raw_transactions(id) ON DELETE CASCADE;
+
+ALTER TABLE hl_position_changes
+    DROP CONSTRAINT IF EXISTS hl_position_changes_raw_transaction_id_fkey,
+    ADD CONSTRAINT hl_position_changes_raw_transaction_id_fkey
+        FOREIGN KEY (raw_transaction_id) REFERENCES raw_transactions(id) ON DELETE CASCADE;
+
+ALTER TABLE wallet_ledger
+    DROP CONSTRAINT IF EXISTS wallet_ledger_raw_transaction_id_fkey,
+    ADD CONSTRAINT wallet_ledger_raw_transaction_id_fkey
+        FOREIGN KEY (raw_transaction_id) REFERENCES raw_transactions(id) ON DELETE CASCADE;
+
+-- ---------------------------------------------------------------------------
+-- 10. decoded_events -> protocol_events  (CASCADE)
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE protocol_events
+    DROP CONSTRAINT IF EXISTS protocol_events_raw_event_id_fkey,
+    ADD CONSTRAINT protocol_events_raw_event_id_fkey
+        FOREIGN KEY (raw_event_id) REFERENCES decoded_events(id) ON DELETE CASCADE;
+
+-- ---------------------------------------------------------------------------
+-- 11. dataset_version_id references  (SET NULL)
+--     These are optional FK columns; if the version is deleted the child
+--     record remains valid with a NULL version pointer.
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE ledger_entries
@@ -119,7 +206,7 @@ ALTER TABLE dataset_completeness
         FOREIGN KEY (dataset_version_id) REFERENCES dataset_versions(id) ON DELETE SET NULL;
 
 -- ---------------------------------------------------------------------------
--- 6. ingestion_run_id optional references  (SET NULL)
+-- 12. ingestion_run_id optional references  (SET NULL)
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE raw_transactions
