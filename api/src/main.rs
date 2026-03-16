@@ -211,6 +211,7 @@ struct JobEntry {
 }
 
 const JOB_TTL_SECS: u64 = 3600; // 1 hour
+const JOB_CLEANUP_INTERVAL_SECS: u64 = 300; // 5 minutes
 
 impl AppState {
     /// Remove completed/failed jobs older than JOB_TTL_SECS.
@@ -337,6 +338,22 @@ async fn main() -> anyhow::Result<()> {
             RATE_LIMIT_REFILL_RATE,
         )),
     });
+
+    // Background task: periodically prune stale jobs and export jobs so
+    // completed/failed entries don't accumulate in memory indefinitely.
+    {
+        let state = Arc::clone(&shared_state);
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(JOB_CLEANUP_INTERVAL_SECS));
+            interval.tick().await; // first tick completes immediately
+            loop {
+                interval.tick().await;
+                state.prune_stale_jobs().await;
+                state.prune_stale_export_jobs().await;
+            }
+        });
+    }
 
     let protected = Router::new()
         .route("/v1/ingest", post(trigger_ingest))
@@ -3874,6 +3891,71 @@ mod tests {
         assert!(jobs.contains_key(&new_id));
     }
 
+    #[tokio::test]
+    async fn test_background_cleanup_prunes_both_maps() {
+        let state = test_state();
+        let old_job = Uuid::new_v4();
+        let old_export = Uuid::new_v4();
+        let fresh_job = Uuid::new_v4();
+
+        let expired = Instant::now() - std::time::Duration::from_secs(JOB_TTL_SECS + 1);
+
+        state.jobs.write().await.insert(
+            old_job,
+            JobEntry {
+                status: JobStatus {
+                    id: old_job,
+                    state: JobState::Completed,
+                    message: None,
+                },
+                finished_at: Some(expired),
+            },
+        );
+        state.jobs.write().await.insert(
+            fresh_job,
+            JobEntry {
+                status: JobStatus {
+                    id: fresh_job,
+                    state: JobState::Running,
+                    message: None,
+                },
+                finished_at: None,
+            },
+        );
+        state.export_jobs.write().await.insert(
+            old_export,
+            ExportJobEntry {
+                status: ExportJobStatus {
+                    id: old_export,
+                    state: JobState::Failed,
+                    dataset: "test".to_string(),
+                    format: "json".to_string(),
+                    record_count: None,
+                    message: None,
+                    delivered_to: None,
+                    delivery_status: None,
+                    dataset_version_id: None,
+                    dataset_version: None,
+                    completeness_status: None,
+                    completeness_coverage: None,
+                    started_at: None,
+                    completed_at: None,
+                    last_ingestion_run_id: None,
+                },
+                finished_at: Some(expired),
+                data: None,
+            },
+        );
+
+        // Both prune methods should clear stale entries
+        state.prune_stale_jobs().await;
+        state.prune_stale_export_jobs().await;
+
+        assert!(!state.jobs.read().await.contains_key(&old_job));
+        assert!(state.jobs.read().await.contains_key(&fresh_job));
+        assert!(!state.export_jobs.read().await.contains_key(&old_export));
+    }
+
     #[test]
     fn test_job_state_serialization() {
         let status = JobStatus {
@@ -4109,9 +4191,13 @@ mod tests {
                 RATE_LIMIT_REFILL_RATE,
             )),
         });
-        let app = test_router_with_state(Arc::clone(&state));
 
-        let req1 = axum::http::Request::builder()
+        // Hold the single permit so the next ingest request is guaranteed to
+        // get 503 — no timing dependency on a spawned background task.
+        let _held_permit = state.job_semaphore.clone().acquire_owned().await.unwrap();
+
+        let app = test_router_with_state(Arc::clone(&state));
+        let req = axum::http::Request::builder()
             .method("POST")
             .uri("/v1/ingest")
             .header("content-type", "application/json")
@@ -4124,27 +4210,8 @@ mod tests {
                 .unwrap(),
             ))
             .unwrap();
-        let resp1 = app.oneshot(req1).await.unwrap();
-        assert_ne!(resp1.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let app2 = test_router_with_state(Arc::clone(&state));
-        let req2 = axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/ingest")
-            .header("content-type", "application/json")
-            .header("authorization", "Bearer secret")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({
-                    "chain": "solana",
-                    "wallet": "def456"
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let resp2 = app2.oneshot(req2).await.unwrap();
-        assert_eq!(resp2.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
