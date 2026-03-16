@@ -137,13 +137,10 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::InitDb => {
-            if let Some(p) = pool {
-                info!("Running migrations...");
-                sqlx::migrate!("../migrations").run(&p).await?;
-                info!("Database initialized successfully.");
-            } else {
-                error!("--db-url is required for InitDb");
-            }
+            let p = pool.ok_or_else(|| anyhow::anyhow!("--db-url is required for init-db"))?;
+            info!("Running migrations...");
+            sqlx::migrate!("../migrations").run(&p).await?;
+            info!("Database initialized successfully.");
         }
         Commands::Ingest {
             chain,
