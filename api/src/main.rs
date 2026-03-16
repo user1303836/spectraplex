@@ -292,11 +292,13 @@ pub struct JobStatus {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
     Pending,
     Running,
+    /// Data generation complete, sink delivery in progress.
+    Delivering,
     Completed,
     Failed,
 }
@@ -2586,16 +2588,25 @@ async fn create_export_job(
                     None
                 };
 
-                let completed_time = chrono::Utc::now();
+                let has_sink = sink_config.is_some();
 
-                // Mark completed and store data (short lock scope)
+                // Store export data and transition to the correct intermediate
+                // state.  When a sink is configured the job enters
+                // `Delivering` so clients never observe "Completed + pending
+                // delivery".  Without a sink we go straight to `Completed`.
                 {
                     let mut exports = state_clone.export_jobs.write().await;
                     if let Some(entry) = exports.get_mut(&job_id) {
-                        entry.status.state = JobState::Completed;
+                        entry.status.state = if has_sink {
+                            JobState::Delivering
+                        } else {
+                            JobState::Completed
+                        };
                         entry.status.record_count = Some(record_count);
                         entry.status.message = Some(format!("Exported {record_count} records"));
-                        entry.status.completed_at = Some(completed_time);
+                        if !has_sink {
+                            entry.status.completed_at = Some(chrono::Utc::now());
+                        }
                         // Populate provenance metadata from export
                         entry.status.dataset_version_id = export_meta.dataset_version_id;
                         entry.status.dataset_version = export_meta.dataset_version;
@@ -2642,17 +2653,21 @@ async fn create_export_job(
                         }
                     };
 
-                    // Brief re-lock to record delivery outcome
+                    // Transition Delivering → Completed or Delivering → Failed
                     let mut exports = state_clone.export_jobs.write().await;
                     if let Some(entry) = exports.get_mut(&job_id) {
                         match delivery_result {
                             Ok(destination) => {
+                                entry.status.state = JobState::Completed;
                                 entry.status.delivered_to = Some(destination);
                                 entry.status.delivery_status = Some("delivered".to_string());
+                                entry.status.completed_at = Some(chrono::Utc::now());
                             }
                             Err(msg) => {
+                                entry.status.state = JobState::Failed;
                                 entry.status.delivery_status = Some("failed".to_string());
                                 entry.status.message = Some(msg);
+                                entry.status.completed_at = Some(chrono::Utc::now());
                             }
                         }
                     }
@@ -2985,15 +3000,15 @@ async fn download_export(
             );
             Ok(response)
         }
-        JobState::Running | JobState::Pending => Err(AppError {
+        JobState::Running | JobState::Pending | JobState::Delivering => Err(AppError {
             status: StatusCode::CONFLICT,
             message: format!(
                 "Export job {} is still {}",
                 job_id,
-                if matches!(entry.status.state, JobState::Running) {
-                    "running"
-                } else {
-                    "pending"
+                match entry.status.state {
+                    JobState::Running => "running",
+                    JobState::Delivering => "delivering",
+                    _ => "pending",
                 }
             ),
         }),
@@ -3774,6 +3789,7 @@ mod tests {
         for (variant, expected) in [
             (JobState::Pending, "pending"),
             (JobState::Running, "running"),
+            (JobState::Delivering, "delivering"),
             (JobState::Completed, "completed"),
             (JobState::Failed, "failed"),
         ] {
