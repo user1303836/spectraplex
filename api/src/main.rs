@@ -753,8 +753,21 @@ fn validate_sink_config(config: &SinkConfig, export_dir: &str) -> Result<(), App
 /// Validates that a local file export path resolves to a location within
 /// `export_dir`. Rejects path traversal, absolute paths outside the root,
 /// and symlink-based escapes.
+///
+/// **TOCTOU note**: This check canonicalizes at validation time, but the
+/// actual write happens later in `LocalFileSink::deliver`. A symlink
+/// created between validation and write could bypass this check.  Full
+/// mitigation would require O_NOFOLLOW or chroot, which is impractical
+/// here; the canonicalization check is defense-in-depth.
 fn validate_export_file_path(path: &str, export_dir: &str) -> Result<(), AppError> {
     use std::path::Path;
+
+    // Reject null bytes which could cause path truncation in lower layers
+    if path.contains('\0') {
+        return Err(AppError::bad_request(
+            "file_path must not contain null bytes",
+        ));
+    }
 
     // Reject paths containing `..` segments
     if path.contains("..") {
@@ -6517,6 +6530,23 @@ mod tests {
         assert!(err
             .message
             .contains("outside the configured export directory"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_sink_config_local_file_null_byte_rejected() {
+        let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = SinkConfig {
+            sink_type: SinkType::LocalFile,
+            file_path: Some("legit.txt\0../../etc/passwd".to_string()),
+            url: None,
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        let err = validate_sink_config(&config, dir.to_str().unwrap()).unwrap_err();
+        assert!(err.message.contains("null bytes"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -74,6 +74,7 @@ impl AppConfig {
     /// - `database_url` must not be empty (required for all database operations)
     /// - `port` must be non-zero (0 means OS-assigned, unusual and likely misconfiguration)
     /// - `pool_size` must be between 1 and 1000
+    /// - `export_dir` must not be empty
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.database_url.trim().is_empty() {
             return Err(ConfigError::Validation(
@@ -88,6 +89,11 @@ impl AppConfig {
         if self.pool_size == 0 || self.pool_size > 1000 {
             return Err(ConfigError::Validation(
                 "pool_size must be between 1 and 1000".to_string(),
+            ));
+        }
+        if self.export_dir.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "export_dir must not be empty".to_string(),
             ));
         }
         Ok(())
@@ -267,5 +273,29 @@ mod tests {
             ..AppConfig::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_empty_export_dir() {
+        let config = AppConfig {
+            database_url: "postgres://localhost/test".to_string(),
+            export_dir: "".to_string(),
+            ..AppConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation(ref msg) if msg.contains("export_dir")),
+            "expected export_dir validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_whitespace_export_dir() {
+        let config = AppConfig {
+            database_url: "postgres://localhost/test".to_string(),
+            export_dir: "   ".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 }
