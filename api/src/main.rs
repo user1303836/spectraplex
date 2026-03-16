@@ -4321,7 +4321,7 @@ mod tests {
         assert!(matches!(cp.chain, Chain::Solana));
         assert_eq!(cp.last_signature, Some("sig2".to_string()));
         assert_eq!(cp.last_timestamp, Some(200));
-        assert_eq!(cp.last_slot, Some(6000));
+        assert_eq!(cp.last_slot, Some(6000 - 32)); // finality buffer applied
         assert_eq!(cp.last_block, None);
     }
 
@@ -4335,7 +4335,7 @@ mod tests {
         )];
         let cp = build_checkpoint("ethereum", "0xwallet", &txs).unwrap();
         assert!(matches!(cp.chain, Chain::Ethereum));
-        assert_eq!(cp.last_block, Some(1000));
+        assert_eq!(cp.last_block, Some(1000 - 15)); // finality buffer applied
         assert_eq!(cp.last_slot, None);
     }
 

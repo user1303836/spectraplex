@@ -39,6 +39,18 @@ fn str_to_entry_type(s: &str) -> anyhow::Result<EntryType> {
     }
 }
 
+/// Chain-specific finality buffer (number of slots/blocks to subtract from
+/// the latest position when building a checkpoint).  On restart the indexer
+/// will re-fetch from this earlier position; duplicate transactions are
+/// safely discarded by the `ON CONFLICT DO NOTHING` upsert.
+fn finality_buffer(chain: &str) -> i64 {
+    match chain {
+        "solana" => 32,   // probabilistic slot finality (~13 s)
+        "ethereum" => 15, // probabilistic block finality (~3 min)
+        _ => 0,           // hyperliquid has instant finality
+    }
+}
+
 pub fn build_checkpoint(
     chain: &str,
     wallet: &str,
@@ -50,12 +62,14 @@ pub fn build_checkpoint(
 
     let chain_enum = str_to_chain(chain).ok()?;
     let latest = txs.iter().max_by_key(|tx| tx.timestamp)?;
+    let buffer = finality_buffer(chain);
 
     let last_slot = match chain {
         "solana" => txs
             .iter()
             .filter_map(|tx| tx.raw_metadata.get("slot").and_then(|v| v.as_i64()))
-            .max(),
+            .max()
+            .map(|s| (s - buffer).max(0)),
         _ => None,
     };
 
@@ -63,7 +77,8 @@ pub fn build_checkpoint(
         "ethereum" => txs
             .iter()
             .filter_map(|tx| tx.raw_metadata.get("block_number").and_then(|v| v.as_i64()))
-            .max(),
+            .max()
+            .map(|b| (b - buffer).max(0)),
         _ => None,
     };
 
@@ -777,5 +792,80 @@ mod tests {
             let recovered = str_to_entry_type(s).unwrap();
             assert_eq!(entry_type_to_str(&recovered), s);
         }
+    }
+
+    #[test]
+    fn test_finality_buffer_values() {
+        assert_eq!(finality_buffer("solana"), 32);
+        assert_eq!(finality_buffer("ethereum"), 15);
+        assert_eq!(finality_buffer("hyperliquid"), 0);
+        assert_eq!(finality_buffer("unknown"), 0);
+    }
+
+    #[test]
+    fn test_checkpoint_solana_applies_finality_buffer() {
+        let slot: i64 = 200_000_000;
+        let txs = vec![Transaction {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            wallet_address: "wallet".to_string(),
+            timestamp: 1700000000,
+            tx_hash: "sig1".to_string(),
+            chain: Chain::Solana,
+            raw_metadata: serde_json::json!({ "slot": slot }),
+        }];
+        let cp = build_checkpoint("solana", "wallet", &txs).unwrap();
+        assert_eq!(cp.last_slot, Some(slot - 32));
+        assert_eq!(cp.last_block, None);
+    }
+
+    #[test]
+    fn test_checkpoint_ethereum_applies_finality_buffer() {
+        let block: i64 = 19_000_000;
+        let txs = vec![Transaction {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            wallet_address: "wallet".to_string(),
+            timestamp: 1700000000,
+            tx_hash: "0xabc".to_string(),
+            chain: Chain::Ethereum,
+            raw_metadata: serde_json::json!({ "block_number": block }),
+        }];
+        let cp = build_checkpoint("ethereum", "wallet", &txs).unwrap();
+        assert_eq!(cp.last_block, Some(block - 15));
+        assert_eq!(cp.last_slot, None);
+    }
+
+    #[test]
+    fn test_checkpoint_hyperliquid_no_finality_buffer() {
+        let txs = vec![Transaction {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            wallet_address: "wallet".to_string(),
+            timestamp: 1700000000,
+            tx_hash: "h1".to_string(),
+            chain: Chain::Hyperliquid,
+            raw_metadata: serde_json::json!({}),
+        }];
+        let cp = build_checkpoint("hyperliquid", "wallet", &txs).unwrap();
+        assert_eq!(cp.last_slot, None);
+        assert_eq!(cp.last_block, None);
+        assert_eq!(cp.last_timestamp, Some(1700000000));
+    }
+
+    #[test]
+    fn test_checkpoint_solana_slot_saturating_sub() {
+        let txs = vec![Transaction {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            wallet_address: "wallet".to_string(),
+            timestamp: 1700000000,
+            tx_hash: "sig_early".to_string(),
+            chain: Chain::Solana,
+            raw_metadata: serde_json::json!({ "slot": 10 }),
+        }];
+        let cp = build_checkpoint("solana", "wallet", &txs).unwrap();
+        // slot 10 - buffer 32 saturates to 0
+        assert_eq!(cp.last_slot, Some(0));
     }
 }
