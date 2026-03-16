@@ -20,6 +20,12 @@ use spectraplex_core::v2::{
 use tracing::warn;
 use uuid::Uuid;
 
+/// Maximum retry attempts for transient RPC failures.
+const RPC_MAX_RETRIES: u32 = 3;
+
+/// Base delay for exponential backoff on RPC retries (100ms).
+const RPC_RETRY_BASE_MS: u64 = 100;
+
 /// Maximum block range per eth_getLogs request.
 const DEFAULT_BLOCK_CHUNK: u64 = 2000;
 
@@ -80,11 +86,45 @@ impl EvmAdapter {
     }
 
     // -----------------------------------------------------------------------
+    // Low-level RPC retry helper
+    // -----------------------------------------------------------------------
+
+    /// Execute `get_logs` with exponential backoff retry on transient failures.
+    async fn get_logs_with_retry(&self, filter: &Filter) -> anyhow::Result<Vec<Log>> {
+        let mut last_err = None;
+        for attempt in 0..RPC_MAX_RETRIES {
+            self.rate_limiter.until_ready().await;
+            match self.provider.get_logs(filter).await {
+                Ok(logs) => return Ok(logs),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt + 1 < RPC_MAX_RETRIES {
+                        let delay = Duration::from_millis(RPC_RETRY_BASE_MS * 2u64.pow(attempt));
+                        warn!(
+                            attempt = attempt + 1,
+                            max_retries = RPC_MAX_RETRIES,
+                            delay_ms = delay.as_millis() as u64,
+                            error = %last_err.as_ref().unwrap(),
+                            "RPC get_logs failed, retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+        let err = last_err
+            .map(|e| anyhow::anyhow!(e))
+            .unwrap_or_else(|| anyhow::anyhow!("get_logs failed after retries"));
+        warn!(error = %err, attempts = RPC_MAX_RETRIES, "RPC get_logs failed after all retries");
+        Err(err)
+    }
+
+    // -----------------------------------------------------------------------
     // Low-level log fetching methods
     // -----------------------------------------------------------------------
 
     /// Fetch logs for a given contract address across a block range, chunked
-    /// to avoid RPC limits.
+    /// to avoid RPC limits. Retries transient failures with exponential backoff.
     ///
     /// This is the original address-filter method. Correct for contract targets
     /// (returns all events emitted *by* that contract).
@@ -100,14 +140,12 @@ impl EvmAdapter {
         while start <= to_block {
             let end = std::cmp::min(start + self.block_chunk - 1, to_block);
 
-            self.rate_limiter.until_ready().await;
-
             let filter = Filter::new()
                 .address(address)
                 .from_block(start)
                 .to_block(end);
 
-            let logs = self.provider.get_logs(&filter).await?;
+            let logs = self.get_logs_with_retry(&filter).await?;
             all_logs.extend(logs);
 
             start = end + 1;
@@ -117,6 +155,7 @@ impl EvmAdapter {
     }
 
     /// Fetch logs by topic filters with an optional address constraint.
+    /// Retries transient failures with exponential backoff.
     ///
     /// Generalizes `fetch_logs` by accepting up to 4 topic-position filters
     /// and an optional set of contract addresses. This is the building block
@@ -138,8 +177,6 @@ impl EvmAdapter {
         while start <= to_block {
             let end = std::cmp::min(start + self.block_chunk - 1, to_block);
 
-            self.rate_limiter.until_ready().await;
-
             let mut filter = Filter::new().from_block(start).to_block(end);
 
             if !addresses.is_empty() {
@@ -158,7 +195,7 @@ impl EvmAdapter {
                 filter = filter.topic3(t3);
             }
 
-            let logs = self.provider.get_logs(&filter).await?;
+            let logs = self.get_logs_with_retry(&filter).await?;
             all_logs.extend(logs);
 
             start = end + 1;
@@ -771,6 +808,17 @@ mod tests {
     #[test]
     fn test_adapter_block_chunk_default() {
         assert_eq!(DEFAULT_BLOCK_CHUNK, 2000);
+    }
+
+    #[test]
+    fn test_retry_constants() {
+        assert_eq!(RPC_MAX_RETRIES, 3);
+        assert_eq!(RPC_RETRY_BASE_MS, 100);
+        // Verify backoff progression: 100ms, 200ms, 400ms
+        for attempt in 0..RPC_MAX_RETRIES {
+            let delay_ms = RPC_RETRY_BASE_MS * 2u64.pow(attempt);
+            assert!(delay_ms <= 400, "backoff should not exceed 400ms");
+        }
     }
 
     #[test]

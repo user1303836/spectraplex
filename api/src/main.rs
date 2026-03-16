@@ -625,6 +625,9 @@ fn validate_wallet(wallet: &str) -> Result<(), AppError> {
 }
 
 async fn fire_callback(url: &str, payload: &serde_json::Value) {
+    const MAX_RETRIES: u32 = 3;
+    const BASE_DELAY_MS: u64 = 500;
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
@@ -636,8 +639,43 @@ async fn fire_callback(url: &str, payload: &serde_json::Value) {
             return;
         }
     };
-    if let Err(e) = client.post(url).json(payload).send().await {
-        warn!(error = %e, url, "Callback request failed");
+
+    for attempt in 0..MAX_RETRIES {
+        match client.post(url).json(payload).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() || status.is_redirection() {
+                    return;
+                }
+                if status.is_client_error() {
+                    warn!(status = %status, url, "Callback returned client error, not retrying");
+                    return;
+                }
+                // Server error (5xx): retry
+                if attempt + 1 < MAX_RETRIES {
+                    let delay = Duration::from_millis(BASE_DELAY_MS * 2u64.pow(attempt));
+                    warn!(
+                        status = %status, url, attempt = attempt + 1,
+                        "Callback returned server error, retrying in {}ms", delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                } else {
+                    warn!(status = %status, url, "Callback failed after {} attempts", MAX_RETRIES);
+                }
+            }
+            Err(e) => {
+                if attempt + 1 < MAX_RETRIES {
+                    let delay = Duration::from_millis(BASE_DELAY_MS * 2u64.pow(attempt));
+                    warn!(
+                        error = %e, url, attempt = attempt + 1,
+                        "Callback request failed, retrying in {}ms", delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                } else {
+                    warn!(error = %e, url, "Callback failed after {} attempts", MAX_RETRIES);
+                }
+            }
+        }
     }
 }
 
