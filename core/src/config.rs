@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub allowed_wallets: Option<String>,
     pub solana_grpc_url: Option<String>,
     pub solana_grpc_token: Option<String>,
+    pub export_dir: String,
 }
 
 /// Errors from config validation.
@@ -62,6 +63,7 @@ impl Default for AppConfig {
             allowed_wallets: None,
             solana_grpc_url: None,
             solana_grpc_token: None,
+            export_dir: "./exports".to_string(),
         }
     }
 }
@@ -72,6 +74,7 @@ impl AppConfig {
     /// - `database_url` must not be empty (required for all database operations)
     /// - `port` must be non-zero (0 means OS-assigned, unusual and likely misconfiguration)
     /// - `pool_size` must be between 1 and 1000
+    /// - `export_dir` must not be empty
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.database_url.trim().is_empty() {
             return Err(ConfigError::Validation(
@@ -88,6 +91,11 @@ impl AppConfig {
                 "pool_size must be between 1 and 1000".to_string(),
             ));
         }
+        if self.export_dir.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "export_dir must not be empty".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -102,6 +110,7 @@ impl AppConfig {
                 "EVM_RPC_URL",
                 "SOLANA_GRPC_URL",
                 "SOLANA_GRPC_TOKEN",
+                "EXPORT_DIR",
             ]))
             .extract()
             .map_err(Box::new)
@@ -264,5 +273,29 @@ mod tests {
             ..AppConfig::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_empty_export_dir() {
+        let config = AppConfig {
+            database_url: "postgres://localhost/test".to_string(),
+            export_dir: "".to_string(),
+            ..AppConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation(ref msg) if msg.contains("export_dir")),
+            "expected export_dir validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_whitespace_export_dir() {
+        let config = AppConfig {
+            database_url: "postgres://localhost/test".to_string(),
+            export_dir: "   ".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 }
