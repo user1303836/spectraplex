@@ -69,7 +69,13 @@ fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<
             }
         };
         if fee != BigDecimal::from(0) {
-            let fee_token = fill.fee_token.as_deref().unwrap_or("USDC");
+            let fee_token = match fill.fee_token.as_deref() {
+                Some(t) => t,
+                None => {
+                    warn!(tx_hash = %tx.tx_hash, "fee_token missing from fill, defaulting to USDC");
+                    "USDC"
+                }
+            };
             entries.push(LedgerEntry {
                 id: deterministic_id(tx.id, entry_index),
                 transaction_id: tx.id,
