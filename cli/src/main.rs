@@ -544,7 +544,7 @@ mod tests {
         assert_eq!(cp.wallet_address, "0xwallet");
         assert_eq!(cp.last_signature, Some("0xbbb".to_string()));
         assert_eq!(cp.last_timestamp, Some(200));
-        assert_eq!(cp.last_block, Some(2000));
+        assert_eq!(cp.last_block, Some(2000 - 15)); // finality buffer applied
         assert_eq!(cp.last_slot, None);
     }
 
@@ -559,7 +559,7 @@ mod tests {
         assert!(matches!(cp.chain, Chain::Solana));
         assert_eq!(cp.last_signature, Some("sig2".to_string()));
         assert_eq!(cp.last_timestamp, Some(400));
-        assert_eq!(cp.last_slot, Some(6000));
+        assert_eq!(cp.last_slot, Some(6000 - 32)); // finality buffer applied
         assert_eq!(cp.last_block, None);
     }
 

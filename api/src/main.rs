@@ -3991,25 +3991,10 @@ mod tests {
                 RATE_LIMIT_REFILL_RATE,
             )),
         });
-        let app = test_router_with_state(Arc::clone(&state));
 
-        let req1 = axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/ingest")
-            .header("content-type", "application/json")
-            .header("authorization", "Bearer secret")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({
-                    "chain": "solana",
-                    "wallet": "abc123"
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let resp1 = app.oneshot(req1).await.unwrap();
-        assert_ne!(resp1.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Hold the single permit so the next ingest request is guaranteed to
+        // get 503 — no timing dependency on a spawned background task.
+        let _held_permit = state.job_semaphore.clone().acquire_owned().await.unwrap();
 
         let app2 = test_router_with_state(Arc::clone(&state));
         let req2 = axum::http::Request::builder()
@@ -4132,7 +4117,7 @@ mod tests {
         assert!(matches!(cp.chain, Chain::Solana));
         assert_eq!(cp.last_signature, Some("sig2".to_string()));
         assert_eq!(cp.last_timestamp, Some(200));
-        assert_eq!(cp.last_slot, Some(6000));
+        assert_eq!(cp.last_slot, Some(6000 - 32)); // finality buffer applied
         assert_eq!(cp.last_block, None);
     }
 
@@ -4146,7 +4131,7 @@ mod tests {
         )];
         let cp = build_checkpoint("ethereum", "0xwallet", &txs).unwrap();
         assert!(matches!(cp.chain, Chain::Ethereum));
-        assert_eq!(cp.last_block, Some(1000));
+        assert_eq!(cp.last_block, Some(1000 - 15)); // finality buffer applied
         assert_eq!(cp.last_slot, None);
     }
 
