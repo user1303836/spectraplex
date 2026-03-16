@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub allowed_wallets: Option<String>,
     pub solana_grpc_url: Option<String>,
     pub solana_grpc_token: Option<String>,
+    pub export_dir: String,
 }
 
 /// Errors from config validation.
@@ -62,6 +63,7 @@ impl Default for AppConfig {
             allowed_wallets: None,
             solana_grpc_url: None,
             solana_grpc_token: None,
+            export_dir: "./exports".to_string(),
         }
     }
 }
@@ -102,6 +104,7 @@ impl AppConfig {
                 "EVM_RPC_URL",
                 "SOLANA_GRPC_URL",
                 "SOLANA_GRPC_TOKEN",
+                "EXPORT_DIR",
             ]))
             .extract()
             .map_err(Box::new)

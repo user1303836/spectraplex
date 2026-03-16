@@ -700,7 +700,11 @@ fn is_valid_header_value(value: &str) -> bool {
 }
 
 /// Validates a SinkConfig at job creation time.
-fn validate_sink_config(config: &SinkConfig) -> Result<(), AppError> {
+///
+/// For `LocalFile` sinks, the file path must resolve to a location inside
+/// `export_dir`. The path is canonicalized (resolving symlinks) and checked
+/// against the canonical export root to prevent directory escape.
+fn validate_sink_config(config: &SinkConfig, export_dir: &str) -> Result<(), AppError> {
     config
         .validate()
         .map_err(|e| AppError::bad_request(format!("Invalid sink config: {e}")))?;
@@ -733,12 +737,7 @@ fn validate_sink_config(config: &SinkConfig) -> Result<(), AppError> {
         }
         SinkType::LocalFile => {
             if let Some(ref path) = config.file_path {
-                // Reject obviously dangerous paths
-                if path.contains("..") {
-                    return Err(AppError::bad_request(
-                        "file_path must not contain '..' path traversal",
-                    ));
-                }
+                validate_export_file_path(path, export_dir)?;
             }
         }
         SinkType::Database => {
@@ -751,7 +750,76 @@ fn validate_sink_config(config: &SinkConfig) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Writes export data to a local file path.
+/// Validates that a local file export path resolves to a location within
+/// `export_dir`. Rejects path traversal, absolute paths outside the root,
+/// and symlink-based escapes.
+fn validate_export_file_path(path: &str, export_dir: &str) -> Result<(), AppError> {
+    use std::path::Path;
+
+    // Reject paths containing `..` segments
+    if path.contains("..") {
+        return Err(AppError::bad_request(
+            "file_path must not contain '..' path traversal",
+        ));
+    }
+
+    let export_root = Path::new(export_dir);
+
+    // Create the export directory if it does not exist
+    if let Err(e) = std::fs::create_dir_all(export_root) {
+        return Err(AppError::bad_request(format!(
+            "Cannot create export directory '{}': {e}",
+            export_dir
+        )));
+    }
+
+    // Canonicalize the export root to resolve symlinks
+    let canonical_root = export_root.canonicalize().map_err(|e| {
+        AppError::bad_request(format!(
+            "Cannot resolve export directory '{}': {e}",
+            export_dir
+        ))
+    })?;
+
+    // Build the candidate path: export_root joined with the user-supplied path.
+    // If the user path is absolute, join() ignores the prefix, so strip any
+    // leading separator to force it relative to the export root.
+    let relative_path = path.trim_start_matches('/');
+    let candidate = canonical_root.join(relative_path);
+
+    // The candidate file may not exist yet (it will be created on write).
+    // Canonicalize the deepest existing ancestor to catch symlink escapes.
+    let mut check = candidate.as_path();
+    loop {
+        match check.canonicalize() {
+            Ok(resolved) => {
+                if !resolved.starts_with(&canonical_root) {
+                    return Err(AppError::bad_request(
+                        "file_path resolves outside the configured export directory",
+                    ));
+                }
+                break;
+            }
+            Err(_) => {
+                // Walk up to the parent that does exist
+                match check.parent() {
+                    Some(parent) if parent != check => {
+                        check = parent;
+                    }
+                    _ => {
+                        return Err(AppError::bad_request(
+                            "file_path resolves outside the configured export directory",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Writes export data to a local file path within the configured export directory.
 struct LocalFileSink {
     path: String,
 }
@@ -763,6 +831,13 @@ impl ExportSink for LocalFileSink {
         data: &[u8],
         _metadata: &DeliveryMetadata,
     ) -> Result<DeliveryReceipt, String> {
+        // Ensure parent directory exists
+        if let Some(parent) = std::path::Path::new(&self.path).parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("Failed to create directory for {}: {e}", self.path))?;
+        }
+
         tokio::fs::write(&self.path, data)
             .await
             .map_err(|e| format!("Failed to write to {}: {e}", self.path))?;
@@ -837,14 +912,26 @@ impl ExportSink for WebhookSink {
 
 /// Builds the appropriate ExportSink from a SinkConfig.
 /// Database sink is not yet implemented and returns an error.
-fn build_sink(config: &SinkConfig) -> Result<Box<dyn ExportSink>, String> {
+///
+/// For `LocalFile` sinks, `export_dir` is the configured export root
+/// directory. The user-supplied file_path is resolved relative to it.
+fn build_sink(config: &SinkConfig, export_dir: &str) -> Result<Box<dyn ExportSink>, String> {
     match config.sink_type {
         SinkType::LocalFile => {
-            let path = config
+            let user_path = config
                 .file_path
                 .as_ref()
                 .ok_or("LocalFile sink requires file_path")?;
-            Ok(Box::new(LocalFileSink { path: path.clone() }))
+
+            let root = std::path::Path::new(export_dir)
+                .canonicalize()
+                .map_err(|e| format!("Cannot resolve export directory: {e}"))?;
+            let relative = user_path.trim_start_matches('/');
+            let resolved = root.join(relative);
+
+            Ok(Box::new(LocalFileSink {
+                path: resolved.to_string_lossy().into_owned(),
+            }))
         }
         SinkType::Webhook => {
             let url = config.url.as_ref().ok_or("Webhook sink requires url")?;
@@ -2504,7 +2591,7 @@ async fn create_export_job(
 
     // Validate sink config if provided
     if let Some(ref sink_config) = req.sink {
-        validate_sink_config(sink_config)?;
+        validate_sink_config(sink_config, &state.config.export_dir)?;
     }
 
     let permit = state
@@ -2550,6 +2637,7 @@ async fn create_export_job(
     let time_start = req.time_start;
     let time_end = req.time_end;
     let sink_config = req.sink.clone();
+    let export_dir = state.config.export_dir.clone();
 
     tokio::spawn(async move {
         let _permit = permit;
@@ -2614,7 +2702,7 @@ async fn create_export_job(
                 // Deliver to sink outside the lock (may involve network I/O)
                 if let Some(ref sc) = sink_config {
                     let body = sink_body.expect("sink_body set when sink_config is Some");
-                    let delivery_result = match build_sink(sc) {
+                    let delivery_result = match build_sink(sc, &export_dir) {
                         Ok(sink) => {
                             let delivery_meta = DeliveryMetadata {
                                 job_id,
@@ -3386,9 +3474,15 @@ mod tests {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://fake:fake@localhost/fake")
             .unwrap();
+        let export_dir = std::env::temp_dir()
+            .join(format!("sp_test_exports_{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        std::fs::create_dir_all(&export_dir).ok();
         let config = AppConfig {
             api_key,
             allowed_wallets,
+            export_dir,
             ..AppConfig::default()
         };
         let allowed_wallets_set = config.allowed_wallets_set();
@@ -6353,29 +6447,77 @@ mod tests {
 
     #[test]
     fn test_validate_sink_config_local_file_valid() {
+        let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
         let config = SinkConfig {
             sink_type: SinkType::LocalFile,
-            file_path: Some("/tmp/export.jsonl".to_string()),
+            file_path: Some("export.jsonl".to_string()),
             url: None,
             headers: None,
             connection_string: None,
             table: None,
         };
-        assert!(validate_sink_config(&config).is_ok());
+        assert!(validate_sink_config(&config, dir.to_str().unwrap()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_validate_sink_config_local_file_path_traversal() {
+        let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
         let config = SinkConfig {
             sink_type: SinkType::LocalFile,
-            file_path: Some("/tmp/../etc/passwd".to_string()),
+            file_path: Some("../etc/passwd".to_string()),
             url: None,
             headers: None,
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config).unwrap_err();
+        let err = validate_sink_config(&config, dir.to_str().unwrap()).unwrap_err();
         assert!(err.message.contains("path traversal"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_sink_config_local_file_absolute_path_rerooted() {
+        // Absolute paths have leading '/' stripped and are re-rooted under export_dir,
+        // so "/etc/passwd" becomes "{export_dir}/etc/passwd" which is safely contained.
+        let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = SinkConfig {
+            sink_type: SinkType::LocalFile,
+            file_path: Some("/etc/passwd".to_string()),
+            url: None,
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        assert!(validate_sink_config(&config, dir.to_str().unwrap()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sink_config_local_file_symlink_escape_rejected() {
+        let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Create a symlink inside export_dir that points outside
+        let escape_link = dir.join("escape");
+        std::os::unix::fs::symlink("/tmp", &escape_link).unwrap();
+        let config = SinkConfig {
+            sink_type: SinkType::LocalFile,
+            file_path: Some("escape/should_not_be_allowed".to_string()),
+            url: None,
+            headers: None,
+            connection_string: None,
+            table: None,
+        };
+        let err = validate_sink_config(&config, dir.to_str().unwrap()).unwrap_err();
+        assert!(err
+            .message
+            .contains("outside the configured export directory"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6388,7 +6530,7 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        assert!(validate_sink_config(&config).is_ok());
+        assert!(validate_sink_config(&config, "/tmp").is_ok());
     }
 
     #[test]
@@ -6401,7 +6543,7 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config).unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").unwrap_err();
         assert!(err.message.contains("private"));
     }
 
@@ -6415,7 +6557,7 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config).unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").unwrap_err();
         assert!(err.message.contains("url"));
     }
 
@@ -6429,7 +6571,7 @@ mod tests {
             connection_string: Some("postgresql://localhost/exports".to_string()),
             table: Some("export_data".to_string()),
         };
-        let err = validate_sink_config(&config).unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").unwrap_err();
         assert!(err.message.contains("not yet implemented"));
     }
 
@@ -6445,7 +6587,7 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config).unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").unwrap_err();
         assert!(err.message.contains("Forbidden webhook header"));
     }
 
@@ -6461,7 +6603,7 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config).unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").unwrap_err();
         assert!(err.message.contains("Invalid header name"));
     }
 
@@ -6477,7 +6619,7 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config).unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").unwrap_err();
         assert!(err.message.contains("control characters"));
     }
 
@@ -6494,7 +6636,7 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        assert!(validate_sink_config(&config).is_ok());
+        assert!(validate_sink_config(&config, "/tmp").is_ok());
     }
 
     #[test]
@@ -6509,20 +6651,23 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        assert!(validate_sink_config(&config).is_ok());
+        assert!(validate_sink_config(&config, "/tmp").is_ok());
     }
 
     #[test]
     fn test_build_sink_local_file() {
+        let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
         let config = SinkConfig {
             sink_type: SinkType::LocalFile,
-            file_path: Some("/tmp/test.jsonl".to_string()),
+            file_path: Some("test.jsonl".to_string()),
             url: None,
             headers: None,
             connection_string: None,
             table: None,
         };
-        assert!(build_sink(&config).is_ok());
+        assert!(build_sink(&config, dir.to_str().unwrap()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6535,7 +6680,7 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        assert!(build_sink(&config).is_ok());
+        assert!(build_sink(&config, "/tmp").is_ok());
     }
 
     #[test]
@@ -6548,7 +6693,7 @@ mod tests {
             connection_string: Some("postgresql://localhost/db".to_string()),
             table: Some("export_data".to_string()),
         };
-        assert!(build_sink(&config).is_err());
+        assert!(build_sink(&config, "/tmp").is_err());
     }
 
     #[tokio::test]
@@ -6614,7 +6759,7 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config).unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").unwrap_err();
         assert!(err.message.contains("HTTP(S)"));
     }
 
@@ -6632,7 +6777,7 @@ mod tests {
                     "format": "jsonl",
                     "sink": {
                         "sink_type": "local_file",
-                        "file_path": "/tmp/spectraplex_export_test.jsonl"
+                        "file_path": "spectraplex_export_test.jsonl"
                     }
                 }))
                 .unwrap(),
@@ -6790,7 +6935,7 @@ mod tests {
                     "dataset": "token_transfers",
                     "sink": {
                         "sink_type": "local_file",
-                        "file_path": "/tmp/../etc/passwd"
+                        "file_path": "../etc/passwd"
                     }
                 }))
                 .unwrap(),
