@@ -13,6 +13,7 @@ use spectraplex_adapters::{
     evm_parser,
     hyperliquid::HyperliquidAdapter,
     hyperliquid_parser,
+    hyperliquid_ws::HyperliquidWsClient,
     repo::{build_checkpoint, Repository},
     solana::SolanaAdapter,
     solana_grpc::SolanaGrpcAdapter,
@@ -190,6 +191,8 @@ struct AppState {
 
 struct StreamEntry {
     id: Uuid,
+    chain: String,
+    wallet: Option<String>,
     cancel: CancellationToken,
     started_at: Instant,
     tx_count: Arc<std::sync::atomic::AtomicU64>,
@@ -199,6 +202,9 @@ struct StreamEntry {
 #[derive(Serialize)]
 struct StreamInfo {
     id: Uuid,
+    chain: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wallet: Option<String>,
     uptime_secs: u64,
     transactions_ingested: u64,
     last_slot: u64,
@@ -1601,26 +1607,49 @@ async fn get_wallet_stats(
 #[derive(Deserialize)]
 struct StartStreamRequest {
     chain: String,
+    wallet: Option<String>,
 }
 
 async fn start_stream(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<StartStreamRequest>,
 ) -> Result<Json<StreamInfo>, AppError> {
-    if payload.chain != "solana" {
-        return Err(AppError::bad_request(
-            "Streaming is currently only supported for solana",
-        ));
-    }
+    match payload.chain.as_str() {
+        "solana" => {
+            if state
+                .config
+                .solana_grpc_url
+                .as_deref()
+                .filter(|u| !u.is_empty())
+                .is_none()
+            {
+                return Err(AppError::bad_request(
+                    "Solana gRPC URL not configured (set SOLANA_GRPC_URL)",
+                ));
+            }
+        }
+        "hyperliquid" => {
+            let wallet = payload.wallet.as_deref().unwrap_or("");
+            validate_wallet(wallet)?;
+            check_wallet_allowed(wallet, &state.allowed_wallets)?;
 
-    let grpc_url = state
-        .config
-        .solana_grpc_url
-        .as_deref()
-        .filter(|u| !u.is_empty())
-        .ok_or_else(|| {
-            AppError::bad_request("Solana gRPC URL not configured (set SOLANA_GRPC_URL)")
-        })?;
+            let streams = state.streams.read().await;
+            let dup = streams
+                .values()
+                .any(|e| e.chain == "hyperliquid" && e.wallet.as_deref() == Some(wallet));
+            drop(streams);
+            if dup {
+                return Err(AppError::bad_request(
+                    "A Hyperliquid stream for this wallet is already active",
+                ));
+            }
+        }
+        other => {
+            return Err(AppError::bad_request(format!(
+                "Unsupported streaming chain: {other}. Supported: solana, hyperliquid"
+            )));
+        }
+    }
 
     let _permit = state
         .stream_semaphore
@@ -1632,9 +1661,8 @@ async fn start_stream(
     let cancel = CancellationToken::new();
     let tx_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let last_slot = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-    let adapter = SolanaGrpcAdapter::new(grpc_url, state.config.solana_grpc_token.clone());
-    let (mut rx, grpc_handle) = adapter.stream_transactions();
+    let chain = payload.chain.clone();
+    let wallet = payload.wallet.clone();
 
     let cancel_clone = cancel.clone();
     let tx_count_clone = Arc::clone(&tx_count);
@@ -1642,58 +1670,185 @@ async fn start_stream(
     let repo = state.repo.clone();
     let state_clone = Arc::clone(&state);
 
-    tokio::spawn(async move {
-        let _permit = _permit;
-        let mut batch: Vec<Transaction> = Vec::new();
-        let mut last_flush = Instant::now();
-        const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
-        const BATCH_SIZE: usize = 100;
+    match chain.as_str() {
+        "solana" => {
+            let grpc_url = state.config.solana_grpc_url.clone().unwrap();
+            let grpc_token = state.config.solana_grpc_token.clone();
+            let adapter = SolanaGrpcAdapter::new(&grpc_url, grpc_token);
+            let (mut rx, grpc_handle) = adapter.stream_transactions();
 
-        loop {
-            tokio::select! {
-                _ = cancel_clone.cancelled() => {
-                    info!(stream_id = %stream_id, "Stream cancelled");
-                    break;
-                }
-                maybe_tx = rx.recv() => {
-                    match maybe_tx {
-                        Some(tx) => {
-                            if let Some(slot) = tx.raw_metadata.get("slot").and_then(|v| v.as_u64()) {
-                                last_slot_clone.store(slot, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            batch.push(tx);
-                            tx_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::spawn(async move {
+                let _permit = _permit;
+                let mut batch: Vec<Transaction> = Vec::new();
+                let mut last_flush = Instant::now();
+                const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+                const BATCH_SIZE: usize = 100;
 
-                            if batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL {
-                                if let Err(e) = repo.save_transactions(&batch).await {
-                                    error!(stream_id = %stream_id, error = %e, "Failed to save streamed transactions");
-                                }
-                                batch.clear();
-                                last_flush = Instant::now();
-                            }
-                        }
-                        None => {
-                            info!(stream_id = %stream_id, "gRPC stream channel closed");
+                loop {
+                    tokio::select! {
+                        _ = cancel_clone.cancelled() => {
+                            info!(stream_id = %stream_id, "Stream cancelled");
                             break;
+                        }
+                        maybe_tx = rx.recv() => {
+                            match maybe_tx {
+                                Some(tx) => {
+                                    if let Some(slot) = tx.raw_metadata.get("slot").and_then(|v| v.as_u64()) {
+                                        last_slot_clone.store(slot, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    batch.push(tx);
+                                    tx_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                                    if batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL {
+                                        if let Err(e) = repo.save_transactions(&batch).await {
+                                            error!(stream_id = %stream_id, error = %e, "Failed to save streamed transactions");
+                                        }
+                                        batch.clear();
+                                        last_flush = Instant::now();
+                                    }
+                                }
+                                None => {
+                                    info!(stream_id = %stream_id, "gRPC stream channel closed");
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
 
-        if !batch.is_empty() {
-            if let Err(e) = repo.save_transactions(&batch).await {
-                error!(stream_id = %stream_id, error = %e, "Failed to flush final batch");
-            }
-        }
+                if !batch.is_empty() {
+                    if let Err(e) = repo.save_transactions(&batch).await {
+                        error!(stream_id = %stream_id, error = %e, "Failed to flush final batch");
+                    }
+                }
 
-        grpc_handle.abort();
-        state_clone.streams.write().await.remove(&stream_id);
-        info!(stream_id = %stream_id, "Stream removed from active set");
-    });
+                grpc_handle.abort();
+                state_clone.streams.write().await.remove(&stream_id);
+                info!(stream_id = %stream_id, "Stream removed from active set");
+            });
+        }
+        "hyperliquid" => {
+            let hl_wallet = wallet.clone().unwrap();
+            let (sender, mut receiver) = tokio::sync::mpsc::channel::<serde_json::Value>(1000);
+
+            let ws_cancel = cancel_clone.clone();
+            let ws_wallet = hl_wallet.clone();
+            let ws_stream_id = stream_id;
+            let ws_handle = tokio::spawn(async move {
+                let client = HyperliquidWsClient::new();
+                let mut retry_count: u32 = 0;
+                const MAX_RETRIES: u32 = 10;
+                loop {
+                    let ws_wallet_ref = ws_wallet.clone();
+                    let sender_ref = sender.clone();
+                    tokio::select! {
+                        result = client.subscribe_user(&ws_wallet_ref, |msg| {
+                            let channel = msg.channel.as_deref().unwrap_or("");
+                            if channel == "subscriptionResponse" || channel.is_empty() {
+                                return;
+                            }
+                            if let Some(data) = msg.data {
+                                if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = sender_ref.try_send(data) {
+                                    warn!(stream_id = %ws_stream_id, "Hyperliquid WS channel full, message dropped");
+                                }
+                            }
+                        }) => {
+                            if let Err(e) = result {
+                                error!(stream_id = %ws_stream_id, error = %e, "Hyperliquid WebSocket error");
+                            }
+                            if ws_cancel.is_cancelled() {
+                                break;
+                            }
+                            retry_count += 1;
+                            if retry_count > MAX_RETRIES {
+                                error!(stream_id = %ws_stream_id, "Exceeded max retries ({MAX_RETRIES}), stopping Hyperliquid WS stream");
+                                break;
+                            }
+                            let backoff = Duration::from_secs(2u64.saturating_pow(retry_count.min(6)));
+                            warn!(stream_id = %ws_stream_id, retry = retry_count, max = MAX_RETRIES,
+                                "Hyperliquid WebSocket disconnected, reconnecting in {:?}", backoff);
+                            tokio::select! {
+                                _ = tokio::time::sleep(backoff) => {}
+                                _ = ws_cancel.cancelled() => { break; }
+                            }
+                        }
+                        _ = ws_cancel.cancelled() => {
+                            info!(stream_id = %ws_stream_id, "Hyperliquid stream cancelled");
+                            break;
+                        }
+                    }
+                    // Reset retry count on successful connection that lasted
+                    // a reasonable amount of time (handled implicitly: if we
+                    // got here via a connection error, retry_count is already
+                    // incremented above).
+                }
+            });
+
+            let hl_wallet_owned = hl_wallet.clone();
+            tokio::spawn(async move {
+                let _permit = _permit;
+                let mut batch: Vec<Transaction> = Vec::new();
+                let mut last_flush = Instant::now();
+                let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, hl_wallet_owned.as_bytes());
+                const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+                const BATCH_SIZE: usize = 100;
+
+                loop {
+                    tokio::select! {
+                        _ = cancel_clone.cancelled() => {
+                            info!(stream_id = %stream_id, "Hyperliquid stream cancelled");
+                            break;
+                        }
+                        msg = receiver.recv() => {
+                            match msg {
+                                Some(data) => {
+                                    let tx = Transaction {
+                                        id: Uuid::new_v4(),
+                                        user_id,
+                                        wallet_address: hl_wallet_owned.clone(),
+                                        timestamp: chrono::Utc::now().timestamp(),
+                                        tx_hash: format!("hl-ws-{}", Uuid::new_v4()),
+                                        chain: Chain::Hyperliquid,
+                                        raw_metadata: data,
+                                    };
+                                    batch.push(tx);
+                                    tx_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                                    if batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL {
+                                        if let Err(e) = repo.save_transactions(&batch).await {
+                                            error!(stream_id = %stream_id, error = %e, "Failed to save HL stream batch");
+                                        }
+                                        batch.clear();
+                                        last_flush = Instant::now();
+                                    }
+                                }
+                                None => {
+                                    info!(stream_id = %stream_id, "Hyperliquid WS channel closed");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !batch.is_empty() {
+                    if let Err(e) = repo.save_transactions(&batch).await {
+                        error!(stream_id = %stream_id, error = %e, "Failed to flush final HL batch");
+                    }
+                }
+
+                ws_handle.abort();
+                state_clone.streams.write().await.remove(&stream_id);
+                info!(stream_id = %stream_id, "Hyperliquid stream removed from active set");
+            });
+        }
+        _ => unreachable!("chain validated above"),
+    }
 
     let entry = StreamEntry {
         id: stream_id,
+        chain: chain.clone(),
+        wallet: wallet.clone(),
         cancel: cancel.clone(),
         started_at: Instant::now(),
         tx_count: Arc::clone(&tx_count),
@@ -1702,6 +1857,8 @@ async fn start_stream(
 
     let info = StreamInfo {
         id: stream_id,
+        chain,
+        wallet,
         uptime_secs: 0,
         transactions_ingested: 0,
         last_slot: 0,
@@ -1738,6 +1895,8 @@ async fn list_streams(
         .values()
         .map(|entry| StreamInfo {
             id: entry.id,
+            chain: entry.chain.clone(),
+            wallet: entry.wallet.clone(),
             uptime_secs: entry.started_at.elapsed().as_secs(),
             transactions_ingested: entry.tx_count.load(std::sync::atomic::Ordering::Relaxed),
             last_slot: entry.last_slot.load(std::sync::atomic::Ordering::Relaxed),
@@ -5203,7 +5362,7 @@ mod tests {
         assert!(json["error"]
             .as_str()
             .unwrap()
-            .contains("only supported for solana"));
+            .contains("Unsupported streaming chain"));
     }
 
     #[tokio::test]
@@ -5305,6 +5464,8 @@ mod tests {
             stream_id,
             StreamEntry {
                 id: stream_id,
+                chain: "solana".to_string(),
+                wallet: None,
                 cancel: cancel.clone(),
                 started_at: Instant::now(),
                 tx_count: Arc::new(std::sync::atomic::AtomicU64::new(42)),
@@ -5337,6 +5498,8 @@ mod tests {
             stream_id,
             StreamEntry {
                 id: stream_id,
+                chain: "solana".to_string(),
+                wallet: None,
                 cancel: CancellationToken::new(),
                 started_at: Instant::now(),
                 tx_count: Arc::new(std::sync::atomic::AtomicU64::new(100)),
@@ -5357,6 +5520,7 @@ mod tests {
         let streams: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert_eq!(streams.len(), 1);
         assert_eq!(streams[0]["id"], stream_id.to_string());
+        assert_eq!(streams[0]["chain"], "solana");
         assert_eq!(streams[0]["transactions_ingested"], 100);
         assert_eq!(streams[0]["last_slot"], 50000);
     }
@@ -5405,14 +5569,174 @@ mod tests {
     fn test_stream_info_serialization() {
         let info = StreamInfo {
             id: Uuid::nil(),
+            chain: "solana".to_string(),
+            wallet: None,
             uptime_secs: 120,
             transactions_ingested: 5000,
             last_slot: 300000,
         };
         let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["chain"], "solana");
+        assert!(json.get("wallet").is_none());
         assert_eq!(json["uptime_secs"], 120);
         assert_eq!(json["transactions_ingested"], 5000);
         assert_eq!(json["last_slot"], 300000);
+
+        let info_hl = StreamInfo {
+            id: Uuid::nil(),
+            chain: "hyperliquid".to_string(),
+            wallet: Some("0xabc123".to_string()),
+            uptime_secs: 60,
+            transactions_ingested: 10,
+            last_slot: 0,
+        };
+        let json_hl = serde_json::to_value(&info_hl).unwrap();
+        assert_eq!(json_hl["chain"], "hyperliquid");
+        assert_eq!(json_hl["wallet"], "0xabc123");
+    }
+
+    #[tokio::test]
+    async fn test_stream_start_hyperliquid_missing_wallet() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/stream/start")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({"chain": "hyperliquid"})).unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid wallet address length"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_start_hyperliquid_invalid_wallet() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/stream/start")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "hyperliquid",
+                    "wallet": "bad wallet!@#"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid characters"));
+    }
+
+    #[tokio::test]
+    async fn test_list_streams_includes_chain_and_wallet() {
+        let state = test_state();
+        let stream_id = Uuid::new_v4();
+        state.streams.write().await.insert(
+            stream_id,
+            StreamEntry {
+                id: stream_id,
+                chain: "hyperliquid".to_string(),
+                wallet: Some("0xabc123".to_string()),
+                cancel: CancellationToken::new(),
+                started_at: Instant::now(),
+                tx_count: Arc::new(std::sync::atomic::AtomicU64::new(5)),
+                last_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+        );
+
+        let app = test_router_with_state(Arc::clone(&state));
+        let req = axum::http::Request::builder()
+            .uri("/v1/streams")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let streams: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0]["chain"], "hyperliquid");
+        assert_eq!(streams[0]["wallet"], "0xabc123");
+        assert_eq!(streams[0]["transactions_ingested"], 5);
+    }
+
+    #[tokio::test]
+    async fn test_stream_start_hyperliquid_forbidden_wallet() {
+        let state = test_state_with_config(
+            Some(TEST_API_KEY.to_string()),
+            Some("0xAllowedWallet".to_string()),
+        );
+        let app = test_router_with_state(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/stream/start")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "hyperliquid",
+                    "wallet": "0xNotAllowed"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_stream_start_hyperliquid_duplicate_wallet() {
+        let state = test_state();
+        let stream_id = Uuid::new_v4();
+        state.streams.write().await.insert(
+            stream_id,
+            StreamEntry {
+                id: stream_id,
+                chain: "hyperliquid".to_string(),
+                wallet: Some("0xDuplicateWallet".to_string()),
+                cancel: CancellationToken::new(),
+                started_at: Instant::now(),
+                tx_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                last_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+        );
+
+        let app = test_router_with_state(Arc::clone(&state));
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/stream/start")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "hyperliquid",
+                    "wallet": "0xDuplicateWallet"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("already active"));
     }
 
     // -----------------------------------------------------------------------
