@@ -181,6 +181,46 @@ pub struct RawTransaction {
 }
 
 // ---------------------------------------------------------------------------
+// Raw EVM Trace (Bronze)
+// ---------------------------------------------------------------------------
+
+/// Supported tracer types for `debug_traceTransaction`.
+///
+/// Each variant corresponds to a built-in Geth tracer. The `Other` variant
+/// accommodates node-specific or future tracers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[serde(rename_all = "camelCase")]
+#[strum(serialize_all = "camelCase")]
+pub enum EvmTraceType {
+    /// Geth `callTracer` — nested call tree with value transfers.
+    CallTracer,
+    /// Geth `prestateTracer` — pre/post state diffs per account.
+    PrestateTracer,
+    /// Geth `flatCallTracer` — flat list of calls (Erigon/Reth).
+    FlatCallTracer,
+    /// Any other tracer type.
+    Other,
+}
+
+/// Bronze-layer raw EVM trace record.
+///
+/// Stores the full JSON response from `debug_traceTransaction` (or
+/// `trace_transaction`) for a single transaction. The `raw_trace` field
+/// contains the complete tracer output as JSONB, preserving all data for
+/// downstream Silver-layer parsing (e.g. NativeBalanceDelta extraction).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawEvmTrace {
+    pub id: Uuid,
+    pub transaction_hash: String,
+    pub block_number: Option<i64>,
+    pub network: String,
+    pub trace_type: EvmTraceType,
+    pub raw_trace: serde_json::Value,
+    pub ingestion_run_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
 // Target Match
 // ---------------------------------------------------------------------------
 
@@ -1070,5 +1110,132 @@ mod tests {
         let back: IngestionBatch = serde_json::from_str(&json).unwrap();
         assert_eq!(back.records.len(), 1);
         assert_eq!(back.records[0].network, "base-mainnet");
+    }
+
+    // -- EvmTraceType --
+
+    #[test]
+    fn evm_trace_type_serde_roundtrip() {
+        for (variant, expected_str) in [
+            (EvmTraceType::CallTracer, "\"callTracer\""),
+            (EvmTraceType::PrestateTracer, "\"prestateTracer\""),
+            (EvmTraceType::FlatCallTracer, "\"flatCallTracer\""),
+            (EvmTraceType::Other, "\"other\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_str, "serialize {variant:?}");
+            let back: EvmTraceType = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "deserialize {expected_str}");
+        }
+    }
+
+    #[test]
+    fn evm_trace_type_display() {
+        assert_eq!(EvmTraceType::CallTracer.to_string(), "callTracer");
+        assert_eq!(EvmTraceType::PrestateTracer.to_string(), "prestateTracer");
+        assert_eq!(EvmTraceType::FlatCallTracer.to_string(), "flatCallTracer");
+        assert_eq!(EvmTraceType::Other.to_string(), "other");
+    }
+
+    #[test]
+    fn evm_trace_type_from_str() {
+        assert_eq!(
+            EvmTraceType::from_str("callTracer").unwrap(),
+            EvmTraceType::CallTracer
+        );
+        assert_eq!(
+            EvmTraceType::from_str("prestateTracer").unwrap(),
+            EvmTraceType::PrestateTracer
+        );
+        assert_eq!(
+            EvmTraceType::from_str("flatCallTracer").unwrap(),
+            EvmTraceType::FlatCallTracer
+        );
+        assert_eq!(
+            EvmTraceType::from_str("other").unwrap(),
+            EvmTraceType::Other
+        );
+        assert!(EvmTraceType::from_str("unknown").is_err());
+    }
+
+    // -- RawEvmTrace --
+
+    #[test]
+    fn raw_evm_trace_serde_roundtrip() {
+        let trace = RawEvmTrace {
+            id: Uuid::new_v4(),
+            transaction_hash: "0xdeadbeef".to_string(),
+            block_number: Some(18_000_000),
+            network: "ethereum-mainnet".to_string(),
+            trace_type: EvmTraceType::CallTracer,
+            raw_trace: serde_json::json!({
+                "type": "CALL",
+                "from": "0x1111111111111111111111111111111111111111",
+                "to": "0x2222222222222222222222222222222222222222",
+                "value": "0xde0b6b3a7640000",
+                "gas": "0x5208",
+                "gasUsed": "0x5208",
+                "input": "0x",
+                "output": "0x",
+            }),
+            ingestion_run_id: None,
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&trace).unwrap();
+        let back: RawEvmTrace = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.transaction_hash, "0xdeadbeef");
+        assert_eq!(back.network, "ethereum-mainnet");
+        assert_eq!(back.trace_type, EvmTraceType::CallTracer);
+        assert_eq!(back.block_number, Some(18_000_000));
+        assert!(back.raw_trace.get("type").is_some());
+    }
+
+    #[test]
+    fn raw_evm_trace_no_wallet_or_user_fields() {
+        let trace = RawEvmTrace {
+            id: Uuid::new_v4(),
+            transaction_hash: "0xabc".to_string(),
+            block_number: None,
+            network: "base-mainnet".to_string(),
+            trace_type: EvmTraceType::PrestateTracer,
+            raw_trace: serde_json::json!({}),
+            ingestion_run_id: Some(Uuid::new_v4()),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&trace).unwrap();
+        assert!(!json.contains("wallet_address"));
+        assert!(!json.contains("user_id"));
+    }
+
+    #[test]
+    fn raw_evm_trace_prestate_tracer_format() {
+        let trace = RawEvmTrace {
+            id: Uuid::new_v4(),
+            transaction_hash: "0xabc123".to_string(),
+            block_number: Some(19_000_000),
+            network: "ethereum-mainnet".to_string(),
+            trace_type: EvmTraceType::PrestateTracer,
+            raw_trace: serde_json::json!({
+                "pre": {
+                    "0x1111111111111111111111111111111111111111": {
+                        "balance": "0xde0b6b3a7640000",
+                        "nonce": 42
+                    }
+                },
+                "post": {
+                    "0x1111111111111111111111111111111111111111": {
+                        "balance": "0xc9f2c9cd04674edea40000000",
+                        "nonce": 43
+                    }
+                }
+            }),
+            ingestion_run_id: None,
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&trace).unwrap();
+        let back: RawEvmTrace = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.trace_type, EvmTraceType::PrestateTracer);
+        assert!(back.raw_trace.get("pre").is_some());
+        assert!(back.raw_trace.get("post").is_some());
     }
 }

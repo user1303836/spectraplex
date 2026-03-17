@@ -15,9 +15,10 @@ use spectraplex_core::connector::{
 };
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
 use spectraplex_core::v2::{
-    ChainFamily, IndexTarget, IngestionBatch, RawTransaction, TargetKind, TargetMode,
+    ChainFamily, EvmTraceType, IndexTarget, IngestionBatch, RawEvmTrace, RawTransaction,
+    TargetKind, TargetMode,
 };
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Maximum retry attempts for transient RPC failures.
@@ -49,6 +50,17 @@ pub struct EvmAdapter {
     >,
     block_chunk: u64,
     network: String,
+    /// HTTP client and URL for raw `debug_traceTransaction` RPC calls.
+    /// When `None`, trace calls use `trace_http_client` + `rpc_url`. When
+    /// `Some`, trace calls use the separate trace URL (allowing free RPC
+    /// for standard calls and a paid archive node for traces).
+    trace_rpc: Option<(reqwest::Client, reqwest::Url)>,
+    /// Shared HTTP client for trace calls when no separate trace RPC URL
+    /// is configured. Built once at construction to enable connection reuse.
+    trace_http_client: reqwest::Client,
+    /// The primary RPC URL, used as fallback for trace calls when
+    /// `trace_rpc` is not set.
+    rpc_url: reqwest::Url,
 }
 
 impl EvmAdapter {
@@ -59,17 +71,25 @@ impl EvmAdapter {
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .build()?;
-        let provider = ProviderBuilder::new().connect_reqwest(client, url);
+        let provider = ProviderBuilder::new().connect_reqwest(client, url.clone());
 
         // 5 requests per second by default (safe for public RPCs)
         let quota = Quota::per_second(NonZeroU32::new(5).unwrap());
         let limiter = RateLimiter::direct(quota);
+
+        let trace_http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(10))
+            .build()?;
 
         Ok(Self {
             provider: Arc::new(provider),
             rate_limiter: Arc::new(limiter),
             block_chunk: DEFAULT_BLOCK_CHUNK,
             network: "ethereum-mainnet".to_string(),
+            trace_rpc: None,
+            trace_http_client,
+            rpc_url: url,
         })
     }
 
@@ -83,6 +103,22 @@ impl EvmAdapter {
     pub fn with_network(mut self, network: &str) -> Self {
         self.network = network.to_string();
         self
+    }
+
+    /// Set a separate RPC URL for trace requests (`debug_traceTransaction`).
+    ///
+    /// When set, trace fetching uses this URL instead of the primary one.
+    /// This allows separating the standard RPC endpoint (which may be a
+    /// free/public node) from the trace-capable endpoint (which often
+    /// requires a paid tier or an archive node).
+    pub fn with_trace_rpc_url(mut self, rpc_url: &str) -> anyhow::Result<Self> {
+        let url: reqwest::Url = rpc_url.parse()?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(10))
+            .build()?;
+        self.trace_rpc = Some((client, url));
+        Ok(self)
     }
 
     // -----------------------------------------------------------------------
@@ -553,6 +589,201 @@ impl EvmAdapter {
             }
         }
         Ok(None)
+    }
+
+    // -----------------------------------------------------------------------
+    // Trace fetching (Phase 2 — Bronze layer)
+    // -----------------------------------------------------------------------
+
+    /// Fetch a transaction trace via `debug_traceTransaction` with the
+    /// `callTracer` configuration.
+    ///
+    /// The `callTracer` returns a nested call tree showing all internal
+    /// calls, value transfers, and gas usage. This is the most commonly
+    /// supported tracer across Geth, Erigon, and Reth nodes.
+    ///
+    /// Returns `Ok(None)` if the RPC provider does not support the debug
+    /// namespace (returns a method-not-found error).
+    ///
+    /// The raw JSON response is returned as-is for Bronze-layer storage.
+    /// Parsing into structured types is deferred to the Silver-layer
+    /// materializer (Phase 3).
+    pub async fn fetch_call_trace(
+        &self,
+        tx_hash: B256,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        self.fetch_trace(tx_hash, EvmTraceType::CallTracer).await
+    }
+
+    /// Fetch a transaction trace via `debug_traceTransaction` with the
+    /// `prestateTracer` configuration (with `diffMode: true`).
+    ///
+    /// The `prestateTracer` in diff mode returns pre- and post-state for
+    /// every account touched by the transaction, including balance changes.
+    /// This is the ideal data source for `NativeBalanceDelta` extraction.
+    ///
+    /// Returns `Ok(None)` if the RPC provider does not support the debug
+    /// namespace.
+    pub async fn fetch_prestate_trace(
+        &self,
+        tx_hash: B256,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        self.fetch_trace(tx_hash, EvmTraceType::PrestateTracer)
+            .await
+    }
+
+    /// Core trace fetching method. Issues a `debug_traceTransaction` raw
+    /// JSON-RPC call with the specified tracer configuration.
+    ///
+    /// Uses raw HTTP+JSON-RPC because alloy's `Provider::raw_request`
+    /// requires `Sized` and cannot be called on `dyn Provider`. Since we
+    /// store the raw JSONB anyway (Bronze layer), typed deserialization
+    /// is unnecessary at this stage.
+    async fn fetch_trace(
+        &self,
+        tx_hash: B256,
+        trace_type: EvmTraceType,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        self.rate_limiter.until_ready().await;
+
+        let tx_hash_hex = format!("{tx_hash:#x}");
+
+        let tracer_config = match trace_type {
+            EvmTraceType::CallTracer => json!({
+                "tracer": "callTracer",
+                "tracerConfig": {
+                    "onlyTopCall": false,
+                    "withLog": true,
+                }
+            }),
+            EvmTraceType::PrestateTracer => json!({
+                "tracer": "prestateTracer",
+                "tracerConfig": {
+                    "diffMode": true,
+                }
+            }),
+            EvmTraceType::FlatCallTracer => json!({
+                "tracer": "flatCallTracer",
+            }),
+            // `Other` is a catch-all for unrecognized or future tracers.
+            // Falls back to a plain callTracer as the safest default since
+            // there is no user-supplied tracer name at this layer.
+            EvmTraceType::Other => json!({
+                "tracer": "callTracer",
+            }),
+        };
+
+        let rpc_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "debug_traceTransaction",
+            "params": [tx_hash_hex, tracer_config],
+        });
+
+        // Use trace-specific RPC URL if configured, otherwise fall back to
+        // the primary RPC URL with the shared trace HTTP client.
+        let (client, url) = match &self.trace_rpc {
+            Some((c, u)) => (c.clone(), u.clone()),
+            None => (self.trace_http_client.clone(), self.rpc_url.clone()),
+        };
+
+        let resp = client
+            .post(url)
+            .json(&rpc_body)
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?;
+
+        // JSON-RPC error handling
+        if let Some(error) = resp.get("error") {
+            let err_msg = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            let err_code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+
+            // Method not found / not supported patterns.
+            // Only match method-level errors, not transaction-level errors like
+            // "transaction not found" which have a different meaning.
+            if err_code == -32601
+                || err_msg.contains("method not found")
+                || err_msg.contains("method not available")
+                || err_msg.contains("method does not exist")
+                || err_msg.contains("debug_traceTransaction is not available")
+            {
+                debug!(
+                    tx_hash = %tx_hash_hex,
+                    "debug_traceTransaction not supported by this RPC provider"
+                );
+                return Ok(None);
+            }
+
+            return Err(anyhow::anyhow!(
+                "debug_traceTransaction failed for {}: code={}, message={}",
+                tx_hash_hex,
+                err_code,
+                err_msg,
+            ));
+        }
+
+        match resp.get("result") {
+            Some(result) => Ok(Some(result.clone())),
+            None => Err(anyhow::anyhow!(
+                "debug_traceTransaction response missing 'result' for {}",
+                tx_hash_hex,
+            )),
+        }
+    }
+
+    /// Fetch traces for a batch of transaction hashes and return
+    /// `RawEvmTrace` records ready for Bronze-layer storage.
+    ///
+    /// Skips transactions where the trace call returns `None` (unsupported
+    /// provider) or fails with a non-fatal error. Logs warnings for
+    /// individual failures without aborting the batch.
+    pub async fn fetch_traces_for_transactions(
+        &self,
+        tx_hashes: &[B256],
+        trace_type: EvmTraceType,
+        block_numbers: &HashMap<B256, Option<i64>>,
+        ingestion_run_id: Option<Uuid>,
+    ) -> Vec<RawEvmTrace> {
+        let mut traces = Vec::new();
+
+        for tx_hash in tx_hashes {
+            let result = self.fetch_trace(*tx_hash, trace_type).await;
+            match result {
+                Ok(Some(raw_trace)) => {
+                    let tx_hash_str = format!("{tx_hash:#x}");
+                    let block_number = block_numbers.get(tx_hash).copied().unwrap_or(None);
+                    traces.push(RawEvmTrace {
+                        id: Uuid::new_v4(),
+                        transaction_hash: tx_hash_str,
+                        block_number,
+                        network: self.network.clone(),
+                        trace_type,
+                        raw_trace,
+                        ingestion_run_id,
+                        created_at: Utc::now(),
+                    });
+                }
+                Ok(None) => {
+                    // Provider does not support traces — stop trying
+                    debug!("trace API not supported, skipping remaining transactions");
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        tx_hash = %format!("{tx_hash:#x}"),
+                        error = %e,
+                        "failed to fetch trace, skipping"
+                    );
+                }
+            }
+        }
+
+        traces
     }
 }
 
@@ -1182,5 +1413,98 @@ mod tests {
         let new_cursor = json!({"last_block": 19_000_000u64});
         let from2 = cursor_to_from_block(Some(&new_cursor), 20_000_000, 10, 2000);
         assert_eq!(from2, 19_000_001);
+    }
+
+    // -- Trace configuration --
+
+    #[test]
+    fn test_call_tracer_config_format() {
+        let config = json!({
+            "tracer": "callTracer",
+            "tracerConfig": {
+                "onlyTopCall": false,
+                "withLog": true,
+            }
+        });
+        assert_eq!(config["tracer"], "callTracer");
+        assert_eq!(config["tracerConfig"]["onlyTopCall"], false);
+        assert_eq!(config["tracerConfig"]["withLog"], true);
+    }
+
+    #[test]
+    fn test_prestate_tracer_config_format() {
+        let config = json!({
+            "tracer": "prestateTracer",
+            "tracerConfig": {
+                "diffMode": true,
+            }
+        });
+        assert_eq!(config["tracer"], "prestateTracer");
+        assert_eq!(config["tracerConfig"]["diffMode"], true);
+    }
+
+    #[test]
+    fn test_raw_evm_trace_construction() {
+        let trace = RawEvmTrace {
+            id: Uuid::new_v4(),
+            transaction_hash: "0xabc".to_string(),
+            block_number: Some(18_000_000),
+            network: "ethereum-mainnet".to_string(),
+            trace_type: EvmTraceType::CallTracer,
+            raw_trace: json!({
+                "type": "CALL",
+                "from": "0x1111111111111111111111111111111111111111",
+                "to": "0x2222222222222222222222222222222222222222",
+                "value": "0xde0b6b3a7640000",
+            }),
+            ingestion_run_id: None,
+            created_at: Utc::now(),
+        };
+        assert_eq!(trace.network, "ethereum-mainnet");
+        assert_eq!(trace.trace_type, EvmTraceType::CallTracer);
+        assert!(trace.raw_trace.get("type").is_some());
+    }
+
+    #[test]
+    fn test_trace_rpc_defaults_to_none() {
+        // When no trace RPC URL is set, trace_rpc field is None.
+        // The fetch_trace method falls back to the primary rpc_url.
+        let adapter = EvmAdapter::new("http://localhost:8545");
+        assert!(adapter.is_ok());
+        let adapter = adapter.unwrap();
+        assert!(adapter.trace_rpc.is_none());
+    }
+
+    #[test]
+    fn test_with_trace_rpc_url_sets_rpc() {
+        let adapter = EvmAdapter::new("http://localhost:8545")
+            .unwrap()
+            .with_trace_rpc_url("http://localhost:8546");
+        assert!(adapter.is_ok());
+        let adapter = adapter.unwrap();
+        assert!(adapter.trace_rpc.is_some());
+    }
+
+    #[test]
+    fn test_trace_type_to_rpc_tracer_name() {
+        // Verify EvmTraceType display strings match the Geth tracer names
+        assert_eq!(EvmTraceType::CallTracer.to_string(), "callTracer");
+        assert_eq!(EvmTraceType::PrestateTracer.to_string(), "prestateTracer");
+        assert_eq!(EvmTraceType::FlatCallTracer.to_string(), "flatCallTracer");
+    }
+
+    #[test]
+    fn test_fetch_traces_block_number_map() {
+        // Verify that block_numbers HashMap lookup works correctly
+        let tx_hash = B256::from([0xaa; 32]);
+        let mut block_numbers: HashMap<B256, Option<i64>> = HashMap::new();
+        block_numbers.insert(tx_hash, Some(18_000_000));
+
+        let result = block_numbers.get(&tx_hash).copied().unwrap_or(None);
+        assert_eq!(result, Some(18_000_000));
+
+        let missing = B256::from([0xbb; 32]);
+        let result = block_numbers.get(&missing).copied().unwrap_or(None);
+        assert_eq!(result, None);
     }
 }

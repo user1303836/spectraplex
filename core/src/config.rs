@@ -20,6 +20,16 @@ pub struct AppConfig {
     pub solana_grpc_url: Option<String>,
     pub solana_grpc_token: Option<String>,
     pub export_dir: String,
+    /// Enable EVM trace fetching via `debug_traceTransaction`.
+    /// Requires an RPC provider that supports the `debug` namespace (e.g.
+    /// Alchemy, Infura with add-on, or a full/archive node).
+    /// Disabled by default because most public RPC endpoints do not support it.
+    pub evm_trace_enabled: bool,
+    /// URL for the EVM debug/trace RPC endpoint. When set, trace requests
+    /// use this URL instead of `evm_rpc_url`. This allows separating the
+    /// standard RPC endpoint (which may be a free/public node) from the
+    /// trace-capable endpoint (which often requires a paid tier).
+    pub evm_trace_rpc_url: Option<String>,
 }
 
 /// Errors from config validation.
@@ -64,6 +74,8 @@ impl Default for AppConfig {
             solana_grpc_url: None,
             solana_grpc_token: None,
             export_dir: "./exports".to_string(),
+            evm_trace_enabled: false,
+            evm_trace_rpc_url: None,
         }
     }
 }
@@ -111,6 +123,7 @@ impl AppConfig {
                 "SOLANA_GRPC_URL",
                 "SOLANA_GRPC_TOKEN",
                 "EXPORT_DIR",
+                "EVM_TRACE_RPC_URL",
             ]))
             .extract()
             .map_err(Box::new)
@@ -145,6 +158,8 @@ mod tests {
         assert_eq!(config.pool_size, 10);
         assert_eq!(config.log_level, "info");
         assert_eq!(config.ingest_limit, 50);
+        assert!(!config.evm_trace_enabled);
+        assert!(config.evm_trace_rpc_url.is_none());
     }
 
     #[test]
