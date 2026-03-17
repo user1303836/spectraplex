@@ -85,6 +85,32 @@ curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
   http://127.0.0.1:3000/v1/jobs/<JOB_ID>
 ```
 
+### Real-Time Streaming
+
+```bash
+# Start a Solana gRPC stream (requires SOLANA_GRPC_URL)
+curl -X POST http://127.0.0.1:3000/v1/stream/start \
+  -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"chain": "solana"}'
+
+# Start a Hyperliquid WebSocket stream for a wallet
+curl -X POST http://127.0.0.1:3000/v1/stream/start \
+  -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"chain": "hyperliquid", "wallet": "0x..."}'
+
+# List active streams
+curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
+  http://127.0.0.1:3000/v1/streams
+
+# Stop a stream
+curl -X POST http://127.0.0.1:3000/v1/stream/<STREAM_ID>/stop \
+  -H "Authorization: Bearer $SPECTRAPLEX_API_KEY"
+```
+
+Hyperliquid streams subscribe to user fills, funding, and ledger updates via WebSocket with automatic reconnection.
+
 ### Targets and Networks
 
 ```bash
