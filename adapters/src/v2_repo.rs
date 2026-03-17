@@ -11,8 +11,8 @@ use spectraplex_core::materializer::{
 };
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
-    DatasetVersionStatus, IndexTarget, IngestionRun, Network, RawTransaction, TargetKind,
-    TargetMatch, TargetMode,
+    DatasetVersionStatus, EvmTraceType, IndexTarget, IngestionRun, Network, RawEvmTrace,
+    RawTransaction, TargetKind, TargetMatch, TargetMode,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -1163,6 +1163,66 @@ pub fn build_dataset_filter_query(
     args.add(offset).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok((sql, args))
+}
+
+/// Build a batch INSERT for `raw_evm_traces` with ON CONFLICT DO NOTHING.
+pub fn build_raw_evm_trace_insert(
+    traces: &[RawEvmTrace],
+) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+    let mut query = String::from(
+        "INSERT INTO raw_evm_traces \
+         (id, transaction_hash, block_number, network, trace_type, raw_trace, ingestion_run_id, created_at) \
+         VALUES ",
+    );
+    let mut args = sqlx::postgres::PgArguments::default();
+    for (i, t) in traces.iter().enumerate() {
+        let base = i * 8;
+        if i > 0 {
+            query.push_str(", ");
+        }
+        query.push_str(&format!(
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+            base + 7,
+            base + 8,
+        ));
+        use sqlx::Arguments;
+        args.add(t.id).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&t.transaction_hash)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(t.block_number)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&t.network).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(t.trace_type.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&t.raw_trace).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(t.ingestion_run_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(t.created_at).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    query.push_str(" ON CONFLICT (network, transaction_hash) DO NOTHING");
+    Ok((query, args))
+}
+
+/// Map a database row to a `RawEvmTrace`.
+fn row_to_raw_evm_trace(row: &sqlx::postgres::PgRow) -> anyhow::Result<RawEvmTrace> {
+    use std::str::FromStr;
+    Ok(RawEvmTrace {
+        id: row.try_get("id")?,
+        transaction_hash: row.try_get("transaction_hash")?,
+        block_number: row.try_get("block_number")?,
+        network: row.try_get("network")?,
+        trace_type: EvmTraceType::from_str(row.try_get::<String, _>("trace_type")?.as_str())
+            .map_err(|e| anyhow::anyhow!("invalid trace_type: {e}"))?,
+        raw_trace: row.try_get("raw_trace")?,
+        ingestion_run_id: row.try_get("ingestion_run_id")?,
+        created_at: row.try_get("created_at")?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2751,6 +2811,59 @@ impl Repository {
         )
         .await
     }
+
+    // -----------------------------------------------------------------------
+    // Raw EVM Traces (Bronze)
+    // -----------------------------------------------------------------------
+
+    /// Bulk insert raw EVM trace records.
+    pub async fn save_raw_evm_traces(&self, traces: &[RawEvmTrace]) -> anyhow::Result<()> {
+        for chunk in traces.chunks(Self::V2_BATCH_SIZE) {
+            let (query, args) = build_raw_evm_trace_insert(chunk)?;
+            sqlx::query_with(&query, args).execute(self.pool()).await?;
+        }
+        Ok(())
+    }
+
+    /// Fetch a raw EVM trace by network and transaction hash.
+    pub async fn get_raw_evm_trace(
+        &self,
+        network: &str,
+        transaction_hash: &str,
+    ) -> anyhow::Result<Option<RawEvmTrace>> {
+        let row = sqlx::query(
+            "SELECT id, transaction_hash, block_number, network, trace_type, \
+             raw_trace, ingestion_run_id, created_at \
+             FROM raw_evm_traces WHERE network = $1 AND transaction_hash = $2",
+        )
+        .bind(network)
+        .bind(transaction_hash)
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref().map(row_to_raw_evm_trace).transpose()
+    }
+
+    /// Fetch all raw EVM traces for a block range (inclusive).
+    pub async fn get_raw_evm_traces_by_block_range(
+        &self,
+        network: &str,
+        from_block: i64,
+        to_block: i64,
+    ) -> anyhow::Result<Vec<RawEvmTrace>> {
+        let rows = sqlx::query(
+            "SELECT id, transaction_hash, block_number, network, trace_type, \
+             raw_trace, ingestion_run_id, created_at \
+             FROM raw_evm_traces \
+             WHERE network = $1 AND block_number >= $2 AND block_number <= $3 \
+             ORDER BY block_number",
+        )
+        .bind(network)
+        .bind(from_block)
+        .bind(to_block)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_raw_evm_trace).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4057,6 +4170,95 @@ mod tests {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
             _assert_send(repo.query_pool_snapshots(None, None, None, None, 50, 0));
+        }
+        let _ = _check;
+    }
+
+    // -- raw_evm_trace batch insert --
+
+    fn make_raw_evm_trace() -> RawEvmTrace {
+        RawEvmTrace {
+            id: Uuid::new_v4(),
+            transaction_hash: "0xdeadbeef1234567890".to_string(),
+            block_number: Some(18_000_000),
+            network: "ethereum-mainnet".to_string(),
+            trace_type: EvmTraceType::CallTracer,
+            raw_trace: serde_json::json!({
+                "type": "CALL",
+                "from": "0x1111111111111111111111111111111111111111",
+                "to": "0x2222222222222222222222222222222222222222",
+                "value": "0xde0b6b3a7640000",
+                "gas": "0x5208",
+                "gasUsed": "0x5208",
+                "input": "0x",
+                "output": "0x",
+            }),
+            ingestion_run_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn raw_evm_trace_insert_has_8_params_per_row() {
+        let trace = make_raw_evm_trace();
+        let (query, _) = build_raw_evm_trace_insert(&[trace]).unwrap();
+
+        assert!(query.starts_with("INSERT INTO raw_evm_traces"));
+        assert!(query.contains("$8"));
+        assert!(!query.contains("$9"));
+        assert!(query.contains("ON CONFLICT (network, transaction_hash) DO NOTHING"));
+    }
+
+    #[test]
+    fn raw_evm_trace_insert_multiple_rows() {
+        let traces = vec![make_raw_evm_trace(), make_raw_evm_trace()];
+        let (query, _) = build_raw_evm_trace_insert(&traces).unwrap();
+
+        assert!(query.contains("$16"));
+        assert!(!query.contains("$17"));
+    }
+
+    #[test]
+    fn raw_evm_trace_insert_preserves_trace_type_string() {
+        let mut trace = make_raw_evm_trace();
+        trace.trace_type = EvmTraceType::PrestateTracer;
+        let (query, _) = build_raw_evm_trace_insert(&[trace]).unwrap();
+        assert!(query.contains("raw_evm_traces"));
+    }
+
+    #[test]
+    fn raw_evm_trace_insert_empty_batch() {
+        let traces: Vec<RawEvmTrace> = vec![];
+        let result = build_raw_evm_trace_insert(&traces);
+        // Empty batch should still produce a valid (but useless) query
+        assert!(result.is_ok());
+    }
+
+    // -- raw_evm_trace repo methods are Send --
+
+    #[test]
+    fn repo_save_raw_evm_traces_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.save_raw_evm_traces(&[]));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_get_raw_evm_trace_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.get_raw_evm_trace("ethereum-mainnet", "0xdeadbeef"));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_get_raw_evm_traces_by_block_range_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.get_raw_evm_traces_by_block_range("ethereum-mainnet", 100, 200));
         }
         let _ = _check;
     }
