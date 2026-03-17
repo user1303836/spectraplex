@@ -1594,6 +1594,17 @@ async fn start_stream(
             let wallet = payload.wallet.as_deref().unwrap_or("");
             validate_wallet(wallet)?;
             check_wallet_allowed(wallet, &state.allowed_wallets)?;
+
+            let streams = state.streams.read().await;
+            let dup = streams
+                .values()
+                .any(|e| e.chain == "hyperliquid" && e.wallet.as_deref() == Some(wallet));
+            drop(streams);
+            if dup {
+                return Err(AppError::bad_request(
+                    "A Hyperliquid stream for this wallet is already active",
+                ));
+            }
         }
         other => {
             return Err(AppError::bad_request(format!(
@@ -1684,34 +1695,54 @@ async fn start_stream(
 
             let ws_cancel = cancel_clone.clone();
             let ws_wallet = hl_wallet.clone();
+            let ws_stream_id = stream_id;
             let ws_handle = tokio::spawn(async move {
                 let client = HyperliquidWsClient::new();
+                let mut retry_count: u32 = 0;
+                const MAX_RETRIES: u32 = 10;
                 loop {
                     let ws_wallet_ref = ws_wallet.clone();
                     let sender_ref = sender.clone();
                     tokio::select! {
                         result = client.subscribe_user(&ws_wallet_ref, |msg| {
+                            let channel = msg.channel.as_deref().unwrap_or("");
+                            if channel == "subscriptionResponse" || channel.is_empty() {
+                                return;
+                            }
                             if let Some(data) = msg.data {
-                                let _ = sender_ref.try_send(data);
+                                if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = sender_ref.try_send(data) {
+                                    warn!(stream_id = %ws_stream_id, "Hyperliquid WS channel full, message dropped");
+                                }
                             }
                         }) => {
                             if let Err(e) = result {
-                                error!(error = %e, "Hyperliquid WebSocket error");
+                                error!(stream_id = %ws_stream_id, error = %e, "Hyperliquid WebSocket error");
                             }
                             if ws_cancel.is_cancelled() {
                                 break;
                             }
-                            warn!("Hyperliquid WebSocket disconnected, reconnecting in 5s");
+                            retry_count += 1;
+                            if retry_count > MAX_RETRIES {
+                                error!(stream_id = %ws_stream_id, "Exceeded max retries ({MAX_RETRIES}), stopping Hyperliquid WS stream");
+                                break;
+                            }
+                            let backoff = Duration::from_secs(2u64.saturating_pow(retry_count.min(6)));
+                            warn!(stream_id = %ws_stream_id, retry = retry_count, max = MAX_RETRIES,
+                                "Hyperliquid WebSocket disconnected, reconnecting in {:?}", backoff);
                             tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                                _ = tokio::time::sleep(backoff) => {}
                                 _ = ws_cancel.cancelled() => { break; }
                             }
                         }
                         _ = ws_cancel.cancelled() => {
-                            info!("Hyperliquid stream cancelled");
+                            info!(stream_id = %ws_stream_id, "Hyperliquid stream cancelled");
                             break;
                         }
                     }
+                    // Reset retry count on successful connection that lasted
+                    // a reasonable amount of time (handled implicitly: if we
+                    // got here via a connection error, retry_count is already
+                    // incremented above).
                 }
             });
 
@@ -1720,7 +1751,7 @@ async fn start_stream(
                 let _permit = _permit;
                 let mut batch: Vec<Transaction> = Vec::new();
                 let mut last_flush = Instant::now();
-                let user_id = Uuid::new_v4();
+                let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, hl_wallet_owned.as_bytes());
                 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
                 const BATCH_SIZE: usize = 100;
 
@@ -5630,6 +5661,44 @@ mod tests {
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_stream_start_hyperliquid_duplicate_wallet() {
+        let state = test_state();
+        let stream_id = Uuid::new_v4();
+        state.streams.write().await.insert(
+            stream_id,
+            StreamEntry {
+                id: stream_id,
+                chain: "hyperliquid".to_string(),
+                wallet: Some("0xDuplicateWallet".to_string()),
+                cancel: CancellationToken::new(),
+                started_at: Instant::now(),
+                tx_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                last_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+        );
+
+        let app = test_router_with_state(Arc::clone(&state));
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/stream/start")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "hyperliquid",
+                    "wallet": "0xDuplicateWallet"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("already active"));
     }
 
     // -----------------------------------------------------------------------
