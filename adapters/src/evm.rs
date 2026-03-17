@@ -45,10 +45,13 @@ pub struct EvmAdapter {
     block_chunk: u64,
     network: String,
     /// HTTP client and URL for raw `debug_traceTransaction` RPC calls.
-    /// When `None`, trace calls use `rpc_url`. When `Some`, trace calls
-    /// use the separate trace URL (allowing free RPC for standard calls
-    /// and a paid archive node for traces).
+    /// When `None`, trace calls use `trace_http_client` + `rpc_url`. When
+    /// `Some`, trace calls use the separate trace URL (allowing free RPC
+    /// for standard calls and a paid archive node for traces).
     trace_rpc: Option<(reqwest::Client, reqwest::Url)>,
+    /// Shared HTTP client for trace calls when no separate trace RPC URL
+    /// is configured. Built once at construction to enable connection reuse.
+    trace_http_client: reqwest::Client,
     /// The primary RPC URL, used as fallback for trace calls when
     /// `trace_rpc` is not set.
     rpc_url: reqwest::Url,
@@ -68,12 +71,18 @@ impl EvmAdapter {
         let quota = Quota::per_second(NonZeroU32::new(5).unwrap());
         let limiter = RateLimiter::direct(quota);
 
+        let trace_http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(10))
+            .build()?;
+
         Ok(Self {
             provider: Arc::new(provider),
             rate_limiter: Arc::new(limiter),
             block_chunk: DEFAULT_BLOCK_CHUNK,
             network: "ethereum-mainnet".to_string(),
             trace_rpc: None,
+            trace_http_client,
             rpc_url: url,
         })
     }
@@ -619,6 +628,9 @@ impl EvmAdapter {
             EvmTraceType::FlatCallTracer => json!({
                 "tracer": "flatCallTracer",
             }),
+            // `Other` is a catch-all for unrecognized or future tracers.
+            // Falls back to a plain callTracer as the safest default since
+            // there is no user-supplied tracer name at this layer.
             EvmTraceType::Other => json!({
                 "tracer": "callTracer",
             }),
@@ -632,15 +644,10 @@ impl EvmAdapter {
         });
 
         // Use trace-specific RPC URL if configured, otherwise fall back to
-        // the primary RPC URL with a fresh reqwest client.
+        // the primary RPC URL with the shared trace HTTP client.
         let (client, url) = match &self.trace_rpc {
             Some((c, u)) => (c.clone(), u.clone()),
-            None => {
-                let c = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(60))
-                    .build()?;
-                (c, self.rpc_url.clone())
-            }
+            None => (self.trace_http_client.clone(), self.rpc_url.clone()),
         };
 
         let resp = client
@@ -659,11 +666,14 @@ impl EvmAdapter {
                 .unwrap_or("unknown error");
             let err_code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
 
-            // Method not found / not supported patterns
+            // Method not found / not supported patterns.
+            // Only match method-level errors, not transaction-level errors like
+            // "transaction not found" which have a different meaning.
             if err_code == -32601
-                || err_msg.contains("not found")
-                || err_msg.contains("not available")
-                || err_msg.contains("does not exist")
+                || err_msg.contains("method not found")
+                || err_msg.contains("method not available")
+                || err_msg.contains("method does not exist")
+                || err_msg.contains("debug_traceTransaction is not available")
             {
                 debug!(
                     tx_hash = %tx_hash_hex,

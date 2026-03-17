@@ -1205,7 +1205,7 @@ pub fn build_raw_evm_trace_insert(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         args.add(t.created_at).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    query.push_str(" ON CONFLICT (network, transaction_hash) DO NOTHING");
+    query.push_str(" ON CONFLICT (network, transaction_hash, trace_type) DO NOTHING");
     Ok((query, args))
 }
 
@@ -2825,19 +2825,22 @@ impl Repository {
         Ok(())
     }
 
-    /// Fetch a raw EVM trace by network and transaction hash.
+    /// Fetch a raw EVM trace by network, transaction hash, and trace type.
     pub async fn get_raw_evm_trace(
         &self,
         network: &str,
         transaction_hash: &str,
+        trace_type: EvmTraceType,
     ) -> anyhow::Result<Option<RawEvmTrace>> {
         let row = sqlx::query(
             "SELECT id, transaction_hash, block_number, network, trace_type, \
              raw_trace, ingestion_run_id, created_at \
-             FROM raw_evm_traces WHERE network = $1 AND transaction_hash = $2",
+             FROM raw_evm_traces \
+             WHERE network = $1 AND transaction_hash = $2 AND trace_type = $3",
         )
         .bind(network)
         .bind(transaction_hash)
+        .bind(trace_type.to_string())
         .fetch_optional(self.pool())
         .await?;
         row.as_ref().map(row_to_raw_evm_trace).transpose()
@@ -4206,7 +4209,7 @@ mod tests {
         assert!(query.starts_with("INSERT INTO raw_evm_traces"));
         assert!(query.contains("$8"));
         assert!(!query.contains("$9"));
-        assert!(query.contains("ON CONFLICT (network, transaction_hash) DO NOTHING"));
+        assert!(query.contains("ON CONFLICT (network, transaction_hash, trace_type) DO NOTHING"));
     }
 
     #[test]
@@ -4228,9 +4231,11 @@ mod tests {
 
     #[test]
     fn raw_evm_trace_insert_empty_batch() {
+        // Empty batch produces syntactically incomplete SQL (no VALUES rows).
+        // This is a known pre-existing pattern: callers (save_raw_evm_traces)
+        // guard against it via .chunks() which yields no chunks for empty input.
         let traces: Vec<RawEvmTrace> = vec![];
         let result = build_raw_evm_trace_insert(&traces);
-        // Empty batch should still produce a valid (but useless) query
         assert!(result.is_ok());
     }
 
@@ -4249,7 +4254,11 @@ mod tests {
     fn repo_get_raw_evm_trace_is_send() {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
-            _assert_send(repo.get_raw_evm_trace("ethereum-mainnet", "0xdeadbeef"));
+            _assert_send(repo.get_raw_evm_trace(
+                "ethereum-mainnet",
+                "0xdeadbeef",
+                EvmTraceType::CallTracer,
+            ));
         }
         let _ = _check;
     }

@@ -26,9 +26,11 @@ CREATE TABLE IF NOT EXISTS raw_evm_traces (
 -- 2. Indexes
 -- ---------------------------------------------------------------------------
 
--- Primary lookup: find trace by transaction hash and network.
-CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_evm_traces_tx_network
-    ON raw_evm_traces(network, transaction_hash);
+-- Primary lookup: find trace by transaction hash, network, and trace type.
+-- Includes trace_type so that multiple tracer outputs (e.g. callTracer and
+-- prestateTracer) can coexist for the same transaction.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_evm_traces_tx_network_type
+    ON raw_evm_traces(network, transaction_hash, trace_type);
 
 -- Lookup by block number for range-based queries and reorg handling.
 CREATE INDEX IF NOT EXISTS idx_raw_evm_traces_block_number
