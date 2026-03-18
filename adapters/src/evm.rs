@@ -3,8 +3,10 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::consensus::Transaction as TransactionTrait;
-use alloy::primitives::{Address, B256};
+use alloy::consensus::{BlockHeader, Transaction as TransactionTrait};
+use alloy::network::primitives::HeaderResponse;
+use alloy::network::{BlockResponse, TransactionResponse};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::{Filter, Log};
 use chrono::Utc;
@@ -29,6 +31,11 @@ const RPC_RETRY_BASE_MS: u64 = 100;
 
 /// Maximum block range per eth_getLogs request.
 const DEFAULT_BLOCK_CHUNK: u64 = 2000;
+
+/// Maximum number of blocks to scan per `eth_getBlockByNumber` request when
+/// fetching native ETH transfers. Kept smaller than `DEFAULT_BLOCK_CHUNK`
+/// because full-block fetches are heavier than log queries.
+const NATIVE_TX_BLOCK_CHUNK: u64 = 50;
 
 /// ERC-20 Transfer event signature: keccak256("Transfer(address,address,uint256)")
 const ERC20_TRANSFER_TOPIC: &str =
@@ -296,6 +303,151 @@ impl EvmAdapter {
         Ok(result)
     }
 
+    /// Fetch native ETH transactions involving a wallet address.
+    ///
+    /// Scans blocks in the given range by fetching full blocks via
+    /// `eth_getBlockByNumber(n, true)` and filtering transactions where
+    /// `from == wallet` or `to == wallet`. This captures:
+    /// - Plain ETH transfers (value > 0)
+    /// - Contract calls from the wallet (any outbound tx)
+    /// - ETH received from contracts or other wallets
+    ///
+    /// Returns structured metadata for each matching transaction, ready to
+    /// be converted into V1 `Transaction` or V2 `RawTransaction` records.
+    ///
+    /// **Performance note**: This performs one RPC call per block, so it is
+    /// significantly more expensive than log-based queries. The block range
+    /// should be kept reasonable (controlled by `NATIVE_TX_BLOCK_CHUNK`).
+    async fn fetch_wallet_native_txs(
+        &self,
+        wallet: Address,
+        from_block: u64,
+        to_block: u64,
+    ) -> anyhow::Result<Vec<NativeTxRecord>> {
+        let mut records = Vec::new();
+
+        let mut block_num = from_block;
+        while block_num <= to_block {
+            self.rate_limiter.until_ready().await;
+
+            // Fetch full block with transactions
+            let block_opt = self
+                .provider
+                .get_block_by_number(block_num.into())
+                .full()
+                .await;
+
+            let block = match block_opt {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    block_num += 1;
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        block_number = block_num,
+                        error = %e,
+                        "Failed to fetch block for native tx scan, skipping"
+                    );
+                    block_num += 1;
+                    continue;
+                }
+            };
+
+            let block_timestamp = block.header().timestamp();
+            let block_hash = block.header().hash();
+
+            if let Some(txs) = block.transactions().as_transactions() {
+                for tx in txs {
+                    let tx_from = tx.from();
+                    let tx_to = tx.to();
+
+                    let from_match = tx_from == wallet;
+                    let to_match = tx_to == Some(wallet);
+
+                    if from_match || to_match {
+                        let tx_hash = format!("{:#x}", tx.tx_hash());
+                        let value = TransactionTrait::value(tx);
+
+                        // Fetch receipt for gas data (only for outbound txs)
+                        let mut gas_used: Option<u128> = None;
+                        let mut effective_gas_price: Option<u128> = None;
+                        if from_match {
+                            self.rate_limiter.until_ready().await;
+                            if let Ok(Some(receipt)) =
+                                self.provider.get_transaction_receipt(tx.tx_hash()).await
+                            {
+                                gas_used = Some(receipt.gas_used as u128);
+                                effective_gas_price = Some(receipt.effective_gas_price);
+                            }
+                        }
+
+                        records.push(NativeTxRecord {
+                            tx_hash,
+                            from: format!("{tx_from:#x}"),
+                            to: tx_to.map(|a| format!("{a:#x}")),
+                            value,
+                            block_number: block_num,
+                            block_hash: format!("{block_hash:#x}"),
+                            block_timestamp,
+                            gas_used,
+                            effective_gas_price,
+                        });
+                    }
+                }
+            }
+
+            block_num += 1;
+        }
+
+        Ok(records)
+    }
+
+    /// Combined wallet history fetch: ERC-20 Transfer logs + native ETH
+    /// transactions.
+    ///
+    /// Fetches both ERC-20 Transfer events (via topic-based log filter) and
+    /// native ETH transactions (via block scanning) for a wallet, then merges
+    /// and deduplicates the results by tx_hash.
+    ///
+    /// For the native tx scan, the block range is capped to
+    /// `NATIVE_TX_BLOCK_CHUNK` blocks from the end of the range to keep RPC
+    /// costs reasonable. The ERC-20 log query covers the full range since it
+    /// is much cheaper (2 calls per chunk vs 1 call per block).
+    async fn fetch_wallet_combined(
+        &self,
+        wallet: Address,
+        from_block: u64,
+        to_block: u64,
+    ) -> anyhow::Result<(Vec<Log>, Vec<NativeTxRecord>)> {
+        // ERC-20 Transfer logs: full range, efficient topic-based query
+        let logs = self
+            .fetch_wallet_erc20_logs(wallet, from_block, to_block)
+            .await?;
+
+        // Native ETH transactions: scan blocks from the end of the range,
+        // capped to NATIVE_TX_BLOCK_CHUNK blocks to limit RPC cost.
+        let native_from = if to_block.saturating_sub(from_block) > NATIVE_TX_BLOCK_CHUNK {
+            to_block.saturating_sub(NATIVE_TX_BLOCK_CHUNK) + 1
+        } else {
+            from_block
+        };
+
+        let native_txs = self
+            .fetch_wallet_native_txs(wallet, native_from, to_block)
+            .await?;
+
+        debug!(
+            wallet = %format!("{wallet:#x}"),
+            erc20_logs = logs.len(),
+            native_txs = native_txs.len(),
+            native_block_range = format!("{native_from}..{to_block}"),
+            "Combined wallet fetch complete"
+        );
+
+        Ok((logs, native_txs))
+    }
+
     // -----------------------------------------------------------------------
     // Transaction enrichment
     // -----------------------------------------------------------------------
@@ -433,16 +585,16 @@ impl EvmAdapter {
     // V2 Connector backfill paths
     // -----------------------------------------------------------------------
 
-    /// Wallet backfill: topic-filtered ERC-20 Transfer logs.
+    /// Wallet backfill: ERC-20 Transfer logs + native ETH transactions.
     ///
-    /// Uses topic-based filtering (wallet in topic\[1\] or topic\[2\]) instead
-    /// of the incorrect address filter. This returns Transfer events where
-    /// the wallet is the sender or receiver, regardless of which contract
-    /// emitted them.
+    /// Fetches both:
+    /// 1. ERC-20 Transfer events via topic-based log filter (full range)
+    /// 2. Native ETH transactions via block scanning (capped to
+    ///    `NATIVE_TX_BLOCK_CHUNK` blocks from the end of the range)
     ///
-    /// NOTE: Native ETH transfers without log events require block-scanning
-    /// or trace APIs. Tx-level value/from/to fields are still enriched onto
-    /// the first log per tx, which the parser uses for native value detection.
+    /// Results are merged and deduplicated by tx_hash so that transactions
+    /// which both emit Transfer logs and carry native value are not double-
+    /// counted.
     async fn wallet_backfill(
         &self,
         target: &IndexTarget,
@@ -460,12 +612,35 @@ impl EvmAdapter {
 
         let from_block = cursor_to_from_block(cursor, latest_block, limit, self.block_chunk);
 
-        let logs = self
-            .fetch_wallet_erc20_logs(wallet_addr, from_block, latest_block)
+        let (logs, native_txs) = self
+            .fetch_wallet_combined(wallet_addr, from_block, latest_block)
             .await?;
 
         let enrichment = self.enrich_tx_data(&logs).await;
-        let records = self.logs_to_raw_transactions(&logs, &enrichment, "evm-rpc-wallet-backfill");
+        let mut records =
+            self.logs_to_raw_transactions(&logs, &enrichment, "evm-rpc-wallet-backfill");
+
+        // Track tx hashes already present from ERC-20 log records
+        let existing_hashes: HashSet<String> = records.iter().map(|r| r.tx_hash.clone()).collect();
+
+        // Add native ETH transactions not already covered by log records
+        for ntx in &native_txs {
+            if existing_hashes.contains(&ntx.tx_hash) {
+                continue;
+            }
+            let timestamp = i64::try_from(ntx.block_timestamp).unwrap_or(i64::MAX);
+            records.push(RawTransaction {
+                id: Uuid::new_v4(),
+                network: self.network.clone(),
+                tx_hash: ntx.tx_hash.clone(),
+                timestamp,
+                block_number: Some(ntx.block_number as i64),
+                raw_metadata: ntx.to_raw_metadata(),
+                source: "evm-rpc-wallet-backfill-native".to_string(),
+                ingestion_run_id: None,
+                ingested_at: Utc::now(),
+            });
+        }
 
         Ok(IngestionBatch {
             records,
@@ -865,11 +1040,11 @@ impl ChainIngestor for EvmAdapter {
             latest_block.saturating_sub(total_blocks)
         };
 
-        // Use wallet-semantic topic filtering (ERC-20 Transfer events where
-        // the wallet is sender or receiver) instead of the address filter
-        // which only returns logs emitted BY a contract at that address.
-        let logs = self
-            .fetch_wallet_erc20_logs(address, from_block, latest_block)
+        // Fetch both ERC-20 Transfer logs and native ETH transactions.
+        // ERC-20 logs cover the full range; native tx scanning is capped
+        // to NATIVE_TX_BLOCK_CHUNK blocks from the end of the range.
+        let (logs, native_txs) = self
+            .fetch_wallet_combined(address, from_block, latest_block)
             .await?;
 
         let seen_tx_hashes = self.enrich_tx_data(&logs).await;
@@ -877,6 +1052,7 @@ impl ChainIngestor for EvmAdapter {
         let mut transactions = Vec::new();
         let mut emitted_tx_hashes = HashSet::new();
 
+        // 1. ERC-20 Transfer log records
         for log in &logs {
             let tx_hash = match log.transaction_hash {
                 Some(h) => format!("{h:#x}"),
@@ -922,7 +1098,84 @@ impl ChainIngestor for EvmAdapter {
             });
         }
 
+        // 2. Native ETH transaction records (not already covered by logs)
+        for ntx in &native_txs {
+            if emitted_tx_hashes.contains(&ntx.tx_hash) {
+                continue; // Already covered by an ERC-20 log
+            }
+            emitted_tx_hashes.insert(ntx.tx_hash.clone());
+
+            let raw_metadata = ntx.to_raw_metadata();
+            let timestamp = i64::try_from(ntx.block_timestamp).unwrap_or(i64::MAX);
+
+            transactions.push(Transaction {
+                id: Uuid::new_v4(),
+                user_id,
+                wallet_address: wallet.to_string(),
+                timestamp,
+                tx_hash: ntx.tx_hash.clone(),
+                chain: Chain::Ethereum,
+                raw_metadata,
+            });
+        }
+
         Ok(transactions)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native ETH transaction record
+// ---------------------------------------------------------------------------
+
+/// A native ETH transaction involving the target wallet, discovered by
+/// scanning blocks for transactions where `from` or `to` matches.
+///
+/// This is a lightweight intermediate record that gets converted into the
+/// V1 `Transaction` or V2 `RawTransaction` format with the same metadata
+/// shape that the downstream parser expects.
+struct NativeTxRecord {
+    tx_hash: String,
+    from: String,
+    to: Option<String>,
+    value: U256,
+    block_number: u64,
+    block_hash: String,
+    block_timestamp: u64,
+    gas_used: Option<u128>,
+    effective_gas_price: Option<u128>,
+}
+
+impl NativeTxRecord {
+    /// Build `raw_metadata` in the same shape the EVM parser expects.
+    ///
+    /// The parser looks for:
+    /// - `value` (hex) for native ETH transfers
+    /// - `from` / `to` for direction detection
+    /// - `gas_used` / `effective_gas_price` for fee calculation
+    /// - `block_number`, `block_hash`, `transaction_hash` for provenance
+    /// - `source_type: "native_transfer"` to distinguish from log-based records
+    fn to_raw_metadata(&self) -> serde_json::Value {
+        let mut metadata = json!({
+            "transaction_hash": &self.tx_hash,
+            "block_number": self.block_number,
+            "block_hash": &self.block_hash,
+            "from": &self.from,
+            "to": &self.to,
+            "value": format!("{:#x}", self.value),
+            "source_type": "native_transfer",
+        });
+
+        if let (Some(gas), Some(price)) = (self.gas_used, self.effective_gas_price) {
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert("gas_used".to_string(), json!(format!("{gas:#x}")));
+                obj.insert(
+                    "effective_gas_price".to_string(),
+                    json!(format!("{price:#x}")),
+                );
+            }
+        }
+
+        metadata
     }
 }
 
@@ -1348,12 +1601,75 @@ mod tests {
         // Source strings should identify the ingestion path
         let sources = [
             "evm-rpc-wallet-backfill",
+            "evm-rpc-wallet-backfill-native",
             "evm-rpc-contract-backfill",
             "evm-rpc-topic-filter-backfill",
         ];
         for s in sources {
             assert!(s.starts_with("evm-rpc-"));
         }
+    }
+
+    // -- NativeTxRecord metadata shape --
+
+    #[test]
+    fn test_native_tx_record_metadata_shape() {
+        let record = NativeTxRecord {
+            tx_hash: "0xdeadbeef".to_string(),
+            from: "0x1111111111111111111111111111111111111111".to_string(),
+            to: Some("0x2222222222222222222222222222222222222222".to_string()),
+            value: U256::from(1_000_000_000_000_000_000u128), // 1 ETH
+            block_number: 18_000_000,
+            block_hash: "0xblockhash".to_string(),
+            block_timestamp: 1700000000,
+            gas_used: Some(21000),
+            effective_gas_price: Some(1_000_000_000), // 1 gwei
+        };
+
+        let metadata = record.to_raw_metadata();
+
+        // Required fields for the downstream EVM parser
+        assert_eq!(
+            metadata["from"],
+            "0x1111111111111111111111111111111111111111"
+        );
+        assert_eq!(metadata["to"], "0x2222222222222222222222222222222222222222");
+        assert!(metadata["value"].as_str().unwrap().starts_with("0x"));
+        assert_eq!(metadata["block_number"], 18_000_000);
+        assert_eq!(metadata["source_type"], "native_transfer");
+
+        // Gas fields should be present when provided
+        assert!(metadata["gas_used"].as_str().is_some());
+        assert!(metadata["effective_gas_price"].as_str().is_some());
+    }
+
+    #[test]
+    fn test_native_tx_record_no_gas_fields_when_incoming() {
+        let record = NativeTxRecord {
+            tx_hash: "0xdeadbeef".to_string(),
+            from: "0xsender".to_string(),
+            to: Some("0xreceiver".to_string()),
+            value: U256::from(1u64),
+            block_number: 18_000_000,
+            block_hash: "0xblockhash".to_string(),
+            block_timestamp: 1700000000,
+            gas_used: None,
+            effective_gas_price: None,
+        };
+
+        let metadata = record.to_raw_metadata();
+        assert!(metadata.get("gas_used").is_none());
+        assert!(metadata.get("effective_gas_price").is_none());
+    }
+
+    #[test]
+    fn test_native_tx_block_chunk_constant() {
+        // Native tx scanning should be much smaller than log chunk
+        // to limit RPC cost
+        let native = NATIVE_TX_BLOCK_CHUNK;
+        let default = DEFAULT_BLOCK_CHUNK;
+        assert!(native < default);
+        assert_eq!(native, 50);
     }
 
     // -- Cursor/checkpoint roundtrip --
