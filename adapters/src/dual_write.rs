@@ -377,16 +377,76 @@ impl Repository {
             .into_iter()
             .collect();
 
-        let raw_id_map = match self.lookup_raw_transaction_ids(&pairs).await {
+        let mut raw_id_map = match self.lookup_raw_transaction_ids(&pairs).await {
             Ok(m) => m,
             Err(e) => {
                 warn!(
                     error = %e,
-                    "Silver materialization: failed to resolve raw_transaction_ids, falling back to None"
+                    "Silver materialization: failed to resolve raw_transaction_ids"
                 );
                 HashMap::new()
             }
         };
+
+        // 1b. Self-healing: for any V1-only transactions that have no
+        //     corresponding V2 raw_transactions row, create the V2 rows now
+        //     so Silver records always have provenance.
+        let missing_txs: Vec<&Transaction> = txs
+            .iter()
+            .filter(|tx| {
+                let key = (
+                    chain_to_default_network(&tx.chain).to_string(),
+                    tx.tx_hash.clone(),
+                );
+                !raw_id_map.contains_key(&key)
+            })
+            .collect();
+
+        if !missing_txs.is_empty() {
+            let v2_rows: Vec<RawTransaction> =
+                missing_txs.iter().map(|tx| v1_tx_to_v2_raw(tx)).collect();
+
+            match self.save_raw_transactions(&v2_rows).await {
+                Ok(()) => {
+                    info!(
+                        count = v2_rows.len(),
+                        "Silver materialization: back-filled V2 raw_transactions for V1-only rows"
+                    );
+
+                    // Re-resolve IDs for the newly inserted rows.
+                    let missing_pairs: Vec<(String, String)> = missing_txs
+                        .iter()
+                        .map(|tx| {
+                            (
+                                chain_to_default_network(&tx.chain).to_string(),
+                                tx.tx_hash.clone(),
+                            )
+                        })
+                        .collect::<HashSet<_>>()
+                        .into_iter()
+                        .collect();
+
+                    match self.lookup_raw_transaction_ids(&missing_pairs).await {
+                        Ok(new_ids) => {
+                            raw_id_map.extend(new_ids);
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "Silver materialization: failed to re-resolve IDs after back-fill"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        count = v2_rows.len(),
+                        "Silver materialization: failed to back-fill V2 raw_transactions"
+                    );
+                }
+            }
+        }
 
         // 2. Get or create dataset versions for each dataset that will receive records.
         let dataset_versions = self.resolve_silver_dataset_versions().await;
