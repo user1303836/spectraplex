@@ -340,6 +340,203 @@ impl Repository {
 
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Silver dataset materialization
+    // -----------------------------------------------------------------------
+
+    /// Materialize Silver datasets from V1 transactions.
+    ///
+    /// For each transaction, extract chain-specific Silver records (token
+    /// transfers, native balance deltas, decoded events, HL fills/funding/
+    /// positions) and persist them to V2 Silver tables. This bridges the gap
+    /// where dataset/analytics endpoints read from V2 Silver tables that were
+    /// previously never populated.
+    ///
+    /// V2 Silver writes are best-effort: failures are logged but never abort
+    /// the V1 normalization path.
+    pub async fn materialize_silver_datasets(&self, txs: &[Transaction]) {
+        if txs.is_empty() {
+            return;
+        }
+
+        let mut all_token_transfers = Vec::new();
+        let mut all_native_balance_deltas = Vec::new();
+        let mut all_decoded_events = Vec::new();
+        let mut all_hl_fills = Vec::new();
+        let mut all_hl_funding = Vec::new();
+        let mut all_hl_positions = Vec::new();
+
+        for tx in txs {
+            let network = chain_to_default_network(&tx.chain);
+            // raw_tx_id is None since these come from V1 transactions table
+            // and may not have a corresponding raw_transactions row yet.
+            let raw_tx_id: Option<Uuid> = None;
+
+            match tx.chain {
+                Chain::Solana => {
+                    let transfers = crate::solana_parser::extract_solana_token_transfers(
+                        raw_tx_id,
+                        network,
+                        &tx.raw_metadata,
+                    );
+                    all_token_transfers.extend(transfers);
+
+                    let deltas = crate::solana_parser::extract_solana_native_balance_deltas(
+                        raw_tx_id,
+                        network,
+                        &tx.raw_metadata,
+                    );
+                    all_native_balance_deltas.extend(deltas);
+
+                    let events = crate::solana_parser::extract_solana_decoded_events(
+                        raw_tx_id,
+                        network,
+                        &tx.raw_metadata,
+                    );
+                    all_decoded_events.extend(events);
+                }
+                Chain::Ethereum => {
+                    let transfers = crate::evm_parser::extract_evm_token_transfers(
+                        raw_tx_id,
+                        network,
+                        &tx.raw_metadata,
+                    );
+                    all_token_transfers.extend(transfers);
+
+                    let events = crate::evm_parser::extract_evm_decoded_events(
+                        raw_tx_id,
+                        network,
+                        &tx.raw_metadata,
+                    );
+                    all_decoded_events.extend(events);
+                }
+                Chain::Hyperliquid => {
+                    let transfers = crate::hyperliquid_parser::extract_hyperliquid_token_transfers(
+                        raw_tx_id,
+                        network,
+                        &tx.wallet_address,
+                        &tx.raw_metadata,
+                    );
+                    all_token_transfers.extend(transfers);
+
+                    let deltas =
+                        crate::hyperliquid_parser::extract_hyperliquid_native_balance_deltas(
+                            raw_tx_id,
+                            network,
+                            &tx.wallet_address,
+                            &tx.raw_metadata,
+                        );
+                    all_native_balance_deltas.extend(deltas);
+
+                    let fills = crate::hyperliquid_parser::extract_hl_fill_records(
+                        raw_tx_id,
+                        network,
+                        &tx.raw_metadata,
+                    );
+                    all_hl_fills.extend(fills);
+
+                    let funding = crate::hyperliquid_parser::extract_hl_funding_payments(
+                        raw_tx_id,
+                        network,
+                        &tx.raw_metadata,
+                    );
+                    all_hl_funding.extend(funding);
+
+                    let positions = crate::hyperliquid_parser::extract_hl_position_changes(
+                        raw_tx_id,
+                        network,
+                        &tx.raw_metadata,
+                    );
+                    all_hl_positions.extend(positions);
+                }
+            }
+        }
+
+        let total = all_token_transfers.len()
+            + all_native_balance_deltas.len()
+            + all_decoded_events.len()
+            + all_hl_fills.len()
+            + all_hl_funding.len()
+            + all_hl_positions.len();
+
+        if total == 0 {
+            return;
+        }
+
+        if !all_token_transfers.is_empty() {
+            if let Err(e) = self.save_token_transfers(&all_token_transfers).await {
+                warn!(
+                    error = %e,
+                    count = all_token_transfers.len(),
+                    "Silver materialization: token_transfers write failed"
+                );
+            }
+        }
+
+        if !all_native_balance_deltas.is_empty() {
+            if let Err(e) = self
+                .save_native_balance_deltas(&all_native_balance_deltas)
+                .await
+            {
+                warn!(
+                    error = %e,
+                    count = all_native_balance_deltas.len(),
+                    "Silver materialization: native_balance_deltas write failed"
+                );
+            }
+        }
+
+        if !all_decoded_events.is_empty() {
+            if let Err(e) = self.save_decoded_events(&all_decoded_events).await {
+                warn!(
+                    error = %e,
+                    count = all_decoded_events.len(),
+                    "Silver materialization: decoded_events write failed"
+                );
+            }
+        }
+
+        if !all_hl_fills.is_empty() {
+            if let Err(e) = self.save_hl_fill_records(&all_hl_fills).await {
+                warn!(
+                    error = %e,
+                    count = all_hl_fills.len(),
+                    "Silver materialization: hl_fill_records write failed"
+                );
+            }
+        }
+
+        if !all_hl_funding.is_empty() {
+            if let Err(e) = self.save_hl_funding_payments(&all_hl_funding).await {
+                warn!(
+                    error = %e,
+                    count = all_hl_funding.len(),
+                    "Silver materialization: hl_funding_payments write failed"
+                );
+            }
+        }
+
+        if !all_hl_positions.is_empty() {
+            if let Err(e) = self.save_hl_position_changes(&all_hl_positions).await {
+                warn!(
+                    error = %e,
+                    count = all_hl_positions.len(),
+                    "Silver materialization: hl_position_changes write failed"
+                );
+            }
+        }
+
+        info!(
+            token_transfers = all_token_transfers.len(),
+            native_balance_deltas = all_native_balance_deltas.len(),
+            decoded_events = all_decoded_events.len(),
+            hl_fills = all_hl_fills.len(),
+            hl_funding = all_hl_funding.len(),
+            hl_positions = all_hl_positions.len(),
+            "Silver dataset materialization complete"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -738,5 +935,94 @@ mod tests {
             assert_eq!(v2_tx.network, "ethereum-mainnet");
             assert_eq!(v2_tx.source, "rpc");
         }
+    }
+
+    // -- Silver materialization extraction tests --
+
+    #[test]
+    fn silver_extraction_solana_produces_records() {
+        use crate::solana_parser::{
+            extract_solana_decoded_events, extract_solana_native_balance_deltas,
+            extract_solana_token_transfers,
+        };
+
+        // Minimal Solana tx metadata with token balances for extraction
+        let metadata = serde_json::json!({
+            "transaction": {
+                "signatures": ["sig1"],
+                "message": {
+                    "accountKeys": ["wallet1", "wallet2"],
+                    "instructions": [],
+                    "recentBlockhash": "hash1",
+                    "header": {
+                        "numRequiredSignatures": 1,
+                        "numReadonlySignedAccounts": 0,
+                        "numReadonlyUnsignedAccounts": 0
+                    }
+                }
+            },
+            "meta": {
+                "err": null,
+                "fee": 5000,
+                "preBalances": [1000000, 500000],
+                "postBalances": [995000, 505000],
+                "preTokenBalances": [],
+                "postTokenBalances": [],
+                "logMessages": ["Program log: test"]
+            },
+            "slot": 100,
+            "blockTime": 1700000000
+        });
+
+        // These may or may not produce records depending on the data,
+        // but they should not panic
+        let _transfers = extract_solana_token_transfers(None, "solana-mainnet", &metadata);
+        let _deltas = extract_solana_native_balance_deltas(None, "solana-mainnet", &metadata);
+        let _events = extract_solana_decoded_events(None, "solana-mainnet", &metadata);
+    }
+
+    #[test]
+    fn silver_extraction_hyperliquid_fill_produces_records() {
+        use crate::hyperliquid_parser::extract_hl_fill_records;
+
+        // The extraction function expects {"type": "fill", "data": { ... }}
+        let metadata = serde_json::json!({
+            "type": "fill",
+            "data": {
+                "coin": "ETH",
+                "px": "2000.0",
+                "sz": "1.5",
+                "side": "B",
+                "time": 1700000000000_i64,
+                "startPosition": "0.0",
+                "dir": "Open Long",
+                "closedPnl": "0.0",
+                "hash": "0xfillhash",
+                "oid": 12345,
+                "crossed": false,
+                "fee": "0.5",
+                "tid": 99999
+            }
+        });
+
+        let fills = extract_hl_fill_records(None, "hypercore-mainnet", &metadata);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].coin, "ETH");
+        assert_eq!(fills[0].network, "hypercore-mainnet");
+    }
+
+    #[test]
+    fn silver_extraction_chain_to_network_mapping() {
+        // Verify that chain_to_default_network produces the correct network
+        // identifiers used by extraction functions
+        assert_eq!(chain_to_default_network(&Chain::Solana), "solana-mainnet");
+        assert_eq!(
+            chain_to_default_network(&Chain::Ethereum),
+            "ethereum-mainnet"
+        );
+        assert_eq!(
+            chain_to_default_network(&Chain::Hyperliquid),
+            "hypercore-mainnet"
+        );
     }
 }

@@ -451,16 +451,16 @@ async fn main() -> anyhow::Result<()> {
 
             let mut all_entries = Vec::new();
 
-            for tx in transactions {
+            for tx in &transactions {
                 let result = match tx.chain {
                     spectraplex_core::models::Chain::Solana => {
-                        solana_parser::parse_solana_transaction(&tx)
+                        solana_parser::parse_solana_transaction(tx)
                     }
                     spectraplex_core::models::Chain::Hyperliquid => {
-                        hyperliquid_parser::parse_hyperliquid_transaction(&tx)
+                        hyperliquid_parser::parse_hyperliquid_transaction(tx)
                     }
                     spectraplex_core::models::Chain::Ethereum => {
-                        evm_parser::parse_evm_transaction(&tx)
+                        evm_parser::parse_evm_transaction(tx)
                     }
                 };
                 match result {
@@ -478,6 +478,10 @@ async fn main() -> anyhow::Result<()> {
                 );
                 let repo = Repository::new(p);
                 repo.save_ledger_entries(&all_entries).await?;
+
+                // Materialize V2 Silver datasets (best-effort)
+                repo.materialize_silver_datasets(&transactions).await;
+
                 info!("Normalization complete");
             } else {
                 let mut out_file = File::create(&output)?;
