@@ -630,18 +630,63 @@ fn validate_wallet(wallet: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Build a reqwest client that pins DNS resolution to validated (non-private)
+/// IP addresses.  This prevents DNS rebinding attacks where the hostname
+/// resolves to a public IP at validation time but to a private IP when the
+/// actual HTTP request is made.
+///
+/// Returns `Err` if DNS resolution fails, yields no addresses, or any
+/// resolved address is private/loopback.
+async fn build_ssrf_safe_client(url: &str, timeout: Duration) -> Result<reqwest::Client, String> {
+    let parsed: reqwest::Url = url.parse().map_err(|e| format!("invalid URL: {e}"))?;
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no hostname".to_string())?
+        .to_string();
+
+    if is_private_ip(&host) {
+        return Err("hostname is a private/loopback address".to_string());
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let lookup_host = format!("{host}:{port}");
+
+    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&lookup_host)
+        .await
+        .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?
+        .collect();
+
+    if resolved.is_empty() {
+        return Err(format!("DNS resolution returned no addresses for {host}"));
+    }
+
+    for addr in &resolved {
+        if is_private_ip(&addr.ip().to_string()) {
+            return Err(format!(
+                "hostname {host} resolves to private address {}",
+                addr.ip()
+            ));
+        }
+    }
+
+    // Pin the resolved addresses so reqwest does not re-resolve at send time.
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&host, &resolved)
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))
+}
+
 async fn fire_callback(url: &str, payload: &serde_json::Value) {
     const MAX_RETRIES: u32 = 3;
     const BASE_DELAY_MS: u64 = 500;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build();
-    let client = match client {
+    let client = match build_ssrf_safe_client(url, Duration::from_secs(10)).await {
         Ok(c) => c,
         Err(e) => {
-            warn!(error = %e, url, "Failed to build callback HTTP client");
+            warn!(error = %e, url, "Rejected callback URL at delivery time (SSRF protection)");
             return;
         }
     };
@@ -717,23 +762,70 @@ fn is_private_ip(host: &str) -> bool {
     }
 }
 
-fn validate_callback_url(url: &str) -> Result<(), AppError> {
-    let parsed: Result<reqwest::Url, _> = url.parse();
-    match parsed {
-        Ok(u) if u.scheme() == "https" || u.scheme() == "http" => {
-            if let Some(host) = u.host_str() {
-                if is_private_ip(host) {
-                    return Err(AppError::bad_request(
-                        "callback_url must not target private/loopback addresses",
-                    ));
-                }
-            }
-            Ok(())
-        }
-        _ => Err(AppError::bad_request(
+async fn validate_callback_url(url: &str) -> Result<(), AppError> {
+    // Delegates to resolve_and_validate_callback_url and discards the resolved addrs.
+    resolve_and_validate_callback_url(url).await.map(|_| ())
+}
+
+/// Resolve a callback URL's hostname, validate that none of the resolved IPs
+/// are private/loopback, and return the validated `(host, port, addresses)`.
+///
+/// DNS lookup failures are treated as **deny** (not allow), because an
+/// unresolvable hostname could be used to bypass validation at creation
+/// time and then resolve to a private address later (DNS rebinding).
+async fn resolve_and_validate_callback_url(
+    url: &str,
+) -> Result<(String, u16, Vec<std::net::SocketAddr>), AppError> {
+    let parsed: reqwest::Url = url
+        .parse()
+        .map_err(|_| AppError::bad_request("callback_url must be a valid HTTP(S) URL"))?;
+
+    if parsed.scheme() != "https" && parsed.scheme() != "http" {
+        return Err(AppError::bad_request(
             "callback_url must be a valid HTTP(S) URL",
-        )),
+        ));
     }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AppError::bad_request("callback_url must contain a hostname"))?
+        .to_string();
+
+    // Reject hostnames that are directly private/loopback literals
+    if is_private_ip(&host) {
+        return Err(AppError::bad_request(
+            "callback_url must not target private/loopback addresses",
+        ));
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let lookup_host = format!("{host}:{port}");
+
+    // DNS lookup failure = deny. An unresolvable hostname at creation time
+    // could resolve to a private IP later (DNS rebinding).
+    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&lookup_host)
+        .await
+        .map_err(|e| {
+            AppError::bad_request(format!("callback_url hostname failed DNS resolution: {e}"))
+        })?
+        .collect();
+
+    if resolved.is_empty() {
+        return Err(AppError::bad_request(
+            "callback_url hostname resolved to no addresses",
+        ));
+    }
+
+    for addr in &resolved {
+        let ip_str = addr.ip().to_string();
+        if is_private_ip(&ip_str) {
+            return Err(AppError::bad_request(
+                "callback_url must not resolve to private/loopback addresses",
+            ));
+        }
+    }
+
+    Ok((host, port, resolved))
 }
 
 // ---------------------------------------------------------------------------
@@ -772,7 +864,7 @@ fn is_valid_header_value(value: &str) -> bool {
 /// For `LocalFile` sinks, the file path must resolve to a location inside
 /// `export_dir`. The path is canonicalized (resolving symlinks) and checked
 /// against the canonical export root to prevent directory escape.
-fn validate_sink_config(config: &SinkConfig, export_dir: &str) -> Result<(), AppError> {
+async fn validate_sink_config(config: &SinkConfig, export_dir: &str) -> Result<(), AppError> {
     config
         .validate()
         .map_err(|e| AppError::bad_request(format!("Invalid sink config: {e}")))?;
@@ -780,7 +872,7 @@ fn validate_sink_config(config: &SinkConfig, export_dir: &str) -> Result<(), App
     match config.sink_type {
         SinkType::Webhook => {
             if let Some(ref url) = config.url {
-                validate_callback_url(url)?;
+                validate_callback_url(url).await?;
             }
             if let Some(ref headers) = config.headers {
                 for (name, value) in headers {
@@ -933,6 +1025,12 @@ impl ExportSink for LocalFileSink {
 }
 
 /// POSTs export data to an HTTP(S) webhook URL.
+///
+/// Uses `build_ssrf_safe_client` at delivery time to resolve DNS, validate
+/// that all resolved IPs are non-private, and pin the resolved addresses
+/// into the reqwest client. This prevents DNS rebinding attacks where the
+/// hostname resolves to a different (private) IP between validation and
+/// delivery.
 struct WebhookSink {
     url: String,
     headers: Option<std::collections::HashMap<String, String>>,
@@ -945,11 +1043,8 @@ impl ExportSink for WebhookSink {
         data: &[u8],
         metadata: &DeliveryMetadata,
     ) -> Result<DeliveryReceipt, String> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+        // Re-resolve and validate at delivery time to prevent DNS rebinding.
+        let client = build_ssrf_safe_client(&self.url, Duration::from_secs(30)).await?;
 
         let content_type = match metadata.format.as_str() {
             "csv" => "text/csv; charset=utf-8",
@@ -1056,7 +1151,7 @@ async fn trigger_ingest(
     validate_wallet(&payload.wallet)?;
     check_wallet_allowed(&payload.wallet, &state.allowed_wallets)?;
     if let Some(ref url) = payload.callback_url {
-        validate_callback_url(url)?;
+        validate_callback_url(url).await?;
     }
 
     let chain = payload.chain.clone();
@@ -1291,7 +1386,7 @@ async fn trigger_normalize(
     validate_wallet(&payload.wallet)?;
     check_wallet_allowed(&payload.wallet, &state.allowed_wallets)?;
     if let Some(ref url) = payload.callback_url {
-        validate_callback_url(url)?;
+        validate_callback_url(url).await?;
     }
 
     let permit = state
@@ -2819,7 +2914,7 @@ async fn create_export_job(
 
     // Validate sink config if provided
     if let Some(ref sink_config) = req.sink {
-        validate_sink_config(sink_config, &state.config.export_dir)?;
+        validate_sink_config(sink_config, &state.config.export_dir).await?;
     }
 
     let permit = state
@@ -4777,45 +4872,69 @@ mod tests {
         assert_ne!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn test_validate_callback_url_valid_https() {
-        assert!(validate_callback_url("https://example.com/webhook").is_ok());
+    #[tokio::test]
+    async fn test_validate_callback_url_valid_https() {
+        assert!(validate_callback_url("https://example.com/webhook")
+            .await
+            .is_ok());
     }
 
-    #[test]
-    fn test_validate_callback_url_valid_http() {
-        assert!(validate_callback_url("http://example.com/callback").is_ok());
+    #[tokio::test]
+    async fn test_validate_callback_url_valid_http() {
+        assert!(validate_callback_url("http://example.com/callback")
+            .await
+            .is_ok());
     }
 
-    #[test]
-    fn test_validate_callback_url_invalid() {
-        let err = validate_callback_url("not-a-url").unwrap_err();
+    #[tokio::test]
+    async fn test_validate_callback_url_invalid() {
+        let err = validate_callback_url("not-a-url").await.unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn test_validate_callback_url_ftp_rejected() {
-        let err = validate_callback_url("ftp://example.com/file").unwrap_err();
+    #[tokio::test]
+    async fn test_validate_callback_url_ftp_rejected() {
+        let err = validate_callback_url("ftp://example.com/file")
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn test_validate_callback_url_loopback_rejected() {
-        let err = validate_callback_url("http://127.0.0.1:8080/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_validate_callback_url_loopback_rejected() {
+        let err = validate_callback_url("http://127.0.0.1:8080/hook")
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn test_validate_callback_url_localhost_rejected() {
-        let err = validate_callback_url("https://localhost/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_validate_callback_url_localhost_rejected() {
+        let err = validate_callback_url("https://localhost/hook")
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn test_validate_callback_url_private_ip_rejected() {
-        assert!(validate_callback_url("http://10.0.0.1/hook").is_err());
-        assert!(validate_callback_url("http://172.16.0.1/hook").is_err());
-        assert!(validate_callback_url("http://192.168.1.1/hook").is_err());
+    #[tokio::test]
+    async fn test_validate_callback_url_private_ip_rejected() {
+        assert!(validate_callback_url("http://10.0.0.1/hook").await.is_err());
+        assert!(validate_callback_url("http://172.16.0.1/hook")
+            .await
+            .is_err());
+        assert!(validate_callback_url("http://192.168.1.1/hook")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_callback_url_dns_resolution_loopback() {
+        // localhost resolves to 127.0.0.1 / ::1 — must be rejected even
+        // when passed as a hostname instead of a literal IP.
+        let err = validate_callback_url("http://localhost:9999/hook")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -4876,29 +4995,59 @@ mod tests {
         assert!(!is_private_ip("2606:4700::1111"));
     }
 
-    #[test]
-    fn test_callback_client_disables_redirects() {
-        // Verify the callback HTTP client is built with redirect policy none.
-        // This prevents redirect-based SSRF where a public URL redirects to
-        // a private address, bypassing the hostname-level SSRF check.
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        // Client builds successfully with redirect policy disabled
-        drop(client);
+    #[tokio::test]
+    async fn test_ssrf_safe_client_rejects_loopback() {
+        let result =
+            build_ssrf_safe_client("http://127.0.0.1:8080/hook", Duration::from_secs(5)).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("private"));
     }
 
-    #[test]
-    fn test_webhook_sink_client_disables_redirects() {
-        // Verify the webhook sink HTTP client is built with redirect policy none.
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        drop(client);
+    #[tokio::test]
+    async fn test_ssrf_safe_client_rejects_private_ip() {
+        let result = build_ssrf_safe_client("http://10.0.0.1/hook", Duration::from_secs(5)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_safe_client_rejects_dns_failure() {
+        let result = build_ssrf_safe_client(
+            "http://this-domain-does-not-exist-zzzzz.example/hook",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(result.is_err());
+        // DNS failure should be an error, not silently allowed
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("DNS resolution failed") || err.contains("No such host"),
+            "Expected DNS failure error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_safe_client_accepts_public_url() {
+        // example.com resolves to public IPs
+        let result =
+            build_ssrf_safe_client("https://example.com/hook", Duration::from_secs(5)).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_safe_client_localhost_dns_rejected() {
+        // localhost resolves to 127.0.0.1 / ::1 which are private
+        let result =
+            build_ssrf_safe_client("http://localhost:9999/hook", Duration::from_secs(5)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_callback_url_dns_failure_rejected() {
+        // DNS resolution failure should be denied, not allowed
+        let err = validate_callback_url("http://this-domain-does-not-exist-zzzzz.example/hook")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -6927,8 +7076,8 @@ mod tests {
 
     // -- Sink tests (P4-W3) --
 
-    #[test]
-    fn test_validate_sink_config_local_file_valid() {
+    #[tokio::test]
+    async fn test_validate_sink_config_local_file_valid() {
         let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = SinkConfig {
@@ -6939,12 +7088,14 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        assert!(validate_sink_config(&config, dir.to_str().unwrap()).is_ok());
+        assert!(validate_sink_config(&config, dir.to_str().unwrap())
+            .await
+            .is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_validate_sink_config_local_file_path_traversal() {
+    #[tokio::test]
+    async fn test_validate_sink_config_local_file_path_traversal() {
         let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = SinkConfig {
@@ -6955,13 +7106,15 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, dir.to_str().unwrap()).unwrap_err();
+        let err = validate_sink_config(&config, dir.to_str().unwrap())
+            .await
+            .unwrap_err();
         assert!(err.message.contains("path traversal"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_validate_sink_config_local_file_absolute_path_rerooted() {
+    #[tokio::test]
+    async fn test_validate_sink_config_local_file_absolute_path_rerooted() {
         // Absolute paths have leading '/' stripped and are re-rooted under export_dir,
         // so "/etc/passwd" becomes "{export_dir}/etc/passwd" which is safely contained.
         let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
@@ -6974,13 +7127,15 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        assert!(validate_sink_config(&config, dir.to_str().unwrap()).is_ok());
+        assert!(validate_sink_config(&config, dir.to_str().unwrap())
+            .await
+            .is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn test_validate_sink_config_local_file_symlink_escape_rejected() {
+    #[tokio::test]
+    async fn test_validate_sink_config_local_file_symlink_escape_rejected() {
         let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -6995,15 +7150,17 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, dir.to_str().unwrap()).unwrap_err();
+        let err = validate_sink_config(&config, dir.to_str().unwrap())
+            .await
+            .unwrap_err();
         assert!(err
             .message
             .contains("outside the configured export directory"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_validate_sink_config_local_file_null_byte_rejected() {
+    #[tokio::test]
+    async fn test_validate_sink_config_local_file_null_byte_rejected() {
         let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = SinkConfig {
@@ -7014,13 +7171,15 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, dir.to_str().unwrap()).unwrap_err();
+        let err = validate_sink_config(&config, dir.to_str().unwrap())
+            .await
+            .unwrap_err();
         assert!(err.message.contains("null bytes"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_valid() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_valid() {
         let config = SinkConfig {
             sink_type: SinkType::Webhook,
             file_path: None,
@@ -7029,11 +7188,11 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        assert!(validate_sink_config(&config, "/tmp").is_ok());
+        assert!(validate_sink_config(&config, "/tmp").await.is_ok());
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_loopback_rejected() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_loopback_rejected() {
         let config = SinkConfig {
             sink_type: SinkType::Webhook,
             file_path: None,
@@ -7042,12 +7201,12 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, "/tmp").unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("private"));
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_missing_url() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_missing_url() {
         let config = SinkConfig {
             sink_type: SinkType::Webhook,
             file_path: None,
@@ -7056,12 +7215,12 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, "/tmp").unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("url"));
     }
 
-    #[test]
-    fn test_validate_sink_config_database_rejected() {
+    #[tokio::test]
+    async fn test_validate_sink_config_database_rejected() {
         let config = SinkConfig {
             sink_type: SinkType::Database,
             file_path: None,
@@ -7070,12 +7229,12 @@ mod tests {
             connection_string: Some("postgresql://localhost/exports".to_string()),
             table: Some("export_data".to_string()),
         };
-        let err = validate_sink_config(&config, "/tmp").unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("not yet implemented"));
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_forbidden_header() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_forbidden_header() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("Authorization".to_string(), "Bearer secret".to_string());
         let config = SinkConfig {
@@ -7086,12 +7245,12 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, "/tmp").unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("Forbidden webhook header"));
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_invalid_header_name() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_invalid_header_name() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("Bad Header\r\n".to_string(), "value".to_string());
         let config = SinkConfig {
@@ -7102,12 +7261,12 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, "/tmp").unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("Invalid header name"));
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_control_char_in_value() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_control_char_in_value() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Custom".to_string(), "val\r\nInjected: true".to_string());
         let config = SinkConfig {
@@ -7118,12 +7277,12 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, "/tmp").unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("control characters"));
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_valid_custom_headers() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_valid_custom_headers() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Custom-Header".to_string(), "some-value".to_string());
         headers.insert("X-Api_Key".to_string(), "key123".to_string());
@@ -7135,11 +7294,11 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        assert!(validate_sink_config(&config, "/tmp").is_ok());
+        assert!(validate_sink_config(&config, "/tmp").await.is_ok());
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_tab_in_value_allowed() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_tab_in_value_allowed() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Custom".to_string(), "value\twith\ttabs".to_string());
         let config = SinkConfig {
@@ -7150,7 +7309,7 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        assert!(validate_sink_config(&config, "/tmp").is_ok());
+        assert!(validate_sink_config(&config, "/tmp").await.is_ok());
     }
 
     #[test]
@@ -7258,7 +7417,7 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, "/tmp").unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("HTTP(S)"));
     }
 
