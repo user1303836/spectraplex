@@ -32,9 +32,10 @@ const RPC_RETRY_BASE_MS: u64 = 100;
 /// Maximum block range per eth_getLogs request.
 const DEFAULT_BLOCK_CHUNK: u64 = 2000;
 
-/// Maximum number of blocks to scan per `eth_getBlockByNumber` request when
-/// fetching native ETH transfers. Kept smaller than `DEFAULT_BLOCK_CHUNK`
-/// because full-block fetches are heavier than log queries.
+/// Number of blocks per chunk when scanning for native ETH transfers via
+/// `eth_getBlockByNumber`. Full-block fetches are much heavier than log
+/// queries (1 RPC call per block), so scanning is done in chunks of this
+/// size across the full requested range.
 const NATIVE_TX_BLOCK_CHUNK: u64 = 50;
 
 /// ERC-20 Transfer event signature: keccak256("Transfer(address,address,uint256)")
@@ -316,8 +317,8 @@ impl EvmAdapter {
     /// be converted into V1 `Transaction` or V2 `RawTransaction` records.
     ///
     /// **Performance note**: This performs one RPC call per block, so it is
-    /// significantly more expensive than log-based queries. The block range
-    /// should be kept reasonable (controlled by `NATIVE_TX_BLOCK_CHUNK`).
+    /// significantly more expensive than log-based queries. Callers should
+    /// invoke this in chunks of `NATIVE_TX_BLOCK_CHUNK` blocks at a time.
     async fn fetch_wallet_native_txs(
         &self,
         wallet: Address,
@@ -410,10 +411,9 @@ impl EvmAdapter {
     /// native ETH transactions (via block scanning) for a wallet, then merges
     /// and deduplicates the results by tx_hash.
     ///
-    /// For the native tx scan, the block range is capped to
-    /// `NATIVE_TX_BLOCK_CHUNK` blocks from the end of the range to keep RPC
-    /// costs reasonable. The ERC-20 log query covers the full range since it
-    /// is much cheaper (2 calls per chunk vs 1 call per block).
+    /// Both queries cover the full requested range. Native tx scanning is
+    /// done in chunks of `NATIVE_TX_BLOCK_CHUNK` blocks to keep per-call
+    /// RPC pressure manageable while ensuring no blocks are skipped.
     async fn fetch_wallet_combined(
         &self,
         wallet: Address,
@@ -425,24 +425,32 @@ impl EvmAdapter {
             .fetch_wallet_erc20_logs(wallet, from_block, to_block)
             .await?;
 
-        // Native ETH transactions: scan blocks from the end of the range,
-        // capped to NATIVE_TX_BLOCK_CHUNK blocks to limit RPC cost.
-        let native_from = if to_block.saturating_sub(from_block) > NATIVE_TX_BLOCK_CHUNK {
-            to_block.saturating_sub(NATIVE_TX_BLOCK_CHUNK) + 1
-        } else {
-            from_block
-        };
+        // Native ETH transactions: scan the full range in chunks.
+        let mut native_txs = Vec::new();
+        let mut chunk_start = from_block;
+        let total_blocks = to_block.saturating_sub(from_block) + 1;
 
-        let native_txs = self
-            .fetch_wallet_native_txs(wallet, native_from, to_block)
-            .await?;
+        while chunk_start <= to_block {
+            let chunk_end = std::cmp::min(
+                chunk_start.saturating_add(NATIVE_TX_BLOCK_CHUNK - 1),
+                to_block,
+            );
+
+            let chunk_results = self
+                .fetch_wallet_native_txs(wallet, chunk_start, chunk_end)
+                .await?;
+            native_txs.extend(chunk_results);
+
+            chunk_start = chunk_end.saturating_add(1);
+        }
 
         debug!(
             wallet = %format!("{wallet:#x}"),
             erc20_logs = logs.len(),
             native_txs = native_txs.len(),
-            native_block_range = format!("{native_from}..{to_block}"),
-            "Combined wallet fetch complete"
+            native_block_range = format!("{from_block}..{to_block}"),
+            total_blocks = total_blocks,
+            "Combined wallet fetch complete (full range native scan)"
         );
 
         Ok((logs, native_txs))
@@ -589,8 +597,8 @@ impl EvmAdapter {
     ///
     /// Fetches both:
     /// 1. ERC-20 Transfer events via topic-based log filter (full range)
-    /// 2. Native ETH transactions via block scanning (capped to
-    ///    `NATIVE_TX_BLOCK_CHUNK` blocks from the end of the range)
+    /// 2. Native ETH transactions via block scanning (full range, in chunks
+    ///    of `NATIVE_TX_BLOCK_CHUNK` blocks)
     ///
     /// Results are merged and deduplicated by tx_hash so that transactions
     /// which both emit Transfer logs and carry native value are not double-
@@ -1041,8 +1049,7 @@ impl ChainIngestor for EvmAdapter {
         };
 
         // Fetch both ERC-20 Transfer logs and native ETH transactions.
-        // ERC-20 logs cover the full range; native tx scanning is capped
-        // to NATIVE_TX_BLOCK_CHUNK blocks from the end of the range.
+        // Both queries cover the full requested range.
         let (logs, native_txs) = self
             .fetch_wallet_combined(address, from_block, latest_block)
             .await?;
@@ -1664,8 +1671,8 @@ mod tests {
 
     #[test]
     fn test_native_tx_block_chunk_constant() {
-        // Native tx scanning should be much smaller than log chunk
-        // to limit RPC cost
+        // Native tx chunk size should be much smaller than log chunk
+        // since block fetches are heavier (1 RPC call per block)
         let native = NATIVE_TX_BLOCK_CHUNK;
         let default = DEFAULT_BLOCK_CHUNK;
         assert!(native < default);
