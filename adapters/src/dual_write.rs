@@ -448,6 +448,105 @@ impl Repository {
             }
         }
 
+        // 1c. Self-healing: create target_matches for back-filled raw_transactions
+        //     so target-scoped dataset queries (which JOIN through target_matches)
+        //     can see V1-only data.
+        {
+            // Group all transactions by (network, wallet_address) to resolve targets.
+            let mut wallet_groups: HashMap<(String, String), Vec<&Transaction>> = HashMap::new();
+            for tx in txs {
+                let network = chain_to_default_network(&tx.chain).to_string();
+                wallet_groups
+                    .entry((network, tx.wallet_address.clone()))
+                    .or_default()
+                    .push(tx);
+            }
+
+            for ((network, wallet_address), group_txs) in &wallet_groups {
+                // Look up or create the IndexTarget for this wallet.
+                let target = match self
+                    .get_index_target_by_address(TargetKind::Wallet, network, wallet_address)
+                    .await
+                {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        // Derive Chain from network to create the target.
+                        let chain = match network.as_str() {
+                            "solana-mainnet" => Chain::Solana,
+                            "ethereum-mainnet" => Chain::Ethereum,
+                            "hypercore-mainnet" => Chain::Hyperliquid,
+                            _ => {
+                                warn!(
+                                    network = %network,
+                                    wallet = %wallet_address,
+                                    "Silver materialization: unknown network, skipping target_matches"
+                                );
+                                continue;
+                            }
+                        };
+                        match self
+                            .ensure_wallet_target(&chain, wallet_address, None)
+                            .await
+                        {
+                            Ok(t) => t,
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    wallet = %wallet_address,
+                                    network = %network,
+                                    "Silver materialization: failed to ensure wallet target for target_matches"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            wallet = %wallet_address,
+                            network = %network,
+                            "Silver materialization: failed to look up target for target_matches"
+                        );
+                        continue;
+                    }
+                };
+
+                // Collect resolved raw_transaction_ids for this group.
+                let raw_tx_ids: Vec<Uuid> = group_txs
+                    .iter()
+                    .filter_map(|tx| {
+                        let key = (
+                            chain_to_default_network(&tx.chain).to_string(),
+                            tx.tx_hash.clone(),
+                        );
+                        raw_id_map.get(&key).copied()
+                    })
+                    .collect();
+
+                if raw_tx_ids.is_empty() {
+                    continue;
+                }
+
+                let matches = build_target_matches(target.id, &raw_tx_ids);
+                if let Err(e) = self.save_target_matches(&matches).await {
+                    warn!(
+                        error = %e,
+                        count = matches.len(),
+                        wallet = %wallet_address,
+                        network = %network,
+                        "Silver materialization: failed to back-fill target_matches"
+                    );
+                } else {
+                    info!(
+                        count = matches.len(),
+                        wallet = %wallet_address,
+                        network = %network,
+                        "Silver materialization: back-filled target_matches for V1-only rows"
+                    );
+                }
+            }
+        }
+
         // 2. Get or create dataset versions for each dataset that will receive records.
         let dataset_versions = self.resolve_silver_dataset_versions().await;
 
