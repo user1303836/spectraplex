@@ -630,18 +630,63 @@ fn validate_wallet(wallet: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Build a reqwest client that pins DNS resolution to validated (non-private)
+/// IP addresses.  This prevents DNS rebinding attacks where the hostname
+/// resolves to a public IP at validation time but to a private IP when the
+/// actual HTTP request is made.
+///
+/// Returns `Err` if DNS resolution fails, yields no addresses, or any
+/// resolved address is private/loopback.
+async fn build_ssrf_safe_client(url: &str, timeout: Duration) -> Result<reqwest::Client, String> {
+    let parsed: reqwest::Url = url.parse().map_err(|e| format!("invalid URL: {e}"))?;
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no hostname".to_string())?
+        .to_string();
+
+    if is_private_ip(&host) {
+        return Err("hostname is a private/loopback address".to_string());
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let lookup_host = format!("{host}:{port}");
+
+    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&lookup_host)
+        .await
+        .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?
+        .collect();
+
+    if resolved.is_empty() {
+        return Err(format!("DNS resolution returned no addresses for {host}"));
+    }
+
+    for addr in &resolved {
+        if is_private_ip(&addr.ip().to_string()) {
+            return Err(format!(
+                "hostname {host} resolves to private address {}",
+                addr.ip()
+            ));
+        }
+    }
+
+    // Pin the resolved addresses so reqwest does not re-resolve at send time.
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&host, &resolved)
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))
+}
+
 async fn fire_callback(url: &str, payload: &serde_json::Value) {
     const MAX_RETRIES: u32 = 3;
     const BASE_DELAY_MS: u64 = 500;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build();
-    let client = match client {
+    let client = match build_ssrf_safe_client(url, Duration::from_secs(10)).await {
         Ok(c) => c,
         Err(e) => {
-            warn!(error = %e, url, "Failed to build callback HTTP client");
+            warn!(error = %e, url, "Rejected callback URL at delivery time (SSRF protection)");
             return;
         }
     };
@@ -718,41 +763,69 @@ fn is_private_ip(host: &str) -> bool {
 }
 
 async fn validate_callback_url(url: &str) -> Result<(), AppError> {
-    let parsed: Result<reqwest::Url, _> = url.parse();
-    match parsed {
-        Ok(u) if u.scheme() == "https" || u.scheme() == "http" => {
-            if let Some(host) = u.host_str() {
-                // Reject hostnames that are directly private/loopback literals
-                if is_private_ip(host) {
-                    return Err(AppError::bad_request(
-                        "callback_url must not target private/loopback addresses",
-                    ));
-                }
+    // Delegates to resolve_and_validate_callback_url and discards the resolved addrs.
+    resolve_and_validate_callback_url(url).await.map(|_| ())
+}
 
-                // Resolve DNS to catch hostnames that map to private IPs
-                // (e.g. attacker-controlled DNS pointing to 127.0.0.1)
-                let port = u.port_or_known_default().unwrap_or(443);
-                let lookup_host = format!("{host}:{port}");
-                let resolved: Vec<std::net::SocketAddr> =
-                    match tokio::net::lookup_host(&lookup_host).await {
-                        Ok(addrs) => addrs.collect(),
-                        Err(_) => Vec::new(),
-                    };
-                for addr in &resolved {
-                    let ip_str = addr.ip().to_string();
-                    if is_private_ip(&ip_str) {
-                        return Err(AppError::bad_request(
-                            "callback_url must not resolve to private/loopback addresses",
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }
-        _ => Err(AppError::bad_request(
+/// Resolve a callback URL's hostname, validate that none of the resolved IPs
+/// are private/loopback, and return the validated `(host, port, addresses)`.
+///
+/// DNS lookup failures are treated as **deny** (not allow), because an
+/// unresolvable hostname could be used to bypass validation at creation
+/// time and then resolve to a private address later (DNS rebinding).
+async fn resolve_and_validate_callback_url(
+    url: &str,
+) -> Result<(String, u16, Vec<std::net::SocketAddr>), AppError> {
+    let parsed: reqwest::Url = url
+        .parse()
+        .map_err(|_| AppError::bad_request("callback_url must be a valid HTTP(S) URL"))?;
+
+    if parsed.scheme() != "https" && parsed.scheme() != "http" {
+        return Err(AppError::bad_request(
             "callback_url must be a valid HTTP(S) URL",
-        )),
+        ));
     }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AppError::bad_request("callback_url must contain a hostname"))?
+        .to_string();
+
+    // Reject hostnames that are directly private/loopback literals
+    if is_private_ip(&host) {
+        return Err(AppError::bad_request(
+            "callback_url must not target private/loopback addresses",
+        ));
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let lookup_host = format!("{host}:{port}");
+
+    // DNS lookup failure = deny. An unresolvable hostname at creation time
+    // could resolve to a private IP later (DNS rebinding).
+    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&lookup_host)
+        .await
+        .map_err(|e| {
+            AppError::bad_request(format!("callback_url hostname failed DNS resolution: {e}"))
+        })?
+        .collect();
+
+    if resolved.is_empty() {
+        return Err(AppError::bad_request(
+            "callback_url hostname resolved to no addresses",
+        ));
+    }
+
+    for addr in &resolved {
+        let ip_str = addr.ip().to_string();
+        if is_private_ip(&ip_str) {
+            return Err(AppError::bad_request(
+                "callback_url must not resolve to private/loopback addresses",
+            ));
+        }
+    }
+
+    Ok((host, port, resolved))
 }
 
 // ---------------------------------------------------------------------------
@@ -952,6 +1025,12 @@ impl ExportSink for LocalFileSink {
 }
 
 /// POSTs export data to an HTTP(S) webhook URL.
+///
+/// Uses `build_ssrf_safe_client` at delivery time to resolve DNS, validate
+/// that all resolved IPs are non-private, and pin the resolved addresses
+/// into the reqwest client. This prevents DNS rebinding attacks where the
+/// hostname resolves to a different (private) IP between validation and
+/// delivery.
 struct WebhookSink {
     url: String,
     headers: Option<std::collections::HashMap<String, String>>,
@@ -964,11 +1043,8 @@ impl ExportSink for WebhookSink {
         data: &[u8],
         metadata: &DeliveryMetadata,
     ) -> Result<DeliveryReceipt, String> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+        // Re-resolve and validate at delivery time to prevent DNS rebinding.
+        let client = build_ssrf_safe_client(&self.url, Duration::from_secs(30)).await?;
 
         let content_type = match metadata.format.as_str() {
             "csv" => "text/csv; charset=utf-8",
@@ -4919,29 +4995,59 @@ mod tests {
         assert!(!is_private_ip("2606:4700::1111"));
     }
 
-    #[test]
-    fn test_callback_client_disables_redirects() {
-        // Verify the callback HTTP client is built with redirect policy none.
-        // This prevents redirect-based SSRF where a public URL redirects to
-        // a private address, bypassing the hostname-level SSRF check.
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        // Client builds successfully with redirect policy disabled
-        drop(client);
+    #[tokio::test]
+    async fn test_ssrf_safe_client_rejects_loopback() {
+        let result =
+            build_ssrf_safe_client("http://127.0.0.1:8080/hook", Duration::from_secs(5)).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("private"));
     }
 
-    #[test]
-    fn test_webhook_sink_client_disables_redirects() {
-        // Verify the webhook sink HTTP client is built with redirect policy none.
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        drop(client);
+    #[tokio::test]
+    async fn test_ssrf_safe_client_rejects_private_ip() {
+        let result = build_ssrf_safe_client("http://10.0.0.1/hook", Duration::from_secs(5)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_safe_client_rejects_dns_failure() {
+        let result = build_ssrf_safe_client(
+            "http://this-domain-does-not-exist-zzzzz.example/hook",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(result.is_err());
+        // DNS failure should be an error, not silently allowed
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("DNS resolution failed") || err.contains("No such host"),
+            "Expected DNS failure error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_safe_client_accepts_public_url() {
+        // example.com resolves to public IPs
+        let result =
+            build_ssrf_safe_client("https://example.com/hook", Duration::from_secs(5)).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_safe_client_localhost_dns_rejected() {
+        // localhost resolves to 127.0.0.1 / ::1 which are private
+        let result =
+            build_ssrf_safe_client("http://localhost:9999/hook", Duration::from_secs(5)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_callback_url_dns_failure_rejected() {
+        // DNS resolution failure should be denied, not allowed
+        let err = validate_callback_url("http://this-domain-does-not-exist-zzzzz.example/hook")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
