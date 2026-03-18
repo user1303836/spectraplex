@@ -717,15 +717,34 @@ fn is_private_ip(host: &str) -> bool {
     }
 }
 
-fn validate_callback_url(url: &str) -> Result<(), AppError> {
+async fn validate_callback_url(url: &str) -> Result<(), AppError> {
     let parsed: Result<reqwest::Url, _> = url.parse();
     match parsed {
         Ok(u) if u.scheme() == "https" || u.scheme() == "http" => {
             if let Some(host) = u.host_str() {
+                // Reject hostnames that are directly private/loopback literals
                 if is_private_ip(host) {
                     return Err(AppError::bad_request(
                         "callback_url must not target private/loopback addresses",
                     ));
+                }
+
+                // Resolve DNS to catch hostnames that map to private IPs
+                // (e.g. attacker-controlled DNS pointing to 127.0.0.1)
+                let port = u.port_or_known_default().unwrap_or(443);
+                let lookup_host = format!("{host}:{port}");
+                let resolved: Vec<std::net::SocketAddr> =
+                    match tokio::net::lookup_host(&lookup_host).await {
+                        Ok(addrs) => addrs.collect(),
+                        Err(_) => Vec::new(),
+                    };
+                for addr in &resolved {
+                    let ip_str = addr.ip().to_string();
+                    if is_private_ip(&ip_str) {
+                        return Err(AppError::bad_request(
+                            "callback_url must not resolve to private/loopback addresses",
+                        ));
+                    }
                 }
             }
             Ok(())
@@ -772,7 +791,7 @@ fn is_valid_header_value(value: &str) -> bool {
 /// For `LocalFile` sinks, the file path must resolve to a location inside
 /// `export_dir`. The path is canonicalized (resolving symlinks) and checked
 /// against the canonical export root to prevent directory escape.
-fn validate_sink_config(config: &SinkConfig, export_dir: &str) -> Result<(), AppError> {
+async fn validate_sink_config(config: &SinkConfig, export_dir: &str) -> Result<(), AppError> {
     config
         .validate()
         .map_err(|e| AppError::bad_request(format!("Invalid sink config: {e}")))?;
@@ -780,7 +799,7 @@ fn validate_sink_config(config: &SinkConfig, export_dir: &str) -> Result<(), App
     match config.sink_type {
         SinkType::Webhook => {
             if let Some(ref url) = config.url {
-                validate_callback_url(url)?;
+                validate_callback_url(url).await?;
             }
             if let Some(ref headers) = config.headers {
                 for (name, value) in headers {
@@ -1056,7 +1075,7 @@ async fn trigger_ingest(
     validate_wallet(&payload.wallet)?;
     check_wallet_allowed(&payload.wallet, &state.allowed_wallets)?;
     if let Some(ref url) = payload.callback_url {
-        validate_callback_url(url)?;
+        validate_callback_url(url).await?;
     }
 
     let chain = payload.chain.clone();
@@ -1291,7 +1310,7 @@ async fn trigger_normalize(
     validate_wallet(&payload.wallet)?;
     check_wallet_allowed(&payload.wallet, &state.allowed_wallets)?;
     if let Some(ref url) = payload.callback_url {
-        validate_callback_url(url)?;
+        validate_callback_url(url).await?;
     }
 
     let permit = state
@@ -2819,7 +2838,7 @@ async fn create_export_job(
 
     // Validate sink config if provided
     if let Some(ref sink_config) = req.sink {
-        validate_sink_config(sink_config, &state.config.export_dir)?;
+        validate_sink_config(sink_config, &state.config.export_dir).await?;
     }
 
     let permit = state
@@ -4777,45 +4796,69 @@ mod tests {
         assert_ne!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn test_validate_callback_url_valid_https() {
-        assert!(validate_callback_url("https://example.com/webhook").is_ok());
+    #[tokio::test]
+    async fn test_validate_callback_url_valid_https() {
+        assert!(validate_callback_url("https://example.com/webhook")
+            .await
+            .is_ok());
     }
 
-    #[test]
-    fn test_validate_callback_url_valid_http() {
-        assert!(validate_callback_url("http://example.com/callback").is_ok());
+    #[tokio::test]
+    async fn test_validate_callback_url_valid_http() {
+        assert!(validate_callback_url("http://example.com/callback")
+            .await
+            .is_ok());
     }
 
-    #[test]
-    fn test_validate_callback_url_invalid() {
-        let err = validate_callback_url("not-a-url").unwrap_err();
+    #[tokio::test]
+    async fn test_validate_callback_url_invalid() {
+        let err = validate_callback_url("not-a-url").await.unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn test_validate_callback_url_ftp_rejected() {
-        let err = validate_callback_url("ftp://example.com/file").unwrap_err();
+    #[tokio::test]
+    async fn test_validate_callback_url_ftp_rejected() {
+        let err = validate_callback_url("ftp://example.com/file")
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn test_validate_callback_url_loopback_rejected() {
-        let err = validate_callback_url("http://127.0.0.1:8080/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_validate_callback_url_loopback_rejected() {
+        let err = validate_callback_url("http://127.0.0.1:8080/hook")
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn test_validate_callback_url_localhost_rejected() {
-        let err = validate_callback_url("https://localhost/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_validate_callback_url_localhost_rejected() {
+        let err = validate_callback_url("https://localhost/hook")
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn test_validate_callback_url_private_ip_rejected() {
-        assert!(validate_callback_url("http://10.0.0.1/hook").is_err());
-        assert!(validate_callback_url("http://172.16.0.1/hook").is_err());
-        assert!(validate_callback_url("http://192.168.1.1/hook").is_err());
+    #[tokio::test]
+    async fn test_validate_callback_url_private_ip_rejected() {
+        assert!(validate_callback_url("http://10.0.0.1/hook").await.is_err());
+        assert!(validate_callback_url("http://172.16.0.1/hook")
+            .await
+            .is_err());
+        assert!(validate_callback_url("http://192.168.1.1/hook")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_callback_url_dns_resolution_loopback() {
+        // localhost resolves to 127.0.0.1 / ::1 — must be rejected even
+        // when passed as a hostname instead of a literal IP.
+        let err = validate_callback_url("http://localhost:9999/hook")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -6927,8 +6970,8 @@ mod tests {
 
     // -- Sink tests (P4-W3) --
 
-    #[test]
-    fn test_validate_sink_config_local_file_valid() {
+    #[tokio::test]
+    async fn test_validate_sink_config_local_file_valid() {
         let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = SinkConfig {
@@ -6939,12 +6982,14 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        assert!(validate_sink_config(&config, dir.to_str().unwrap()).is_ok());
+        assert!(validate_sink_config(&config, dir.to_str().unwrap())
+            .await
+            .is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_validate_sink_config_local_file_path_traversal() {
+    #[tokio::test]
+    async fn test_validate_sink_config_local_file_path_traversal() {
         let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = SinkConfig {
@@ -6955,13 +7000,15 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, dir.to_str().unwrap()).unwrap_err();
+        let err = validate_sink_config(&config, dir.to_str().unwrap())
+            .await
+            .unwrap_err();
         assert!(err.message.contains("path traversal"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_validate_sink_config_local_file_absolute_path_rerooted() {
+    #[tokio::test]
+    async fn test_validate_sink_config_local_file_absolute_path_rerooted() {
         // Absolute paths have leading '/' stripped and are re-rooted under export_dir,
         // so "/etc/passwd" becomes "{export_dir}/etc/passwd" which is safely contained.
         let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
@@ -6974,13 +7021,15 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        assert!(validate_sink_config(&config, dir.to_str().unwrap()).is_ok());
+        assert!(validate_sink_config(&config, dir.to_str().unwrap())
+            .await
+            .is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn test_validate_sink_config_local_file_symlink_escape_rejected() {
+    #[tokio::test]
+    async fn test_validate_sink_config_local_file_symlink_escape_rejected() {
         let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -6995,15 +7044,17 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, dir.to_str().unwrap()).unwrap_err();
+        let err = validate_sink_config(&config, dir.to_str().unwrap())
+            .await
+            .unwrap_err();
         assert!(err
             .message
             .contains("outside the configured export directory"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_validate_sink_config_local_file_null_byte_rejected() {
+    #[tokio::test]
+    async fn test_validate_sink_config_local_file_null_byte_rejected() {
         let dir = std::env::temp_dir().join(format!("sp_test_export_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = SinkConfig {
@@ -7014,13 +7065,15 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, dir.to_str().unwrap()).unwrap_err();
+        let err = validate_sink_config(&config, dir.to_str().unwrap())
+            .await
+            .unwrap_err();
         assert!(err.message.contains("null bytes"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_valid() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_valid() {
         let config = SinkConfig {
             sink_type: SinkType::Webhook,
             file_path: None,
@@ -7029,11 +7082,11 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        assert!(validate_sink_config(&config, "/tmp").is_ok());
+        assert!(validate_sink_config(&config, "/tmp").await.is_ok());
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_loopback_rejected() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_loopback_rejected() {
         let config = SinkConfig {
             sink_type: SinkType::Webhook,
             file_path: None,
@@ -7042,12 +7095,12 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, "/tmp").unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("private"));
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_missing_url() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_missing_url() {
         let config = SinkConfig {
             sink_type: SinkType::Webhook,
             file_path: None,
@@ -7056,12 +7109,12 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, "/tmp").unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("url"));
     }
 
-    #[test]
-    fn test_validate_sink_config_database_rejected() {
+    #[tokio::test]
+    async fn test_validate_sink_config_database_rejected() {
         let config = SinkConfig {
             sink_type: SinkType::Database,
             file_path: None,
@@ -7070,12 +7123,12 @@ mod tests {
             connection_string: Some("postgresql://localhost/exports".to_string()),
             table: Some("export_data".to_string()),
         };
-        let err = validate_sink_config(&config, "/tmp").unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("not yet implemented"));
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_forbidden_header() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_forbidden_header() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("Authorization".to_string(), "Bearer secret".to_string());
         let config = SinkConfig {
@@ -7086,12 +7139,12 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, "/tmp").unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("Forbidden webhook header"));
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_invalid_header_name() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_invalid_header_name() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("Bad Header\r\n".to_string(), "value".to_string());
         let config = SinkConfig {
@@ -7102,12 +7155,12 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, "/tmp").unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("Invalid header name"));
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_control_char_in_value() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_control_char_in_value() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Custom".to_string(), "val\r\nInjected: true".to_string());
         let config = SinkConfig {
@@ -7118,12 +7171,12 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, "/tmp").unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("control characters"));
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_valid_custom_headers() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_valid_custom_headers() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Custom-Header".to_string(), "some-value".to_string());
         headers.insert("X-Api_Key".to_string(), "key123".to_string());
@@ -7135,11 +7188,11 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        assert!(validate_sink_config(&config, "/tmp").is_ok());
+        assert!(validate_sink_config(&config, "/tmp").await.is_ok());
     }
 
-    #[test]
-    fn test_validate_sink_config_webhook_tab_in_value_allowed() {
+    #[tokio::test]
+    async fn test_validate_sink_config_webhook_tab_in_value_allowed() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Custom".to_string(), "value\twith\ttabs".to_string());
         let config = SinkConfig {
@@ -7150,7 +7203,7 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        assert!(validate_sink_config(&config, "/tmp").is_ok());
+        assert!(validate_sink_config(&config, "/tmp").await.is_ok());
     }
 
     #[test]
@@ -7258,7 +7311,7 @@ mod tests {
             connection_string: None,
             table: None,
         };
-        let err = validate_sink_config(&config, "/tmp").unwrap_err();
+        let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("HTTP(S)"));
     }
 
