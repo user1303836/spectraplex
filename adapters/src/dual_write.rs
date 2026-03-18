@@ -11,6 +11,7 @@ use spectraplex_core::models::{Chain, IndexerCheckpoint, Transaction};
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, IndexTarget, RawTransaction, TargetKind, TargetMatch, TargetMode,
 };
+use std::collections::HashMap;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -323,11 +324,12 @@ impl Repository {
 
     /// Internal: convert and write V2 raw_transactions + target_matches.
     ///
-    /// Uses `upsert_raw_transactions_returning_ids` to always resolve the
-    /// canonical `raw_transactions.id` for each transaction, even when the
-    /// raw insert loses the dedup race (i.e. the row already exists from a
-    /// different target's ingestion). The canonical IDs are then used to
-    /// create `target_matches`, ensuring all targets get linked correctly.
+    /// EVM ingestion can emit multiple V1 rows per on-chain transaction (one
+    /// per matching log), so the input may contain duplicate `(network, tx_hash)`
+    /// pairs.  PostgreSQL's `ON CONFLICT DO UPDATE` rejects touching the same
+    /// row twice in a single statement, so we deduplicate before upserting and
+    /// then map every *original* transaction back to its canonical ID for the
+    /// target_matches.
     async fn v2_write_transactions(
         &self,
         txs: &[Transaction],
@@ -337,10 +339,45 @@ impl Repository {
             return Ok(());
         }
 
+        // 1. Convert all V1 txs to V2 raw transactions.
         let v2_txs: Vec<RawTransaction> = txs.iter().map(v1_tx_to_v2_raw).collect();
-        let canonical_ids = self.upsert_raw_transactions_returning_ids(&v2_txs).await?;
 
-        let matches = build_target_matches(target_id, &canonical_ids);
+        // 2. Deduplicate by (network, tx_hash), keeping the first occurrence.
+        let mut seen: HashMap<(&str, &str), usize> = HashMap::new();
+        let mut deduped: Vec<&RawTransaction> = Vec::new();
+        for tx in &v2_txs {
+            let key = (tx.network.as_str(), tx.tx_hash.as_str());
+            if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(key) {
+                e.insert(deduped.len());
+                deduped.push(tx);
+            }
+        }
+
+        // 3. Upsert only the unique set and get canonical IDs back.
+        let deduped_owned: Vec<RawTransaction> = deduped.into_iter().cloned().collect();
+        let canonical_ids = self
+            .upsert_raw_transactions_returning_ids(&deduped_owned)
+            .await?;
+
+        // 4. Build (network, tx_hash) → canonical ID map from the upsert results.
+        let id_map: HashMap<(&str, &str), Uuid> = deduped_owned
+            .iter()
+            .zip(canonical_ids.iter())
+            .map(|(tx, &id)| ((tx.network.as_str(), tx.tx_hash.as_str()), id))
+            .collect();
+
+        // 5. Resolve canonical IDs for ALL original transactions (including
+        //    duplicates) and create target_matches.
+        let all_canonical_ids: Vec<Uuid> = v2_txs
+            .iter()
+            .filter_map(|tx| {
+                id_map
+                    .get(&(tx.network.as_str(), tx.tx_hash.as_str()))
+                    .copied()
+            })
+            .collect();
+
+        let matches = build_target_matches(target_id, &all_canonical_ids);
         self.save_target_matches(&matches).await?;
 
         Ok(())
@@ -800,5 +837,73 @@ mod tests {
         assert_eq!(matches_b[0].target_id, target_b_id);
         // Each match has its own unique id
         assert_ne!(matches_a[0].id, matches_b[0].id);
+    }
+
+    // -- EVM multi-log dedup within a single batch --
+
+    #[test]
+    fn evm_multi_log_dedup_produces_unique_raw_txs() {
+        // An EVM transaction with 3 matching logs produces 3 V1 rows that
+        // share the same tx_hash. After conversion to V2, dedup by
+        // (network, tx_hash) should yield exactly 1 unique raw transaction.
+        let shared_hash = "0xmultilog";
+        let txs: Vec<Transaction> = (0..3)
+            .map(|i| Transaction {
+                id: Uuid::new_v4(),
+                user_id: Uuid::new_v4(),
+                wallet_address: "0xwallet".to_string(),
+                timestamp: 1700000000,
+                tx_hash: shared_hash.to_string(),
+                chain: Chain::Ethereum,
+                raw_metadata: serde_json::json!({"block_number": 18000000, "log_index": i}),
+            })
+            .collect();
+
+        let v2_txs: Vec<RawTransaction> = txs.iter().map(v1_tx_to_v2_raw).collect();
+        assert_eq!(v2_txs.len(), 3, "all 3 V1 rows convert to V2");
+
+        // Deduplicate by (network, tx_hash)
+        let mut seen = std::collections::HashMap::new();
+        let mut deduped = Vec::new();
+        for tx in &v2_txs {
+            let key = (tx.network.as_str(), tx.tx_hash.as_str());
+            if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(key) {
+                e.insert(deduped.len());
+                deduped.push(tx);
+            }
+        }
+        assert_eq!(deduped.len(), 1, "dedup yields exactly 1 unique raw tx");
+        assert_eq!(deduped[0].tx_hash, shared_hash);
+
+        // Simulate canonical ID assignment after upsert
+        let canonical_id = Uuid::new_v4();
+        let id_map: std::collections::HashMap<(&str, &str), Uuid> = deduped
+            .iter()
+            .map(|tx| ((tx.network.as_str(), tx.tx_hash.as_str()), canonical_id))
+            .collect();
+
+        // All 3 original V2 txs should resolve to the same canonical ID
+        let all_ids: Vec<Uuid> = v2_txs
+            .iter()
+            .filter_map(|tx| {
+                id_map
+                    .get(&(tx.network.as_str(), tx.tx_hash.as_str()))
+                    .copied()
+            })
+            .collect();
+        assert_eq!(all_ids.len(), 3, "all original txs get a canonical ID");
+        assert!(
+            all_ids.iter().all(|&id| id == canonical_id),
+            "all map to the same canonical ID"
+        );
+
+        // Target matches: one per original tx, all pointing to canonical_id
+        let target_id = Uuid::new_v4();
+        let matches = build_target_matches(target_id, &all_ids);
+        assert_eq!(matches.len(), 3, "one target_match per original V1 row");
+        for m in &matches {
+            assert_eq!(m.raw_transaction_id, canonical_id);
+            assert_eq!(m.target_id, target_id);
+        }
     }
 }
