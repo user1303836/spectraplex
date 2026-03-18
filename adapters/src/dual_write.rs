@@ -322,6 +322,12 @@ impl Repository {
     }
 
     /// Internal: convert and write V2 raw_transactions + target_matches.
+    ///
+    /// Uses `upsert_raw_transactions_returning_ids` to always resolve the
+    /// canonical `raw_transactions.id` for each transaction, even when the
+    /// raw insert loses the dedup race (i.e. the row already exists from a
+    /// different target's ingestion). The canonical IDs are then used to
+    /// create `target_matches`, ensuring all targets get linked correctly.
     async fn v2_write_transactions(
         &self,
         txs: &[Transaction],
@@ -332,10 +338,9 @@ impl Repository {
         }
 
         let v2_txs: Vec<RawTransaction> = txs.iter().map(v1_tx_to_v2_raw).collect();
-        self.save_raw_transactions(&v2_txs).await?;
+        let canonical_ids = self.upsert_raw_transactions_returning_ids(&v2_txs).await?;
 
-        let raw_tx_ids: Vec<Uuid> = v2_txs.iter().map(|rt| rt.id).collect();
-        let matches = build_target_matches(target_id, &raw_tx_ids);
+        let matches = build_target_matches(target_id, &canonical_ids);
         self.save_target_matches(&matches).await?;
 
         Ok(())
@@ -738,5 +743,62 @@ mod tests {
             assert_eq!(v2_tx.network, "ethereum-mainnet");
             assert_eq!(v2_tx.source, "rpc");
         }
+    }
+
+    // -- Multi-wallet target match assembly --
+
+    #[test]
+    fn multi_wallet_v2_target_matches_share_raw_tx() {
+        // Two wallets see the same tx_hash on the same chain. The V2 raw
+        // transaction should be deduplicated, and each wallet's target should
+        // get its own target_match pointing to the same raw_transaction_id.
+        let shared_tx_hash = "0xshared_hash";
+        let shared_chain = Chain::Ethereum;
+        let shared_meta = serde_json::json!({"block_number": 18000000});
+
+        let wallet_a_tx = Transaction {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            wallet_address: "wallet_a".to_string(),
+            timestamp: 1700000000,
+            tx_hash: shared_tx_hash.to_string(),
+            chain: shared_chain.clone(),
+            raw_metadata: shared_meta.clone(),
+        };
+
+        let wallet_b_tx = Transaction {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            wallet_address: "wallet_b".to_string(),
+            timestamp: 1700000000,
+            tx_hash: shared_tx_hash.to_string(),
+            chain: shared_chain,
+            raw_metadata: shared_meta,
+        };
+
+        // Both convert to V2 raw transactions with the same tx_hash
+        let v2_a = v1_tx_to_v2_raw(&wallet_a_tx);
+        let v2_b = v1_tx_to_v2_raw(&wallet_b_tx);
+        assert_eq!(v2_a.tx_hash, v2_b.tx_hash);
+        assert_eq!(v2_a.network, v2_b.network);
+
+        // After upsert, the canonical ID would be the same for both.
+        // Simulate by using a single canonical ID.
+        let canonical_id = Uuid::new_v4();
+
+        let target_a_id = Uuid::new_v4();
+        let target_b_id = Uuid::new_v4();
+
+        let matches_a = build_target_matches(target_a_id, &[canonical_id]);
+        let matches_b = build_target_matches(target_b_id, &[canonical_id]);
+
+        assert_eq!(matches_a.len(), 1);
+        assert_eq!(matches_b.len(), 1);
+        assert_eq!(matches_a[0].raw_transaction_id, canonical_id);
+        assert_eq!(matches_b[0].raw_transaction_id, canonical_id);
+        assert_eq!(matches_a[0].target_id, target_a_id);
+        assert_eq!(matches_b[0].target_id, target_b_id);
+        // Each match has its own unique id
+        assert_ne!(matches_a[0].id, matches_b[0].id);
     }
 }
