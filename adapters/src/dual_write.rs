@@ -9,8 +9,10 @@
 use chrono::Utc;
 use spectraplex_core::models::{Chain, IndexerCheckpoint, Transaction};
 use spectraplex_core::v2::{
-    ChainFamily, Checkpoint, IndexTarget, RawTransaction, TargetKind, TargetMatch, TargetMode,
+    ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
+    DatasetVersionStatus, IndexTarget, RawTransaction, TargetKind, TargetMatch, TargetMode,
 };
+use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -347,11 +349,13 @@ impl Repository {
 
     /// Materialize Silver datasets from V1 transactions.
     ///
-    /// For each transaction, extract chain-specific Silver records (token
+    /// For each transaction, resolves the canonical `raw_transactions.id` via a
+    /// batch lookup, then extracts chain-specific Silver records (token
     /// transfers, native balance deltas, decoded events, HL fills/funding/
-    /// positions) and persist them to V2 Silver tables. This bridges the gap
-    /// where dataset/analytics endpoints read from V2 Silver tables that were
-    /// previously never populated.
+    /// positions) with proper `raw_transaction_id` linking. After writing the
+    /// Silver records, creates or bumps dataset versions and updates
+    /// completeness metadata so dataset status and export provenance reflect
+    /// the newly materialized rows.
     ///
     /// V2 Silver writes are best-effort: failures are logged but never abort
     /// the V1 normalization path.
@@ -360,6 +364,34 @@ impl Repository {
             return;
         }
 
+        // 1. Batch-resolve canonical raw_transactions.id for each (network, tx_hash).
+        let pairs: Vec<(String, String)> = txs
+            .iter()
+            .map(|tx| {
+                (
+                    chain_to_default_network(&tx.chain).to_string(),
+                    tx.tx_hash.clone(),
+                )
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let raw_id_map = match self.lookup_raw_transaction_ids(&pairs).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Silver materialization: failed to resolve raw_transaction_ids, falling back to None"
+                );
+                HashMap::new()
+            }
+        };
+
+        // 2. Get or create dataset versions for each dataset that will receive records.
+        let dataset_versions = self.resolve_silver_dataset_versions().await;
+
+        // 3. Extract Silver records with resolved raw_tx_id and dataset_version_id.
         let mut all_token_transfers = Vec::new();
         let mut all_native_balance_deltas = Vec::new();
         let mut all_decoded_events = Vec::new();
@@ -369,84 +401,111 @@ impl Repository {
 
         for tx in txs {
             let network = chain_to_default_network(&tx.chain);
-            // raw_tx_id is None since these come from V1 transactions table
-            // and may not have a corresponding raw_transactions row yet.
-            let raw_tx_id: Option<Uuid> = None;
+            let raw_tx_id = raw_id_map
+                .get(&(network.to_string(), tx.tx_hash.clone()))
+                .copied();
 
             match tx.chain {
                 Chain::Solana => {
-                    let transfers = crate::solana_parser::extract_solana_token_transfers(
+                    let mut transfers = crate::solana_parser::extract_solana_token_transfers(
                         raw_tx_id,
                         network,
                         &tx.raw_metadata,
                     );
+                    stamp_dataset_version_id(&mut transfers, &dataset_versions, "token_transfers");
                     all_token_transfers.extend(transfers);
 
-                    let deltas = crate::solana_parser::extract_solana_native_balance_deltas(
+                    let mut deltas = crate::solana_parser::extract_solana_native_balance_deltas(
                         raw_tx_id,
                         network,
                         &tx.raw_metadata,
+                    );
+                    stamp_dataset_version_id(
+                        &mut deltas,
+                        &dataset_versions,
+                        "native_balance_deltas",
                     );
                     all_native_balance_deltas.extend(deltas);
 
-                    let events = crate::solana_parser::extract_solana_decoded_events(
+                    let mut events = crate::solana_parser::extract_solana_decoded_events(
                         raw_tx_id,
                         network,
                         &tx.raw_metadata,
                     );
+                    stamp_dataset_version_id(&mut events, &dataset_versions, "decoded_events");
                     all_decoded_events.extend(events);
                 }
                 Chain::Ethereum => {
-                    let transfers = crate::evm_parser::extract_evm_token_transfers(
+                    let mut transfers = crate::evm_parser::extract_evm_token_transfers(
                         raw_tx_id,
                         network,
                         &tx.raw_metadata,
                     );
+                    stamp_dataset_version_id(&mut transfers, &dataset_versions, "token_transfers");
                     all_token_transfers.extend(transfers);
 
-                    let events = crate::evm_parser::extract_evm_decoded_events(
+                    let mut events = crate::evm_parser::extract_evm_decoded_events(
                         raw_tx_id,
                         network,
                         &tx.raw_metadata,
                     );
+                    stamp_dataset_version_id(&mut events, &dataset_versions, "decoded_events");
                     all_decoded_events.extend(events);
                 }
                 Chain::Hyperliquid => {
-                    let transfers = crate::hyperliquid_parser::extract_hyperliquid_token_transfers(
-                        raw_tx_id,
-                        network,
-                        &tx.wallet_address,
-                        &tx.raw_metadata,
-                    );
+                    let mut transfers =
+                        crate::hyperliquid_parser::extract_hyperliquid_token_transfers(
+                            raw_tx_id,
+                            network,
+                            &tx.wallet_address,
+                            &tx.raw_metadata,
+                        );
+                    stamp_dataset_version_id(&mut transfers, &dataset_versions, "token_transfers");
                     all_token_transfers.extend(transfers);
 
-                    let deltas =
+                    let mut deltas =
                         crate::hyperliquid_parser::extract_hyperliquid_native_balance_deltas(
                             raw_tx_id,
                             network,
                             &tx.wallet_address,
                             &tx.raw_metadata,
                         );
+                    stamp_dataset_version_id(
+                        &mut deltas,
+                        &dataset_versions,
+                        "native_balance_deltas",
+                    );
                     all_native_balance_deltas.extend(deltas);
 
-                    let fills = crate::hyperliquid_parser::extract_hl_fill_records(
+                    let mut fills = crate::hyperliquid_parser::extract_hl_fill_records(
                         raw_tx_id,
                         network,
                         &tx.raw_metadata,
                     );
+                    stamp_dataset_version_id(&mut fills, &dataset_versions, "hl_fill_records");
                     all_hl_fills.extend(fills);
 
-                    let funding = crate::hyperliquid_parser::extract_hl_funding_payments(
+                    let mut funding = crate::hyperliquid_parser::extract_hl_funding_payments(
                         raw_tx_id,
                         network,
                         &tx.raw_metadata,
+                    );
+                    stamp_dataset_version_id(
+                        &mut funding,
+                        &dataset_versions,
+                        "hl_funding_payments",
                     );
                     all_hl_funding.extend(funding);
 
-                    let positions = crate::hyperliquid_parser::extract_hl_position_changes(
+                    let mut positions = crate::hyperliquid_parser::extract_hl_position_changes(
                         raw_tx_id,
                         network,
                         &tx.raw_metadata,
+                    );
+                    stamp_dataset_version_id(
+                        &mut positions,
+                        &dataset_versions,
+                        "hl_position_changes",
                     );
                     all_hl_positions.extend(positions);
                 }
@@ -464,6 +523,7 @@ impl Repository {
             return;
         }
 
+        // 4. Write Silver records to the database.
         if !all_token_transfers.is_empty() {
             if let Err(e) = self.save_token_transfers(&all_token_transfers).await {
                 warn!(
@@ -536,6 +596,227 @@ impl Repository {
             hl_positions = all_hl_positions.len(),
             "Silver dataset materialization complete"
         );
+
+        // 5. Update dataset completeness metadata.
+        //    Group by (chain, wallet_address) to resolve targets, then update
+        //    completeness for each (target, dataset, network) combination.
+        self.update_silver_completeness(txs, &dataset_versions, total)
+            .await;
+    }
+
+    /// Get or create dataset versions for each Silver dataset table.
+    /// Returns a map from dataset_name to the active DatasetVersion id.
+    async fn resolve_silver_dataset_versions(&self) -> HashMap<String, Uuid> {
+        let dataset_names = [
+            "token_transfers",
+            "native_balance_deltas",
+            "decoded_events",
+            "hl_fill_records",
+            "hl_funding_payments",
+            "hl_position_changes",
+        ];
+
+        let mut versions = HashMap::new();
+        for name in &dataset_names {
+            match self.get_active_dataset_version(name).await {
+                Ok(Some(dv)) => {
+                    versions.insert(name.to_string(), dv.id);
+                }
+                Ok(None) => {
+                    // Create initial version
+                    let dv = DatasetVersion {
+                        id: Uuid::new_v4(),
+                        dataset_name: name.to_string(),
+                        version: 1,
+                        parser_hash: None,
+                        created_at: Utc::now(),
+                        notes: Some("Auto-created during Silver materialization".to_string()),
+                        status: DatasetVersionStatus::Active,
+                    };
+                    match self.create_dataset_version(&dv).await {
+                        Ok(()) => {
+                            versions.insert(name.to_string(), dv.id);
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                dataset = %name,
+                                "Failed to create dataset version"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        dataset = %name,
+                        "Failed to look up dataset version"
+                    );
+                }
+            }
+        }
+        versions
+    }
+
+    /// Update dataset completeness for each (target, dataset, network) touched
+    /// by the materialization run.
+    async fn update_silver_completeness(
+        &self,
+        txs: &[Transaction],
+        dataset_versions: &HashMap<String, Uuid>,
+        total_records: usize,
+    ) {
+        // Group transactions by (network, wallet_address) to resolve targets.
+        let mut wallet_groups: HashMap<(String, String), Vec<&Transaction>> = HashMap::new();
+        for tx in txs {
+            let network = chain_to_default_network(&tx.chain).to_string();
+            wallet_groups
+                .entry((network, tx.wallet_address.clone()))
+                .or_default()
+                .push(tx);
+        }
+
+        for ((network, wallet_address), group_txs) in &wallet_groups {
+            let network = network.as_str();
+
+            // Look up the target for this wallet.
+            let target_id = match self
+                .get_index_target_by_address(TargetKind::Wallet, network, wallet_address)
+                .await
+            {
+                Ok(Some(target)) => target.id,
+                Ok(None) => {
+                    // No target exists for this wallet; skip completeness update.
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        wallet = %wallet_address,
+                        network = %network,
+                        "Failed to look up target for completeness update"
+                    );
+                    continue;
+                }
+            };
+
+            // Compute time coverage from the transactions in this group.
+            let coverage_start = group_txs.iter().map(|tx| tx.timestamp).min();
+            let coverage_end = group_txs.iter().map(|tx| tx.timestamp).max();
+            let block_start = group_txs
+                .iter()
+                .filter_map(|tx| extract_block_number(&tx.chain, &tx.raw_metadata))
+                .min();
+            let block_end = group_txs
+                .iter()
+                .filter_map(|tx| extract_block_number(&tx.chain, &tx.raw_metadata))
+                .max();
+
+            // Determine which datasets were populated for this network.
+            let dataset_names: Vec<&str> = match network {
+                "solana-mainnet" => {
+                    vec!["token_transfers", "native_balance_deltas", "decoded_events"]
+                }
+                "ethereum-mainnet" => vec!["token_transfers", "decoded_events"],
+                "hypercore-mainnet" => vec![
+                    "token_transfers",
+                    "native_balance_deltas",
+                    "hl_fill_records",
+                    "hl_funding_payments",
+                    "hl_position_changes",
+                ],
+                _ => vec!["token_transfers"],
+            };
+
+            let now = Utc::now();
+            for ds_name in dataset_names {
+                let dataset_version_id = dataset_versions.get(ds_name).copied();
+                let dc = DatasetCompleteness {
+                    id: Uuid::new_v4(),
+                    target_id,
+                    dataset_name: ds_name.to_string(),
+                    dataset_version_id,
+                    network: network.to_string(),
+                    status: CompletenessStatus::Partial,
+                    coverage_start,
+                    coverage_end,
+                    block_start,
+                    block_end,
+                    last_ingestion_run_id: None,
+                    records_count: total_records as i64,
+                    gap_ranges: None,
+                    notes: None,
+                    created_at: now,
+                    updated_at: now,
+                };
+                if let Err(e) = self.upsert_dataset_completeness(&dc).await {
+                    warn!(
+                        error = %e,
+                        target_id = %target_id,
+                        dataset = %ds_name,
+                        network = %network,
+                        "Failed to update dataset completeness"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for stamping dataset_version_id on Silver records
+// ---------------------------------------------------------------------------
+
+/// Trait for Silver records that have a `dataset_version_id` field.
+trait HasDatasetVersionId {
+    fn set_dataset_version_id(&mut self, id: Option<Uuid>);
+}
+
+impl HasDatasetVersionId for spectraplex_core::materializer::TokenTransfer {
+    fn set_dataset_version_id(&mut self, id: Option<Uuid>) {
+        self.dataset_version_id = id;
+    }
+}
+
+impl HasDatasetVersionId for spectraplex_core::materializer::NativeBalanceDelta {
+    fn set_dataset_version_id(&mut self, id: Option<Uuid>) {
+        self.dataset_version_id = id;
+    }
+}
+
+impl HasDatasetVersionId for spectraplex_core::materializer::DecodedEvent {
+    fn set_dataset_version_id(&mut self, id: Option<Uuid>) {
+        self.dataset_version_id = id;
+    }
+}
+
+impl HasDatasetVersionId for spectraplex_core::materializer::HlFillRecord {
+    fn set_dataset_version_id(&mut self, id: Option<Uuid>) {
+        self.dataset_version_id = id;
+    }
+}
+
+impl HasDatasetVersionId for spectraplex_core::materializer::HlFundingPayment {
+    fn set_dataset_version_id(&mut self, id: Option<Uuid>) {
+        self.dataset_version_id = id;
+    }
+}
+
+impl HasDatasetVersionId for spectraplex_core::materializer::HlPositionChange {
+    fn set_dataset_version_id(&mut self, id: Option<Uuid>) {
+        self.dataset_version_id = id;
+    }
+}
+
+fn stamp_dataset_version_id<T: HasDatasetVersionId>(
+    records: &mut [T],
+    versions: &HashMap<String, Uuid>,
+    dataset_name: &str,
+) {
+    if let Some(&version_id) = versions.get(dataset_name) {
+        for r in records.iter_mut() {
+            r.set_dataset_version_id(Some(version_id));
+        }
     }
 }
 
@@ -1024,5 +1305,113 @@ mod tests {
             chain_to_default_network(&Chain::Hyperliquid),
             "hypercore-mainnet"
         );
+    }
+
+    // -- stamp_dataset_version_id tests --
+
+    #[test]
+    fn stamp_dataset_version_id_sets_version_on_records() {
+        use bigdecimal::BigDecimal;
+        use spectraplex_core::materializer::TokenTransfer;
+
+        let version_id = Uuid::new_v4();
+        let mut versions = std::collections::HashMap::new();
+        versions.insert("token_transfers".to_string(), version_id);
+
+        let mut records = vec![TokenTransfer {
+            id: Uuid::new_v4(),
+            raw_transaction_id: None,
+            network: "solana-mainnet".to_string(),
+            token_address: "mint1".to_string(),
+            token_symbol: None,
+            from_address: "addr1".to_string(),
+            to_address: "addr2".to_string(),
+            amount: BigDecimal::from(100),
+            decimals: 9,
+            transfer_index: 0,
+            dataset_version_id: None,
+            created_at: Utc::now(),
+        }];
+
+        stamp_dataset_version_id(&mut records, &versions, "token_transfers");
+        assert_eq!(records[0].dataset_version_id, Some(version_id));
+    }
+
+    #[test]
+    fn stamp_dataset_version_id_noop_when_no_version() {
+        use bigdecimal::BigDecimal;
+        use spectraplex_core::materializer::TokenTransfer;
+
+        let versions = std::collections::HashMap::new();
+
+        let mut records = vec![TokenTransfer {
+            id: Uuid::new_v4(),
+            raw_transaction_id: None,
+            network: "solana-mainnet".to_string(),
+            token_address: "mint1".to_string(),
+            token_symbol: None,
+            from_address: "addr1".to_string(),
+            to_address: "addr2".to_string(),
+            amount: BigDecimal::from(100),
+            decimals: 9,
+            transfer_index: 0,
+            dataset_version_id: None,
+            created_at: Utc::now(),
+        }];
+
+        stamp_dataset_version_id(&mut records, &versions, "token_transfers");
+        assert_eq!(records[0].dataset_version_id, None);
+    }
+
+    // -- raw_tx_id resolution mapping test --
+
+    #[test]
+    fn raw_tx_id_lookup_pairs_are_unique() {
+        // Verify that the unique (network, tx_hash) pairs are correctly
+        // derived from transactions with potential duplicates.
+        let txs = [
+            Transaction {
+                id: Uuid::new_v4(),
+                user_id: Uuid::new_v4(),
+                wallet_address: "wallet1".to_string(),
+                timestamp: 1700000000,
+                tx_hash: "0xhash1".to_string(),
+                chain: Chain::Ethereum,
+                raw_metadata: serde_json::json!({"block_number": 18000000}),
+            },
+            Transaction {
+                id: Uuid::new_v4(),
+                user_id: Uuid::new_v4(),
+                wallet_address: "wallet2".to_string(),
+                timestamp: 1700000000,
+                tx_hash: "0xhash1".to_string(), // duplicate tx_hash
+                chain: Chain::Ethereum,
+                raw_metadata: serde_json::json!({"block_number": 18000000}),
+            },
+            Transaction {
+                id: Uuid::new_v4(),
+                user_id: Uuid::new_v4(),
+                wallet_address: "wallet1".to_string(),
+                timestamp: 1700000001,
+                tx_hash: "0xhash2".to_string(),
+                chain: Chain::Ethereum,
+                raw_metadata: serde_json::json!({"block_number": 18000001}),
+            },
+        ];
+
+        let pairs: std::collections::HashSet<(String, String)> = txs
+            .iter()
+            .map(|tx| {
+                (
+                    chain_to_default_network(&tx.chain).to_string(),
+                    tx.tx_hash.clone(),
+                )
+            })
+            .collect();
+
+        // 3 transactions but only 2 unique (network, tx_hash) pairs
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.contains(&("ethereum-mainnet".to_string(), "0xhash1".to_string())));
+        assert!(pairs.contains(&("ethereum-mainnet".to_string(), "0xhash2".to_string())));
     }
 }

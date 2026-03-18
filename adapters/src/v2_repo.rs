@@ -1453,6 +1453,40 @@ impl Repository {
         rows.iter().map(row_to_raw_transaction).collect()
     }
 
+    /// Batch-lookup canonical `raw_transactions.id` values by `(network, tx_hash)` pairs.
+    ///
+    /// Returns a map from `(network, tx_hash)` to the canonical UUID. Pairs that
+    /// have no matching row in `raw_transactions` are silently omitted from the
+    /// result. Processes in chunks of `V2_BATCH_SIZE` to stay within parameter limits.
+    pub async fn lookup_raw_transaction_ids(
+        &self,
+        pairs: &[(String, String)],
+    ) -> anyhow::Result<std::collections::HashMap<(String, String), Uuid>> {
+        use sqlx::Row;
+        let mut result = std::collections::HashMap::with_capacity(pairs.len());
+        for chunk in pairs.chunks(Self::V2_BATCH_SIZE) {
+            let networks: Vec<&str> = chunk.iter().map(|(n, _)| n.as_str()).collect();
+            let hashes: Vec<&str> = chunk.iter().map(|(_, h)| h.as_str()).collect();
+            let rows = sqlx::query(
+                "SELECT id, network, tx_hash \
+                 FROM raw_transactions \
+                 WHERE (network, tx_hash) IN \
+                   (SELECT unnest($1::text[]), unnest($2::text[]))",
+            )
+            .bind(&networks)
+            .bind(&hashes)
+            .fetch_all(self.pool())
+            .await?;
+            for row in &rows {
+                let id: Uuid = row.try_get("id")?;
+                let network: String = row.try_get("network")?;
+                let tx_hash: String = row.try_get("tx_hash")?;
+                result.insert((network, tx_hash), id);
+            }
+        }
+        Ok(result)
+    }
+
     // -----------------------------------------------------------------------
     // TargetMatches
     // -----------------------------------------------------------------------
