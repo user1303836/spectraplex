@@ -1429,16 +1429,16 @@ async fn trigger_normalize(
             let txs = state_clone.repo.get_transactions_by_wallet(&wallet).await?;
 
             let mut all_entries = Vec::new();
-            for tx in txs {
+            for tx in &txs {
                 let result = match tx.chain {
                     spectraplex_core::models::Chain::Solana => {
-                        solana_parser::parse_solana_transaction(&tx)
+                        solana_parser::parse_solana_transaction(tx)
                     }
                     spectraplex_core::models::Chain::Hyperliquid => {
-                        hyperliquid_parser::parse_hyperliquid_transaction(&tx)
+                        hyperliquid_parser::parse_hyperliquid_transaction(tx)
                     }
                     spectraplex_core::models::Chain::Ethereum => {
-                        evm_parser::parse_evm_transaction(&tx)
+                        evm_parser::parse_evm_transaction(tx)
                     }
                 };
                 match result {
@@ -1451,6 +1451,13 @@ async fn trigger_normalize(
 
             let count = all_entries.len();
             state_clone.repo.save_ledger_entries(&all_entries).await?;
+
+            // Materialize V2 Silver datasets (best-effort)
+            state_clone
+                .repo
+                .materialize_silver_datasets(&txs)
+                .await;
+
             Ok::<usize, anyhow::Error>(count)
         }
         .await;
