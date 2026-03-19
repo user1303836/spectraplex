@@ -158,6 +158,12 @@ async fn main() -> anyhow::Result<()> {
                 id
             });
 
+            // When writing to a file (no DB), truncate the output file once before
+            // processing wallets so a fresh run starts clean, then append per wallet.
+            if pool.is_none() {
+                File::create(&output)?;
+            }
+
             for wallet in &wallets {
                 info!(wallet = %wallet, chain = %chain, "Starting ingestion");
 
@@ -284,9 +290,12 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                 } else {
-                    let mut file = File::create(&output)?;
-                    for event in events {
-                        serde_json::to_writer(&file, &event)?;
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&output)?;
+                    for event in &events {
+                        serde_json::to_writer(&mut file, event)?;
                         writeln!(file)?;
                     }
                     info!(path = ?output, wallet = %wallet, "Data written to file");
@@ -955,5 +964,66 @@ mod tests {
             }
             _ => panic!("expected Ingest command"),
         }
+    }
+
+    #[test]
+    fn test_multi_wallet_file_output_appends() {
+        // Verify that writing multiple wallets' transactions to a file does
+        // not truncate earlier wallets' data. This is a regression test for
+        // the bug where File::create inside the wallet loop overwrote the
+        // output on each iteration.
+        use std::io::{BufRead, BufReader};
+
+        let dir = std::env::temp_dir().join(format!("sp_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output_path = dir.join("multi_wallet.jsonl");
+
+        // Simulate the file-output path: truncate once, then append per wallet.
+        File::create(&output_path).unwrap();
+
+        let wallets = vec!["wallet_a", "wallet_b", "wallet_c"];
+        for wallet in &wallets {
+            let txs = vec![make_tx(
+                Chain::Ethereum,
+                &format!("0x{wallet}"),
+                100,
+                json!({"wallet": wallet}),
+            )];
+
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&output_path)
+                .unwrap();
+            for tx in &txs {
+                serde_json::to_writer(&mut file, tx).unwrap();
+                writeln!(file).unwrap();
+            }
+        }
+
+        // Read back and verify all three wallets are present
+        let file = File::open(&output_path).unwrap();
+        let reader = BufReader::new(file);
+        let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
+
+        assert_eq!(
+            lines.len(),
+            3,
+            "output should contain one line per wallet, got {}",
+            lines.len()
+        );
+
+        for (i, wallet) in wallets.iter().enumerate() {
+            let parsed: serde_json::Value = serde_json::from_str(&lines[i]).unwrap();
+            assert_eq!(
+                parsed["tx_hash"].as_str().unwrap(),
+                format!("0x{wallet}"),
+                "line {} should contain tx from {}",
+                i,
+                wallet
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

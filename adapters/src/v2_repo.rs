@@ -283,6 +283,53 @@ pub fn build_raw_transaction_insert(
     Ok((query, args))
 }
 
+/// Build a batch INSERT for `raw_transactions` with ON CONFLICT DO UPDATE
+/// and RETURNING id, so we always get the canonical row ID back.
+pub fn build_raw_transaction_upsert_returning(
+    txs: &[RawTransaction],
+) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+    let mut query = String::from(
+        "INSERT INTO raw_transactions \
+         (id, network, tx_hash, timestamp, block_number, raw_metadata, source, ingestion_run_id, ingested_at) \
+         VALUES ",
+    );
+    let mut args = sqlx::postgres::PgArguments::default();
+    for (i, tx) in txs.iter().enumerate() {
+        let base = i * 9;
+        if i > 0 {
+            query.push_str(", ");
+        }
+        query.push_str(&format!(
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+            base + 7,
+            base + 8,
+            base + 9,
+        ));
+        use sqlx::Arguments;
+        args.add(tx.id).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&tx.network).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&tx.tx_hash).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(tx.timestamp).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(tx.block_number)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&tx.raw_metadata)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(&tx.source).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(tx.ingestion_run_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(tx.ingested_at)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    query.push_str(" ON CONFLICT (network, tx_hash) DO UPDATE SET updated_at = NOW() RETURNING id");
+    Ok((query, args))
+}
+
 /// Build a batch INSERT for `target_matches` with ON CONFLICT DO NOTHING.
 pub fn build_target_match_insert(
     matches: &[TargetMatch],
@@ -1419,6 +1466,32 @@ impl Repository {
             sqlx::query_with(&query, args).execute(self.pool()).await?;
         }
         Ok(())
+    }
+
+    /// Insert raw transactions and return the canonical database IDs.
+    ///
+    /// Uses `ON CONFLICT (network, tx_hash) DO UPDATE SET updated_at = NOW()`
+    /// so that the RETURNING clause always yields the canonical row ID, even
+    /// when the raw transaction already exists from a different target's
+    /// ingestion. This is critical for multi-target deduplication: the same
+    /// on-chain transaction is stored once, but multiple targets can reference
+    /// it via `target_matches`.
+    pub async fn upsert_raw_transactions_returning_ids(
+        &self,
+        txs: &[RawTransaction],
+    ) -> anyhow::Result<Vec<Uuid>> {
+        let mut all_ids = Vec::with_capacity(txs.len());
+        for chunk in txs.chunks(Self::V2_BATCH_SIZE) {
+            let (query, args) = build_raw_transaction_upsert_returning(chunk)?;
+            let rows = sqlx::query_with(&query, args)
+                .fetch_all(self.pool())
+                .await?;
+            for row in &rows {
+                let id: Uuid = row.try_get("id")?;
+                all_ids.push(id);
+            }
+        }
+        Ok(all_ids)
     }
 
     pub async fn get_raw_transaction_by_hash(
@@ -3083,6 +3156,32 @@ mod tests {
         // 5 rows * 9 params = 45 => highest param is $45
         assert!(query.contains("$45"));
         assert!(!query.contains("$46"));
+    }
+
+    // -- raw_transactions upsert returning --
+
+    #[test]
+    fn raw_tx_upsert_returning_single() {
+        let tx = make_raw_tx();
+        let (query, _) = build_raw_transaction_upsert_returning(&[tx]).unwrap();
+
+        assert!(query.starts_with("INSERT INTO raw_transactions"));
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9)"));
+        assert!(query.ends_with(
+            "ON CONFLICT (network, tx_hash) DO UPDATE SET updated_at = NOW() RETURNING id"
+        ));
+    }
+
+    #[test]
+    fn raw_tx_upsert_returning_multiple() {
+        let txs: Vec<_> = (0..3).map(|_| make_raw_tx()).collect();
+        let (query, _) = build_raw_transaction_upsert_returning(&txs).unwrap();
+
+        assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9)"));
+        assert!(query.contains("($10, $11, $12, $13, $14, $15, $16, $17, $18)"));
+        assert!(query.ends_with(
+            "ON CONFLICT (network, tx_hash) DO UPDATE SET updated_at = NOW() RETURNING id"
+        ));
     }
 
     // -- target_matches batch insert --

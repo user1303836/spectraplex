@@ -161,7 +161,7 @@ impl Repository {
             args.add(&tx.raw_metadata)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
-        query.push_str(" ON CONFLICT (chain, tx_hash) DO NOTHING");
+        query.push_str(" ON CONFLICT (chain, tx_hash, wallet_address) DO NOTHING");
         Ok((query, args))
     }
 
@@ -619,7 +619,7 @@ impl Repository {
             args.add(&tx.raw_metadata)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
-        query.push_str(" ON CONFLICT (chain, tx_hash) DO NOTHING");
+        query.push_str(" ON CONFLICT (chain, tx_hash, wallet_address) DO NOTHING");
         sqlx::query_with(&query, args).execute(executor).await?;
         Ok(())
     }
@@ -729,7 +729,7 @@ mod tests {
 
         assert!(query.starts_with("INSERT INTO transactions"));
         assert!(query.contains("($1, $2, $3, $4, $5, $6::chain_enum, $7)"));
-        assert!(query.ends_with("ON CONFLICT (chain, tx_hash) DO NOTHING"));
+        assert!(query.ends_with("ON CONFLICT (chain, tx_hash, wallet_address) DO NOTHING"));
     }
 
     #[test]
@@ -740,7 +740,7 @@ mod tests {
         assert!(query.contains("($1, $2, $3, $4, $5, $6::chain_enum, $7)"));
         assert!(query.contains("($8, $9, $10, $11, $12, $13::chain_enum, $14)"));
         assert!(query.contains("($15, $16, $17, $18, $19, $20::chain_enum, $21)"));
-        assert!(query.ends_with("ON CONFLICT (chain, tx_hash) DO NOTHING"));
+        assert!(query.ends_with("ON CONFLICT (chain, tx_hash, wallet_address) DO NOTHING"));
     }
 
     #[test]
@@ -867,5 +867,39 @@ mod tests {
         let cp = build_checkpoint("solana", "wallet", &txs).unwrap();
         // slot 10 - buffer 32 saturates to 0
         assert_eq!(cp.last_slot, Some(0));
+    }
+
+    #[test]
+    fn test_build_transaction_insert_multi_wallet_same_hash() {
+        // Two wallets share the same on-chain transaction. With the updated
+        // UNIQUE(chain, tx_hash, wallet_address) constraint, both rows can
+        // coexist in the same batch insert.
+        let shared_hash = "0xshared";
+        let tx_a = Transaction {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            wallet_address: "wallet_a".to_string(),
+            timestamp: 1700000000,
+            tx_hash: shared_hash.to_string(),
+            chain: Chain::Ethereum,
+            raw_metadata: serde_json::json!({}),
+        };
+        let tx_b = Transaction {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            wallet_address: "wallet_b".to_string(),
+            timestamp: 1700000000,
+            tx_hash: shared_hash.to_string(),
+            chain: Chain::Ethereum,
+            raw_metadata: serde_json::json!({}),
+        };
+
+        let (query, _args) = Repository::build_transaction_insert(&[tx_a, tx_b]).unwrap();
+
+        // Both rows should be present in the VALUES clause
+        assert!(query.contains("($1, $2, $3, $4, $5, $6::chain_enum, $7)"));
+        assert!(query.contains("($8, $9, $10, $11, $12, $13::chain_enum, $14)"));
+        // The constraint includes wallet_address so both can succeed
+        assert!(query.ends_with("ON CONFLICT (chain, tx_hash, wallet_address) DO NOTHING"));
     }
 }
