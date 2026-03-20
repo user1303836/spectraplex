@@ -48,6 +48,11 @@ pub struct ProviderConfig {
     /// Resolved at registry construction time.
     #[serde(default)]
     pub token_env: Option<String>,
+    /// Direct auth token value. Takes precedence over `token_env`.
+    /// Used during legacy config synthesis to pass through tokens that
+    /// were set in the TOML config rather than via environment variables.
+    #[serde(default)]
+    pub token: Option<String>,
     /// Optional extra HTTP headers for this provider.
     #[serde(default)]
     pub headers: Option<HashMap<String, String>>,
@@ -240,8 +245,10 @@ impl AppConfig {
     pub fn effective_provider_config(
         &self,
     ) -> (HashMap<String, NetworkConfig>, Vec<ProviderConfig>) {
-        // If the user supplied explicit provider config, use it as-is.
-        if !self.networks.is_empty() || !self.providers.is_empty() {
+        // If the user supplied both structured sections, use them as-is.
+        // Legacy synthesis only runs when BOTH are empty; having just one
+        // section present is not enough to suppress the defaults.
+        if !self.networks.is_empty() && !self.providers.is_empty() {
             return (self.networks.clone(), self.providers.clone());
         }
 
@@ -261,6 +268,7 @@ impl AppConfig {
             priority: Some(1),
             capabilities: vec!["historical".to_string(), "balances".to_string()],
             token_env: None,
+            token: None,
             headers: None,
         });
 
@@ -272,13 +280,11 @@ impl AppConfig {
                 url: grpc_url.clone(),
                 priority: Some(1),
                 capabilities: vec!["stream".to_string()],
-                // If solana_grpc_token is set directly, we pass it via the env
-                // var SOLANA_GRPC_TOKEN which the registry will resolve.
-                token_env: if self.solana_grpc_token.is_some() {
-                    Some("SOLANA_GRPC_TOKEN".to_string())
-                } else {
-                    None
-                },
+                // Also check the env var as a fallback for tokens not set in TOML.
+                token_env: Some("SOLANA_GRPC_TOKEN".to_string()),
+                // Pass the resolved TOML value directly so it is not lost when
+                // the raw env var is absent.
+                token: self.solana_grpc_token.clone(),
                 headers: None,
             });
         }
@@ -300,6 +306,7 @@ impl AppConfig {
                 "balances".to_string(),
             ],
             token_env: None,
+            token: None,
             headers: None,
         });
 
@@ -316,31 +323,36 @@ impl AppConfig {
                 priority: Some(2),
                 capabilities: vec!["debug_trace_transaction".to_string()],
                 token_env: None,
+                token: None,
                 headers: None,
             });
         }
 
         // Hyperliquid mainnet — always synthesized.
+        // The canonical network ID is "hypercore-mainnet" (matching the seeded
+        // `networks` table and all existing Hyperliquid codepaths).
         networks.insert(
-            "hyperliquid-mainnet".to_string(),
+            "hypercore-mainnet".to_string(),
             NetworkConfig { enabled: true },
         );
         providers.push(ProviderConfig {
-            network: "hyperliquid-mainnet".to_string(),
+            network: "hypercore-mainnet".to_string(),
             kind: "rest".to_string(),
             url: "https://api.hyperliquid.xyz".to_string(),
             priority: Some(1),
             capabilities: vec!["historical".to_string()],
             token_env: None,
+            token: None,
             headers: None,
         });
         providers.push(ProviderConfig {
-            network: "hyperliquid-mainnet".to_string(),
+            network: "hypercore-mainnet".to_string(),
             kind: "ws".to_string(),
             url: "wss://api.hyperliquid.xyz/ws".to_string(),
             priority: Some(1),
             capabilities: vec!["stream".to_string()],
             token_env: None,
+            token: None,
             headers: None,
         });
 
@@ -535,11 +547,11 @@ mod tests {
         let config = AppConfig::default();
         let (networks, providers) = config.effective_provider_config();
 
-        // Should synthesize solana-mainnet, ethereum-mainnet, hyperliquid-mainnet.
+        // Should synthesize solana-mainnet, ethereum-mainnet, hypercore-mainnet.
         assert_eq!(networks.len(), 3);
         assert!(networks.contains_key("solana-mainnet"));
         assert!(networks.contains_key("ethereum-mainnet"));
-        assert!(networks.contains_key("hyperliquid-mainnet"));
+        assert!(networks.contains_key("hypercore-mainnet"));
 
         // Solana RPC + Ethereum RPC + Hyperliquid REST + Hyperliquid WS = 4.
         assert_eq!(providers.len(), 4);
@@ -566,6 +578,9 @@ mod tests {
         assert!(sol_grpc.is_some());
         let grpc = sol_grpc.unwrap();
         assert_eq!(grpc.url, "https://grpc.example.com");
+        // The token should be passed through directly from the config value.
+        assert_eq!(grpc.token.as_deref(), Some("secret"));
+        // token_env is also set as a fallback.
         assert_eq!(grpc.token_env.as_deref(), Some("SOLANA_GRPC_TOKEN"));
     }
 
@@ -629,6 +644,7 @@ mod tests {
             priority: Some(1),
             capabilities: vec!["historical".to_string()],
             token_env: None,
+            token: None,
             headers: None,
         }];
 
@@ -647,13 +663,33 @@ mod tests {
     }
 
     #[test]
+    fn test_effective_config_partial_structured_still_synthesizes() {
+        // Only networks supplied, no providers. Legacy synthesis should
+        // still run because both sections must be non-empty to suppress it.
+        let mut networks = HashMap::new();
+        networks.insert("base-mainnet".to_string(), NetworkConfig { enabled: true });
+
+        let config = AppConfig {
+            networks,
+            ..AppConfig::default()
+        };
+        let (nets, provs) = config.effective_provider_config();
+
+        // Legacy synthesis should produce its default providers.
+        assert!(nets.contains_key("solana-mainnet"));
+        assert!(nets.contains_key("ethereum-mainnet"));
+        assert!(nets.contains_key("hypercore-mainnet"));
+        assert!(!provs.is_empty());
+    }
+
+    #[test]
     fn test_provider_registry_from_default_config() {
         let config = AppConfig::default();
         let registry = config.provider_registry().unwrap();
 
         let sol = NetworkId::new("solana-mainnet");
         let eth = NetworkId::new("ethereum-mainnet");
-        let hl = NetworkId::new("hyperliquid-mainnet");
+        let hl = NetworkId::new("hypercore-mainnet");
 
         assert!(registry.is_network_enabled(&sol));
         assert!(registry.is_network_enabled(&eth));
@@ -701,6 +737,7 @@ mod tests {
                     "receipts".to_string(),
                 ],
                 token_env: None,
+                token: None,
                 headers: None,
             },
             ProviderConfig {
@@ -714,6 +751,7 @@ mod tests {
                     "receipts".to_string(),
                 ],
                 token_env: None,
+                token: None,
                 headers: None,
             },
         ];

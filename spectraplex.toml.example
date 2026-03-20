@@ -37,7 +37,7 @@ solana_rpc_url = "https://api.mainnet-beta.solana.com"
 # [networks.arbitrum-mainnet]
 # enabled = true
 #
-# [networks.hyperliquid-mainnet]
+# [networks.hypercore-mainnet]
 # enabled = true
 
 # -- Solana providers --
@@ -94,14 +94,14 @@ solana_rpc_url = "https://api.mainnet-beta.solana.com"
 # -- Hyperliquid providers --
 
 # [[providers]]
-# network = "hyperliquid-mainnet"
+# network = "hypercore-mainnet"
 # kind = "rest"
 # url = "https://api.hyperliquid.xyz"
 # priority = 1
 # capabilities = ["historical"]
 
 # [[providers]]
-# network = "hyperliquid-mainnet"
+# network = "hypercore-mainnet"
 # kind = "ws"
 # url = "wss://api.hyperliquid.xyz/ws"
 # priority = 1

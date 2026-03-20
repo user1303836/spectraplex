@@ -23,7 +23,7 @@ use crate::config::{NetworkConfig, ProviderConfig};
 /// Typed newtype for network identifiers.
 ///
 /// Uses kebab-case slug format: `solana-mainnet`, `ethereum-mainnet`,
-/// `base-mainnet`, `arbitrum-mainnet`, `hyperliquid-mainnet`, etc.
+/// `base-mainnet`, `arbitrum-mainnet`, `hypercore-mainnet`, etc.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct NetworkId(String);
@@ -181,11 +181,13 @@ impl ProviderRegistry {
                 )));
             }
 
-            // Resolve the auth token from an env var if specified.
-            let token = match &pc.token_env {
-                Some(env_var) => std::env::var(env_var).ok(),
-                None => None,
-            };
+            // Resolve the auth token: direct `token` value takes precedence,
+            // then `token_env` is looked up from the environment, then None.
+            let token = pc.token.clone().or_else(|| {
+                pc.token_env
+                    .as_ref()
+                    .and_then(|env_var| std::env::var(env_var).ok())
+            });
 
             // Parse capabilities.
             let capabilities: Vec<ProviderCapability> = pc
@@ -354,6 +356,7 @@ mod tests {
                 priority: Some(1),
                 capabilities: vec!["historical".to_string(), "balances".to_string()],
                 token_env: None,
+                token: None,
                 headers: None,
             },
             ProviderConfig {
@@ -363,6 +366,7 @@ mod tests {
                 priority: Some(1),
                 capabilities: vec!["stream".to_string()],
                 token_env: Some("SOLANA_GRPC_TOKEN".to_string()),
+                token: None,
                 headers: None,
             },
             ProviderConfig {
@@ -377,6 +381,7 @@ mod tests {
                     "balances".to_string(),
                 ],
                 token_env: None,
+                token: None,
                 headers: None,
             },
             ProviderConfig {
@@ -386,6 +391,7 @@ mod tests {
                 priority: Some(2),
                 capabilities: vec!["debug_trace_transaction".to_string()],
                 token_env: None,
+                token: None,
                 headers: None,
             },
             // Provider for disabled network — should be filtered out.
@@ -396,6 +402,7 @@ mod tests {
                 priority: Some(1),
                 capabilities: vec!["historical".to_string()],
                 token_env: None,
+                token: None,
                 headers: None,
             },
         ]
@@ -455,6 +462,7 @@ mod tests {
                 priority: Some(10),
                 capabilities: vec!["historical".to_string()],
                 token_env: None,
+                token: None,
                 headers: None,
             },
             ProviderConfig {
@@ -464,6 +472,7 @@ mod tests {
                 priority: Some(1),
                 capabilities: vec!["historical".to_string()],
                 token_env: None,
+                token: None,
                 headers: None,
             },
         ];
@@ -509,6 +518,7 @@ mod tests {
             priority: Some(1),
             capabilities: vec!["historical".to_string()],
             token_env: None,
+            token: None,
             headers: None,
         }];
 
@@ -530,6 +540,7 @@ mod tests {
             priority: Some(1),
             capabilities: vec![],
             token_env: None,
+            token: None,
             headers: None,
         }];
 
@@ -551,6 +562,7 @@ mod tests {
             priority: Some(1),
             capabilities: vec!["time_travel".to_string()],
             token_env: None,
+            token: None,
             headers: None,
         }];
 
@@ -572,6 +584,7 @@ mod tests {
             priority: Some(1),
             capabilities: vec!["historical".to_string()],
             token_env: None,
+            token: None,
             headers: None,
         }];
 
@@ -593,6 +606,7 @@ mod tests {
             priority: None,
             capabilities: vec!["historical".to_string()],
             token_env: None,
+            token: None,
             headers: None,
         }];
 
@@ -618,6 +632,7 @@ mod tests {
             priority: Some(1),
             capabilities: vec!["stream".to_string()],
             token_env: Some("TEST_GRPC_TOKEN_XYZ".to_string()),
+            token: None,
             headers: None,
         }];
 
@@ -627,6 +642,34 @@ mod tests {
         assert_eq!(p.token.as_deref(), Some("my-secret-token"));
 
         std::env::remove_var("TEST_GRPC_TOKEN_XYZ");
+    }
+
+    #[test]
+    fn registry_direct_token_takes_precedence_over_env() {
+        // Set an env var, but also provide a direct token value.
+        // The direct value should win.
+        std::env::set_var("TEST_GRPC_TOKEN_PRECEDENCE", "env-value");
+
+        let mut networks = HashMap::new();
+        networks.insert("test".to_string(), NetworkConfig { enabled: true });
+
+        let providers = vec![ProviderConfig {
+            network: "test".to_string(),
+            kind: "grpc".to_string(),
+            url: "https://grpc.test".to_string(),
+            priority: Some(1),
+            capabilities: vec!["stream".to_string()],
+            token_env: Some("TEST_GRPC_TOKEN_PRECEDENCE".to_string()),
+            token: Some("direct-value".to_string()),
+            headers: None,
+        }];
+
+        let registry = ProviderRegistry::from_config(&networks, &providers).unwrap();
+        let net = NetworkId::new("test");
+        let p = registry.resolve(&net, ProviderCapability::Stream).unwrap();
+        assert_eq!(p.token.as_deref(), Some("direct-value"));
+
+        std::env::remove_var("TEST_GRPC_TOKEN_PRECEDENCE");
     }
 
     #[test]
@@ -644,6 +687,7 @@ mod tests {
             priority: Some(1),
             capabilities: vec!["stream".to_string()],
             token_env: Some("DEFINITELY_NOT_SET_TOKEN_ABC123".to_string()),
+            token: None,
             headers: None,
         }];
 
@@ -727,6 +771,7 @@ mod tests {
             priority: Some(1),
             capabilities: vec!["historical".to_string()],
             token_env: None,
+            token: None,
             headers: Some(hdrs),
         }];
 
