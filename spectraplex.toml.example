@@ -4,11 +4,105 @@ database_url = "postgres://spectraplex:spectraplex@localhost:5432/spectraplex"
 pool_size = 10
 log_level = "info"
 ingest_limit = 50
-solana_rpc_url = "https://api.mainnet-beta.solana.com"
 export_dir = "./exports"
 
-# EVM trace API support (requires debug namespace on the RPC node).
-# Most public RPC endpoints do NOT support this. Use a paid provider
-# (Alchemy, Infura with Trace add-on) or a self-hosted archive node.
+# ---------------------------------------------------------------------------
+# Legacy singleton fields (DEPRECATED — prefer structured provider config)
+# ---------------------------------------------------------------------------
+# These fields still work for backward compatibility. If `[networks.*]` and
+# `[[providers]]` sections are present, the legacy fields are ignored.
+
+solana_rpc_url = "https://api.mainnet-beta.solana.com"
+# evm_rpc_url = "https://eth.llamarpc.com"
+# solana_grpc_url = "https://your-yellowstone-endpoint"
+# solana_grpc_token = "..."
 # evm_trace_enabled = false
 # evm_trace_rpc_url = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
+
+# ---------------------------------------------------------------------------
+# Structured network and provider configuration (V2, recommended)
+# ---------------------------------------------------------------------------
+# Enable the networks you want to index. Each network needs at least one
+# provider entry with the capabilities your workload requires.
+
+# [networks.solana-mainnet]
+# enabled = true
+#
+# [networks.ethereum-mainnet]
+# enabled = true
+#
+# [networks.base-mainnet]
+# enabled = true
+#
+# [networks.arbitrum-mainnet]
+# enabled = true
+#
+# [networks.hyperliquid-mainnet]
+# enabled = true
+
+# -- Solana providers --
+
+# [[providers]]
+# network = "solana-mainnet"
+# kind = "rpc"
+# url = "https://api.mainnet-beta.solana.com"
+# priority = 1
+# capabilities = ["historical", "balances"]
+
+# [[providers]]
+# network = "solana-mainnet"
+# kind = "grpc"
+# url = "https://your-yellowstone-endpoint"
+# token_env = "SOLANA_GRPC_TOKEN"
+# priority = 1
+# capabilities = ["stream"]
+
+# -- Ethereum providers --
+
+# [[providers]]
+# network = "ethereum-mainnet"
+# kind = "rpc"
+# url = "https://eth.llamarpc.com"
+# priority = 1
+# capabilities = ["historical", "logs", "receipts", "balances"]
+
+# [[providers]]
+# network = "ethereum-mainnet"
+# kind = "trace"
+# url = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
+# priority = 2
+# capabilities = ["debug_trace_transaction"]
+
+# -- Base providers --
+
+# [[providers]]
+# network = "base-mainnet"
+# kind = "rpc"
+# url = "https://mainnet.base.org"
+# priority = 1
+# capabilities = ["historical", "logs", "receipts", "balances"]
+
+# -- Arbitrum providers --
+
+# [[providers]]
+# network = "arbitrum-mainnet"
+# kind = "rpc"
+# url = "https://arb1.arbitrum.io/rpc"
+# priority = 1
+# capabilities = ["historical", "logs", "receipts", "balances"]
+
+# -- Hyperliquid providers --
+
+# [[providers]]
+# network = "hyperliquid-mainnet"
+# kind = "rest"
+# url = "https://api.hyperliquid.xyz"
+# priority = 1
+# capabilities = ["historical"]
+
+# [[providers]]
+# network = "hyperliquid-mainnet"
+# kind = "ws"
+# url = "wss://api.hyperliquid.xyz/ws"
+# priority = 1
+# capabilities = ["stream"]
