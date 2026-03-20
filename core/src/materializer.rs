@@ -57,7 +57,11 @@ pub enum DatasetName {
 }
 
 impl DatasetName {
-    /// Returns the SQL-compatible string for this dataset name.
+    /// Returns the canonical public name as a SQL-compatible string.
+    ///
+    /// This is the name used in API routes, dataset versions, completeness
+    /// tracking, and export metadata. It matches the `Display`/`FromStr`
+    /// serialization of the enum.
     pub fn as_sql_str(&self) -> &'static str {
         match self {
             DatasetName::LedgerEntries => "ledger_entries",
@@ -73,6 +77,97 @@ impl DatasetName {
             DatasetName::HlTradeHistory => "hl_trade_history",
             DatasetName::ProtocolEvents => "protocol_events",
             DatasetName::PoolSnapshots => "pool_snapshots",
+        }
+    }
+
+    /// Returns the physical PostgreSQL table name for this dataset.
+    ///
+    /// Most datasets share their canonical and physical names. The three
+    /// Hyperliquid Silver datasets have different physical table names:
+    ///
+    /// | Canonical          | Physical               |
+    /// |--------------------|------------------------|
+    /// | `hl_fills`         | `hl_fill_records`      |
+    /// | `hl_funding`       | `hl_funding_payments`  |
+    /// | `positions`        | `hl_position_changes`  |
+    pub fn physical_table(&self) -> &'static str {
+        match self {
+            DatasetName::LedgerEntries => "ledger_entries",
+            DatasetName::TokenTransfers => "token_transfers",
+            DatasetName::NativeBalanceDeltas => "native_balance_deltas",
+            DatasetName::DecodedEvents => "decoded_events",
+            DatasetName::HlFills => "hl_fill_records",
+            DatasetName::HlFunding => "hl_funding_payments",
+            DatasetName::Positions => "hl_position_changes",
+            DatasetName::WalletLedger => "wallet_ledger",
+            DatasetName::BalanceHistory => "balance_history",
+            DatasetName::HlPnlSummary => "hl_pnl_summary",
+            DatasetName::HlTradeHistory => "hl_trade_history",
+            DatasetName::ProtocolEvents => "protocol_events",
+            DatasetName::PoolSnapshots => "pool_snapshots",
+        }
+    }
+
+    /// Resolve a `DatasetName` from a physical table name.
+    ///
+    /// Returns `None` if the table name does not correspond to any known
+    /// dataset.  This is the reverse of [`physical_table`](Self::physical_table).
+    pub fn from_physical_table(table: &str) -> Option<DatasetName> {
+        // Check physical names that differ from canonical names first.
+        match table {
+            "hl_fill_records" => return Some(DatasetName::HlFills),
+            "hl_funding_payments" => return Some(DatasetName::HlFunding),
+            "hl_position_changes" => return Some(DatasetName::Positions),
+            _ => {}
+        }
+        // For all others, canonical name == physical table name, so FromStr works.
+        table.parse::<DatasetName>().ok()
+    }
+
+    /// Returns the dataset tier (Bronze, Silver, or Gold).
+    pub fn tier(&self) -> DatasetTier {
+        match self {
+            DatasetName::LedgerEntries
+            | DatasetName::TokenTransfers
+            | DatasetName::NativeBalanceDeltas
+            | DatasetName::DecodedEvents
+            | DatasetName::HlFills
+            | DatasetName::HlFunding
+            | DatasetName::Positions => DatasetTier::Silver,
+
+            DatasetName::WalletLedger
+            | DatasetName::BalanceHistory
+            | DatasetName::HlPnlSummary
+            | DatasetName::HlTradeHistory
+            | DatasetName::ProtocolEvents
+            | DatasetName::PoolSnapshots => DatasetTier::Gold,
+        }
+    }
+
+    /// Returns the chain families that can produce this dataset.
+    pub fn chain_families(&self) -> &'static [ChainFamily] {
+        match self {
+            DatasetName::TokenTransfers | DatasetName::NativeBalanceDeltas => &[
+                ChainFamily::Solana,
+                ChainFamily::Evm,
+                ChainFamily::Hyperliquid,
+            ],
+            DatasetName::DecodedEvents => &[ChainFamily::Solana, ChainFamily::Evm],
+            DatasetName::LedgerEntries => &[
+                ChainFamily::Solana,
+                ChainFamily::Evm,
+                ChainFamily::Hyperliquid,
+            ],
+            DatasetName::HlFills | DatasetName::HlFunding | DatasetName::Positions => {
+                &[ChainFamily::Hyperliquid]
+            }
+            DatasetName::WalletLedger | DatasetName::BalanceHistory => &[
+                ChainFamily::Solana,
+                ChainFamily::Evm,
+                ChainFamily::Hyperliquid,
+            ],
+            DatasetName::HlPnlSummary | DatasetName::HlTradeHistory => &[ChainFamily::Hyperliquid],
+            DatasetName::ProtocolEvents | DatasetName::PoolSnapshots => &[ChainFamily::Evm],
         }
     }
 
@@ -93,6 +188,170 @@ impl DatasetName {
             DatasetName::ProtocolEvents,
             DatasetName::PoolSnapshots,
         ]
+    }
+
+    /// Returns all Silver-tier dataset names.
+    pub fn silver() -> &'static [DatasetName] {
+        &[
+            DatasetName::LedgerEntries,
+            DatasetName::TokenTransfers,
+            DatasetName::NativeBalanceDeltas,
+            DatasetName::DecodedEvents,
+            DatasetName::HlFills,
+            DatasetName::HlFunding,
+            DatasetName::Positions,
+        ]
+    }
+
+    /// Returns all Gold-tier dataset names.
+    pub fn gold() -> &'static [DatasetName] {
+        &[
+            DatasetName::WalletLedger,
+            DatasetName::BalanceHistory,
+            DatasetName::HlPnlSummary,
+            DatasetName::HlTradeHistory,
+            DatasetName::ProtocolEvents,
+            DatasetName::PoolSnapshots,
+        ]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dataset Tier
+// ---------------------------------------------------------------------------
+
+/// Classification tier for datasets in the Bronze-Silver-Gold model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum DatasetTier {
+    /// Raw canonical chain data.
+    Bronze,
+    /// Normalized records derived from Bronze.
+    Silver,
+    /// Derived/aggregated datasets for specific use cases.
+    Gold,
+}
+
+// ---------------------------------------------------------------------------
+// Dataset Registry
+// ---------------------------------------------------------------------------
+
+/// Central dataset registry providing canonical name resolution and metadata.
+///
+/// The registry is the single source of truth for mapping between:
+/// - canonical public dataset names (used in APIs, versions, completeness)
+/// - physical PostgreSQL table names (used in SQL queries)
+/// - dataset tier classification
+/// - chain family support
+/// - query/export capability
+///
+/// All dataset metadata lookups should go through this registry instead of
+/// using hardcoded string literals.
+pub struct DatasetRegistry;
+
+impl DatasetRegistry {
+    /// Resolve a canonical dataset name from a string that could be either
+    /// a canonical name or a physical table name.
+    ///
+    /// Tries canonical name parsing first, then falls back to physical table
+    /// name lookup. Returns `None` if neither matches.
+    pub fn resolve(name: &str) -> Option<DatasetName> {
+        name.parse::<DatasetName>()
+            .ok()
+            .or_else(|| DatasetName::from_physical_table(name))
+    }
+
+    /// Returns all datasets that are queryable via the dataset records endpoint.
+    ///
+    /// Excludes `LedgerEntries` which is served through the legacy
+    /// `/v1/ledger/:wallet` endpoint.
+    pub fn queryable() -> &'static [DatasetName] {
+        &[
+            DatasetName::TokenTransfers,
+            DatasetName::NativeBalanceDeltas,
+            DatasetName::DecodedEvents,
+            DatasetName::HlFills,
+            DatasetName::HlFunding,
+            DatasetName::Positions,
+            DatasetName::WalletLedger,
+            DatasetName::BalanceHistory,
+            DatasetName::HlPnlSummary,
+            DatasetName::HlTradeHistory,
+            DatasetName::ProtocolEvents,
+            DatasetName::PoolSnapshots,
+        ]
+    }
+
+    /// Returns all datasets that support export.
+    ///
+    /// Excludes `LedgerEntries` which is served through the legacy
+    /// `/v1/export/:wallet` endpoint.
+    pub fn exportable() -> &'static [DatasetName] {
+        &[
+            DatasetName::TokenTransfers,
+            DatasetName::NativeBalanceDeltas,
+            DatasetName::DecodedEvents,
+            DatasetName::HlFills,
+            DatasetName::HlFunding,
+            DatasetName::Positions,
+            DatasetName::WalletLedger,
+            DatasetName::BalanceHistory,
+            DatasetName::HlPnlSummary,
+            DatasetName::HlTradeHistory,
+            DatasetName::ProtocolEvents,
+            DatasetName::PoolSnapshots,
+        ]
+    }
+
+    /// Returns the Silver datasets that should be materialized for a given
+    /// network identifier.
+    ///
+    /// This replaces the scattered per-network string literal lists in
+    /// dual_write.rs.
+    pub fn silver_datasets_for_network(network: &str) -> Vec<DatasetName> {
+        match network {
+            "solana-mainnet" => vec![
+                DatasetName::TokenTransfers,
+                DatasetName::NativeBalanceDeltas,
+                DatasetName::DecodedEvents,
+            ],
+            "ethereum-mainnet" => vec![DatasetName::TokenTransfers, DatasetName::DecodedEvents],
+            "hypercore-mainnet" => vec![
+                DatasetName::TokenTransfers,
+                DatasetName::NativeBalanceDeltas,
+                DatasetName::HlFills,
+                DatasetName::HlFunding,
+                DatasetName::Positions,
+            ],
+            _ => vec![DatasetName::TokenTransfers],
+        }
+    }
+
+    /// Returns the Silver datasets that need version tracking during
+    /// materialization.
+    ///
+    /// These are the datasets whose versions are resolved and stamped
+    /// during the dual-write Silver materialization path.
+    pub fn silver_materializable() -> &'static [DatasetName] {
+        &[
+            DatasetName::TokenTransfers,
+            DatasetName::NativeBalanceDeltas,
+            DatasetName::DecodedEvents,
+            DatasetName::HlFills,
+            DatasetName::HlFunding,
+            DatasetName::Positions,
+        ]
+    }
+
+    /// Check whether a canonical name string is a known queryable dataset.
+    pub fn is_queryable(name: &str) -> bool {
+        Self::queryable().iter().any(|ds| ds.as_sql_str() == name)
+    }
+
+    /// Check whether a canonical name string is a known exportable dataset.
+    pub fn is_exportable(name: &str) -> bool {
+        Self::exportable().iter().any(|ds| ds.as_sql_str() == name)
     }
 }
 
@@ -2026,5 +2285,302 @@ mod tests {
         assert_eq!(back.pools.len(), 1);
         assert_eq!(back.protocols.len(), 1);
         assert_eq!(back.total_tvl, Some(BigDecimal::from(4000000)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Dataset Registry tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn physical_table_mapping() {
+        // Datasets where canonical != physical
+        assert_eq!(DatasetName::HlFills.physical_table(), "hl_fill_records");
+        assert_eq!(
+            DatasetName::HlFunding.physical_table(),
+            "hl_funding_payments"
+        );
+        assert_eq!(
+            DatasetName::Positions.physical_table(),
+            "hl_position_changes"
+        );
+
+        // Datasets where canonical == physical
+        assert_eq!(
+            DatasetName::TokenTransfers.physical_table(),
+            "token_transfers"
+        );
+        assert_eq!(
+            DatasetName::NativeBalanceDeltas.physical_table(),
+            "native_balance_deltas"
+        );
+        assert_eq!(
+            DatasetName::DecodedEvents.physical_table(),
+            "decoded_events"
+        );
+        assert_eq!(
+            DatasetName::LedgerEntries.physical_table(),
+            "ledger_entries"
+        );
+        assert_eq!(DatasetName::WalletLedger.physical_table(), "wallet_ledger");
+        assert_eq!(
+            DatasetName::BalanceHistory.physical_table(),
+            "balance_history"
+        );
+        assert_eq!(DatasetName::HlPnlSummary.physical_table(), "hl_pnl_summary");
+        assert_eq!(
+            DatasetName::HlTradeHistory.physical_table(),
+            "hl_trade_history"
+        );
+        assert_eq!(
+            DatasetName::ProtocolEvents.physical_table(),
+            "protocol_events"
+        );
+        assert_eq!(
+            DatasetName::PoolSnapshots.physical_table(),
+            "pool_snapshots"
+        );
+    }
+
+    #[test]
+    fn from_physical_table_roundtrip() {
+        // Every dataset can be recovered from its physical table name.
+        for ds in DatasetName::all() {
+            let recovered = DatasetName::from_physical_table(ds.physical_table());
+            assert_eq!(
+                recovered,
+                Some(*ds),
+                "from_physical_table({}) should return {:?}",
+                ds.physical_table(),
+                ds
+            );
+        }
+    }
+
+    #[test]
+    fn from_physical_table_unknown_returns_none() {
+        assert_eq!(DatasetName::from_physical_table("nonexistent_table"), None);
+        assert_eq!(DatasetName::from_physical_table(""), None);
+    }
+
+    #[test]
+    fn from_physical_table_canonical_names_also_work() {
+        // Canonical names should also resolve (they are the same as physical
+        // for most datasets, and for the three HL datasets they are the
+        // canonical form which FromStr handles).
+        assert_eq!(
+            DatasetName::from_physical_table("token_transfers"),
+            Some(DatasetName::TokenTransfers)
+        );
+        assert_eq!(
+            DatasetName::from_physical_table("wallet_ledger"),
+            Some(DatasetName::WalletLedger)
+        );
+    }
+
+    #[test]
+    fn tier_classification() {
+        // Silver datasets
+        assert_eq!(DatasetName::LedgerEntries.tier(), DatasetTier::Silver);
+        assert_eq!(DatasetName::TokenTransfers.tier(), DatasetTier::Silver);
+        assert_eq!(DatasetName::NativeBalanceDeltas.tier(), DatasetTier::Silver);
+        assert_eq!(DatasetName::DecodedEvents.tier(), DatasetTier::Silver);
+        assert_eq!(DatasetName::HlFills.tier(), DatasetTier::Silver);
+        assert_eq!(DatasetName::HlFunding.tier(), DatasetTier::Silver);
+        assert_eq!(DatasetName::Positions.tier(), DatasetTier::Silver);
+
+        // Gold datasets
+        assert_eq!(DatasetName::WalletLedger.tier(), DatasetTier::Gold);
+        assert_eq!(DatasetName::BalanceHistory.tier(), DatasetTier::Gold);
+        assert_eq!(DatasetName::HlPnlSummary.tier(), DatasetTier::Gold);
+        assert_eq!(DatasetName::HlTradeHistory.tier(), DatasetTier::Gold);
+        assert_eq!(DatasetName::ProtocolEvents.tier(), DatasetTier::Gold);
+        assert_eq!(DatasetName::PoolSnapshots.tier(), DatasetTier::Gold);
+    }
+
+    #[test]
+    fn silver_gold_partitions_cover_all_datasets() {
+        let mut all_partitioned: Vec<DatasetName> = Vec::new();
+        all_partitioned.extend_from_slice(DatasetName::silver());
+        all_partitioned.extend_from_slice(DatasetName::gold());
+        all_partitioned.sort_by_key(|d| d.as_sql_str());
+
+        let mut all_datasets: Vec<DatasetName> = DatasetName::all().to_vec();
+        all_datasets.sort_by_key(|d| d.as_sql_str());
+
+        assert_eq!(
+            all_partitioned, all_datasets,
+            "silver() + gold() must cover all datasets exactly once"
+        );
+    }
+
+    #[test]
+    fn tier_matches_partition() {
+        for ds in DatasetName::silver() {
+            assert_eq!(
+                ds.tier(),
+                DatasetTier::Silver,
+                "{ds:?} is in silver() but tier() returns {:?}",
+                ds.tier()
+            );
+        }
+        for ds in DatasetName::gold() {
+            assert_eq!(
+                ds.tier(),
+                DatasetTier::Gold,
+                "{ds:?} is in gold() but tier() returns {:?}",
+                ds.tier()
+            );
+        }
+    }
+
+    #[test]
+    fn chain_families_non_empty() {
+        for ds in DatasetName::all() {
+            assert!(
+                !ds.chain_families().is_empty(),
+                "{ds:?} must support at least one chain family"
+            );
+        }
+    }
+
+    #[test]
+    fn hl_datasets_support_hyperliquid() {
+        for ds in &[
+            DatasetName::HlFills,
+            DatasetName::HlFunding,
+            DatasetName::Positions,
+            DatasetName::HlPnlSummary,
+            DatasetName::HlTradeHistory,
+        ] {
+            assert!(
+                ds.chain_families().contains(&ChainFamily::Hyperliquid),
+                "{ds:?} should support Hyperliquid"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_resolve_canonical_names() {
+        for ds in DatasetName::all() {
+            let resolved = DatasetRegistry::resolve(ds.as_sql_str());
+            assert_eq!(
+                resolved,
+                Some(*ds),
+                "resolve({}) should return {:?}",
+                ds.as_sql_str(),
+                ds
+            );
+        }
+    }
+
+    #[test]
+    fn registry_resolve_physical_names() {
+        // Physical names that differ from canonical should still resolve.
+        assert_eq!(
+            DatasetRegistry::resolve("hl_fill_records"),
+            Some(DatasetName::HlFills)
+        );
+        assert_eq!(
+            DatasetRegistry::resolve("hl_funding_payments"),
+            Some(DatasetName::HlFunding)
+        );
+        assert_eq!(
+            DatasetRegistry::resolve("hl_position_changes"),
+            Some(DatasetName::Positions)
+        );
+    }
+
+    #[test]
+    fn registry_resolve_unknown_returns_none() {
+        assert_eq!(DatasetRegistry::resolve("unknown"), None);
+        assert_eq!(DatasetRegistry::resolve(""), None);
+    }
+
+    #[test]
+    fn registry_queryable_contains_all_non_legacy_datasets() {
+        let queryable = DatasetRegistry::queryable();
+        // All 12 non-legacy datasets should be queryable.
+        assert_eq!(queryable.len(), 12);
+        // LedgerEntries should not be in the queryable list.
+        assert!(
+            !queryable.contains(&DatasetName::LedgerEntries),
+            "LedgerEntries served via legacy endpoint, not dataset query"
+        );
+    }
+
+    #[test]
+    fn registry_exportable_contains_all_non_legacy_datasets() {
+        let exportable = DatasetRegistry::exportable();
+        assert_eq!(exportable.len(), 12);
+        assert!(
+            !exportable.contains(&DatasetName::LedgerEntries),
+            "LedgerEntries served via legacy endpoint, not dataset export"
+        );
+    }
+
+    #[test]
+    fn registry_is_queryable() {
+        assert!(DatasetRegistry::is_queryable("token_transfers"));
+        assert!(DatasetRegistry::is_queryable("hl_fills"));
+        assert!(DatasetRegistry::is_queryable("wallet_ledger"));
+        assert!(!DatasetRegistry::is_queryable("ledger_entries"));
+        assert!(!DatasetRegistry::is_queryable("nonexistent"));
+    }
+
+    #[test]
+    fn registry_is_exportable() {
+        assert!(DatasetRegistry::is_exportable("token_transfers"));
+        assert!(DatasetRegistry::is_exportable("pool_snapshots"));
+        assert!(!DatasetRegistry::is_exportable("ledger_entries"));
+        assert!(!DatasetRegistry::is_exportable("nonexistent"));
+    }
+
+    #[test]
+    fn registry_silver_datasets_for_network() {
+        let solana = DatasetRegistry::silver_datasets_for_network("solana-mainnet");
+        assert_eq!(solana.len(), 3);
+        assert!(solana.contains(&DatasetName::TokenTransfers));
+        assert!(solana.contains(&DatasetName::NativeBalanceDeltas));
+        assert!(solana.contains(&DatasetName::DecodedEvents));
+
+        let eth = DatasetRegistry::silver_datasets_for_network("ethereum-mainnet");
+        assert_eq!(eth.len(), 2);
+        assert!(eth.contains(&DatasetName::TokenTransfers));
+        assert!(eth.contains(&DatasetName::DecodedEvents));
+
+        let hl = DatasetRegistry::silver_datasets_for_network("hypercore-mainnet");
+        assert_eq!(hl.len(), 5);
+        assert!(hl.contains(&DatasetName::HlFills));
+        assert!(hl.contains(&DatasetName::HlFunding));
+        assert!(hl.contains(&DatasetName::Positions));
+
+        let unknown = DatasetRegistry::silver_datasets_for_network("unknown-network");
+        assert_eq!(unknown.len(), 1);
+        assert!(unknown.contains(&DatasetName::TokenTransfers));
+    }
+
+    #[test]
+    fn registry_silver_materializable() {
+        let mat = DatasetRegistry::silver_materializable();
+        assert_eq!(mat.len(), 6);
+        // Should not include LedgerEntries (legacy Silver) or any Gold datasets.
+        assert!(!mat.contains(&DatasetName::LedgerEntries));
+        assert!(!mat.contains(&DatasetName::WalletLedger));
+    }
+
+    #[test]
+    fn dataset_tier_serde_roundtrip() {
+        for tier in &[DatasetTier::Bronze, DatasetTier::Silver, DatasetTier::Gold] {
+            let json = serde_json::to_string(tier).unwrap();
+            let back: DatasetTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, tier);
+        }
+    }
+
+    #[test]
+    fn dataset_tier_display() {
+        assert_eq!(DatasetTier::Bronze.to_string(), "bronze");
+        assert_eq!(DatasetTier::Silver.to_string(), "silver");
+        assert_eq!(DatasetTier::Gold.to_string(), "gold");
     }
 }

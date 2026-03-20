@@ -5,9 +5,9 @@
 
 use chrono::{DateTime, Utc};
 use spectraplex_core::materializer::{
-    BalanceSnapshot, DecodedEvent, HlFillRecord, HlFundingPayment, HlPnlSummary, HlPositionChange,
-    HlTradeHistory, NativeBalanceDelta, PoolSnapshot, ProtocolEvent, TokenTransfer,
-    WalletLedgerRecord,
+    BalanceSnapshot, DatasetName, DecodedEvent, HlFillRecord, HlFundingPayment, HlPnlSummary,
+    HlPositionChange, HlTradeHistory, NativeBalanceDelta, PoolSnapshot, ProtocolEvent,
+    TokenTransfer, WalletLedgerRecord,
 };
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
@@ -2291,7 +2291,7 @@ impl Repository {
                     dt.from_address, dt.to_address, dt.amount, dt.decimals, dt.transfer_index, dt.dataset_version_id, dt.created_at";
         let (sql, args) = build_dataset_filter_query(
             cols,
-            "token_transfers",
+            DatasetName::TokenTransfers.physical_table(),
             "dt.created_at",
             target_id,
             network,
@@ -2319,7 +2319,7 @@ impl Repository {
                     dt.pre_balance, dt.post_balance, dt.delta, dt.is_fee_payer, dt.dataset_version_id, dt.created_at";
         let (sql, args) = build_dataset_filter_query(
             cols,
-            "native_balance_deltas",
+            DatasetName::NativeBalanceDeltas.physical_table(),
             "dt.created_at",
             target_id,
             network,
@@ -2347,7 +2347,7 @@ impl Repository {
                     dt.event_name, dt.log_index, dt.decoded_fields, dt.raw_fields, dt.dataset_version_id, dt.created_at";
         let (sql, args) = build_dataset_filter_query(
             cols,
-            "decoded_events",
+            DatasetName::DecodedEvents.physical_table(),
             "dt.created_at",
             target_id,
             network,
@@ -2375,7 +2375,7 @@ impl Repository {
                     dt.closed_pnl, dt.fee, dt.fee_token, dt.fill_time, dt.order_id, dt.trade_id, dt.dataset_version_id, dt.created_at";
         let (sql, args) = build_dataset_filter_query(
             cols,
-            "hl_fill_records",
+            DatasetName::HlFills.physical_table(),
             "dt.fill_time",
             target_id,
             network,
@@ -2404,7 +2404,7 @@ impl Repository {
                     dt.payment_time, dt.dataset_version_id, dt.created_at";
         let (sql, args) = build_dataset_filter_query(
             cols,
-            "hl_funding_payments",
+            DatasetName::HlFunding.physical_table(),
             "dt.payment_time",
             target_id,
             network,
@@ -2433,7 +2433,7 @@ impl Repository {
                     dt.direction, dt.source_event, dt.dataset_version_id, dt.created_at";
         let (sql, args) = build_dataset_filter_query(
             cols,
-            "hl_position_changes",
+            DatasetName::Positions.physical_table(),
             "dt.created_at",
             target_id,
             network,
@@ -2654,7 +2654,7 @@ impl Repository {
                     dt.fee_amount, dt.fee_asset, dt.cost_basis, dt.proceeds, dt.dataset_version_id, dt.created_at";
         let (sql, args) = build_dataset_filter_query(
             cols,
-            "wallet_ledger",
+            DatasetName::WalletLedger.physical_table(),
             "dt.timestamp",
             target_id,
             network,
@@ -2701,7 +2701,7 @@ impl Repository {
                     dt.balance, dt.tx_hash, dt.dataset_version_id, dt.created_at";
         let (sql, args) = build_dataset_filter_query(
             cols,
-            "balance_history",
+            DatasetName::BalanceHistory.physical_table(),
             "dt.timestamp",
             target_id,
             network,
@@ -2750,7 +2750,7 @@ impl Repository {
                     dt.win_count, dt.loss_count, dt.dataset_version_id, dt.created_at";
         let (sql, args) = build_dataset_filter_query(
             cols,
-            "hl_pnl_summary",
+            DatasetName::HlPnlSummary.physical_table(),
             "dt.period_end",
             target_id,
             network,
@@ -2795,7 +2795,7 @@ impl Repository {
                     dt.fees, dt.num_fills, dt.dataset_version_id, dt.created_at";
         let (sql, args) = build_dataset_filter_query(
             cols,
-            "hl_trade_history",
+            DatasetName::HlTradeHistory.physical_table(),
             "dt.closed_at",
             target_id,
             network,
@@ -2842,7 +2842,7 @@ impl Repository {
                     dt.dataset_version_id, dt.created_at";
         let (sql, args) = build_dataset_filter_query(
             cols,
-            "protocol_events",
+            DatasetName::ProtocolEvents.physical_table(),
             "dt.timestamp",
             target_id,
             network,
@@ -2888,7 +2888,7 @@ impl Repository {
                     dt.dataset_version_id, dt.created_at";
         let (sql, args) = build_dataset_filter_query(
             cols,
-            "pool_snapshots",
+            DatasetName::PoolSnapshots.physical_table(),
             "dt.snapshot_timestamp",
             target_id,
             network,
@@ -3953,7 +3953,7 @@ mod tests {
     fn dataset_filter_query_no_filters() {
         let (sql, _) = build_dataset_filter_query(
             "dt.id, dt.network",
-            "token_transfers",
+            DatasetName::TokenTransfers.physical_table(),
             "dt.created_at",
             None,
             None,
@@ -3975,7 +3975,7 @@ mod tests {
         let tid = Uuid::new_v4();
         let (sql, _) = build_dataset_filter_query(
             "dt.id",
-            "token_transfers",
+            DatasetName::TokenTransfers.physical_table(),
             "dt.created_at",
             Some(tid),
             None,
@@ -3995,7 +3995,7 @@ mod tests {
     fn dataset_filter_query_network_only() {
         let (sql, _) = build_dataset_filter_query(
             "dt.id",
-            "token_transfers",
+            DatasetName::TokenTransfers.physical_table(),
             "dt.created_at",
             None,
             Some("solana-mainnet"),
@@ -4014,7 +4014,7 @@ mod tests {
     fn dataset_filter_query_time_window_only() {
         let (sql, _) = build_dataset_filter_query(
             "dt.id",
-            "token_transfers",
+            DatasetName::TokenTransfers.physical_table(),
             "dt.created_at",
             None,
             None,
@@ -4035,7 +4035,7 @@ mod tests {
         let tid = Uuid::new_v4();
         let (sql, _) = build_dataset_filter_query(
             "dt.id",
-            "token_transfers",
+            DatasetName::TokenTransfers.physical_table(),
             "dt.created_at",
             Some(tid),
             Some("solana-mainnet"),
@@ -4058,7 +4058,7 @@ mod tests {
     fn dataset_filter_query_order_col_customizable() {
         let (sql, _) = build_dataset_filter_query(
             "dt.id",
-            "hl_fill_records",
+            DatasetName::HlFills.physical_table(),
             "dt.fill_time",
             None,
             None,
@@ -4133,7 +4133,7 @@ mod tests {
     fn wallet_ledger_query_builder_basic() {
         let (sql, _) = build_dataset_filter_query(
             "dt.*",
-            "wallet_ledger",
+            DatasetName::WalletLedger.physical_table(),
             "dt.timestamp",
             None,
             None,
@@ -4152,7 +4152,7 @@ mod tests {
         let tid = Uuid::new_v4();
         let (sql, _) = build_dataset_filter_query(
             "dt.*",
-            "wallet_ledger",
+            DatasetName::WalletLedger.physical_table(),
             "dt.timestamp",
             Some(tid),
             None,
@@ -4170,7 +4170,7 @@ mod tests {
     fn balance_history_query_builder_basic() {
         let (sql, _) = build_dataset_filter_query(
             "dt.*",
-            "balance_history",
+            DatasetName::BalanceHistory.physical_table(),
             "dt.timestamp",
             None,
             None,
@@ -4187,7 +4187,7 @@ mod tests {
     fn balance_history_query_builder_with_network() {
         let (sql, _) = build_dataset_filter_query(
             "dt.*",
-            "balance_history",
+            DatasetName::BalanceHistory.physical_table(),
             "dt.timestamp",
             None,
             Some("solana-mainnet"),
@@ -4224,7 +4224,7 @@ mod tests {
     fn protocol_events_query_builder_basic() {
         let (sql, _) = build_dataset_filter_query(
             "dt.*",
-            "protocol_events",
+            DatasetName::ProtocolEvents.physical_table(),
             "dt.timestamp",
             None,
             None,
@@ -4242,7 +4242,7 @@ mod tests {
     fn protocol_events_query_builder_with_network() {
         let (sql, _) = build_dataset_filter_query(
             "dt.*",
-            "protocol_events",
+            DatasetName::ProtocolEvents.physical_table(),
             "dt.timestamp",
             None,
             Some("ethereum-mainnet"),
@@ -4259,7 +4259,7 @@ mod tests {
     fn pool_snapshots_query_builder_basic() {
         let (sql, _) = build_dataset_filter_query(
             "dt.*",
-            "pool_snapshots",
+            DatasetName::PoolSnapshots.physical_table(),
             "dt.snapshot_timestamp",
             None,
             None,
@@ -4277,7 +4277,7 @@ mod tests {
     fn pool_snapshots_query_builder_with_time_range() {
         let (sql, _) = build_dataset_filter_query(
             "dt.*",
-            "pool_snapshots",
+            DatasetName::PoolSnapshots.physical_table(),
             "dt.snapshot_timestamp",
             None,
             None,

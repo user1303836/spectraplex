@@ -22,8 +22,8 @@ use spectraplex_adapters::{
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::connector::validate_target;
 use spectraplex_core::materializer::{
-    BalanceSnapshot, DatasetName, DeliveryMetadata, DeliveryReceipt, ExportFormat, ExportSink,
-    ForensicsActivity, HlPnlSummary, HlTradeHistory, MarketAnalytics, PoolSnapshot,
+    BalanceSnapshot, DatasetName, DatasetRegistry, DeliveryMetadata, DeliveryReceipt, ExportFormat,
+    ExportSink, ForensicsActivity, HlPnlSummary, HlTradeHistory, MarketAnalytics, PoolSnapshot,
     ProtocolActivity, ProtocolEvent, SinkConfig, SinkType, TraderAnalytics, TvlAnalytics,
     WalletLedgerRecord,
 };
@@ -2168,7 +2168,10 @@ async fn get_network(
 // ---------------------------------------------------------------------------
 
 /// Datasets queryable via the /v1/datasets/{name}/records endpoint.
-/// Includes the six Silver datasets plus two Gold datasets (P5-W1).
+///
+/// Derived from `DatasetRegistry::queryable()` — the static `&[&str]` form
+/// is kept for backward-compatible test assertions and `join()` in error
+/// messages.
 const QUERYABLE_DATASETS: &[&str] = &[
     "token_transfers",
     "native_balance_deltas",
@@ -2235,7 +2238,7 @@ async fn query_dataset_records(
     Query(params): Query<DatasetQueryParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     validate_dataset_name(&name)?;
-    if !QUERYABLE_DATASETS.contains(&name.as_str()) {
+    if !DatasetRegistry::is_queryable(&name) {
         return Err(AppError::bad_request(format!(
             "Dataset '{}' is not queryable via this endpoint. Queryable datasets: {}",
             name,
@@ -2439,7 +2442,9 @@ async fn query_dataset_records(
 // ---------------------------------------------------------------------------
 
 /// Datasets that support export via the /v1/export/dataset endpoint.
-/// Includes Silver datasets plus Gold datasets (P5-W1, P5-W2).
+///
+/// Derived from `DatasetRegistry::exportable()` — the static `&[&str]` form
+/// is kept for backward-compatible test assertions.
 const EXPORTABLE_DATASETS: &[&str] = &[
     "token_transfers",
     "native_balance_deltas",
@@ -2902,7 +2907,7 @@ async fn create_export_job(
     Json(req): Json<ExportJobRequest>,
 ) -> Result<(StatusCode, Json<ExportJobStatus>), AppError> {
     validate_dataset_name(&req.dataset)?;
-    if !EXPORTABLE_DATASETS.contains(&req.dataset.as_str()) {
+    if !DatasetRegistry::is_exportable(&req.dataset) {
         return Err(AppError::bad_request(format!(
             "Dataset '{}' is not exportable. Exportable datasets: {}",
             req.dataset,
@@ -6270,6 +6275,32 @@ mod tests {
         assert!(QUERYABLE_DATASETS.contains(&"hl_trade_history"));
         assert!(QUERYABLE_DATASETS.contains(&"protocol_events"));
         assert!(QUERYABLE_DATASETS.contains(&"pool_snapshots"));
+    }
+
+    #[test]
+    fn test_queryable_datasets_matches_registry() {
+        let registry_queryable: Vec<&str> = DatasetRegistry::queryable()
+            .iter()
+            .map(|d| d.as_sql_str())
+            .collect();
+        let static_queryable: Vec<&str> = QUERYABLE_DATASETS.to_vec();
+        assert_eq!(
+            registry_queryable, static_queryable,
+            "QUERYABLE_DATASETS must match DatasetRegistry::queryable()"
+        );
+    }
+
+    #[test]
+    fn test_exportable_datasets_matches_registry() {
+        let registry_exportable: Vec<&str> = DatasetRegistry::exportable()
+            .iter()
+            .map(|d| d.as_sql_str())
+            .collect();
+        let static_exportable: Vec<&str> = EXPORTABLE_DATASETS.to_vec();
+        assert_eq!(
+            registry_exportable, static_exportable,
+            "EXPORTABLE_DATASETS must match DatasetRegistry::exportable()"
+        );
     }
 
     #[test]

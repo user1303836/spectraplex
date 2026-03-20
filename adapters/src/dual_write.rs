@@ -7,6 +7,7 @@
 //! V2 writes are best-effort: failures are logged but never abort the V1 path.
 
 use chrono::Utc;
+use spectraplex_core::materializer::{DatasetName, DatasetRegistry};
 use spectraplex_core::models::{Chain, IndexerCheckpoint, Transaction};
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
@@ -682,7 +683,11 @@ impl Repository {
                         network,
                         &tx.raw_metadata,
                     );
-                    stamp_dataset_version_id(&mut fills, &dataset_versions, "hl_fill_records");
+                    stamp_dataset_version_id(
+                        &mut fills,
+                        &dataset_versions,
+                        DatasetName::HlFills.as_sql_str(),
+                    );
                     all_hl_fills.extend(fills);
 
                     let mut funding = crate::hyperliquid_parser::extract_hl_funding_payments(
@@ -693,7 +698,7 @@ impl Repository {
                     stamp_dataset_version_id(
                         &mut funding,
                         &dataset_versions,
-                        "hl_funding_payments",
+                        DatasetName::HlFunding.as_sql_str(),
                     );
                     all_hl_funding.extend(funding);
 
@@ -705,7 +710,7 @@ impl Repository {
                     stamp_dataset_version_id(
                         &mut positions,
                         &dataset_versions,
-                        "hl_position_changes",
+                        DatasetName::Positions.as_sql_str(),
                     );
                     all_hl_positions.extend(positions);
                 }
@@ -804,20 +809,15 @@ impl Repository {
             .await;
     }
 
-    /// Get or create dataset versions for each Silver dataset table.
-    /// Returns a map from dataset_name to the active DatasetVersion id.
+    /// Get or create dataset versions for each Silver dataset.
+    ///
+    /// Returns a map from canonical dataset name to the active DatasetVersion
+    /// id.  Uses `DatasetRegistry::silver_materializable()` as the
+    /// authoritative list of Silver datasets that need version tracking.
     async fn resolve_silver_dataset_versions(&self) -> HashMap<String, Uuid> {
-        let dataset_names = [
-            "token_transfers",
-            "native_balance_deltas",
-            "decoded_events",
-            "hl_fill_records",
-            "hl_funding_payments",
-            "hl_position_changes",
-        ];
-
         let mut versions = HashMap::new();
-        for name in &dataset_names {
+        for ds in DatasetRegistry::silver_materializable() {
+            let name = ds.as_sql_str();
             match self.get_active_dataset_version(name).await {
                 Ok(Some(dv)) => {
                     versions.insert(name.to_string(), dv.id);
@@ -912,24 +912,13 @@ impl Repository {
                 .filter_map(|tx| extract_block_number(&tx.chain, &tx.raw_metadata))
                 .max();
 
-            // Determine which datasets were populated for this network.
-            let dataset_names: Vec<&str> = match network {
-                "solana-mainnet" => {
-                    vec!["token_transfers", "native_balance_deltas", "decoded_events"]
-                }
-                "ethereum-mainnet" => vec!["token_transfers", "decoded_events"],
-                "hypercore-mainnet" => vec![
-                    "token_transfers",
-                    "native_balance_deltas",
-                    "hl_fill_records",
-                    "hl_funding_payments",
-                    "hl_position_changes",
-                ],
-                _ => vec!["token_transfers"],
-            };
+            // Determine which datasets were populated for this network
+            // using the canonical registry.
+            let datasets = DatasetRegistry::silver_datasets_for_network(network);
 
             let now = Utc::now();
-            for ds_name in dataset_names {
+            for ds in &datasets {
+                let ds_name = ds.as_sql_str();
                 let dataset_version_id = dataset_versions.get(ds_name).copied();
                 let dc = DatasetCompleteness {
                     id: Uuid::new_v4(),
