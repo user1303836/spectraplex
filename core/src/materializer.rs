@@ -147,11 +147,15 @@ impl DatasetName {
     /// Returns the chain families that can produce this dataset.
     pub fn chain_families(&self) -> &'static [ChainFamily] {
         match self {
-            DatasetName::TokenTransfers | DatasetName::NativeBalanceDeltas => &[
+            DatasetName::TokenTransfers => &[
                 ChainFamily::Solana,
                 ChainFamily::Evm,
                 ChainFamily::Hyperliquid,
             ],
+            // EVM native balance deltas require trace infrastructure that is
+            // not yet wired into the materializer. Add ChainFamily::Evm here
+            // once the trace-based materializer in evm_parser.rs is enabled.
+            DatasetName::NativeBalanceDeltas => &[ChainFamily::Solana, ChainFamily::Hyperliquid],
             DatasetName::DecodedEvents => &[ChainFamily::Solana, ChainFamily::Evm],
             DatasetName::LedgerEntries => &[
                 ChainFamily::Solana,
@@ -304,27 +308,50 @@ impl DatasetRegistry {
         ]
     }
 
+    /// Derive the [`ChainFamily`] for a network identifier.
+    ///
+    /// Uses the network ID prefix to determine the family. The mapping
+    /// mirrors the `chain_family` column seeded in the `networks` table
+    /// (see `20260308000001_add_networks.sql`).
+    pub fn chain_family_for_network(network: &str) -> Option<ChainFamily> {
+        if network.starts_with("solana-") {
+            Some(ChainFamily::Solana)
+        } else if network.starts_with("ethereum-")
+            || network.starts_with("base-")
+            || network.starts_with("arbitrum-")
+            || network.starts_with("hyperevm-")
+        {
+            Some(ChainFamily::Evm)
+        } else if network.starts_with("hypercore-") {
+            Some(ChainFamily::Hyperliquid)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the Silver datasets materializable for a given chain family.
+    ///
+    /// Filters [`silver_materializable()`](Self::silver_materializable) to
+    /// datasets whose [`chain_families()`](DatasetName::chain_families)
+    /// includes `family`.
+    pub fn silver_datasets_for_family(family: ChainFamily) -> Vec<DatasetName> {
+        Self::silver_materializable()
+            .iter()
+            .filter(|ds| ds.chain_families().contains(&family))
+            .copied()
+            .collect()
+    }
+
     /// Returns the Silver datasets that should be materialized for a given
     /// network identifier.
     ///
-    /// This replaces the scattered per-network string literal lists in
-    /// dual_write.rs.
+    /// Derives the chain family from the network ID prefix and delegates to
+    /// [`silver_datasets_for_family()`](Self::silver_datasets_for_family).
+    /// Returns an empty vec for unrecognised networks.
     pub fn silver_datasets_for_network(network: &str) -> Vec<DatasetName> {
-        match network {
-            "solana-mainnet" => vec![
-                DatasetName::TokenTransfers,
-                DatasetName::NativeBalanceDeltas,
-                DatasetName::DecodedEvents,
-            ],
-            "ethereum-mainnet" => vec![DatasetName::TokenTransfers, DatasetName::DecodedEvents],
-            "hypercore-mainnet" => vec![
-                DatasetName::TokenTransfers,
-                DatasetName::NativeBalanceDeltas,
-                DatasetName::HlFills,
-                DatasetName::HlFunding,
-                DatasetName::Positions,
-            ],
-            _ => vec![DatasetName::TokenTransfers],
+        match Self::chain_family_for_network(network) {
+            Some(family) => Self::silver_datasets_for_family(family),
+            None => Vec::new(),
         }
     }
 
@@ -2536,27 +2563,145 @@ mod tests {
     }
 
     #[test]
+    fn chain_family_for_network_lookup() {
+        // Solana family
+        assert_eq!(
+            DatasetRegistry::chain_family_for_network("solana-mainnet"),
+            Some(ChainFamily::Solana)
+        );
+        assert_eq!(
+            DatasetRegistry::chain_family_for_network("solana-devnet"),
+            Some(ChainFamily::Solana)
+        );
+        assert_eq!(
+            DatasetRegistry::chain_family_for_network("solana-testnet"),
+            Some(ChainFamily::Solana)
+        );
+
+        // EVM family
+        assert_eq!(
+            DatasetRegistry::chain_family_for_network("ethereum-mainnet"),
+            Some(ChainFamily::Evm)
+        );
+        assert_eq!(
+            DatasetRegistry::chain_family_for_network("ethereum-sepolia"),
+            Some(ChainFamily::Evm)
+        );
+        assert_eq!(
+            DatasetRegistry::chain_family_for_network("base-mainnet"),
+            Some(ChainFamily::Evm)
+        );
+        assert_eq!(
+            DatasetRegistry::chain_family_for_network("base-sepolia"),
+            Some(ChainFamily::Evm)
+        );
+        assert_eq!(
+            DatasetRegistry::chain_family_for_network("arbitrum-mainnet"),
+            Some(ChainFamily::Evm)
+        );
+        assert_eq!(
+            DatasetRegistry::chain_family_for_network("arbitrum-sepolia"),
+            Some(ChainFamily::Evm)
+        );
+        assert_eq!(
+            DatasetRegistry::chain_family_for_network("hyperevm-mainnet"),
+            Some(ChainFamily::Evm)
+        );
+        assert_eq!(
+            DatasetRegistry::chain_family_for_network("hyperevm-testnet"),
+            Some(ChainFamily::Evm)
+        );
+
+        // Hyperliquid family
+        assert_eq!(
+            DatasetRegistry::chain_family_for_network("hypercore-mainnet"),
+            Some(ChainFamily::Hyperliquid)
+        );
+        assert_eq!(
+            DatasetRegistry::chain_family_for_network("hypercore-testnet"),
+            Some(ChainFamily::Hyperliquid)
+        );
+
+        // Unknown
+        assert_eq!(
+            DatasetRegistry::chain_family_for_network("unknown-network"),
+            None
+        );
+        assert_eq!(DatasetRegistry::chain_family_for_network(""), None);
+    }
+
+    #[test]
+    fn silver_datasets_for_family_coverage() {
+        let solana = DatasetRegistry::silver_datasets_for_family(ChainFamily::Solana);
+        assert!(solana.contains(&DatasetName::TokenTransfers));
+        assert!(solana.contains(&DatasetName::NativeBalanceDeltas));
+        assert!(solana.contains(&DatasetName::DecodedEvents));
+        assert!(!solana.contains(&DatasetName::HlFills));
+
+        let evm = DatasetRegistry::silver_datasets_for_family(ChainFamily::Evm);
+        assert!(evm.contains(&DatasetName::TokenTransfers));
+        assert!(evm.contains(&DatasetName::DecodedEvents));
+        // NativeBalanceDeltas not yet materializable for EVM (needs trace infra)
+        assert!(!evm.contains(&DatasetName::NativeBalanceDeltas));
+        assert!(!evm.contains(&DatasetName::HlFills));
+
+        let hl = DatasetRegistry::silver_datasets_for_family(ChainFamily::Hyperliquid);
+        assert!(hl.contains(&DatasetName::TokenTransfers));
+        assert!(hl.contains(&DatasetName::NativeBalanceDeltas));
+        assert!(hl.contains(&DatasetName::HlFills));
+        assert!(hl.contains(&DatasetName::HlFunding));
+        assert!(hl.contains(&DatasetName::Positions));
+        assert!(!hl.contains(&DatasetName::DecodedEvents));
+    }
+
+    #[test]
     fn registry_silver_datasets_for_network() {
+        // Solana networks
         let solana = DatasetRegistry::silver_datasets_for_network("solana-mainnet");
-        assert_eq!(solana.len(), 3);
         assert!(solana.contains(&DatasetName::TokenTransfers));
         assert!(solana.contains(&DatasetName::NativeBalanceDeltas));
         assert!(solana.contains(&DatasetName::DecodedEvents));
 
-        let eth = DatasetRegistry::silver_datasets_for_network("ethereum-mainnet");
-        assert_eq!(eth.len(), 2);
-        assert!(eth.contains(&DatasetName::TokenTransfers));
-        assert!(eth.contains(&DatasetName::DecodedEvents));
+        // All EVM networks produce the same datasets
+        for network in &[
+            "ethereum-mainnet",
+            "ethereum-sepolia",
+            "base-mainnet",
+            "base-sepolia",
+            "arbitrum-mainnet",
+            "arbitrum-sepolia",
+            "hyperevm-mainnet",
+            "hyperevm-testnet",
+        ] {
+            let evm = DatasetRegistry::silver_datasets_for_network(network);
+            assert!(
+                evm.contains(&DatasetName::TokenTransfers),
+                "{network} missing token_transfers"
+            );
+            assert!(
+                evm.contains(&DatasetName::DecodedEvents),
+                "{network} missing decoded_events"
+            );
+            assert!(
+                !evm.contains(&DatasetName::NativeBalanceDeltas),
+                "{network} should not have native_balance_deltas (no trace materializer)"
+            );
+        }
 
+        // Hyperliquid networks
         let hl = DatasetRegistry::silver_datasets_for_network("hypercore-mainnet");
-        assert_eq!(hl.len(), 5);
+        assert!(hl.contains(&DatasetName::TokenTransfers));
+        assert!(hl.contains(&DatasetName::NativeBalanceDeltas));
         assert!(hl.contains(&DatasetName::HlFills));
         assert!(hl.contains(&DatasetName::HlFunding));
         assert!(hl.contains(&DatasetName::Positions));
 
+        let hl_test = DatasetRegistry::silver_datasets_for_network("hypercore-testnet");
+        assert_eq!(hl.len(), hl_test.len());
+
+        // Unknown network returns empty
         let unknown = DatasetRegistry::silver_datasets_for_network("unknown-network");
-        assert_eq!(unknown.len(), 1);
-        assert!(unknown.contains(&DatasetName::TokenTransfers));
+        assert!(unknown.is_empty());
     }
 
     #[test]
