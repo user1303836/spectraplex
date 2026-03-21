@@ -1,5 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use spectraplex_core::provider::{NetworkContext, ProviderCapability};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, warn};
 
@@ -49,6 +50,17 @@ impl HyperliquidWsClient {
     }
 
     pub fn with_url(url: &str) -> Self {
+        Self {
+            url: url.to_string(),
+        }
+    }
+
+    /// Create a new WS client from a `NetworkContext`.
+    ///
+    /// Uses the `Stream` capability provider URL. Falls back to the
+    /// hardcoded default if no stream provider is configured.
+    pub fn from_network_context(ctx: &NetworkContext) -> Self {
+        let url = ctx.url(ProviderCapability::Stream).unwrap_or(HL_WS_URL);
         Self {
             url: url.to_string(),
         }
@@ -221,5 +233,59 @@ mod tests {
         let json = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"trades","coin":"SOL"}}}"#;
         let msg: WsMessage = serde_json::from_str(json).unwrap();
         assert_eq!(msg.channel.as_deref(), Some("subscriptionResponse"));
+    }
+
+    // -- Construction from NetworkContext --
+
+    #[test]
+    fn test_ws_client_from_network_context() {
+        use spectraplex_core::config::{NetworkConfig, ProviderConfig};
+        use spectraplex_core::provider::{NetworkId, ProviderRegistry};
+        use std::collections::HashMap;
+
+        let mut networks = HashMap::new();
+        networks.insert(
+            "hypercore-mainnet".to_string(),
+            NetworkConfig { enabled: true },
+        );
+
+        let providers = vec![ProviderConfig {
+            network: "hypercore-mainnet".to_string(),
+            kind: "ws".to_string(),
+            url: "wss://custom-ws.example.com/ws".to_string(),
+            priority: Some(1),
+            capabilities: vec!["stream".to_string()],
+            token_env: None,
+            token: None,
+            headers: None,
+        }];
+
+        let registry = ProviderRegistry::from_config(&networks, &providers).unwrap();
+        let net = NetworkId::new("hypercore-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &net).unwrap();
+        let client = HyperliquidWsClient::from_network_context(&ctx);
+
+        assert_eq!(client.url, "wss://custom-ws.example.com/ws");
+    }
+
+    #[test]
+    fn test_ws_client_from_network_context_fallback() {
+        use spectraplex_core::config::NetworkConfig;
+        use spectraplex_core::provider::{NetworkId, ProviderRegistry};
+        use std::collections::HashMap;
+
+        let mut networks = HashMap::new();
+        networks.insert(
+            "hypercore-mainnet".to_string(),
+            NetworkConfig { enabled: true },
+        );
+
+        // No providers at all
+        let registry = ProviderRegistry::from_config(&networks, &[]).unwrap();
+        let net = NetworkId::new("hypercore-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &net).unwrap();
+        let client = HyperliquidWsClient::from_network_context(&ctx);
+
+        assert_eq!(client.url, HL_WS_URL);
     }
 }

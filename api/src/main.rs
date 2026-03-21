@@ -28,6 +28,9 @@ use spectraplex_core::materializer::{
     WalletLedgerRecord,
 };
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
+use spectraplex_core::provider::{
+    chain_to_network_id, NetworkContext, NetworkId, ProviderCapability, ProviderRegistry,
+};
 use spectraplex_core::v2::{
     normalize_evm_address, normalize_solana_address, ChainFamily, DatasetCompleteness,
     DatasetVersion, IndexTarget, Network, TargetKind, TargetMode,
@@ -180,6 +183,7 @@ impl RateLimiter {
 struct AppState {
     repo: Repository,
     config: AppConfig,
+    provider_registry: ProviderRegistry,
     allowed_wallets: Option<HashSet<String>>,
     jobs: RwLock<HashMap<Uuid, JobEntry>>,
     job_semaphore: Arc<Semaphore>,
@@ -334,9 +338,20 @@ async fn main() -> anyhow::Result<()> {
     info!("Database migrations complete");
 
     let allowed_wallets = config.allowed_wallets_set();
+
+    // Build the provider registry from config (handles legacy compat).
+    let provider_registry = config
+        .provider_registry()
+        .map_err(|e| anyhow::anyhow!("failed to build provider registry: {e}"))?;
+    info!(
+        enabled_networks = provider_registry.enabled_networks().count(),
+        "Provider registry initialized"
+    );
+
     let shared_state = Arc::new(AppState {
         repo: Repository::new(pool),
         config: config.clone(),
+        provider_registry,
         allowed_wallets,
         jobs: RwLock::new(HashMap::new()),
         job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
@@ -505,7 +520,15 @@ async fn rate_limit_middleware(
 
 #[derive(Deserialize)]
 struct IngestRequest {
+    /// Chain name for backward compatibility (e.g. "solana", "ethereum", "hyperliquid").
+    /// Prefer `network` for new integrations.
+    #[serde(default)]
     chain: String,
+    /// Network ID (e.g. "solana-mainnet", "ethereum-mainnet", "base-mainnet").
+    /// When provided, takes precedence over `chain`. Falls back to `chain`
+    /// via default network mapping when absent.
+    #[serde(default)]
+    network: Option<String>,
     wallet: String,
     user_id: Option<Uuid>,
     callback_url: Option<String>,
@@ -1154,12 +1177,26 @@ async fn trigger_ingest(
         validate_callback_url(url).await?;
     }
 
-    let chain = payload.chain.clone();
+    // Resolve chain from network (preferred) or use chain directly (compat).
+    let chain = if let Some(ref network) = payload.network {
+        // Derive chain alias from network ID for backward compat
+        match network.as_str() {
+            n if n.starts_with("solana") => "solana".to_string(),
+            n if n.starts_with("hypercore") || n.starts_with("hyperliquid") => {
+                "hyperliquid".to_string()
+            }
+            // Any EVM network (ethereum, base, arbitrum, etc.)
+            _ => "ethereum".to_string(),
+        }
+    } else {
+        payload.chain.clone()
+    };
     match chain.as_str() {
         "solana" | "ethereum" | "hyperliquid" => {}
         other => {
             return Err(AppError::bad_request(format!(
-                "Unsupported chain: {other}. Supported chains: solana, ethereum, hyperliquid"
+                "Unsupported chain: {other}. Supported chains: solana, ethereum, hyperliquid. \
+                 Or use 'network' parameter with a network ID like 'solana-mainnet'."
             )));
         }
     }
@@ -1188,6 +1225,7 @@ async fn trigger_ingest(
     let state_clone = Arc::clone(&state);
     let wallet = payload.wallet.clone();
     let callback_url = payload.callback_url.clone();
+    let explicit_network = payload.network.clone();
     let limit = state.config.ingest_limit;
     let user_id = payload.user_id.unwrap_or_else(Uuid::new_v4);
 
@@ -1234,21 +1272,42 @@ async fn trigger_ingest(
                 }
             };
 
+            // Resolve network context: prefer explicit network, fall back to chain alias
+            let net_ctx = if let Some(ref net) = explicit_network {
+                NetworkContext::from_registry(
+                    &state_clone.provider_registry,
+                    &NetworkId::new(net.clone()),
+                )
+            } else {
+                chain_to_network_id(&chain).and_then(|net_id| {
+                    NetworkContext::from_registry(&state_clone.provider_registry, &net_id)
+                })
+            };
+
             let events: Vec<Transaction> = match chain.as_str() {
                 "hyperliquid" => {
-                    let adapter = HyperliquidAdapter::new();
+                    let adapter = match &net_ctx {
+                        Some(ctx) => HyperliquidAdapter::from_network_context(ctx),
+                        None => HyperliquidAdapter::new(),
+                    };
                     adapter
                         .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                         .await?
                 }
                 "ethereum" => {
-                    let adapter = EvmAdapter::new(&state_clone.config.evm_rpc_url)?;
+                    let adapter = match &net_ctx {
+                        Some(ctx) => EvmAdapter::from_network_context(ctx)?,
+                        None => EvmAdapter::new(&state_clone.config.evm_rpc_url)?,
+                    };
                     adapter
                         .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                         .await?
                 }
                 "solana" => {
-                    let adapter = SolanaAdapter::new(&state_clone.config.solana_rpc_url);
+                    let adapter = match &net_ctx {
+                        Some(ctx) => SolanaAdapter::from_network_context(ctx)?,
+                        None => SolanaAdapter::new(&state_clone.config.solana_rpc_url),
+                    };
                     adapter
                         .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                         .await?
@@ -1359,6 +1418,7 @@ async fn trigger_batch_ingest(
     for item in payload.wallets {
         let single = Json(IngestRequest {
             chain: item.chain,
+            network: None,
             wallet: item.wallet,
             user_id: item.user_id,
             callback_url: item.callback_url,
@@ -1708,7 +1768,14 @@ async fn get_wallet_stats(
 
 #[derive(Deserialize)]
 struct StartStreamRequest {
+    /// Chain name for backward compatibility (e.g. "solana", "hyperliquid").
+    /// Prefer `network` for new integrations.
+    #[serde(default)]
     chain: String,
+    /// Network ID (e.g. "solana-mainnet", "hypercore-mainnet").
+    /// When provided, takes precedence over `chain`.
+    #[serde(default)]
+    network: Option<String>,
     wallet: Option<String>,
 }
 
@@ -1716,17 +1783,44 @@ async fn start_stream(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<StartStreamRequest>,
 ) -> Result<Json<StreamInfo>, AppError> {
-    match payload.chain.as_str() {
+    // Resolve chain from network (preferred) or use chain directly (compat).
+    let chain_resolved = if let Some(ref network) = payload.network {
+        match network.as_str() {
+            n if n.starts_with("solana") => "solana".to_string(),
+            n if n.starts_with("hypercore") || n.starts_with("hyperliquid") => {
+                "hyperliquid".to_string()
+            }
+            _ => "ethereum".to_string(),
+        }
+    } else {
+        payload.chain.clone()
+    };
+
+    match chain_resolved.as_str() {
         "solana" => {
-            if state
-                .config
-                .solana_grpc_url
-                .as_deref()
-                .filter(|u| !u.is_empty())
-                .is_none()
+            // Check for stream capability in registry first, fall back to legacy config
+            let has_stream = payload
+                .network
+                .as_ref()
+                .and_then(|n| {
+                    NetworkContext::from_registry(
+                        &state.provider_registry,
+                        &NetworkId::new(n.clone()),
+                    )
+                })
+                .map(|ctx| ctx.has_capability(ProviderCapability::Stream))
+                .unwrap_or(false);
+
+            if !has_stream
+                && state
+                    .config
+                    .solana_grpc_url
+                    .as_deref()
+                    .filter(|u| !u.is_empty())
+                    .is_none()
             {
                 return Err(AppError::bad_request(
-                    "Solana gRPC URL not configured (set SOLANA_GRPC_URL)",
+                    "Solana gRPC URL not configured (set SOLANA_GRPC_URL or configure a provider with stream capability)",
                 ));
             }
         }
@@ -1763,7 +1857,7 @@ async fn start_stream(
     let cancel = CancellationToken::new();
     let tx_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let last_slot = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let chain = payload.chain.clone();
+    let chain = chain_resolved;
     let wallet = payload.wallet.clone();
 
     let cancel_clone = cancel.clone();
@@ -1772,11 +1866,26 @@ async fn start_stream(
     let repo = state.repo.clone();
     let state_clone = Arc::clone(&state);
 
+    // Resolve network context: prefer explicit network, fall back to chain alias
+    let stream_net_ctx = if let Some(ref net) = payload.network {
+        NetworkContext::from_registry(&state.provider_registry, &NetworkId::new(net.clone()))
+    } else {
+        chain_to_network_id(&chain)
+            .and_then(|net_id| NetworkContext::from_registry(&state.provider_registry, &net_id))
+    };
+
     match chain.as_str() {
         "solana" => {
-            let grpc_url = state.config.solana_grpc_url.clone().unwrap();
-            let grpc_token = state.config.solana_grpc_token.clone();
-            let adapter = SolanaGrpcAdapter::new(&grpc_url, grpc_token);
+            let adapter = match &stream_net_ctx {
+                Some(ctx) if ctx.has_capability(ProviderCapability::Stream) => {
+                    SolanaGrpcAdapter::from_network_context(ctx).map_err(AppError::internal)?
+                }
+                _ => {
+                    let grpc_url = state.config.solana_grpc_url.clone().unwrap();
+                    let grpc_token = state.config.solana_grpc_token.clone();
+                    SolanaGrpcAdapter::new(&grpc_url, grpc_token)
+                }
+            };
             let (mut rx, grpc_handle) = adapter.stream_transactions();
 
             tokio::spawn(async move {
@@ -1837,7 +1946,10 @@ async fn start_stream(
             let ws_wallet = hl_wallet.clone();
             let ws_stream_id = stream_id;
             let ws_handle = tokio::spawn(async move {
-                let client = HyperliquidWsClient::new();
+                let client = match &stream_net_ctx {
+                    Some(ctx) => HyperliquidWsClient::from_network_context(ctx),
+                    None => HyperliquidWsClient::new(),
+                };
                 let mut retry_count: u32 = 0;
                 const MAX_RETRIES: u32 = 10;
                 loop {
@@ -3834,9 +3946,11 @@ mod tests {
             ..AppConfig::default()
         };
         let allowed_wallets_set = config.allowed_wallets_set();
+        let provider_registry = config.provider_registry().unwrap();
         Arc::new(AppState {
             repo: Repository::new(pool),
             config,
+            provider_registry,
             allowed_wallets: allowed_wallets_set,
             jobs: RwLock::new(HashMap::new()),
             job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
@@ -4485,9 +4599,11 @@ mod tests {
             api_key: Some("secret".to_string()),
             ..AppConfig::default()
         };
+        let provider_registry = config.provider_registry().unwrap();
         let state = Arc::new(AppState {
             repo: Repository::new(pool),
             config,
+            provider_registry,
             allowed_wallets: None,
             jobs: RwLock::new(HashMap::new()),
             job_semaphore: Arc::new(Semaphore::new(1)),
@@ -5697,9 +5813,11 @@ mod tests {
             ..AppConfig::default()
         };
         let allowed_wallets_set = config.allowed_wallets_set();
+        let provider_registry = config.provider_registry().unwrap();
         let state = Arc::new(AppState {
             repo: Repository::new(pool),
             config,
+            provider_registry,
             allowed_wallets: allowed_wallets_set,
             jobs: RwLock::new(HashMap::new()),
             job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),

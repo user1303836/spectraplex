@@ -304,6 +304,102 @@ impl ProviderRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// NetworkContext
+// ---------------------------------------------------------------------------
+
+/// Bundles what a connector needs from the provider registry.
+///
+/// A `NetworkContext` is the connector-facing view of a resolved network
+/// configuration. It carries the network identity, resolved provider URLs
+/// by capability, and any auth tokens. Connectors accept a `NetworkContext`
+/// instead of raw URL strings, decoupling adapter construction from
+/// environment-specific configuration details.
+#[derive(Debug, Clone)]
+pub struct NetworkContext {
+    /// The network this context represents.
+    pub network: NetworkId,
+    /// Resolved providers available for this network, keyed by capability.
+    /// When multiple providers support the same capability, only the
+    /// highest-priority one is included here (use the registry directly
+    /// for fallback chains).
+    providers: HashMap<ProviderCapability, ResolvedProvider>,
+}
+
+impl NetworkContext {
+    /// Build a `NetworkContext` from the registry for the given network.
+    ///
+    /// Resolves the best provider for each known capability and bundles
+    /// them into the context. Returns `None` if the network is not enabled
+    /// or has no providers.
+    pub fn from_registry(registry: &ProviderRegistry, network: &NetworkId) -> Option<Self> {
+        if !registry.is_network_enabled(network) {
+            return None;
+        }
+
+        let all_capabilities = [
+            ProviderCapability::Historical,
+            ProviderCapability::Balances,
+            ProviderCapability::Stream,
+            ProviderCapability::Logs,
+            ProviderCapability::Receipts,
+            ProviderCapability::DebugTraceTransaction,
+        ];
+
+        let mut providers = HashMap::new();
+        for cap in &all_capabilities {
+            if let Some(p) = registry.resolve(network, *cap) {
+                providers.insert(*cap, p.clone());
+            }
+        }
+
+        Some(Self {
+            network: network.clone(),
+            providers,
+        })
+    }
+
+    /// Get the resolved provider for a specific capability.
+    pub fn provider(&self, capability: ProviderCapability) -> Option<&ResolvedProvider> {
+        self.providers.get(&capability)
+    }
+
+    /// Get the URL for a specific capability, if available.
+    pub fn url(&self, capability: ProviderCapability) -> Option<&str> {
+        self.providers.get(&capability).map(|p| p.url.as_str())
+    }
+
+    /// Get the auth token for a specific capability, if available.
+    pub fn token(&self, capability: ProviderCapability) -> Option<&str> {
+        self.providers
+            .get(&capability)
+            .and_then(|p| p.token.as_deref())
+    }
+
+    /// Returns `true` if this context has a provider for the given capability.
+    pub fn has_capability(&self, capability: ProviderCapability) -> bool {
+        self.providers.contains_key(&capability)
+    }
+
+    /// Returns all capabilities available in this context.
+    pub fn available_capabilities(&self) -> Vec<ProviderCapability> {
+        self.providers.keys().copied().collect()
+    }
+}
+
+/// Map a legacy V1 `chain` string to its default network ID.
+///
+/// This provides backward compatibility: API and CLI callers that still
+/// pass `chain = "solana"` get mapped to `solana-mainnet`, etc.
+pub fn chain_to_network_id(chain: &str) -> Option<NetworkId> {
+    match chain {
+        "solana" => Some(NetworkId::new("solana-mainnet")),
+        "ethereum" => Some(NetworkId::new("ethereum-mainnet")),
+        "hyperliquid" => Some(NetworkId::new("hypercore-mainnet")),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RegistryError
 // ---------------------------------------------------------------------------
 
@@ -784,5 +880,115 @@ mod tests {
             p.headers.get("Authorization").map(|s| s.as_str()),
             Some("Bearer token123")
         );
+    }
+
+    // -- NetworkContext --
+
+    #[test]
+    fn network_context_from_registry() {
+        let registry = ProviderRegistry::from_config(&make_networks(), &make_providers()).unwrap();
+        let sol = NetworkId::new("solana-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &sol).unwrap();
+
+        assert_eq!(ctx.network, sol);
+        assert!(ctx.has_capability(ProviderCapability::Historical));
+        assert!(ctx.has_capability(ProviderCapability::Balances));
+        assert!(ctx.has_capability(ProviderCapability::Stream));
+        assert!(!ctx.has_capability(ProviderCapability::Logs));
+    }
+
+    #[test]
+    fn network_context_url_and_token() {
+        let registry = ProviderRegistry::from_config(&make_networks(), &make_providers()).unwrap();
+        let sol = NetworkId::new("solana-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &sol).unwrap();
+
+        assert_eq!(
+            ctx.url(ProviderCapability::Historical),
+            Some("https://api.mainnet-beta.solana.com")
+        );
+        assert_eq!(
+            ctx.url(ProviderCapability::Stream),
+            Some("https://yellowstone.example.com")
+        );
+        assert!(ctx.url(ProviderCapability::Logs).is_none());
+    }
+
+    #[test]
+    fn network_context_disabled_network_returns_none() {
+        let registry = ProviderRegistry::from_config(&make_networks(), &make_providers()).unwrap();
+        let base = NetworkId::new("base-mainnet");
+        assert!(NetworkContext::from_registry(&registry, &base).is_none());
+    }
+
+    #[test]
+    fn network_context_unknown_network_returns_none() {
+        let registry = ProviderRegistry::from_config(&make_networks(), &make_providers()).unwrap();
+        let unknown = NetworkId::new("polygon-mainnet");
+        assert!(NetworkContext::from_registry(&registry, &unknown).is_none());
+    }
+
+    #[test]
+    fn network_context_evm_has_all_evm_capabilities() {
+        let registry = ProviderRegistry::from_config(&make_networks(), &make_providers()).unwrap();
+        let eth = NetworkId::new("ethereum-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &eth).unwrap();
+
+        assert!(ctx.has_capability(ProviderCapability::Historical));
+        assert!(ctx.has_capability(ProviderCapability::Logs));
+        assert!(ctx.has_capability(ProviderCapability::Receipts));
+        assert!(ctx.has_capability(ProviderCapability::Balances));
+        assert!(ctx.has_capability(ProviderCapability::DebugTraceTransaction));
+        assert!(!ctx.has_capability(ProviderCapability::Stream));
+    }
+
+    #[test]
+    fn network_context_available_capabilities() {
+        let registry = ProviderRegistry::from_config(&make_networks(), &make_providers()).unwrap();
+        let sol = NetworkId::new("solana-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &sol).unwrap();
+
+        let caps = ctx.available_capabilities();
+        assert!(caps.contains(&ProviderCapability::Historical));
+        assert!(caps.contains(&ProviderCapability::Balances));
+        assert!(caps.contains(&ProviderCapability::Stream));
+        assert_eq!(caps.len(), 3);
+    }
+
+    #[test]
+    fn network_context_provider_returns_full_resolved_provider() {
+        let registry = ProviderRegistry::from_config(&make_networks(), &make_providers()).unwrap();
+        let eth = NetworkId::new("ethereum-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &eth).unwrap();
+
+        let p = ctx
+            .provider(ProviderCapability::DebugTraceTransaction)
+            .unwrap();
+        assert_eq!(p.kind, ProviderKind::Trace);
+        assert_eq!(p.url, "https://eth-trace.alchemy.com/v2/KEY");
+    }
+
+    // -- chain_to_network_id --
+
+    #[test]
+    fn chain_to_network_id_known_chains() {
+        assert_eq!(
+            chain_to_network_id("solana").unwrap().as_str(),
+            "solana-mainnet"
+        );
+        assert_eq!(
+            chain_to_network_id("ethereum").unwrap().as_str(),
+            "ethereum-mainnet"
+        );
+        assert_eq!(
+            chain_to_network_id("hyperliquid").unwrap().as_str(),
+            "hypercore-mainnet"
+        );
+    }
+
+    #[test]
+    fn chain_to_network_id_unknown_returns_none() {
+        assert!(chain_to_network_id("bitcoin").is_none());
+        assert!(chain_to_network_id("").is_none());
     }
 }

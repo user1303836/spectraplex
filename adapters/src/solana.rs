@@ -8,6 +8,7 @@ use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use solana_transaction_status::UiTransactionEncoding;
 use spectraplex_core::connector::{Connector, ConnectorCapabilities};
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
+use spectraplex_core::provider::{NetworkContext, ProviderCapability};
 use spectraplex_core::v2::{
     ChainFamily, IndexTarget, IngestionBatch, RawTransaction, TargetKind, TargetMode,
 };
@@ -28,6 +29,27 @@ impl SolanaAdapter {
             )),
             network: "solana-mainnet".to_string(),
         }
+    }
+
+    /// Create a new adapter from a `NetworkContext`.
+    ///
+    /// Resolves the `Historical` provider from the context to obtain the
+    /// RPC URL. Returns an error if no suitable provider is available.
+    pub fn from_network_context(ctx: &NetworkContext) -> anyhow::Result<Self> {
+        let rpc_url = ctx.url(ProviderCapability::Historical).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no RPC provider with 'historical' capability for network '{}'",
+                ctx.network
+            )
+        })?;
+
+        Ok(Self {
+            client: Arc::new(RpcClient::new_with_timeout(
+                rpc_url.to_string(),
+                Duration::from_secs(30),
+            )),
+            network: ctx.network.as_str().to_string(),
+        })
     }
 
     /// Override the network identifier (e.g. "solana-devnet").
@@ -379,5 +401,100 @@ mod tests {
     #[test]
     fn test_source_field_is_descriptive() {
         assert!("solana-rpc-wallet-backfill".starts_with("solana-rpc-"));
+    }
+
+    // -- Construction from NetworkContext --
+
+    #[test]
+    fn test_from_network_context() {
+        use spectraplex_core::config::{NetworkConfig, ProviderConfig};
+        use spectraplex_core::provider::{NetworkId, ProviderRegistry};
+        use std::collections::HashMap;
+
+        let mut networks = HashMap::new();
+        networks.insert(
+            "solana-mainnet".to_string(),
+            NetworkConfig { enabled: true },
+        );
+
+        let providers = vec![ProviderConfig {
+            network: "solana-mainnet".to_string(),
+            kind: "rpc".to_string(),
+            url: "https://api.mainnet-beta.solana.com".to_string(),
+            priority: Some(1),
+            capabilities: vec!["historical".to_string(), "balances".to_string()],
+            token_env: None,
+            token: None,
+            headers: None,
+        }];
+
+        let registry = ProviderRegistry::from_config(&networks, &providers).unwrap();
+        let net = NetworkId::new("solana-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &net).unwrap();
+        let adapter = SolanaAdapter::from_network_context(&ctx).unwrap();
+
+        assert_eq!(adapter.network, "solana-mainnet");
+        assert!(Arc::strong_count(&adapter.client) == 1);
+    }
+
+    #[test]
+    fn test_from_network_context_uses_network_id() {
+        use spectraplex_core::config::{NetworkConfig, ProviderConfig};
+        use spectraplex_core::provider::{NetworkId, ProviderRegistry};
+        use std::collections::HashMap;
+
+        let mut networks = HashMap::new();
+        networks.insert("solana-devnet".to_string(), NetworkConfig { enabled: true });
+
+        let providers = vec![ProviderConfig {
+            network: "solana-devnet".to_string(),
+            kind: "rpc".to_string(),
+            url: "https://api.devnet.solana.com".to_string(),
+            priority: Some(1),
+            capabilities: vec!["historical".to_string()],
+            token_env: None,
+            token: None,
+            headers: None,
+        }];
+
+        let registry = ProviderRegistry::from_config(&networks, &providers).unwrap();
+        let net = NetworkId::new("solana-devnet");
+        let ctx = NetworkContext::from_registry(&registry, &net).unwrap();
+        let adapter = SolanaAdapter::from_network_context(&ctx).unwrap();
+
+        assert_eq!(adapter.network, "solana-devnet");
+    }
+
+    #[test]
+    fn test_from_network_context_no_historical_fails() {
+        use spectraplex_core::config::{NetworkConfig, ProviderConfig};
+        use spectraplex_core::provider::{NetworkId, ProviderRegistry};
+        use std::collections::HashMap;
+
+        let mut networks = HashMap::new();
+        networks.insert(
+            "solana-mainnet".to_string(),
+            NetworkConfig { enabled: true },
+        );
+
+        // Provider with only stream capability, no historical
+        let providers = vec![ProviderConfig {
+            network: "solana-mainnet".to_string(),
+            kind: "grpc".to_string(),
+            url: "https://grpc.example.com".to_string(),
+            priority: Some(1),
+            capabilities: vec!["stream".to_string()],
+            token_env: None,
+            token: None,
+            headers: None,
+        }];
+
+        let registry = ProviderRegistry::from_config(&networks, &providers).unwrap();
+        let net = NetworkId::new("solana-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &net).unwrap();
+        let result = SolanaAdapter::from_network_context(&ctx);
+
+        assert!(result.is_err());
+        assert!(result.err().unwrap().to_string().contains("historical"));
     }
 }

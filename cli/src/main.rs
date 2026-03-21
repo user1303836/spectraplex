@@ -9,8 +9,10 @@ use spectraplex_adapters::{
     solana_grpc::SolanaGrpcAdapter,
     solana_parser,
 };
+use spectraplex_core::config::AppConfig;
 use spectraplex_core::connector::validate_target;
 use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
+use spectraplex_core::provider::{chain_to_network_id, NetworkContext, NetworkId};
 use spectraplex_core::v2::{
     normalize_evm_address, normalize_solana_address, ChainFamily, IndexTarget, TargetKind,
     TargetMode,
@@ -39,8 +41,14 @@ enum Commands {
 
     /// Ingest raw data from blockchain to Bronze layer (JSONL)
     Ingest {
-        #[arg(short, long)]
+        /// Chain name (compat alias). Prefer --network for new usage.
+        #[arg(short, long, default_value = "")]
         chain: String,
+
+        /// Network ID (e.g. solana-mainnet, ethereum-mainnet, base-mainnet).
+        /// Takes precedence over --chain when provided.
+        #[arg(short, long)]
+        network: Option<String>,
 
         /// Wallet address(es) to ingest. Pass multiple times for batch ingestion.
         #[arg(short, long, required = true, num_args = 1..)]
@@ -144,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Ingest {
             chain,
+            network,
             wallet: wallets,
             output,
             rpc,
@@ -152,6 +161,35 @@ async fn main() -> anyhow::Result<()> {
             limit,
             user_id,
         } => {
+            // Resolve chain from --network (preferred) or --chain (compat)
+            let chain = if let Some(ref net) = network {
+                match net.as_str() {
+                    n if n.starts_with("solana") => "solana".to_string(),
+                    n if n.starts_with("hypercore") || n.starts_with("hyperliquid") => {
+                        "hyperliquid".to_string()
+                    }
+                    _ => "ethereum".to_string(),
+                }
+            } else if chain.is_empty() {
+                anyhow::bail!("Either --chain or --network must be provided");
+            } else {
+                chain
+            };
+
+            // Build provider registry from config (best-effort; falls back to CLI args)
+            let net_ctx = {
+                let config = AppConfig::load().ok();
+                config.and_then(|cfg| {
+                    let registry = cfg.provider_registry().ok()?;
+                    let net_id = if let Some(ref net) = network {
+                        NetworkId::new(net.clone())
+                    } else {
+                        chain_to_network_id(&chain)?
+                    };
+                    NetworkContext::from_registry(&registry, &net_id)
+                })
+            };
+
             let user_id = user_id.unwrap_or_else(|| {
                 let id = Uuid::new_v4();
                 info!(user_id = %id, "No --user-id provided, auto-generated");
@@ -208,24 +246,41 @@ async fn main() -> anyhow::Result<()> {
                             adapter
                                 .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
                                 .await?
+                        } else if let Some(ref ctx) = net_ctx {
+                            // Use provider registry
+                            let adapter = SolanaAdapter::from_network_context(ctx)?;
+                            adapter
+                                .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
+                                .await?
                         } else {
-                            anyhow::bail!("Either --grpc-url or --rpc must be provided for Solana");
+                            anyhow::bail!("Either --grpc-url, --rpc, or --network must be provided for Solana");
                         }
                     }
                     "hyperliquid" => {
-                        let adapter = HyperliquidAdapter::new();
+                        let adapter = match &net_ctx {
+                            Some(ctx) => HyperliquidAdapter::from_network_context(ctx),
+                            None => HyperliquidAdapter::new(),
+                        };
                         adapter
                             .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
                             .await?
                     }
                     "ethereum" => {
-                        let rpc_url = rpc
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("--rpc is required for Ethereum"))?;
-                        let adapter = EvmAdapter::new(rpc_url)?;
-                        adapter
-                            .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
-                            .await?
+                        if let Some(ref rpc_url) = rpc {
+                            let adapter = EvmAdapter::new(rpc_url)?;
+                            adapter
+                                .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
+                                .await?
+                        } else if let Some(ref ctx) = net_ctx {
+                            let adapter = EvmAdapter::from_network_context(ctx)?;
+                            adapter
+                                .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
+                                .await?
+                        } else {
+                            anyhow::bail!(
+                                "Either --rpc or --network must be provided for EVM chains"
+                            );
+                        }
                     }
                     _ => {
                         warn!(chain = %chain, "Unsupported chain");
@@ -639,9 +694,36 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ingest_missing_chain() {
-        let result = Cli::try_parse_from(["spectraplex", "ingest", "--wallet", "abc123"]);
-        assert!(result.is_err());
+    fn test_parse_ingest_no_chain_defaults_to_empty() {
+        // --chain is now optional (defaults to ""), --network is preferred
+        let cli = Cli::try_parse_from(["spectraplex", "ingest", "--wallet", "abc123"]).unwrap();
+        match cli.command {
+            Commands::Ingest { chain, network, .. } => {
+                assert_eq!(chain, "");
+                assert!(network.is_none());
+            }
+            _ => panic!("expected Ingest command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ingest_network_flag() {
+        let cli = Cli::try_parse_from([
+            "spectraplex",
+            "ingest",
+            "--network",
+            "solana-mainnet",
+            "--wallet",
+            "abc123",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Ingest { chain, network, .. } => {
+                assert_eq!(chain, ""); // chain defaults to empty when not provided
+                assert_eq!(network.as_deref(), Some("solana-mainnet"));
+            }
+            _ => panic!("expected Ingest command"),
+        }
     }
 
     #[test]
