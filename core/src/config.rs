@@ -240,19 +240,22 @@ impl AppConfig {
     /// creates equivalent structured entries from `solana_rpc_url`,
     /// `evm_rpc_url`, `solana_grpc_url`, and `evm_trace_rpc_url`.
     ///
+    /// When the user supplies partial structured config (only `networks` or
+    /// only `providers`), the synthesized defaults are merged with the user's
+    /// entries so that staged migration works correctly.
+    ///
     /// Returns the effective (networks, providers) tuple. If the user already
-    /// supplied structured config, those are returned unchanged.
+    /// supplied both structured sections, those are returned unchanged.
     pub fn effective_provider_config(
         &self,
     ) -> (HashMap<String, NetworkConfig>, Vec<ProviderConfig>) {
         // If the user supplied both structured sections, use them as-is.
-        // Legacy synthesis only runs when BOTH are empty; having just one
-        // section present is not enough to suppress the defaults.
         if !self.networks.is_empty() && !self.providers.is_empty() {
             return (self.networks.clone(), self.providers.clone());
         }
 
-        // Synthesize from legacy fields.
+        // Synthesize defaults from legacy fields, then merge any partial
+        // structured entries the user provided.
         let mut networks = HashMap::new();
         let mut providers = Vec::new();
 
@@ -355,6 +358,22 @@ impl AppConfig {
             token: None,
             headers: None,
         });
+
+        // Merge any user-supplied partial structured entries so that staged
+        // migration (adding networks or providers incrementally) works.
+        for (id, cfg) in &self.networks {
+            networks.entry(id.clone()).or_insert_with(|| cfg.clone());
+        }
+        for p in &self.providers {
+            // Avoid duplicating a provider that matches an already-synthesized
+            // entry on (network, kind, url).
+            let dominated = providers.iter().any(|existing| {
+                existing.network == p.network && existing.kind == p.kind && existing.url == p.url
+            });
+            if !dominated {
+                providers.push(p.clone());
+            }
+        }
 
         (networks, providers)
     }
@@ -665,7 +684,7 @@ mod tests {
     #[test]
     fn test_effective_config_partial_structured_still_synthesizes() {
         // Only networks supplied, no providers. Legacy synthesis should
-        // still run because both sections must be non-empty to suppress it.
+        // still run AND the user's partial entries should be merged in.
         let mut networks = HashMap::new();
         networks.insert("base-mainnet".to_string(), NetworkConfig { enabled: true });
 
@@ -680,6 +699,45 @@ mod tests {
         assert!(nets.contains_key("ethereum-mainnet"));
         assert!(nets.contains_key("hypercore-mainnet"));
         assert!(!provs.is_empty());
+
+        // The user's partial network entry should also be present.
+        assert!(
+            nets.contains_key("base-mainnet"),
+            "user-supplied partial network entry must be merged"
+        );
+    }
+
+    #[test]
+    fn test_effective_config_partial_providers_merged() {
+        // Only providers supplied, no networks. Legacy synthesis should
+        // run AND the user's provider entry should be merged in.
+        let user_provider = ProviderConfig {
+            network: "base-mainnet".to_string(),
+            kind: "rpc".to_string(),
+            url: "https://base-rpc.example.com".to_string(),
+            priority: Some(1),
+            capabilities: vec!["historical".to_string(), "logs".to_string()],
+            token_env: None,
+            token: None,
+            headers: None,
+        };
+
+        let config = AppConfig {
+            providers: vec![user_provider],
+            ..AppConfig::default()
+        };
+        let (nets, provs) = config.effective_provider_config();
+
+        // Legacy defaults present.
+        assert!(nets.contains_key("solana-mainnet"));
+        assert!(nets.contains_key("ethereum-mainnet"));
+
+        // User's provider entry is merged in.
+        let base_prov = provs
+            .iter()
+            .find(|p| p.network == "base-mainnet")
+            .expect("user-supplied provider must be merged");
+        assert_eq!(base_prov.url, "https://base-rpc.example.com");
     }
 
     #[test]
