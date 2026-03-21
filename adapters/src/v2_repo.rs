@@ -11,8 +11,10 @@ use spectraplex_core::materializer::{
 };
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
-    DatasetVersionStatus, EvmTraceType, IndexTarget, IngestionRun, Network, RawEvmTrace,
-    RawTransaction, TargetKind, TargetMatch, TargetMode,
+    DatasetVersionStatus, EvmTraceType, ExportJob, ExportJobStatus, IndexTarget, IngestionJob,
+    IngestionJobMode, IngestionJobStatus, IngestionRun, MaterializationRun,
+    MaterializationRunStatus, Network, RawEvmTrace, RawTransaction, StreamActualStatus,
+    StreamDesiredStatus, StreamSource, StreamSubscription, TargetKind, TargetMatch, TargetMode,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -1256,6 +1258,101 @@ pub fn build_raw_evm_trace_insert(
     Ok((query, args))
 }
 
+// ---------------------------------------------------------------------------
+// Row-mapping helpers for Durable Control Plane tables
+// ---------------------------------------------------------------------------
+
+fn row_to_ingestion_job(row: &sqlx::postgres::PgRow) -> anyhow::Result<IngestionJob> {
+    use std::str::FromStr;
+    let status_str: String = row.try_get("status")?;
+    let mode_str: String = row.try_get("mode")?;
+    Ok(IngestionJob {
+        id: row.try_get("id")?,
+        target_id: row.try_get("target_id")?,
+        network: row.try_get("network")?,
+        mode: IngestionJobMode::from_str(&mode_str)
+            .map_err(|e| anyhow::anyhow!("invalid ingestion_job mode '{mode_str}': {e}"))?,
+        status: IngestionJobStatus::from_str(&status_str)
+            .map_err(|e| anyhow::anyhow!("invalid ingestion_job status '{status_str}': {e}"))?,
+        priority: row.try_get("priority")?,
+        idempotency_key: row.try_get("idempotency_key")?,
+        requested_by: row.try_get("requested_by")?,
+        callback_url: row.try_get("callback_url")?,
+        error_message: row.try_get("error_message")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn row_to_stream_subscription(row: &sqlx::postgres::PgRow) -> anyhow::Result<StreamSubscription> {
+    use std::str::FromStr;
+    let source_str: String = row.try_get("source")?;
+    let desired_str: String = row.try_get("desired_status")?;
+    let actual_str: String = row.try_get("actual_status")?;
+    Ok(StreamSubscription {
+        id: row.try_get("id")?,
+        target_id: row.try_get("target_id")?,
+        network: row.try_get("network")?,
+        source: StreamSource::from_str(&source_str)
+            .map_err(|e| anyhow::anyhow!("invalid stream source '{source_str}': {e}"))?,
+        desired_status: StreamDesiredStatus::from_str(&desired_str)
+            .map_err(|e| anyhow::anyhow!("invalid desired_status '{desired_str}': {e}"))?,
+        actual_status: StreamActualStatus::from_str(&actual_str)
+            .map_err(|e| anyhow::anyhow!("invalid actual_status '{actual_str}': {e}"))?,
+        lease_owner: row.try_get("lease_owner")?,
+        heartbeat_at: row.try_get("heartbeat_at")?,
+        cursor_state: row.try_get("cursor_state")?,
+        config: row.try_get("config")?,
+        error_message: row.try_get("error_message")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn row_to_export_job(row: &sqlx::postgres::PgRow) -> anyhow::Result<ExportJob> {
+    use std::str::FromStr;
+    let status_str: String = row.try_get("status")?;
+    Ok(ExportJob {
+        id: row.try_get("id")?,
+        dataset: row.try_get("dataset")?,
+        format: row.try_get("format")?,
+        filters: row.try_get("filters")?,
+        sink_config: row.try_get("sink_config")?,
+        status: ExportJobStatus::from_str(&status_str)
+            .map_err(|e| anyhow::anyhow!("invalid export_job status '{status_str}': {e}"))?,
+        worker_id: row.try_get("worker_id")?,
+        record_count: row.try_get("record_count")?,
+        result_location: row.try_get("result_location")?,
+        error_message: row.try_get("error_message")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        started_at: row.try_get("started_at")?,
+        completed_at: row.try_get("completed_at")?,
+    })
+}
+
+fn row_to_materialization_run(row: &sqlx::postgres::PgRow) -> anyhow::Result<MaterializationRun> {
+    use std::str::FromStr;
+    let status_str: String = row.try_get("status")?;
+    Ok(MaterializationRun {
+        id: row.try_get("id")?,
+        dataset_name: row.try_get("dataset_name")?,
+        scope: row.try_get("scope")?,
+        input_watermark: row.try_get("input_watermark")?,
+        output_record_count: row.try_get("output_record_count")?,
+        status: MaterializationRunStatus::from_str(&status_str).map_err(|e| {
+            anyhow::anyhow!("invalid materialization_run status '{status_str}': {e}")
+        })?,
+        dataset_version_id: row.try_get("dataset_version_id")?,
+        worker_id: row.try_get("worker_id")?,
+        started_at: row.try_get("started_at")?,
+        finished_at: row.try_get("finished_at")?,
+        error_message: row.try_get("error_message")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 /// Map a database row to a `RawEvmTrace`.
 fn row_to_raw_evm_trace(row: &sqlx::postgres::PgRow) -> anyhow::Result<RawEvmTrace> {
     use std::str::FromStr;
@@ -1270,6 +1367,21 @@ fn row_to_raw_evm_trace(row: &sqlx::postgres::PgRow) -> anyhow::Result<RawEvmTra
         ingestion_run_id: row.try_get("ingestion_run_id")?,
         created_at: row.try_get("created_at")?,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Durable Control Plane parameter structs
+// ---------------------------------------------------------------------------
+
+/// Parameters for enqueueing an ingestion job.
+pub struct EnqueueIngestionJobParams<'a> {
+    pub target_id: Option<Uuid>,
+    pub network: &'a str,
+    pub mode: &'a str,
+    pub priority: i32,
+    pub idempotency_key: Option<&'a str>,
+    pub requested_by: Option<&'a str>,
+    pub callback_url: Option<&'a str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2974,6 +3086,620 @@ impl Repository {
         .await?;
         rows.iter().map(row_to_raw_evm_trace).collect()
     }
+
+    // -----------------------------------------------------------------------
+    // Ingestion Jobs (Durable Control Plane)
+    // -----------------------------------------------------------------------
+
+    /// Enqueue an ingestion job with status=pending.
+    ///
+    /// If `idempotency_key` is set and a job with that key already exists,
+    /// the existing job is returned instead of creating a duplicate.
+    pub async fn enqueue_ingestion_job(
+        &self,
+        params: &EnqueueIngestionJobParams<'_>,
+    ) -> anyhow::Result<IngestionJob> {
+        // If idempotency key is provided, check for existing job first.
+        if let Some(key) = params.idempotency_key {
+            let existing = sqlx::query(
+                "SELECT id, target_id, network, mode, status, priority, idempotency_key, \
+                 requested_by, callback_url, error_message, created_at, updated_at \
+                 FROM ingestion_jobs WHERE idempotency_key = $1",
+            )
+            .bind(key)
+            .fetch_optional(self.pool())
+            .await?;
+            if let Some(row) = existing {
+                return row_to_ingestion_job(&row);
+            }
+        }
+
+        let id = Uuid::new_v4();
+        let row = sqlx::query(
+            "INSERT INTO ingestion_jobs \
+             (id, target_id, network, mode, status, priority, idempotency_key, \
+              requested_by, callback_url) \
+             VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8) \
+             RETURNING id, target_id, network, mode, status, priority, idempotency_key, \
+                       requested_by, callback_url, error_message, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(params.target_id)
+        .bind(params.network)
+        .bind(params.mode)
+        .bind(params.priority)
+        .bind(params.idempotency_key)
+        .bind(params.requested_by)
+        .bind(params.callback_url)
+        .fetch_one(self.pool())
+        .await?;
+        row_to_ingestion_job(&row)
+    }
+
+    /// Claim the next pending ingestion job using `FOR UPDATE SKIP LOCKED`.
+    ///
+    /// Atomically transitions the job to `claimed` status and creates an
+    /// attempt record. Returns `None` if no pending jobs are available.
+    pub async fn claim_ingestion_job(
+        &self,
+        worker_id: &str,
+    ) -> anyhow::Result<Option<IngestionJob>> {
+        let mut tx = self.pool().begin().await?;
+
+        // Find and lock the highest-priority pending job.
+        let maybe_row = sqlx::query(
+            "SELECT id, target_id, network, mode, status, priority, idempotency_key, \
+             requested_by, callback_url, error_message, created_at, updated_at \
+             FROM ingestion_jobs \
+             WHERE status = 'pending' \
+             ORDER BY priority DESC, created_at ASC \
+             LIMIT 1 \
+             FOR UPDATE SKIP LOCKED",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let row = match maybe_row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let job_id: Uuid = row.try_get("id")?;
+
+        // Transition to claimed.
+        sqlx::query(
+            "UPDATE ingestion_jobs SET status = 'claimed', updated_at = NOW() WHERE id = $1",
+        )
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Create attempt record.
+        sqlx::query(
+            "INSERT INTO ingestion_job_attempts (job_id, worker_id, attempt_num) \
+             VALUES ($1, $2, \
+               COALESCE((SELECT MAX(attempt_num) FROM ingestion_job_attempts WHERE job_id = $1), 0) + 1)",
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        // Re-fetch with updated status.
+        self.get_ingestion_job(job_id).await.map(|opt| {
+            opt.map(|mut j| {
+                j.status = IngestionJobStatus::Claimed;
+                j
+            })
+        })
+    }
+
+    /// Record a heartbeat for an in-progress ingestion job.
+    ///
+    /// Updates both the job's `updated_at` and the latest attempt's
+    /// `heartbeat_at` for the given worker.
+    pub async fn heartbeat_ingestion_job(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE ingestion_jobs SET updated_at = NOW() WHERE id = $1")
+            .bind(job_id)
+            .execute(self.pool())
+            .await?;
+
+        sqlx::query(
+            "UPDATE ingestion_job_attempts SET heartbeat_at = NOW() \
+             WHERE job_id = $1 AND worker_id = $2 AND finished_at IS NULL",
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .execute(self.pool())
+        .await?;
+
+        Ok(())
+    }
+
+    /// Mark an ingestion job as completed.
+    pub async fn complete_ingestion_job(&self, job_id: Uuid) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE ingestion_jobs \
+             SET status = 'completed', updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(job_id)
+        .execute(self.pool())
+        .await?;
+
+        sqlx::query(
+            "UPDATE ingestion_job_attempts SET finished_at = NOW() \
+             WHERE job_id = $1 AND finished_at IS NULL",
+        )
+        .bind(job_id)
+        .execute(self.pool())
+        .await?;
+
+        Ok(())
+    }
+
+    /// Mark an ingestion job as failed with an error message.
+    pub async fn fail_ingestion_job(&self, job_id: Uuid, error: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE ingestion_jobs \
+             SET status = 'failed', error_message = $2, updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(job_id)
+        .bind(error)
+        .execute(self.pool())
+        .await?;
+
+        sqlx::query(
+            "UPDATE ingestion_job_attempts \
+             SET finished_at = NOW(), error_message = $2 \
+             WHERE job_id = $1 AND finished_at IS NULL",
+        )
+        .bind(job_id)
+        .bind(error)
+        .execute(self.pool())
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get an ingestion job by ID.
+    pub async fn get_ingestion_job(&self, id: Uuid) -> anyhow::Result<Option<IngestionJob>> {
+        let row = sqlx::query(
+            "SELECT id, target_id, network, mode, status, priority, idempotency_key, \
+             requested_by, callback_url, error_message, created_at, updated_at \
+             FROM ingestion_jobs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref().map(row_to_ingestion_job).transpose()
+    }
+
+    /// List ingestion jobs with optional status filter.
+    pub async fn list_ingestion_jobs(
+        &self,
+        status: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<IngestionJob>> {
+        let rows = match status {
+            Some(s) => {
+                sqlx::query(
+                    "SELECT id, target_id, network, mode, status, priority, idempotency_key, \
+                     requested_by, callback_url, error_message, created_at, updated_at \
+                     FROM ingestion_jobs WHERE status = $1 \
+                     ORDER BY priority DESC, created_at ASC LIMIT $2 OFFSET $3",
+                )
+                .bind(s)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(self.pool())
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT id, target_id, network, mode, status, priority, idempotency_key, \
+                     requested_by, callback_url, error_message, created_at, updated_at \
+                     FROM ingestion_jobs \
+                     ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(self.pool())
+                .await?
+            }
+        };
+        rows.iter().map(row_to_ingestion_job).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Stream Subscriptions (Durable Control Plane)
+    // -----------------------------------------------------------------------
+
+    /// Create or update a stream subscription.
+    ///
+    /// If a subscription already exists for the same (target_id, network, source),
+    /// updates the desired_status and config.
+    pub async fn upsert_stream_subscription(
+        &self,
+        target_id: Option<Uuid>,
+        network: &str,
+        source: &str,
+        desired_status: &str,
+        config: Option<&serde_json::Value>,
+    ) -> anyhow::Result<StreamSubscription> {
+        let id = Uuid::new_v4();
+        let row = sqlx::query(
+            "INSERT INTO stream_subscriptions \
+             (id, target_id, network, source, desired_status, config) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (target_id, network, source) WHERE target_id IS NOT NULL \
+             DO UPDATE SET \
+               desired_status = EXCLUDED.desired_status, \
+               config = COALESCE(EXCLUDED.config, stream_subscriptions.config), \
+               updated_at = NOW() \
+             RETURNING id, target_id, network, source, desired_status, actual_status, \
+                       lease_owner, heartbeat_at, cursor_state, config, error_message, \
+                       created_at, updated_at",
+        )
+        .bind(id)
+        .bind(target_id)
+        .bind(network)
+        .bind(source)
+        .bind(desired_status)
+        .bind(config)
+        .fetch_one(self.pool())
+        .await?;
+        row_to_stream_subscription(&row)
+    }
+
+    /// Claim a stream subscription lease for a worker.
+    ///
+    /// Uses `FOR UPDATE SKIP LOCKED` to atomically acquire the lease.
+    /// Only claims subscriptions where `desired_status = 'active'` and
+    /// either no current owner or the lease has expired (stale heartbeat).
+    pub async fn claim_stream_lease(
+        &self,
+        subscription_id: Uuid,
+        worker_id: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE stream_subscriptions \
+             SET lease_owner = $2, actual_status = 'running', \
+                 heartbeat_at = NOW(), updated_at = NOW() \
+             WHERE id = $1 \
+               AND desired_status = 'active' \
+               AND (lease_owner IS NULL OR heartbeat_at < NOW() - INTERVAL '5 minutes')",
+        )
+        .bind(subscription_id)
+        .bind(worker_id)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Record a heartbeat for an active stream subscription.
+    pub async fn heartbeat_stream(
+        &self,
+        subscription_id: Uuid,
+        worker_id: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE stream_subscriptions \
+             SET heartbeat_at = NOW(), updated_at = NOW() \
+             WHERE id = $1 AND lease_owner = $2",
+        )
+        .bind(subscription_id)
+        .bind(worker_id)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Release a stream subscription lease, setting actual_status to stopped.
+    pub async fn release_stream_lease(&self, subscription_id: Uuid) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE stream_subscriptions \
+             SET lease_owner = NULL, actual_status = 'stopped', \
+                 heartbeat_at = NULL, updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(subscription_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Update the cursor state for a stream subscription.
+    pub async fn update_stream_cursor(
+        &self,
+        subscription_id: Uuid,
+        cursor_state: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE stream_subscriptions \
+             SET cursor_state = $2, updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(subscription_id)
+        .bind(cursor_state)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Get a stream subscription by ID.
+    pub async fn get_stream_subscription(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<StreamSubscription>> {
+        let row = sqlx::query(
+            "SELECT id, target_id, network, source, desired_status, actual_status, \
+             lease_owner, heartbeat_at, cursor_state, config, error_message, \
+             created_at, updated_at \
+             FROM stream_subscriptions WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref().map(row_to_stream_subscription).transpose()
+    }
+
+    /// List stream subscriptions with optional desired_status filter.
+    pub async fn list_stream_subscriptions(
+        &self,
+        desired_status: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<StreamSubscription>> {
+        let rows = match desired_status {
+            Some(s) => {
+                sqlx::query(
+                    "SELECT id, target_id, network, source, desired_status, actual_status, \
+                     lease_owner, heartbeat_at, cursor_state, config, error_message, \
+                     created_at, updated_at \
+                     FROM stream_subscriptions WHERE desired_status = $1 \
+                     ORDER BY created_at LIMIT $2 OFFSET $3",
+                )
+                .bind(s)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(self.pool())
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT id, target_id, network, source, desired_status, actual_status, \
+                     lease_owner, heartbeat_at, cursor_state, config, error_message, \
+                     created_at, updated_at \
+                     FROM stream_subscriptions \
+                     ORDER BY created_at LIMIT $1 OFFSET $2",
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(self.pool())
+                .await?
+            }
+        };
+        rows.iter().map(row_to_stream_subscription).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Export Jobs (Durable Control Plane)
+    // -----------------------------------------------------------------------
+
+    /// Enqueue an export job with status=pending.
+    pub async fn enqueue_export_job(
+        &self,
+        dataset: &str,
+        format: &str,
+        filters: Option<&serde_json::Value>,
+        sink_config: Option<&serde_json::Value>,
+    ) -> anyhow::Result<ExportJob> {
+        let id = Uuid::new_v4();
+        let row = sqlx::query(
+            "INSERT INTO export_jobs \
+             (id, dataset, format, filters, sink_config) \
+             VALUES ($1, $2, $3, $4, $5) \
+             RETURNING id, dataset, format, filters, sink_config, status, \
+                       worker_id, record_count, result_location, error_message, \
+                       created_at, updated_at, started_at, completed_at",
+        )
+        .bind(id)
+        .bind(dataset)
+        .bind(format)
+        .bind(filters)
+        .bind(sink_config)
+        .fetch_one(self.pool())
+        .await?;
+        row_to_export_job(&row)
+    }
+
+    /// Claim the next pending export job using `FOR UPDATE SKIP LOCKED`.
+    pub async fn claim_export_job(&self, worker_id: &str) -> anyhow::Result<Option<ExportJob>> {
+        let mut tx = self.pool().begin().await?;
+
+        let maybe_row = sqlx::query(
+            "SELECT id FROM export_jobs \
+             WHERE status = 'pending' \
+             ORDER BY created_at ASC \
+             LIMIT 1 \
+             FOR UPDATE SKIP LOCKED",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let row = match maybe_row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let job_id: Uuid = row.try_get("id")?;
+
+        sqlx::query(
+            "UPDATE export_jobs \
+             SET status = 'running', worker_id = $2, started_at = NOW(), updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let updated = sqlx::query(
+            "SELECT id, dataset, format, filters, sink_config, status, \
+             worker_id, record_count, result_location, error_message, \
+             created_at, updated_at, started_at, completed_at \
+             FROM export_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(row_to_export_job(&updated)?))
+    }
+
+    /// Update the status (and optional fields) of an export job.
+    pub async fn update_export_job_status(
+        &self,
+        job_id: Uuid,
+        status: &str,
+        record_count: Option<i32>,
+        result_location: Option<&str>,
+        error_message: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let completed_at = if status == "completed" || status == "failed" {
+            Some(Utc::now())
+        } else {
+            None
+        };
+
+        sqlx::query(
+            "UPDATE export_jobs \
+             SET status = $2, record_count = COALESCE($3, record_count), \
+                 result_location = COALESCE($4, result_location), \
+                 error_message = COALESCE($5, error_message), \
+                 completed_at = COALESCE($6, completed_at), \
+                 updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(job_id)
+        .bind(status)
+        .bind(record_count)
+        .bind(result_location)
+        .bind(error_message)
+        .bind(completed_at)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Get an export job by ID.
+    pub async fn get_export_job(&self, id: Uuid) -> anyhow::Result<Option<ExportJob>> {
+        let row = sqlx::query(
+            "SELECT id, dataset, format, filters, sink_config, status, \
+             worker_id, record_count, result_location, error_message, \
+             created_at, updated_at, started_at, completed_at \
+             FROM export_jobs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref().map(row_to_export_job).transpose()
+    }
+
+    // -----------------------------------------------------------------------
+    // Materialization Runs (Durable Control Plane)
+    // -----------------------------------------------------------------------
+
+    /// Create a new materialization run with status=running.
+    pub async fn create_materialization_run(
+        &self,
+        dataset_name: &str,
+        scope: Option<&serde_json::Value>,
+        input_watermark: Option<i64>,
+        dataset_version_id: Option<Uuid>,
+        worker_id: Option<&str>,
+    ) -> anyhow::Result<MaterializationRun> {
+        let id = Uuid::new_v4();
+        let row = sqlx::query(
+            "INSERT INTO materialization_runs \
+             (id, dataset_name, scope, input_watermark, status, \
+              dataset_version_id, worker_id, started_at) \
+             VALUES ($1, $2, $3, $4, 'running', $5, $6, NOW()) \
+             RETURNING id, dataset_name, scope, input_watermark, output_record_count, \
+                       status, dataset_version_id, worker_id, started_at, finished_at, \
+                       error_message, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(dataset_name)
+        .bind(scope)
+        .bind(input_watermark)
+        .bind(dataset_version_id)
+        .bind(worker_id)
+        .fetch_one(self.pool())
+        .await?;
+        row_to_materialization_run(&row)
+    }
+
+    /// Mark a materialization run as completed with output stats.
+    pub async fn complete_materialization_run(
+        &self,
+        run_id: Uuid,
+        output_record_count: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE materialization_runs \
+             SET status = 'completed', output_record_count = $2, \
+                 finished_at = NOW(), updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(run_id)
+        .bind(output_record_count)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Mark a materialization run as failed.
+    pub async fn fail_materialization_run(&self, run_id: Uuid, error: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE materialization_runs \
+             SET status = 'failed', error_message = $2, \
+                 finished_at = NOW(), updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(run_id)
+        .bind(error)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Get a materialization run by ID.
+    pub async fn get_materialization_run(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<MaterializationRun>> {
+        let row = sqlx::query(
+            "SELECT id, dataset_name, scope, input_watermark, output_record_count, \
+             status, dataset_version_id, worker_id, started_at, finished_at, \
+             error_message, created_at, updated_at \
+             FROM materialization_runs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref().map(row_to_materialization_run).transpose()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4401,6 +5127,336 @@ mod tests {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
             _assert_send(repo.get_raw_evm_traces_by_block_range("ethereum-mainnet", 100, 200));
+        }
+        let _ = _check;
+    }
+
+    // -- Durable Control Plane row mapper tests --
+
+    #[test]
+    fn row_to_ingestion_job_parses_all_statuses() {
+        // This test verifies that IngestionJobStatus::from_str covers all
+        // valid statuses that the CHECK constraint allows.
+        use std::str::FromStr;
+        for s in [
+            "pending",
+            "claimed",
+            "running",
+            "completed",
+            "failed",
+            "cancelled",
+        ] {
+            let result = IngestionJobStatus::from_str(s);
+            assert!(
+                result.is_ok(),
+                "IngestionJobStatus::from_str('{s}') should succeed"
+            );
+        }
+        assert!(IngestionJobStatus::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn row_to_ingestion_job_parses_all_modes() {
+        use std::str::FromStr;
+        for s in ["backfill", "incremental"] {
+            let result = IngestionJobMode::from_str(s);
+            assert!(
+                result.is_ok(),
+                "IngestionJobMode::from_str('{s}') should succeed"
+            );
+        }
+        assert!(IngestionJobMode::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn stream_source_from_str_covers_all_variants() {
+        use std::str::FromStr;
+        for s in ["grpc", "ws", "rpc"] {
+            let result = StreamSource::from_str(s);
+            assert!(
+                result.is_ok(),
+                "StreamSource::from_str('{s}') should succeed"
+            );
+        }
+        assert!(StreamSource::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn stream_desired_status_from_str_covers_all_variants() {
+        use std::str::FromStr;
+        for s in ["active", "paused", "stopped"] {
+            let result = StreamDesiredStatus::from_str(s);
+            assert!(
+                result.is_ok(),
+                "StreamDesiredStatus::from_str('{s}') should succeed"
+            );
+        }
+        assert!(StreamDesiredStatus::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn stream_actual_status_from_str_covers_all_variants() {
+        use std::str::FromStr;
+        for s in ["pending", "running", "paused", "stopped", "error"] {
+            let result = StreamActualStatus::from_str(s);
+            assert!(
+                result.is_ok(),
+                "StreamActualStatus::from_str('{s}') should succeed"
+            );
+        }
+        assert!(StreamActualStatus::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn export_job_status_from_str_covers_all_variants() {
+        use std::str::FromStr;
+        for s in ["pending", "running", "delivering", "completed", "failed"] {
+            let result = ExportJobStatus::from_str(s);
+            assert!(
+                result.is_ok(),
+                "ExportJobStatus::from_str('{s}') should succeed"
+            );
+        }
+        assert!(ExportJobStatus::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn materialization_run_status_from_str_covers_all_variants() {
+        use std::str::FromStr;
+        for s in ["pending", "running", "completed", "failed"] {
+            let result = MaterializationRunStatus::from_str(s);
+            assert!(
+                result.is_ok(),
+                "MaterializationRunStatus::from_str('{s}') should succeed"
+            );
+        }
+        assert!(MaterializationRunStatus::from_str("invalid").is_err());
+    }
+
+    // -- Durable Control Plane repo methods are Send --
+
+    #[test]
+    fn repo_enqueue_ingestion_job_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            let params = EnqueueIngestionJobParams {
+                target_id: None,
+                network: "solana-mainnet",
+                mode: "backfill",
+                priority: 0,
+                idempotency_key: None,
+                requested_by: None,
+                callback_url: None,
+            };
+            _assert_send(repo.enqueue_ingestion_job(&params));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_claim_ingestion_job_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.claim_ingestion_job("worker-1"));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_heartbeat_ingestion_job_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.heartbeat_ingestion_job(Uuid::new_v4(), "worker-1"));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_complete_ingestion_job_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.complete_ingestion_job(Uuid::new_v4()));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_fail_ingestion_job_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.fail_ingestion_job(Uuid::new_v4(), "boom"));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_get_ingestion_job_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.get_ingestion_job(Uuid::new_v4()));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_list_ingestion_jobs_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.list_ingestion_jobs(Some("pending"), 10, 0));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_upsert_stream_subscription_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.upsert_stream_subscription(
+                None,
+                "solana-mainnet",
+                "grpc",
+                "active",
+                None,
+            ));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_claim_stream_lease_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.claim_stream_lease(Uuid::new_v4(), "worker-1"));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_heartbeat_stream_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.heartbeat_stream(Uuid::new_v4(), "worker-1"));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_release_stream_lease_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.release_stream_lease(Uuid::new_v4()));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_get_stream_subscription_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.get_stream_subscription(Uuid::new_v4()));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_list_stream_subscriptions_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.list_stream_subscriptions(Some("active"), 10, 0));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_enqueue_export_job_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.enqueue_export_job("token_transfers", "csv", None, None));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_claim_export_job_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.claim_export_job("worker-1"));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_update_export_job_status_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.update_export_job_status(
+                Uuid::new_v4(),
+                "completed",
+                Some(42),
+                Some("/tmp/out.csv"),
+                None,
+            ));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_get_export_job_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.get_export_job(Uuid::new_v4()));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_create_materialization_run_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.create_materialization_run(
+                "token_transfers",
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_complete_materialization_run_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.complete_materialization_run(Uuid::new_v4(), 100));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_fail_materialization_run_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.fail_materialization_run(Uuid::new_v4(), "parse error"));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_get_materialization_run_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.get_materialization_run(Uuid::new_v4()));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_update_stream_cursor_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            let cursor = serde_json::json!({"last_slot": 300});
+            _assert_send(repo.update_stream_cursor(Uuid::new_v4(), &cursor));
         }
         let _ = _check;
     }
