@@ -3585,16 +3585,16 @@ impl Repository {
 
     /// Claim the next available export job using `FOR UPDATE SKIP LOCKED`.
     ///
-    /// Considers both `pending` jobs and stale `running` jobs whose
+    /// Considers `pending` jobs and stale `running` or `delivering` jobs whose
     /// `heartbeat_at` has exceeded [`Self::STALE_JOB_THRESHOLD_MINUTES`],
-    /// recovering work abandoned by dead workers.
+    /// recovering work abandoned by dead workers at any in-progress phase.
     pub async fn claim_export_job(&self, worker_id: &str) -> anyhow::Result<Option<ExportJob>> {
         let mut tx = self.pool().begin().await?;
 
         let maybe_row = sqlx::query(
             "SELECT id FROM export_jobs \
              WHERE status = 'pending' \
-                OR (status = 'running' \
+                OR (status IN ('running', 'delivering') \
                     AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - make_interval(mins => $1))) \
              ORDER BY created_at ASC \
              LIMIT 1 \
@@ -3675,8 +3675,9 @@ impl Repository {
     /// Record a heartbeat for an in-progress export job.
     ///
     /// Updates `heartbeat_at` and `updated_at` for the given job, but only
-    /// if the caller is the current `worker_id` owner (prevents a stale
-    /// worker from extending its lease after reclaim).
+    /// if the caller is the current `worker_id` owner and the job is in an
+    /// active phase (`running` or `delivering`). Prevents a stale worker
+    /// from extending its lease after reclaim.
     pub async fn heartbeat_export_job(
         &self,
         job_id: Uuid,
@@ -3684,7 +3685,7 @@ impl Repository {
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE export_jobs SET heartbeat_at = NOW(), updated_at = NOW() \
-             WHERE id = $1 AND worker_id = $2 AND status = 'running'",
+             WHERE id = $1 AND worker_id = $2 AND status IN ('running', 'delivering')",
         )
         .bind(job_id)
         .bind(worker_id)
