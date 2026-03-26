@@ -94,26 +94,30 @@ pub fn resolve_effective_network(
         let expected_family = chain_to_family(&tx.chain);
         let family_matches: Vec<&String> = networks
             .iter()
-            .filter(|n| {
-                DatasetRegistry::chain_family_for_network(n) == Some(expected_family)
-            })
+            .filter(|n| DatasetRegistry::chain_family_for_network(n) == Some(expected_family))
             .collect();
         if family_matches.len() == 1 {
             return (family_matches[0].clone(), false);
         }
-        // Still ambiguous within the same family (e.g., same hash on ethereum-mainnet
-        // and base-mainnet). Prefer the chain default as a tiebreaker among matches.
-        let default = chain_to_default_network(&tx.chain);
-        if family_matches.iter().any(|n| n.as_str() == default) {
-            return (default.to_string(), false);
+        // Same-family ambiguity (e.g., same hash on ethereum-mainnet and
+        // base-mainnet).  This is NOT authoritative — we cannot determine
+        // the correct network without explicit context.  Mark as inferred
+        // so callers can skip or warn rather than silently attaching Silver
+        // rows to the wrong network.
+        if !family_matches.is_empty() {
+            // Return deterministic pick but flag as inferred.
+            let default = chain_to_default_network(&tx.chain);
+            let pick = family_matches
+                .iter()
+                .find(|n| n.as_str() == default)
+                .or_else(|| family_matches.iter().min())
+                .unwrap();
+            return ((*pick).clone(), true);
         }
-        // No default match — pick the first family match (deterministic via sort).
-        if let Some(first) = family_matches.into_iter().min() {
-            return (first.clone(), false);
-        }
-        // No family match at all — pick first network overall (sorted).
+        // No family match at all — cross-family only.  Pick deterministically
+        // but flag as inferred.
         if let Some(first) = networks.iter().min() {
-            return (first.clone(), false);
+            return (first.clone(), true);
         }
     }
     (chain_to_default_network(&tx.chain).to_string(), true)
@@ -640,29 +644,46 @@ impl Repository {
             HashMap::new()
         };
 
-        // Helper closure: resolve effective network for a transaction.
-        //
-        // Priority: explicit_network > Bronze raw_transactions > chain default (with warning).
-        let effective_network = |tx: &Transaction| -> String {
+        // Pre-resolve networks for all transactions.  Transactions whose network
+        // cannot be determined authoritatively (same-family ambiguity or no Bronze
+        // row) are excluded — they are skipped rather than attached to a guessed
+        // network.  Callers should re-run normalize with --network to provide
+        // explicit context for skipped transactions.
+        let mut resolved_networks: HashMap<String, String> = HashMap::new(); // tx_hash → network
+        let mut skipped = 0usize;
+        for tx in txs {
             let (network, was_inferred) =
                 resolve_effective_network(tx, explicit_network, &bronze_network_map);
             if was_inferred {
                 warn!(
                     tx_hash = %tx.tx_hash,
                     chain = ?tx.chain,
-                    inferred_network = %network,
-                    "Silver materialization: no Bronze row found for tx_hash; \
-                     inferring network from chain — this may be incorrect for \
-                     L2/sidechain transactions"
+                    guessed_network = %network,
+                    "Silver materialization: network for tx_hash is ambiguous or \
+                     inferred — skipping this transaction. Re-run normalize with \
+                     --network to provide explicit context."
                 );
+                skipped += 1;
+                continue;
             }
-            network
-        };
+            resolved_networks.insert(tx.tx_hash.clone(), network);
+        }
+        if skipped > 0 {
+            warn!(
+                skipped,
+                total = txs.len(),
+                "Silver materialization: skipped transactions with ambiguous network"
+            );
+        }
+
+        // Only proceed with transactions that have authoritative network identity.
+        let effective_network =
+            |tx: &Transaction| -> Option<String> { resolved_networks.get(&tx.tx_hash).cloned() };
 
         // 1. Batch-resolve canonical raw_transactions.id for each (network, tx_hash).
         let pairs: Vec<(String, String)> = txs
             .iter()
-            .map(|tx| (effective_network(tx), tx.tx_hash.clone()))
+            .filter_map(|tx| effective_network(tx).map(|n| (n, tx.tx_hash.clone())))
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -684,8 +705,12 @@ impl Repository {
         let missing_txs: Vec<&Transaction> = txs
             .iter()
             .filter(|tx| {
-                let key = (effective_network(tx), tx.tx_hash.clone());
-                !raw_id_map.contains_key(&key)
+                if let Some(net) = effective_network(tx) {
+                    let key = (net, tx.tx_hash.clone());
+                    !raw_id_map.contains_key(&key)
+                } else {
+                    false // skipped tx — don't back-fill
+                }
             })
             .collect();
 
@@ -694,10 +719,7 @@ impl Repository {
             // (which already consulted Bronze) rather than just the chain default.
             let v2_rows: Vec<RawTransaction> = missing_txs
                 .iter()
-                .map(|tx| {
-                    let resolved_net = effective_network(tx);
-                    v1_tx_to_v2_raw(tx, Some(&resolved_net))
-                })
+                .filter_map(|tx| effective_network(tx).map(|net| v1_tx_to_v2_raw(tx, Some(&net))))
                 .collect();
 
             match self.save_raw_transactions(&v2_rows).await {
@@ -710,7 +732,7 @@ impl Repository {
                     // Re-resolve IDs for the newly inserted rows.
                     let missing_pairs: Vec<(String, String)> = missing_txs
                         .iter()
-                        .map(|tx| (effective_network(tx), tx.tx_hash.clone()))
+                        .filter_map(|tx| effective_network(tx).map(|n| (n, tx.tx_hash.clone())))
                         .collect::<HashSet<_>>()
                         .into_iter()
                         .collect();
@@ -744,11 +766,12 @@ impl Repository {
             // Group all transactions by (network, wallet_address) to resolve targets.
             let mut wallet_groups: HashMap<(String, String), Vec<&Transaction>> = HashMap::new();
             for tx in txs {
-                let network = effective_network(tx);
-                wallet_groups
-                    .entry((network, tx.wallet_address.clone()))
-                    .or_default()
-                    .push(tx);
+                if let Some(network) = effective_network(tx) {
+                    wallet_groups
+                        .entry((network, tx.wallet_address.clone()))
+                        .or_default()
+                        .push(tx);
+                }
             }
 
             for ((network, wallet_address), group_txs) in &wallet_groups {
@@ -799,8 +822,10 @@ impl Repository {
                 let raw_tx_ids: Vec<Uuid> = group_txs
                     .iter()
                     .filter_map(|tx| {
-                        let key = (effective_network(tx), tx.tx_hash.clone());
-                        raw_id_map.get(&key).copied()
+                        effective_network(tx).and_then(|net| {
+                            let key = (net, tx.tx_hash.clone());
+                            raw_id_map.get(&key).copied()
+                        })
                     })
                     .collect();
 
@@ -840,7 +865,10 @@ impl Repository {
         let mut all_hl_positions = Vec::new();
 
         for tx in txs {
-            let network_str = effective_network(tx);
+            let network_str = match effective_network(tx) {
+                Some(n) => n,
+                None => continue, // skip ambiguous transactions
+            };
             let raw_tx_id = raw_id_map
                 .get(&(network_str.clone(), tx.tx_hash.clone()))
                 .copied();
@@ -1045,14 +1073,8 @@ impl Repository {
         // 5. Update dataset completeness metadata.
         //    Group by (chain, wallet_address) to resolve targets, then update
         //    completeness for each (target, dataset, network) combination.
-        self.update_silver_completeness(
-            txs,
-            &dataset_versions,
-            total,
-            explicit_network,
-            &bronze_network_map,
-        )
-        .await;
+        self.update_silver_completeness(txs, &dataset_versions, total, &resolved_networks)
+            .await;
     }
 
     /// Get or create dataset versions for each Silver dataset.
@@ -1107,22 +1129,23 @@ impl Repository {
     /// Update dataset completeness for each (target, dataset, network) touched
     /// by the materialization run.
     ///
-    /// `bronze_network_map` provides `tx_hash -> [actual_networks]` from Bronze
-    /// `raw_transactions` rows, used when `explicit_network` is `None` to avoid
-    /// collapsing L2/sidechain transactions to the wrong default network.
+    /// `resolved_networks` provides `tx_hash -> authoritative_network` — only
+    /// transactions with deterministic network identity are included.
     async fn update_silver_completeness(
         &self,
         txs: &[Transaction],
         dataset_versions: &HashMap<String, Uuid>,
         total_records: usize,
-        explicit_network: Option<&str>,
-        bronze_network_map: &HashMap<String, Vec<String>>,
+        resolved_networks: &HashMap<String, String>,
     ) {
         // Group transactions by (network, wallet_address) to resolve targets.
+        // Skip transactions with no resolved network (ambiguous).
         let mut wallet_groups: HashMap<(String, String), Vec<&Transaction>> = HashMap::new();
         for tx in txs {
-            let (network, _was_inferred) =
-                resolve_effective_network(tx, explicit_network, bronze_network_map);
+            let network = match resolved_networks.get(&tx.tx_hash) {
+                Some(n) => n.clone(),
+                None => continue,
+            };
             wallet_groups
                 .entry((network, tx.wallet_address.clone()))
                 .or_default()
@@ -2338,9 +2361,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_network_multi_network_disambiguates_by_chain_family() {
+    fn resolve_network_cross_family_disambiguates_correctly() {
         // Same tx_hash exists on both ethereum-mainnet and solana-mainnet.
-        // A Chain::Ethereum tx should resolve to ethereum-mainnet.
+        // A Chain::Ethereum tx should resolve to ethereum-mainnet (single
+        // family match → authoritative).
         let tx = make_eth_tx();
         let mut bronze_map = HashMap::new();
         bronze_map.insert(
@@ -2350,13 +2374,14 @@ mod tests {
 
         let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
         assert_eq!(network, "ethereum-mainnet");
-        assert!(!inferred);
+        assert!(!inferred, "single family match is authoritative");
     }
 
     #[test]
-    fn resolve_network_multi_evm_prefers_chain_default() {
-        // Same tx_hash on ethereum-mainnet and base-mainnet.
-        // Chain::Ethereum default is ethereum-mainnet, so it should win.
+    fn resolve_network_same_family_ambiguity_is_inferred() {
+        // Same tx_hash on ethereum-mainnet and base-mainnet (both EVM).
+        // This is ambiguous — should be marked as inferred so callers
+        // can fail closed instead of silently guessing.
         let tx = make_eth_tx();
         let mut bronze_map = HashMap::new();
         bronze_map.insert(
@@ -2365,14 +2390,18 @@ mod tests {
         );
 
         let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
+        assert!(
+            inferred,
+            "same-family ambiguity must be flagged as inferred"
+        );
+        // Still returns a deterministic pick (chain default preferred)
         assert_eq!(network, "ethereum-mainnet");
-        assert!(!inferred);
     }
 
     #[test]
-    fn resolve_network_multi_evm_no_default_picks_deterministic() {
-        // Same tx_hash on base-mainnet and arbitrum-mainnet (no ethereum-mainnet).
-        // Should pick deterministically (alphabetical min).
+    fn resolve_network_same_family_no_default_is_inferred() {
+        // Same tx_hash on base-mainnet and arbitrum-mainnet (both EVM, no
+        // ethereum-mainnet default). Ambiguous — must be inferred.
         let tx = make_eth_tx();
         let mut bronze_map = HashMap::new();
         bronze_map.insert(
@@ -2381,7 +2410,11 @@ mod tests {
         );
 
         let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
-        assert_eq!(network, "arbitrum-mainnet", "should pick alphabetical min");
-        assert!(!inferred);
+        assert!(
+            inferred,
+            "same-family ambiguity must be flagged as inferred"
+        );
+        // Deterministic: alphabetical min
+        assert_eq!(network, "arbitrum-mainnet");
     }
 }
