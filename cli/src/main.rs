@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use spectraplex_adapters::{
+    dual_write::{chain_to_default_source, v2_checkpoint_to_v1},
     evm::EvmAdapter,
     evm_parser,
     hyperliquid::HyperliquidAdapter,
@@ -9,8 +10,10 @@ use spectraplex_adapters::{
     solana_grpc::SolanaGrpcAdapter,
     solana_parser,
 };
+use spectraplex_core::config::AppConfig;
 use spectraplex_core::connector::validate_target;
 use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
+use spectraplex_core::provider::{chain_to_network_id, NetworkContext, NetworkId};
 use spectraplex_core::v2::{
     normalize_evm_address, normalize_solana_address, ChainFamily, IndexTarget, TargetKind,
     TargetMode,
@@ -39,8 +42,14 @@ enum Commands {
 
     /// Ingest raw data from blockchain to Bronze layer (JSONL)
     Ingest {
-        #[arg(short, long)]
+        /// Chain name (compat alias). Prefer --network for new usage.
+        #[arg(short, long, default_value = "")]
         chain: String,
+
+        /// Network ID (e.g. solana-mainnet, ethereum-mainnet, base-mainnet).
+        /// Takes precedence over --chain when provided.
+        #[arg(short, long)]
+        network: Option<String>,
 
         /// Wallet address(es) to ingest. Pass multiple times for batch ingestion.
         #[arg(short, long, required = true, num_args = 1..)]
@@ -72,6 +81,13 @@ enum Commands {
 
         #[arg(short, long, default_value = "silver_ledger.jsonl")]
         output: PathBuf,
+
+        /// Optional V2 network identifier (e.g. "base-mainnet").
+        /// When provided, overrides the chain-derived default during Silver
+        /// materialization.  When omitted, the actual network is resolved
+        /// from existing Bronze raw_transactions rows.
+        #[arg(short, long)]
+        network: Option<String>,
     },
 
     /// Register a new index target
@@ -144,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Ingest {
             chain,
+            network,
             wallet: wallets,
             output,
             rpc,
@@ -152,6 +169,47 @@ async fn main() -> anyhow::Result<()> {
             limit,
             user_id,
         } => {
+            // Resolve chain from --network (preferred) or --chain (compat)
+            let chain = if let Some(ref net) = network {
+                match net.as_str() {
+                    n if n.starts_with("solana") => "solana".to_string(),
+                    n if n.starts_with("hypercore") || n.starts_with("hyperliquid") => {
+                        "hyperliquid".to_string()
+                    }
+                    _ => "ethereum".to_string(),
+                }
+            } else if chain.is_empty() {
+                anyhow::bail!("Either --chain or --network must be provided");
+            } else {
+                chain
+            };
+
+            // Build provider registry from config (best-effort; falls back to CLI args)
+            let net_ctx = {
+                let config = AppConfig::load().ok();
+                config.and_then(|cfg| {
+                    let registry = cfg.provider_registry().ok()?;
+                    let net_id = if let Some(ref net) = network {
+                        NetworkId::new(net.clone())
+                    } else {
+                        chain_to_network_id(&chain)?
+                    };
+                    NetworkContext::from_registry(&registry, &net_id)
+                })
+            };
+
+            // Fail closed: when --network is explicit, the provider registry
+            // MUST resolve it. Silently falling back to --rpc / --grpc-url
+            // would connect to the wrong network (e.g. --network base-mainnet
+            // but --rpc points to Ethereum mainnet).
+            if network.is_some() && net_ctx.is_none() {
+                anyhow::bail!(
+                    "network '{}' is not configured in the provider registry. \
+                     Check spectraplex.toml or SPECTRAPLEX_* environment variables.",
+                    network.as_deref().unwrap()
+                );
+            }
+
             let user_id = user_id.unwrap_or_else(|| {
                 let id = Uuid::new_v4();
                 info!(user_id = %id, "No --user-id provided, auto-generated");
@@ -167,24 +225,89 @@ async fn main() -> anyhow::Result<()> {
             for wallet in &wallets {
                 info!(wallet = %wallet, chain = %chain, "Starting ingestion");
 
+                // Parse chain enum early for V2 checkpoint lookup
+                let chain_enum_for_cp = match chain.as_str() {
+                    "solana" => Chain::Solana,
+                    "ethereum" => Chain::Ethereum,
+                    "hyperliquid" => Chain::Hyperliquid,
+                    _ => unreachable!("unsupported chain filtered earlier"),
+                };
+
+                // Resume path: when --network is provided, use V2 checkpoint
+                // (keyed by network + target) so different EVM networks get
+                // independent resume state. Do NOT fall back to V1 checkpoint
+                // when network is explicit — that would inherit resume state
+                // from a different EVM network. When no V2 checkpoint exists,
+                // start from scratch (full backfill for that network).
                 let checkpoint = if let Some(ref p) = pool {
                     let repo = Repository::new(p.clone());
-                    match repo.get_checkpoint(&chain, wallet).await? {
-                        Some(cp) => {
+                    if let Some(ref net) = network {
+                        // Network-first: try V2 checkpoint scoped by network
+                        let v2_cp = {
+                            // Need target_id for V2 lookup; peek at existing target
+                            let target = repo
+                                .get_index_target_by_address(
+                                    spectraplex_core::v2::TargetKind::Wallet,
+                                    net,
+                                    wallet,
+                                )
+                                .await
+                                .ok()
+                                .flatten();
+                            if let Some(t) = target {
+                                let source = chain_to_default_source(&chain_enum_for_cp);
+                                repo.get_checkpoint_v2(t.id, net, source)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some(v2) = v2_cp {
+                            let cp = v2_checkpoint_to_v1(&v2, &chain_enum_for_cp, wallet);
                             info!(
-                                chain = %chain,
+                                network = %net,
                                 wallet = %wallet,
                                 last_signature = ?cp.last_signature,
                                 last_slot = ?cp.last_slot,
                                 last_block = ?cp.last_block,
                                 last_timestamp = ?cp.last_timestamp,
-                                "Resuming from checkpoint"
+                                "Resuming from V2 checkpoint (network-scoped)"
                             );
                             Some(cp)
-                        }
-                        None => {
-                            info!(chain = %chain, wallet = %wallet, "No existing checkpoint, full ingestion");
+                        } else {
+                            info!(
+                                network = %net,
+                                wallet = %wallet,
+                                "No V2 checkpoint for explicit network, starting fresh"
+                            );
                             None
+                        }
+                    } else {
+                        // No explicit network: use V1 checkpoint as before
+                        match repo.get_checkpoint(&chain, wallet).await? {
+                            Some(cp) => {
+                                info!(
+                                    chain = %chain,
+                                    wallet = %wallet,
+                                    last_signature = ?cp.last_signature,
+                                    last_slot = ?cp.last_slot,
+                                    last_block = ?cp.last_block,
+                                    last_timestamp = ?cp.last_timestamp,
+                                    "Resuming from checkpoint"
+                                );
+                                Some(cp)
+                            }
+                            None => {
+                                info!(
+                                    chain = %chain,
+                                    wallet = %wallet,
+                                    "No existing checkpoint, full ingestion"
+                                );
+                                None
+                            }
                         }
                     }
                 } else {
@@ -208,24 +331,41 @@ async fn main() -> anyhow::Result<()> {
                             adapter
                                 .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
                                 .await?
+                        } else if let Some(ref ctx) = net_ctx {
+                            // Use provider registry
+                            let adapter = SolanaAdapter::from_network_context(ctx)?;
+                            adapter
+                                .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
+                                .await?
                         } else {
-                            anyhow::bail!("Either --grpc-url or --rpc must be provided for Solana");
+                            anyhow::bail!("Either --grpc-url, --rpc, or --network must be provided for Solana");
                         }
                     }
                     "hyperliquid" => {
-                        let adapter = HyperliquidAdapter::new();
+                        let adapter = match &net_ctx {
+                            Some(ctx) => HyperliquidAdapter::from_network_context(ctx),
+                            None => HyperliquidAdapter::new(),
+                        };
                         adapter
                             .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
                             .await?
                     }
                     "ethereum" => {
-                        let rpc_url = rpc
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("--rpc is required for Ethereum"))?;
-                        let adapter = EvmAdapter::new(rpc_url)?;
-                        adapter
-                            .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
-                            .await?
+                        if let Some(ref rpc_url) = rpc {
+                            let adapter = EvmAdapter::new(rpc_url)?;
+                            adapter
+                                .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
+                                .await?
+                        } else if let Some(ref ctx) = net_ctx {
+                            let adapter = EvmAdapter::from_network_context(ctx)?;
+                            adapter
+                                .fetch_history(wallet, limit, user_id, checkpoint.as_ref())
+                                .await?
+                        } else {
+                            anyhow::bail!(
+                                "Either --rpc or --network must be provided for EVM chains"
+                            );
+                        }
                     }
                     _ => {
                         warn!(chain = %chain, "Unsupported chain");
@@ -244,26 +384,56 @@ async fn main() -> anyhow::Result<()> {
                         _ => unreachable!("unsupported chain filtered earlier"),
                     };
 
-                    // Ensure a V2 IndexTarget exists for this wallet (best-effort)
-                    let target_id = match repo
-                        .ensure_wallet_target(&chain_enum, wallet, Some(user_id))
-                        .await
-                    {
-                        Ok(target) => Some(target.id),
-                        Err(e) => {
-                            warn!(
-                                error = %e,
-                                wallet = %wallet,
-                                "Failed to ensure V2 wallet target (V1 path unaffected)"
-                            );
-                            None
+                    // Ensure a V2 IndexTarget exists for this wallet (best-effort).
+                    // When --network is provided, use it so different EVM networks
+                    // get distinct target rows.
+                    let target_id = if let Some(ref net) = network {
+                        match repo
+                            .ensure_wallet_target_for_network(
+                                net,
+                                &chain_enum,
+                                wallet,
+                                Some(user_id),
+                            )
+                            .await
+                        {
+                            Ok(target) => Some(target.id),
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    wallet = %wallet,
+                                    network = %net,
+                                    "Failed to ensure V2 wallet target (V1 path unaffected)"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        match repo
+                            .ensure_wallet_target(&chain_enum, wallet, Some(user_id))
+                            .await
+                        {
+                            Ok(target) => Some(target.id),
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    wallet = %wallet,
+                                    "Failed to ensure V2 wallet target (V1 path unaffected)"
+                                );
+                                None
+                            }
                         }
                     };
 
                     if let Some(cp) = build_checkpoint(&chain, wallet, &events) {
                         if let Some(tid) = target_id {
-                            repo.save_transactions_and_checkpoint_dual_write(&events, &cp, tid)
-                                .await?;
+                            repo.save_transactions_and_checkpoint_dual_write(
+                                &events,
+                                &cp,
+                                tid,
+                                network.as_deref(),
+                            )
+                            .await?;
                         } else {
                             repo.save_transactions_and_checkpoint(&events, &cp).await?;
                         }
@@ -279,7 +449,8 @@ async fn main() -> anyhow::Result<()> {
                         );
                     } else {
                         if let Some(tid) = target_id {
-                            repo.save_transactions_dual_write(&events, tid).await?;
+                            repo.save_transactions_dual_write(&events, tid, network.as_deref())
+                                .await?;
                         } else {
                             repo.save_transactions(&events).await?;
                         }
@@ -435,7 +606,11 @@ async fn main() -> anyhow::Result<()> {
                 info!(count = networks.len(), "Networks listed");
             }
         }
-        Commands::Normalize { input, output } => {
+        Commands::Normalize {
+            input,
+            output,
+            network,
+        } => {
             let input_str = input.to_string_lossy();
             let transactions = if input_str.starts_with("db:") {
                 let wallet = input_str.strip_prefix("db:").unwrap();
@@ -488,8 +663,12 @@ async fn main() -> anyhow::Result<()> {
                 let repo = Repository::new(p);
                 repo.save_ledger_entries(&all_entries).await?;
 
-                // Materialize V2 Silver datasets (best-effort)
-                repo.materialize_silver_datasets(&transactions).await;
+                // Materialize V2 Silver datasets (best-effort).
+                // When an explicit network is provided, use it.  Otherwise,
+                // materialize_silver_datasets resolves the actual network from
+                // existing Bronze raw_transactions rows.
+                repo.materialize_silver_datasets(&transactions, network.as_deref())
+                    .await;
 
                 info!("Normalization complete");
             } else {
@@ -639,9 +818,36 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ingest_missing_chain() {
-        let result = Cli::try_parse_from(["spectraplex", "ingest", "--wallet", "abc123"]);
-        assert!(result.is_err());
+    fn test_parse_ingest_no_chain_defaults_to_empty() {
+        // --chain is now optional (defaults to ""), --network is preferred
+        let cli = Cli::try_parse_from(["spectraplex", "ingest", "--wallet", "abc123"]).unwrap();
+        match cli.command {
+            Commands::Ingest { chain, network, .. } => {
+                assert_eq!(chain, "");
+                assert!(network.is_none());
+            }
+            _ => panic!("expected Ingest command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ingest_network_flag() {
+        let cli = Cli::try_parse_from([
+            "spectraplex",
+            "ingest",
+            "--network",
+            "solana-mainnet",
+            "--wallet",
+            "abc123",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Ingest { chain, network, .. } => {
+                assert_eq!(chain, ""); // chain defaults to empty when not provided
+                assert_eq!(network.as_deref(), Some("solana-mainnet"));
+            }
+            _ => panic!("expected Ingest command"),
+        }
     }
 
     #[test]
@@ -723,9 +929,14 @@ mod tests {
     fn test_parse_normalize_defaults() {
         let cli = Cli::try_parse_from(["spectraplex", "normalize"]).unwrap();
         match cli.command {
-            Commands::Normalize { input, output } => {
+            Commands::Normalize {
+                input,
+                output,
+                network,
+            } => {
                 assert_eq!(input, PathBuf::from("bronze_transactions.jsonl"));
                 assert_eq!(output, PathBuf::from("silver_ledger.jsonl"));
+                assert!(network.is_none());
             }
             _ => panic!("expected Normalize command"),
         }
@@ -743,9 +954,38 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Normalize { input, output } => {
+            Commands::Normalize {
+                input,
+                output,
+                network,
+            } => {
                 assert_eq!(input, PathBuf::from("custom_input.jsonl"));
                 assert_eq!(output, PathBuf::from("custom_output.jsonl"));
+                assert!(network.is_none());
+            }
+            _ => panic!("expected Normalize command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_normalize_with_network() {
+        let cli = Cli::try_parse_from([
+            "spectraplex",
+            "normalize",
+            "--input",
+            "db:0xabc",
+            "--network",
+            "base-mainnet",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Normalize {
+                input,
+                output: _,
+                network,
+            } => {
+                assert_eq!(input, PathBuf::from("db:0xabc"));
+                assert_eq!(network.as_deref(), Some("base-mainnet"));
             }
             _ => panic!("expected Normalize command"),
         }

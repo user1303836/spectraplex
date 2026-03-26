@@ -24,6 +24,16 @@ solana_rpc_url = "https://api.mainnet-beta.solana.com"
 # ---------------------------------------------------------------------------
 # Enable the networks you want to index. Each network needs at least one
 # provider entry with the capabilities your workload requires.
+#
+# When using structured config, API and CLI accept `network` as the primary
+# parameter (e.g. "solana-mainnet", "base-mainnet"). The `chain` parameter
+# still works as a backward-compatible alias that maps to a default network:
+#   solana      -> solana-mainnet
+#   ethereum    -> ethereum-mainnet
+#   hyperliquid -> hypercore-mainnet
+#
+# Adapters are automatically constructed from the provider registry. CLI
+# flags like --rpc and --grpc-url override the registry when provided.
 
 # [networks.solana-mainnet]
 # enabled = true

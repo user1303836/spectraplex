@@ -52,6 +52,78 @@ pub fn chain_to_default_source(chain: &Chain) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Network resolution for normalize path
+// ---------------------------------------------------------------------------
+
+/// Map a V1 `Chain` enum to its V2 `ChainFamily` for disambiguation.
+fn chain_to_family(chain: &Chain) -> ChainFamily {
+    match chain {
+        Chain::Solana => ChainFamily::Solana,
+        Chain::Ethereum => ChainFamily::Evm,
+        Chain::Hyperliquid => ChainFamily::Hyperliquid,
+    }
+}
+
+/// Resolve the effective network for a V1 transaction during Silver
+/// materialization.
+///
+/// Priority:
+/// 1. `explicit_network` — caller-provided override (e.g. from API/CLI request)
+/// 2. `bronze_network_map` — actual network from existing Bronze `raw_transactions`
+///    rows, disambiguated by chain family when a tx_hash exists on multiple networks
+/// 3. `chain_to_default_network()` — last resort, derived from V1 `Chain` enum
+///
+/// The third path is a lossy fallback: `Chain::Ethereum` maps to
+/// `"ethereum-mainnet"` even for L2/sidechain transactions that were originally
+/// ingested as `"base-mainnet"` or `"arbitrum-mainnet"`.  Returns `true` in
+/// the second tuple element when the chain default was used (so callers can log
+/// a warning).
+pub fn resolve_effective_network(
+    tx: &Transaction,
+    explicit_network: Option<&str>,
+    bronze_network_map: &HashMap<String, Vec<String>>,
+) -> (String, bool) {
+    if let Some(n) = explicit_network {
+        return (n.to_string(), false);
+    }
+    if let Some(networks) = bronze_network_map.get(&tx.tx_hash) {
+        if networks.len() == 1 {
+            return (networks[0].clone(), false);
+        }
+        // Multiple networks for the same tx_hash — disambiguate by chain family.
+        let expected_family = chain_to_family(&tx.chain);
+        let family_matches: Vec<&String> = networks
+            .iter()
+            .filter(|n| DatasetRegistry::chain_family_for_network(n) == Some(expected_family))
+            .collect();
+        if family_matches.len() == 1 {
+            return (family_matches[0].clone(), false);
+        }
+        // Same-family ambiguity (e.g., same hash on ethereum-mainnet and
+        // base-mainnet).  This is NOT authoritative — we cannot determine
+        // the correct network without explicit context.  Mark as inferred
+        // so callers can skip or warn rather than silently attaching Silver
+        // rows to the wrong network.
+        if !family_matches.is_empty() {
+            // Return deterministic pick but flag as inferred.
+            let default = chain_to_default_network(&tx.chain);
+            let pick = family_matches
+                .iter()
+                .find(|n| n.as_str() == default)
+                .or_else(|| family_matches.iter().min())
+                .unwrap();
+            return ((*pick).clone(), true);
+        }
+        // No family match at all — cross-family only.  Pick deterministically
+        // but flag as inferred.
+        if let Some(first) = networks.iter().min() {
+            return (first.clone(), true);
+        }
+    }
+    (chain_to_default_network(&tx.chain).to_string(), true)
+}
+
+// ---------------------------------------------------------------------------
 // V1 → V2 conversion functions
 // ---------------------------------------------------------------------------
 
@@ -59,16 +131,25 @@ pub fn chain_to_default_source(chain: &Chain) -> &'static str {
 ///
 /// Per Rollout Plan Section 2.2:
 /// - `user_id` and `wallet_address` are stripped (target-agnostic)
-/// - `chain` maps to `network` via `chain_to_default_network`
+/// - `chain` maps to `network` via `chain_to_default_network` (unless overridden)
 /// - `source` maps via `chain_to_default_source`
 /// - `block_number` is extracted from `raw_metadata` (Solana: `slot`, EVM: `block_number`)
 /// - `id`, `timestamp`, `tx_hash`, `raw_metadata` are copied directly
-pub fn v1_tx_to_v2_raw(tx: &Transaction) -> RawTransaction {
+///
+/// When `explicit_network` is `Some`, it overrides the chain-derived default.
+/// This is critical for EVM networks like `base-mainnet` and `arbitrum-mainnet`
+/// that all map to `Chain::Ethereum` but need distinct network identifiers in
+/// the V2 `raw_transactions` table.
+pub fn v1_tx_to_v2_raw(tx: &Transaction, explicit_network: Option<&str>) -> RawTransaction {
     let block_number = extract_block_number(&tx.chain, &tx.raw_metadata);
+    let network = match explicit_network {
+        Some(n) => n.to_string(),
+        None => chain_to_default_network(&tx.chain).to_string(),
+    };
 
     RawTransaction {
         id: tx.id,
-        network: chain_to_default_network(&tx.chain).to_string(),
+        network,
         tx_hash: tx.tx_hash.clone(),
         timestamp: tx.timestamp,
         block_number,
@@ -100,7 +181,24 @@ fn extract_block_number(chain: &Chain, metadata: &serde_json::Value) -> Option<i
 /// - EVM cursor: `{ last_block }`
 /// - HyperCore cursor: `{ last_timestamp }` (raw seconds)
 pub fn v1_checkpoint_to_v2(cp: &IndexerCheckpoint, target_id: Uuid) -> Checkpoint {
-    let network = chain_to_default_network(&cp.chain).to_string();
+    v1_checkpoint_to_v2_with_network(cp, target_id, None)
+}
+
+/// Convert a V1 checkpoint to V2, with an optional explicit network override.
+///
+/// When `explicit_network` is `Some`, it is used instead of the chain-derived
+/// default. This is critical for EVM networks like `base-mainnet` and
+/// `arbitrum-mainnet` that all map to `Chain::Ethereum` but need distinct
+/// checkpoint rows in the V2 `checkpoints` table.
+pub fn v1_checkpoint_to_v2_with_network(
+    cp: &IndexerCheckpoint,
+    target_id: Uuid,
+    explicit_network: Option<&str>,
+) -> Checkpoint {
+    let network = match explicit_network {
+        Some(n) => n.to_string(),
+        None => chain_to_default_network(&cp.chain).to_string(),
+    };
     let source = chain_to_default_source(&cp.chain).to_string();
 
     let cursor = build_v2_cursor(cp);
@@ -162,6 +260,39 @@ fn build_v2_cursor(cp: &IndexerCheckpoint) -> serde_json::Value {
     serde_json::Value::Object(cursor)
 }
 
+/// Convert a V2 `Checkpoint` back to a V1 `IndexerCheckpoint`.
+///
+/// This is used in the network-first resume path: when an explicit network is
+/// provided, the V2 checkpoint is authoritative and is converted to V1 format
+/// so the existing adapter `fetch_history` methods can consume it.
+pub fn v2_checkpoint_to_v1(
+    v2: &Checkpoint,
+    chain: &Chain,
+    wallet_address: &str,
+) -> IndexerCheckpoint {
+    let cursor = &v2.cursor;
+
+    let last_signature = cursor
+        .get("last_signature")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let last_slot = cursor.get("last_slot").and_then(|v| v.as_i64());
+
+    let last_block = cursor.get("last_block").and_then(|v| v.as_i64());
+
+    let last_timestamp = cursor.get("last_timestamp").and_then(|v| v.as_i64());
+
+    IndexerCheckpoint {
+        chain: chain.clone(),
+        wallet_address: wallet_address.to_string(),
+        last_signature,
+        last_slot,
+        last_block,
+        last_timestamp,
+    }
+}
+
 /// Build `TargetMatch` rows linking a target to a set of raw transaction IDs.
 ///
 /// All matches use `match_reason = "sender"` since V1 wallet ingestion finds
@@ -197,8 +328,42 @@ impl Repository {
         owner_id: Option<Uuid>,
     ) -> anyhow::Result<IndexTarget> {
         let network = chain_to_default_network(chain);
-        let chain_family = ChainFamily::from(chain.clone());
+        self.ensure_wallet_target_inner(
+            network,
+            ChainFamily::from(chain.clone()),
+            wallet_address,
+            owner_id,
+        )
+        .await
+    }
 
+    /// Like `ensure_wallet_target`, but uses an explicit network ID instead of
+    /// deriving it from `Chain`. This is needed for EVM networks like
+    /// `base-mainnet` and `arbitrum-mainnet` that all map to `Chain::Ethereum`
+    /// but must have distinct target rows.
+    pub async fn ensure_wallet_target_for_network(
+        &self,
+        network: &str,
+        chain: &Chain,
+        wallet_address: &str,
+        owner_id: Option<Uuid>,
+    ) -> anyhow::Result<IndexTarget> {
+        self.ensure_wallet_target_inner(
+            network,
+            ChainFamily::from(chain.clone()),
+            wallet_address,
+            owner_id,
+        )
+        .await
+    }
+
+    async fn ensure_wallet_target_inner(
+        &self,
+        network: &str,
+        chain_family: ChainFamily,
+        wallet_address: &str,
+        owner_id: Option<Uuid>,
+    ) -> anyhow::Result<IndexTarget> {
         // Check if target already exists
         if let Some(existing) = self
             .get_index_target_by_address(TargetKind::Wallet, network, wallet_address)
@@ -242,16 +407,23 @@ impl Repository {
     /// V1 write (`save_transactions`) executes first. V2 writes
     /// (`save_raw_transactions` + `save_target_matches`) are best-effort:
     /// failures are logged but do not fail the operation.
+    ///
+    /// When `explicit_network` is provided, V2 raw transactions are stamped
+    /// with the given network instead of the chain-derived default.
     pub async fn save_transactions_dual_write(
         &self,
         txs: &[Transaction],
         target_id: Uuid,
+        explicit_network: Option<&str>,
     ) -> anyhow::Result<()> {
         // V1 write (authoritative)
         self.save_transactions(txs).await?;
 
         // V2 write (best-effort)
-        if let Err(e) = self.v2_write_transactions(txs, target_id).await {
+        if let Err(e) = self
+            .v2_write_transactions(txs, target_id, explicit_network)
+            .await
+        {
             warn!(
                 error = %e,
                 target_id = %target_id,
@@ -267,16 +439,21 @@ impl Repository {
     ///
     /// V1 write (`save_checkpoint`) executes first. V2 write
     /// (`upsert_checkpoint_v2`) is best-effort.
+    ///
+    /// When `explicit_network` is provided it overrides the chain-derived
+    /// default in the V2 checkpoint, ensuring different EVM networks
+    /// get distinct checkpoint rows.
     pub async fn save_checkpoint_dual_write(
         &self,
         checkpoint: &IndexerCheckpoint,
         target_id: Uuid,
+        explicit_network: Option<&str>,
     ) -> anyhow::Result<()> {
         // V1 write (authoritative)
         self.save_checkpoint(checkpoint).await?;
 
         // V2 write (best-effort)
-        let v2_cp = v1_checkpoint_to_v2(checkpoint, target_id);
+        let v2_cp = v1_checkpoint_to_v2_with_network(checkpoint, target_id, explicit_network);
         if let Err(e) = self.upsert_checkpoint_v2(&v2_cp).await {
             warn!(
                 error = %e,
@@ -292,18 +469,25 @@ impl Repository {
     ///
     /// V1 path uses `save_transactions_and_checkpoint` (atomic). V2 writes
     /// are best-effort and run after V1 succeeds.
+    ///
+    /// When `explicit_network` is provided it overrides the chain-derived
+    /// default in the V2 checkpoint.
     pub async fn save_transactions_and_checkpoint_dual_write(
         &self,
         txs: &[Transaction],
         checkpoint: &IndexerCheckpoint,
         target_id: Uuid,
+        explicit_network: Option<&str>,
     ) -> anyhow::Result<()> {
         // V1 write (authoritative, atomic)
         self.save_transactions_and_checkpoint(txs, checkpoint)
             .await?;
 
         // V2 write (best-effort)
-        if let Err(e) = self.v2_write_transactions(txs, target_id).await {
+        if let Err(e) = self
+            .v2_write_transactions(txs, target_id, explicit_network)
+            .await
+        {
             warn!(
                 error = %e,
                 target_id = %target_id,
@@ -312,7 +496,7 @@ impl Repository {
             );
         }
 
-        let v2_cp = v1_checkpoint_to_v2(checkpoint, target_id);
+        let v2_cp = v1_checkpoint_to_v2_with_network(checkpoint, target_id, explicit_network);
         if let Err(e) = self.upsert_checkpoint_v2(&v2_cp).await {
             warn!(
                 error = %e,
@@ -332,17 +516,24 @@ impl Repository {
     /// row twice in a single statement, so we deduplicate before upserting and
     /// then map every *original* transaction back to its canonical ID for the
     /// target_matches.
+    ///
+    /// When `explicit_network` is provided, it overrides the chain-derived
+    /// default in the V2 raw transactions.
     async fn v2_write_transactions(
         &self,
         txs: &[Transaction],
         target_id: Uuid,
+        explicit_network: Option<&str>,
     ) -> anyhow::Result<()> {
         if txs.is_empty() {
             return Ok(());
         }
 
         // 1. Convert all V1 txs to V2 raw transactions.
-        let v2_txs: Vec<RawTransaction> = txs.iter().map(v1_tx_to_v2_raw).collect();
+        let v2_txs: Vec<RawTransaction> = txs
+            .iter()
+            .map(|tx| v1_tx_to_v2_raw(tx, explicit_network))
+            .collect();
 
         // 2. Deduplicate by (network, tx_hash), keeping the first occurrence.
         let mut seen: HashMap<(&str, &str), usize> = HashMap::new();
@@ -399,22 +590,100 @@ impl Repository {
     /// completeness metadata so dataset status and export provenance reflect
     /// the newly materialized rows.
     ///
+    /// When `explicit_network` is provided, it overrides the chain-derived
+    /// default for network lookups and Silver record stamping.
+    ///
+    /// When `explicit_network` is `None` (the normalize path), the function
+    /// consults existing Bronze `raw_transactions` rows to recover the actual
+    /// network for each tx_hash.  Only when no Bronze row exists does it fall
+    /// back to `chain_to_default_network()` — and logs a warning when it does.
+    ///
     /// V2 Silver writes are best-effort: failures are logged but never abort
     /// the V1 normalization path.
-    pub async fn materialize_silver_datasets(&self, txs: &[Transaction]) {
+    pub async fn materialize_silver_datasets(
+        &self,
+        txs: &[Transaction],
+        explicit_network: Option<&str>,
+    ) {
         if txs.is_empty() {
             return;
         }
 
+        // 0. When no explicit network is provided, consult Bronze to recover
+        //    the actual network for each tx_hash.  This is critical because V1
+        //    `Transaction` rows only carry `chain: Chain` (e.g. `Ethereum`),
+        //    which maps to "ethereum-mainnet" by default — but the original
+        //    ingest may have been for "base-mainnet" or "arbitrum-mainnet".
+        //    Bronze `raw_transactions` rows have the correct `network` field.
+        let bronze_network_map: HashMap<String, Vec<String>> = if explicit_network.is_none() {
+            let all_hashes: Vec<String> = txs
+                .iter()
+                .map(|tx| tx.tx_hash.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            match self.lookup_raw_tx_networks_by_hashes(&all_hashes).await {
+                Ok(map) => map
+                    .into_iter()
+                    .map(|(hash, entries)| {
+                        let networks: Vec<String> =
+                            entries.into_iter().map(|(_id, network)| network).collect();
+                        (hash, networks)
+                    })
+                    .collect(),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Silver materialization: failed to resolve networks from Bronze; \
+                         falling back to chain defaults"
+                    );
+                    HashMap::new()
+                }
+            }
+        } else {
+            HashMap::new()
+        };
+
+        // Pre-resolve networks for all transactions.  Transactions whose network
+        // cannot be determined authoritatively (same-family ambiguity or no Bronze
+        // row) are excluded — they are skipped rather than attached to a guessed
+        // network.  Callers should re-run normalize with --network to provide
+        // explicit context for skipped transactions.
+        let mut resolved_networks: HashMap<String, String> = HashMap::new(); // tx_hash → network
+        let mut skipped = 0usize;
+        for tx in txs {
+            let (network, was_inferred) =
+                resolve_effective_network(tx, explicit_network, &bronze_network_map);
+            if was_inferred {
+                warn!(
+                    tx_hash = %tx.tx_hash,
+                    chain = ?tx.chain,
+                    guessed_network = %network,
+                    "Silver materialization: network for tx_hash is ambiguous or \
+                     inferred — skipping this transaction. Re-run normalize with \
+                     --network to provide explicit context."
+                );
+                skipped += 1;
+                continue;
+            }
+            resolved_networks.insert(tx.tx_hash.clone(), network);
+        }
+        if skipped > 0 {
+            warn!(
+                skipped,
+                total = txs.len(),
+                "Silver materialization: skipped transactions with ambiguous network"
+            );
+        }
+
+        // Only proceed with transactions that have authoritative network identity.
+        let effective_network =
+            |tx: &Transaction| -> Option<String> { resolved_networks.get(&tx.tx_hash).cloned() };
+
         // 1. Batch-resolve canonical raw_transactions.id for each (network, tx_hash).
         let pairs: Vec<(String, String)> = txs
             .iter()
-            .map(|tx| {
-                (
-                    chain_to_default_network(&tx.chain).to_string(),
-                    tx.tx_hash.clone(),
-                )
-            })
+            .filter_map(|tx| effective_network(tx).map(|n| (n, tx.tx_hash.clone())))
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -436,17 +705,22 @@ impl Repository {
         let missing_txs: Vec<&Transaction> = txs
             .iter()
             .filter(|tx| {
-                let key = (
-                    chain_to_default_network(&tx.chain).to_string(),
-                    tx.tx_hash.clone(),
-                );
-                !raw_id_map.contains_key(&key)
+                if let Some(net) = effective_network(tx) {
+                    let key = (net, tx.tx_hash.clone());
+                    !raw_id_map.contains_key(&key)
+                } else {
+                    false // skipped tx — don't back-fill
+                }
             })
             .collect();
 
         if !missing_txs.is_empty() {
-            let v2_rows: Vec<RawTransaction> =
-                missing_txs.iter().map(|tx| v1_tx_to_v2_raw(tx)).collect();
+            // For self-healing backfill, use the resolved effective network
+            // (which already consulted Bronze) rather than just the chain default.
+            let v2_rows: Vec<RawTransaction> = missing_txs
+                .iter()
+                .filter_map(|tx| effective_network(tx).map(|net| v1_tx_to_v2_raw(tx, Some(&net))))
+                .collect();
 
             match self.save_raw_transactions(&v2_rows).await {
                 Ok(()) => {
@@ -458,12 +732,7 @@ impl Repository {
                     // Re-resolve IDs for the newly inserted rows.
                     let missing_pairs: Vec<(String, String)> = missing_txs
                         .iter()
-                        .map(|tx| {
-                            (
-                                chain_to_default_network(&tx.chain).to_string(),
-                                tx.tx_hash.clone(),
-                            )
-                        })
+                        .filter_map(|tx| effective_network(tx).map(|n| (n, tx.tx_hash.clone())))
                         .collect::<HashSet<_>>()
                         .into_iter()
                         .collect();
@@ -497,11 +766,12 @@ impl Repository {
             // Group all transactions by (network, wallet_address) to resolve targets.
             let mut wallet_groups: HashMap<(String, String), Vec<&Transaction>> = HashMap::new();
             for tx in txs {
-                let network = chain_to_default_network(&tx.chain).to_string();
-                wallet_groups
-                    .entry((network, tx.wallet_address.clone()))
-                    .or_default()
-                    .push(tx);
+                if let Some(network) = effective_network(tx) {
+                    wallet_groups
+                        .entry((network, tx.wallet_address.clone()))
+                        .or_default()
+                        .push(tx);
+                }
             }
 
             for ((network, wallet_address), group_txs) in &wallet_groups {
@@ -515,19 +785,14 @@ impl Repository {
                         // Derive Chain from network to create the target.
                         let chain = match network.as_str() {
                             "solana-mainnet" => Chain::Solana,
-                            "ethereum-mainnet" => Chain::Ethereum,
                             "hypercore-mainnet" => Chain::Hyperliquid,
-                            _ => {
-                                warn!(
-                                    network = %network,
-                                    wallet = %wallet_address,
-                                    "Silver materialization: unknown network, skipping target_matches"
-                                );
-                                continue;
-                            }
+                            _ => Chain::Ethereum,
                         };
+                        // Use ensure_wallet_target_for_network to preserve
+                        // the explicit network (e.g. base-mainnet) instead of
+                        // collapsing back to the chain default.
                         match self
-                            .ensure_wallet_target(&chain, wallet_address, None)
+                            .ensure_wallet_target_for_network(network, &chain, wallet_address, None)
                             .await
                         {
                             Ok(t) => t,
@@ -557,11 +822,10 @@ impl Repository {
                 let raw_tx_ids: Vec<Uuid> = group_txs
                     .iter()
                     .filter_map(|tx| {
-                        let key = (
-                            chain_to_default_network(&tx.chain).to_string(),
-                            tx.tx_hash.clone(),
-                        );
-                        raw_id_map.get(&key).copied()
+                        effective_network(tx).and_then(|net| {
+                            let key = (net, tx.tx_hash.clone());
+                            raw_id_map.get(&key).copied()
+                        })
                     })
                     .collect();
 
@@ -601,10 +865,14 @@ impl Repository {
         let mut all_hl_positions = Vec::new();
 
         for tx in txs {
-            let network = chain_to_default_network(&tx.chain);
+            let network_str = match effective_network(tx) {
+                Some(n) => n,
+                None => continue, // skip ambiguous transactions
+            };
             let raw_tx_id = raw_id_map
-                .get(&(network.to_string(), tx.tx_hash.clone()))
+                .get(&(network_str.clone(), tx.tx_hash.clone()))
                 .copied();
+            let network = network_str.as_str();
 
             match tx.chain {
                 Chain::Solana => {
@@ -805,7 +1073,7 @@ impl Repository {
         // 5. Update dataset completeness metadata.
         //    Group by (chain, wallet_address) to resolve targets, then update
         //    completeness for each (target, dataset, network) combination.
-        self.update_silver_completeness(txs, &dataset_versions, total)
+        self.update_silver_completeness(txs, &dataset_versions, total, &resolved_networks)
             .await;
     }
 
@@ -860,16 +1128,24 @@ impl Repository {
 
     /// Update dataset completeness for each (target, dataset, network) touched
     /// by the materialization run.
+    ///
+    /// `resolved_networks` provides `tx_hash -> authoritative_network` — only
+    /// transactions with deterministic network identity are included.
     async fn update_silver_completeness(
         &self,
         txs: &[Transaction],
         dataset_versions: &HashMap<String, Uuid>,
         total_records: usize,
+        resolved_networks: &HashMap<String, String>,
     ) {
         // Group transactions by (network, wallet_address) to resolve targets.
+        // Skip transactions with no resolved network (ambiguous).
         let mut wallet_groups: HashMap<(String, String), Vec<&Transaction>> = HashMap::new();
         for tx in txs {
-            let network = chain_to_default_network(&tx.chain).to_string();
+            let network = match resolved_networks.get(&tx.tx_hash) {
+                Some(n) => n.clone(),
+                None => continue,
+            };
             wallet_groups
                 .entry((network, tx.wallet_address.clone()))
                 .or_default()
@@ -1099,7 +1375,7 @@ mod tests {
     #[test]
     fn v1_to_v2_solana_strips_user_and_wallet() {
         let tx = make_solana_tx();
-        let v2 = v1_tx_to_v2_raw(&tx);
+        let v2 = v1_tx_to_v2_raw(&tx, None);
 
         // Verify user_id and wallet_address are not present in serialized form
         let json = serde_json::to_string(&v2).unwrap();
@@ -1110,7 +1386,7 @@ mod tests {
     #[test]
     fn v1_to_v2_solana_maps_network() {
         let tx = make_solana_tx();
-        let v2 = v1_tx_to_v2_raw(&tx);
+        let v2 = v1_tx_to_v2_raw(&tx, None);
         assert_eq!(v2.network, "solana-mainnet");
         assert_eq!(v2.source, "rpc");
     }
@@ -1118,14 +1394,14 @@ mod tests {
     #[test]
     fn v1_to_v2_solana_extracts_block_number_from_slot() {
         let tx = make_solana_tx();
-        let v2 = v1_tx_to_v2_raw(&tx);
+        let v2 = v1_tx_to_v2_raw(&tx, None);
         assert_eq!(v2.block_number, Some(298412345));
     }
 
     #[test]
     fn v1_to_v2_ethereum_maps_network() {
         let tx = make_eth_tx();
-        let v2 = v1_tx_to_v2_raw(&tx);
+        let v2 = v1_tx_to_v2_raw(&tx, None);
         assert_eq!(v2.network, "ethereum-mainnet");
         assert_eq!(v2.source, "rpc");
     }
@@ -1133,14 +1409,14 @@ mod tests {
     #[test]
     fn v1_to_v2_ethereum_extracts_block_number() {
         let tx = make_eth_tx();
-        let v2 = v1_tx_to_v2_raw(&tx);
+        let v2 = v1_tx_to_v2_raw(&tx, None);
         assert_eq!(v2.block_number, Some(18000000));
     }
 
     #[test]
     fn v1_to_v2_hyperliquid_maps_network() {
         let tx = make_hl_tx();
-        let v2 = v1_tx_to_v2_raw(&tx);
+        let v2 = v1_tx_to_v2_raw(&tx, None);
         assert_eq!(v2.network, "hypercore-mainnet");
         assert_eq!(v2.source, "rest");
     }
@@ -1148,14 +1424,14 @@ mod tests {
     #[test]
     fn v1_to_v2_hyperliquid_no_block_number() {
         let tx = make_hl_tx();
-        let v2 = v1_tx_to_v2_raw(&tx);
+        let v2 = v1_tx_to_v2_raw(&tx, None);
         assert_eq!(v2.block_number, None);
     }
 
     #[test]
     fn v1_to_v2_preserves_id_hash_timestamp_metadata() {
         let tx = make_solana_tx();
-        let v2 = v1_tx_to_v2_raw(&tx);
+        let v2 = v1_tx_to_v2_raw(&tx, None);
         assert_eq!(v2.id, tx.id);
         assert_eq!(v2.tx_hash, tx.tx_hash);
         assert_eq!(v2.timestamp, tx.timestamp);
@@ -1165,7 +1441,7 @@ mod tests {
     #[test]
     fn v1_to_v2_ingestion_run_id_is_none() {
         let tx = make_solana_tx();
-        let v2 = v1_tx_to_v2_raw(&tx);
+        let v2 = v1_tx_to_v2_raw(&tx, None);
         assert!(v2.ingestion_run_id.is_none());
     }
 
@@ -1365,7 +1641,7 @@ mod tests {
             })
             .collect();
 
-        let v2_txs: Vec<RawTransaction> = txs.iter().map(v1_tx_to_v2_raw).collect();
+        let v2_txs: Vec<RawTransaction> = txs.iter().map(|tx| v1_tx_to_v2_raw(tx, None)).collect();
         assert_eq!(v2_txs.len(), 5);
 
         for (v1, v2) in txs.iter().zip(v2_txs.iter()) {
@@ -1392,7 +1668,7 @@ mod tests {
             })
             .collect();
 
-        let v2_txs: Vec<RawTransaction> = txs.iter().map(v1_tx_to_v2_raw).collect();
+        let v2_txs: Vec<RawTransaction> = txs.iter().map(|tx| v1_tx_to_v2_raw(tx, None)).collect();
         let raw_ids: Vec<Uuid> = v2_txs.iter().map(|rt| rt.id).collect();
         let matches = build_target_matches(target_id, &raw_ids);
 
@@ -1636,8 +1912,8 @@ mod tests {
         };
 
         // Both convert to V2 raw transactions with the same tx_hash
-        let v2_a = v1_tx_to_v2_raw(&wallet_a_tx);
-        let v2_b = v1_tx_to_v2_raw(&wallet_b_tx);
+        let v2_a = v1_tx_to_v2_raw(&wallet_a_tx, None);
+        let v2_b = v1_tx_to_v2_raw(&wallet_b_tx, None);
         assert_eq!(v2_a.tx_hash, v2_b.tx_hash);
         assert_eq!(v2_a.network, v2_b.network);
 
@@ -1681,7 +1957,7 @@ mod tests {
             })
             .collect();
 
-        let v2_txs: Vec<RawTransaction> = txs.iter().map(v1_tx_to_v2_raw).collect();
+        let v2_txs: Vec<RawTransaction> = txs.iter().map(|tx| v1_tx_to_v2_raw(tx, None)).collect();
         assert_eq!(v2_txs.len(), 3, "all 3 V1 rows convert to V2");
 
         // Deduplicate by (network, tx_hash)
@@ -1727,5 +2003,418 @@ mod tests {
             assert_eq!(m.raw_transaction_id, canonical_id);
             assert_eq!(m.target_id, target_id);
         }
+    }
+
+    // -- v1_checkpoint_to_v2_with_network tests --
+
+    #[test]
+    fn checkpoint_v2_with_explicit_network_overrides_default() {
+        let cp = IndexerCheckpoint {
+            chain: Chain::Ethereum,
+            wallet_address: "0xwallet".to_string(),
+            last_signature: Some("0xabc".to_string()),
+            last_slot: None,
+            last_block: Some(12345),
+            last_timestamp: Some(1700000000),
+        };
+        let target_id = Uuid::new_v4();
+
+        // Without explicit network: uses chain default
+        let v2_default = v1_checkpoint_to_v2(&cp, target_id);
+        assert_eq!(v2_default.network, "ethereum-mainnet");
+
+        // With explicit network: overrides to base-mainnet
+        let v2_override = v1_checkpoint_to_v2_with_network(&cp, target_id, Some("base-mainnet"));
+        assert_eq!(v2_override.network, "base-mainnet");
+        assert_eq!(v2_override.source, "rpc");
+        assert_eq!(v2_override.cursor["last_block"], 12345);
+    }
+
+    #[test]
+    fn checkpoint_v2_with_none_network_uses_default() {
+        let cp = IndexerCheckpoint {
+            chain: Chain::Solana,
+            wallet_address: "wallet".to_string(),
+            last_signature: Some("sig".to_string()),
+            last_slot: Some(100),
+            last_block: None,
+            last_timestamp: Some(1700000000),
+        };
+        let target_id = Uuid::new_v4();
+
+        let v2 = v1_checkpoint_to_v2_with_network(&cp, target_id, None);
+        assert_eq!(v2.network, "solana-mainnet");
+    }
+
+    #[test]
+    fn checkpoint_v2_arbitrum_network_distinct_from_ethereum() {
+        let cp = IndexerCheckpoint {
+            chain: Chain::Ethereum,
+            wallet_address: "0xwallet".to_string(),
+            last_signature: Some("0xabc".to_string()),
+            last_slot: None,
+            last_block: Some(50000),
+            last_timestamp: Some(1700000000),
+        };
+        let target_id = Uuid::new_v4();
+
+        let v2_arb = v1_checkpoint_to_v2_with_network(&cp, target_id, Some("arbitrum-mainnet"));
+        let v2_eth = v1_checkpoint_to_v2_with_network(&cp, target_id, None);
+
+        assert_eq!(v2_arb.network, "arbitrum-mainnet");
+        assert_eq!(v2_eth.network, "ethereum-mainnet");
+        assert_ne!(v2_arb.network, v2_eth.network);
+    }
+
+    // -- v1_tx_to_v2_raw with explicit network --
+
+    #[test]
+    fn v1_tx_to_v2_raw_explicit_network_overrides_chain_default() {
+        let tx = make_eth_tx();
+        let v2 = v1_tx_to_v2_raw(&tx, Some("base-mainnet"));
+        assert_eq!(v2.network, "base-mainnet");
+        // Source is still derived from chain
+        assert_eq!(v2.source, "rpc");
+        // Other fields preserved
+        assert_eq!(v2.tx_hash, tx.tx_hash);
+        assert_eq!(v2.timestamp, tx.timestamp);
+    }
+
+    #[test]
+    fn v1_tx_to_v2_raw_none_network_uses_chain_default() {
+        let tx = make_eth_tx();
+        let v2 = v1_tx_to_v2_raw(&tx, None);
+        assert_eq!(v2.network, "ethereum-mainnet");
+    }
+
+    #[test]
+    fn v1_tx_to_v2_raw_base_mainnet_distinct_from_ethereum() {
+        let tx = make_eth_tx();
+        let v2_base = v1_tx_to_v2_raw(&tx, Some("base-mainnet"));
+        let v2_eth = v1_tx_to_v2_raw(&tx, None);
+        assert_eq!(v2_base.network, "base-mainnet");
+        assert_eq!(v2_eth.network, "ethereum-mainnet");
+        assert_ne!(v2_base.network, v2_eth.network);
+    }
+
+    #[test]
+    fn v1_tx_to_v2_raw_arbitrum_network() {
+        let tx = make_eth_tx();
+        let v2 = v1_tx_to_v2_raw(&tx, Some("arbitrum-mainnet"));
+        assert_eq!(v2.network, "arbitrum-mainnet");
+        assert_eq!(v2.block_number, Some(18000000));
+    }
+
+    #[test]
+    fn v1_tx_to_v2_raw_explicit_network_solana_noop() {
+        // For Solana, explicit network should still work
+        let tx = make_solana_tx();
+        let v2 = v1_tx_to_v2_raw(&tx, Some("solana-mainnet"));
+        assert_eq!(v2.network, "solana-mainnet");
+    }
+
+    // -- v2_checkpoint_to_v1 conversion --
+
+    #[test]
+    fn v2_checkpoint_to_v1_solana_roundtrip() {
+        let original = IndexerCheckpoint {
+            chain: Chain::Solana,
+            wallet_address: "wallet123".to_string(),
+            last_signature: Some("5VERv8NMhzg".to_string()),
+            last_slot: Some(298412345),
+            last_block: None,
+            last_timestamp: Some(1700000000),
+        };
+        let target_id = Uuid::new_v4();
+        let v2 = v1_checkpoint_to_v2(&original, target_id);
+
+        // Convert back to V1
+        let v1 = v2_checkpoint_to_v1(&v2, &Chain::Solana, "wallet123");
+        assert!(matches!(v1.chain, Chain::Solana));
+        assert_eq!(v1.wallet_address, "wallet123");
+        assert_eq!(v1.last_signature, Some("5VERv8NMhzg".to_string()));
+        assert_eq!(v1.last_slot, Some(298412345));
+        assert_eq!(v1.last_block, None);
+        // Solana cursor does not store last_timestamp
+        assert_eq!(v1.last_timestamp, None);
+    }
+
+    #[test]
+    fn v2_checkpoint_to_v1_ethereum_roundtrip() {
+        let original = IndexerCheckpoint {
+            chain: Chain::Ethereum,
+            wallet_address: "0xwallet".to_string(),
+            last_signature: Some("0xabc".to_string()),
+            last_slot: None,
+            last_block: Some(21500000),
+            last_timestamp: Some(1700000000),
+        };
+        let target_id = Uuid::new_v4();
+        let v2 = v1_checkpoint_to_v2(&original, target_id);
+
+        let v1 = v2_checkpoint_to_v1(&v2, &Chain::Ethereum, "0xwallet");
+        assert!(matches!(v1.chain, Chain::Ethereum));
+        assert_eq!(v1.wallet_address, "0xwallet");
+        // EVM cursor stores only last_block
+        assert_eq!(v1.last_block, Some(21500000));
+        assert_eq!(v1.last_slot, None);
+        assert_eq!(v1.last_signature, None);
+    }
+
+    #[test]
+    fn v2_checkpoint_to_v1_hyperliquid_roundtrip() {
+        let original = IndexerCheckpoint {
+            chain: Chain::Hyperliquid,
+            wallet_address: "0xhl".to_string(),
+            last_signature: None,
+            last_slot: None,
+            last_block: None,
+            last_timestamp: Some(1700000000),
+        };
+        let target_id = Uuid::new_v4();
+        let v2 = v1_checkpoint_to_v2(&original, target_id);
+
+        let v1 = v2_checkpoint_to_v1(&v2, &Chain::Hyperliquid, "0xhl");
+        assert!(matches!(v1.chain, Chain::Hyperliquid));
+        assert_eq!(v1.wallet_address, "0xhl");
+        assert_eq!(v1.last_timestamp, Some(1700000000));
+    }
+
+    #[test]
+    fn v2_checkpoint_to_v1_empty_cursor() {
+        let v2 = Checkpoint {
+            id: Uuid::new_v4(),
+            target_id: Uuid::new_v4(),
+            network: "ethereum-mainnet".to_string(),
+            source: "rpc".to_string(),
+            cursor: serde_json::json!({}),
+            updated_at: Utc::now(),
+        };
+
+        let v1 = v2_checkpoint_to_v1(&v2, &Chain::Ethereum, "0xwallet");
+        assert_eq!(v1.last_signature, None);
+        assert_eq!(v1.last_slot, None);
+        assert_eq!(v1.last_block, None);
+        assert_eq!(v1.last_timestamp, None);
+    }
+
+    #[test]
+    fn v2_checkpoint_to_v1_preserves_wallet_and_chain() {
+        let v2 = Checkpoint {
+            id: Uuid::new_v4(),
+            target_id: Uuid::new_v4(),
+            network: "base-mainnet".to_string(),
+            source: "rpc".to_string(),
+            cursor: serde_json::json!({"last_block": 50000}),
+            updated_at: Utc::now(),
+        };
+
+        let v1 = v2_checkpoint_to_v1(&v2, &Chain::Ethereum, "0xbase_wallet");
+        assert!(matches!(v1.chain, Chain::Ethereum));
+        assert_eq!(v1.wallet_address, "0xbase_wallet");
+        assert_eq!(v1.last_block, Some(50000));
+    }
+
+    // -- Batch conversion with explicit network --
+
+    #[test]
+    fn batch_conversion_with_explicit_network_preserves_network() {
+        let txs: Vec<Transaction> = (0..3)
+            .map(|i| Transaction {
+                id: Uuid::new_v4(),
+                user_id: Uuid::new_v4(),
+                wallet_address: "0xwallet".to_string(),
+                timestamp: 1700000000 + i,
+                tx_hash: format!("0xhash{i}"),
+                chain: Chain::Ethereum,
+                raw_metadata: serde_json::json!({"block_number": 18000000 + i}),
+            })
+            .collect();
+
+        let v2_txs: Vec<RawTransaction> = txs
+            .iter()
+            .map(|tx| v1_tx_to_v2_raw(tx, Some("base-mainnet")))
+            .collect();
+
+        assert_eq!(v2_txs.len(), 3);
+        for v2 in &v2_txs {
+            assert_eq!(v2.network, "base-mainnet");
+        }
+    }
+
+    #[test]
+    fn dual_write_batch_assembly_with_explicit_network() {
+        let target_id = Uuid::new_v4();
+        let txs: Vec<Transaction> = (0..3)
+            .map(|i| Transaction {
+                id: Uuid::new_v4(),
+                user_id: Uuid::new_v4(),
+                wallet_address: "0xwallet".to_string(),
+                timestamp: 1700000000 + i,
+                tx_hash: format!("0xhash{i}"),
+                chain: Chain::Ethereum,
+                raw_metadata: serde_json::json!({"block_number": 18000000 + i}),
+            })
+            .collect();
+
+        let v2_txs: Vec<RawTransaction> = txs
+            .iter()
+            .map(|tx| v1_tx_to_v2_raw(tx, Some("arbitrum-mainnet")))
+            .collect();
+        let raw_ids: Vec<Uuid> = v2_txs.iter().map(|rt| rt.id).collect();
+        let matches = build_target_matches(target_id, &raw_ids);
+
+        assert_eq!(v2_txs.len(), 3);
+        assert_eq!(matches.len(), 3);
+        for v2_tx in &v2_txs {
+            assert_eq!(v2_tx.network, "arbitrum-mainnet");
+            assert_eq!(v2_tx.source, "rpc");
+        }
+    }
+
+    // -- resolve_effective_network --
+
+    #[test]
+    fn resolve_network_explicit_wins_over_bronze_and_chain_default() {
+        let tx = make_eth_tx();
+        let mut bronze_map = HashMap::new();
+        bronze_map.insert(tx.tx_hash.clone(), vec!["base-mainnet".to_string()]);
+
+        let (network, inferred) =
+            resolve_effective_network(&tx, Some("arbitrum-mainnet"), &bronze_map);
+        assert_eq!(network, "arbitrum-mainnet");
+        assert!(
+            !inferred,
+            "explicit_network should not be marked as inferred"
+        );
+    }
+
+    #[test]
+    fn resolve_network_bronze_single_match_wins_over_chain_default() {
+        let tx = make_eth_tx();
+        let mut bronze_map = HashMap::new();
+        bronze_map.insert(tx.tx_hash.clone(), vec!["base-mainnet".to_string()]);
+
+        let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
+        assert_eq!(network, "base-mainnet");
+        assert!(!inferred);
+    }
+
+    #[test]
+    fn resolve_network_falls_back_to_chain_default_when_no_bronze_row() {
+        let tx = make_eth_tx();
+        let bronze_map = HashMap::new();
+
+        let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
+        assert_eq!(network, "ethereum-mainnet");
+        assert!(inferred, "chain default should be marked as inferred");
+    }
+
+    #[test]
+    fn resolve_network_solana_from_bronze() {
+        let tx = make_solana_tx();
+        let mut bronze_map = HashMap::new();
+        bronze_map.insert(tx.tx_hash.clone(), vec!["solana-mainnet".to_string()]);
+
+        let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
+        assert_eq!(network, "solana-mainnet");
+        assert!(!inferred);
+    }
+
+    #[test]
+    fn resolve_network_hyperliquid_chain_default() {
+        let tx = make_hl_tx();
+        let bronze_map = HashMap::new();
+
+        let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
+        assert_eq!(network, "hypercore-mainnet");
+        assert!(inferred);
+    }
+
+    #[test]
+    fn resolve_network_evm_l2_not_collapsed_to_ethereum() {
+        let tx = make_eth_tx();
+        let mut bronze_map = HashMap::new();
+        bronze_map.insert(tx.tx_hash.clone(), vec!["base-mainnet".to_string()]);
+
+        let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
+        assert_eq!(network, "base-mainnet");
+        assert!(!inferred);
+        assert_ne!(
+            network,
+            chain_to_default_network(&tx.chain),
+            "should NOT collapse to ethereum-mainnet"
+        );
+    }
+
+    #[test]
+    fn resolve_network_explicit_none_bronze_none_gives_chain_default_with_flag() {
+        let tx = make_eth_tx();
+        let bronze_map = HashMap::new();
+
+        let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
+        assert_eq!(network, "ethereum-mainnet");
+        assert!(
+            inferred,
+            "must flag as inferred so callers can log a warning"
+        );
+    }
+
+    #[test]
+    fn resolve_network_cross_family_disambiguates_correctly() {
+        // Same tx_hash exists on both ethereum-mainnet and solana-mainnet.
+        // A Chain::Ethereum tx should resolve to ethereum-mainnet (single
+        // family match → authoritative).
+        let tx = make_eth_tx();
+        let mut bronze_map = HashMap::new();
+        bronze_map.insert(
+            tx.tx_hash.clone(),
+            vec!["solana-mainnet".to_string(), "ethereum-mainnet".to_string()],
+        );
+
+        let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
+        assert_eq!(network, "ethereum-mainnet");
+        assert!(!inferred, "single family match is authoritative");
+    }
+
+    #[test]
+    fn resolve_network_same_family_ambiguity_is_inferred() {
+        // Same tx_hash on ethereum-mainnet and base-mainnet (both EVM).
+        // This is ambiguous — should be marked as inferred so callers
+        // can fail closed instead of silently guessing.
+        let tx = make_eth_tx();
+        let mut bronze_map = HashMap::new();
+        bronze_map.insert(
+            tx.tx_hash.clone(),
+            vec!["base-mainnet".to_string(), "ethereum-mainnet".to_string()],
+        );
+
+        let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
+        assert!(
+            inferred,
+            "same-family ambiguity must be flagged as inferred"
+        );
+        // Still returns a deterministic pick (chain default preferred)
+        assert_eq!(network, "ethereum-mainnet");
+    }
+
+    #[test]
+    fn resolve_network_same_family_no_default_is_inferred() {
+        // Same tx_hash on base-mainnet and arbitrum-mainnet (both EVM, no
+        // ethereum-mainnet default). Ambiguous — must be inferred.
+        let tx = make_eth_tx();
+        let mut bronze_map = HashMap::new();
+        bronze_map.insert(
+            tx.tx_hash.clone(),
+            vec!["base-mainnet".to_string(), "arbitrum-mainnet".to_string()],
+        );
+
+        let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
+        assert!(
+            inferred,
+            "same-family ambiguity must be flagged as inferred"
+        );
+        // Deterministic: alphabetical min
+        assert_eq!(network, "arbitrum-mainnet");
     }
 }

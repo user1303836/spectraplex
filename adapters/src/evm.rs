@@ -16,6 +16,7 @@ use spectraplex_core::connector::{
     extract_filter_spec, Connector, ConnectorCapabilities, TopicFilterSpec, TypedFilterSpec,
 };
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
+use spectraplex_core::provider::{NetworkContext, ProviderCapability};
 use spectraplex_core::v2::{
     ChainFamily, EvmTraceType, IndexTarget, IngestionBatch, RawEvmTrace, RawTransaction,
     TargetKind, TargetMode,
@@ -127,6 +128,37 @@ impl EvmAdapter {
             .build()?;
         self.trace_rpc = Some((client, url));
         Ok(self)
+    }
+
+    /// Create a new adapter from a `NetworkContext`.
+    ///
+    /// Resolves the primary RPC URL from the `Historical` or `Logs`
+    /// capability. If a `DebugTraceTransaction` provider is available at
+    /// a different URL, it is automatically wired as the trace RPC.
+    ///
+    /// The network identifier is set from the context's network ID.
+    pub fn from_network_context(ctx: &NetworkContext) -> anyhow::Result<Self> {
+        // Find the primary RPC URL — prefer Historical, fall back to Logs
+        let rpc_url = ctx
+            .url(ProviderCapability::Historical)
+            .or_else(|| ctx.url(ProviderCapability::Logs))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no RPC provider with 'historical' or 'logs' capability for network '{}'",
+                    ctx.network
+                )
+            })?;
+
+        let mut adapter = Self::new(rpc_url)?.with_network(ctx.network.as_str());
+
+        // If a separate trace provider exists at a different URL, wire it up
+        if let Some(trace_url) = ctx.url(ProviderCapability::DebugTraceTransaction) {
+            if trace_url != rpc_url {
+                adapter = adapter.with_trace_rpc_url(trace_url)?;
+            }
+        }
+
+        Ok(adapter)
     }
 
     // -----------------------------------------------------------------------
@@ -1839,5 +1871,146 @@ mod tests {
             !contract_filter.address.is_empty(),
             "address filter sets contract constraint (wrong for wallets)"
         );
+    }
+
+    // -- Construction from NetworkContext --
+
+    #[test]
+    fn test_from_network_context_basic() {
+        use spectraplex_core::config::{NetworkConfig, ProviderConfig};
+        use spectraplex_core::provider::{NetworkContext, NetworkId, ProviderRegistry};
+
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "ethereum-mainnet".to_string(),
+            NetworkConfig { enabled: true },
+        );
+
+        let providers = vec![ProviderConfig {
+            network: "ethereum-mainnet".to_string(),
+            kind: "rpc".to_string(),
+            url: "https://eth.llamarpc.com".to_string(),
+            priority: Some(1),
+            capabilities: vec![
+                "historical".to_string(),
+                "logs".to_string(),
+                "receipts".to_string(),
+                "balances".to_string(),
+            ],
+            token_env: None,
+            token: None,
+            headers: None,
+        }];
+
+        let registry = ProviderRegistry::from_config(&networks, &providers).unwrap();
+        let net = NetworkId::new("ethereum-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &net).unwrap();
+        let adapter = EvmAdapter::from_network_context(&ctx).unwrap();
+
+        assert_eq!(adapter.network, "ethereum-mainnet");
+        assert!(adapter.trace_rpc.is_none());
+    }
+
+    #[test]
+    fn test_from_network_context_with_trace() {
+        use spectraplex_core::config::{NetworkConfig, ProviderConfig};
+        use spectraplex_core::provider::{NetworkContext, NetworkId, ProviderRegistry};
+
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "ethereum-mainnet".to_string(),
+            NetworkConfig { enabled: true },
+        );
+
+        let providers = vec![
+            ProviderConfig {
+                network: "ethereum-mainnet".to_string(),
+                kind: "rpc".to_string(),
+                url: "https://eth.llamarpc.com".to_string(),
+                priority: Some(1),
+                capabilities: vec!["historical".to_string(), "logs".to_string()],
+                token_env: None,
+                token: None,
+                headers: None,
+            },
+            ProviderConfig {
+                network: "ethereum-mainnet".to_string(),
+                kind: "trace".to_string(),
+                url: "https://eth-trace.alchemy.com/v2/KEY".to_string(),
+                priority: Some(2),
+                capabilities: vec!["debug_trace_transaction".to_string()],
+                token_env: None,
+                token: None,
+                headers: None,
+            },
+        ];
+
+        let registry = ProviderRegistry::from_config(&networks, &providers).unwrap();
+        let net = NetworkId::new("ethereum-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &net).unwrap();
+        let adapter = EvmAdapter::from_network_context(&ctx).unwrap();
+
+        assert_eq!(adapter.network, "ethereum-mainnet");
+        // Trace RPC should be set since the URL differs from the primary
+        assert!(adapter.trace_rpc.is_some());
+    }
+
+    #[test]
+    fn test_from_network_context_multi_network() {
+        use spectraplex_core::config::{NetworkConfig, ProviderConfig};
+        use spectraplex_core::provider::{NetworkContext, NetworkId, ProviderRegistry};
+
+        let mut networks = std::collections::HashMap::new();
+        networks.insert("base-mainnet".to_string(), NetworkConfig { enabled: true });
+
+        let providers = vec![ProviderConfig {
+            network: "base-mainnet".to_string(),
+            kind: "rpc".to_string(),
+            url: "https://mainnet.base.org".to_string(),
+            priority: Some(1),
+            capabilities: vec!["historical".to_string(), "logs".to_string()],
+            token_env: None,
+            token: None,
+            headers: None,
+        }];
+
+        let registry = ProviderRegistry::from_config(&networks, &providers).unwrap();
+        let net = NetworkId::new("base-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &net).unwrap();
+        let adapter = EvmAdapter::from_network_context(&ctx).unwrap();
+
+        assert_eq!(adapter.network, "base-mainnet");
+    }
+
+    #[test]
+    fn test_from_network_context_no_rpc_fails() {
+        use spectraplex_core::config::{NetworkConfig, ProviderConfig};
+        use spectraplex_core::provider::{NetworkContext, NetworkId, ProviderRegistry};
+
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "ethereum-mainnet".to_string(),
+            NetworkConfig { enabled: true },
+        );
+
+        // Only a trace provider, no historical or logs
+        let providers = vec![ProviderConfig {
+            network: "ethereum-mainnet".to_string(),
+            kind: "trace".to_string(),
+            url: "https://eth-trace.alchemy.com".to_string(),
+            priority: Some(1),
+            capabilities: vec!["debug_trace_transaction".to_string()],
+            token_env: None,
+            token: None,
+            headers: None,
+        }];
+
+        let registry = ProviderRegistry::from_config(&networks, &providers).unwrap();
+        let net = NetworkId::new("ethereum-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &net).unwrap();
+        let result = EvmAdapter::from_network_context(&ctx);
+
+        assert!(result.is_err());
+        assert!(result.err().unwrap().to_string().contains("historical"));
     }
 }

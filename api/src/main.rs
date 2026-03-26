@@ -28,6 +28,9 @@ use spectraplex_core::materializer::{
     WalletLedgerRecord,
 };
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, LedgerEntry, Transaction};
+use spectraplex_core::provider::{
+    chain_to_network_id, NetworkContext, NetworkId, ProviderCapability, ProviderRegistry,
+};
 use spectraplex_core::v2::{
     normalize_evm_address, normalize_solana_address, ChainFamily, DatasetCompleteness,
     DatasetVersion, IndexTarget, Network, TargetKind, TargetMode,
@@ -180,6 +183,7 @@ impl RateLimiter {
 struct AppState {
     repo: Repository,
     config: AppConfig,
+    provider_registry: ProviderRegistry,
     allowed_wallets: Option<HashSet<String>>,
     jobs: RwLock<HashMap<Uuid, JobEntry>>,
     job_semaphore: Arc<Semaphore>,
@@ -334,9 +338,20 @@ async fn main() -> anyhow::Result<()> {
     info!("Database migrations complete");
 
     let allowed_wallets = config.allowed_wallets_set();
+
+    // Build the provider registry from config (handles legacy compat).
+    let provider_registry = config
+        .provider_registry()
+        .map_err(|e| anyhow::anyhow!("failed to build provider registry: {e}"))?;
+    info!(
+        enabled_networks = provider_registry.enabled_networks().count(),
+        "Provider registry initialized"
+    );
+
     let shared_state = Arc::new(AppState {
         repo: Repository::new(pool),
         config: config.clone(),
+        provider_registry,
         allowed_wallets,
         jobs: RwLock::new(HashMap::new()),
         job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
@@ -505,7 +520,15 @@ async fn rate_limit_middleware(
 
 #[derive(Deserialize)]
 struct IngestRequest {
+    /// Chain name for backward compatibility (e.g. "solana", "ethereum", "hyperliquid").
+    /// Prefer `network` for new integrations.
+    #[serde(default)]
     chain: String,
+    /// Network ID (e.g. "solana-mainnet", "ethereum-mainnet", "base-mainnet").
+    /// When provided, takes precedence over `chain`. Falls back to `chain`
+    /// via default network mapping when absent.
+    #[serde(default)]
+    network: Option<String>,
     wallet: String,
     user_id: Option<Uuid>,
     callback_url: Option<String>,
@@ -519,6 +542,11 @@ struct BatchIngestRequest {
 #[derive(Deserialize)]
 struct NormalizeRequest {
     wallet: String,
+    /// Optional V2 network identifier (e.g. `"base-mainnet"`).  When provided,
+    /// overrides the chain-derived default during Silver materialization.  When
+    /// omitted, the normalize path resolves the actual network from existing
+    /// Bronze `raw_transactions` rows.
+    network: Option<String>,
     callback_url: Option<String>,
 }
 
@@ -1154,12 +1182,41 @@ async fn trigger_ingest(
         validate_callback_url(url).await?;
     }
 
-    let chain = payload.chain.clone();
+    // Resolve chain from network (preferred) or use chain directly (compat).
+    let chain = if let Some(ref network) = payload.network {
+        // Derive chain alias from network ID for backward compat
+        match network.as_str() {
+            n if n.starts_with("solana") => "solana".to_string(),
+            n if n.starts_with("hypercore") || n.starts_with("hyperliquid") => {
+                "hyperliquid".to_string()
+            }
+            // Any EVM network (ethereum, base, arbitrum, etc.)
+            _ => "ethereum".to_string(),
+        }
+    } else {
+        payload.chain.clone()
+    };
     match chain.as_str() {
         "solana" | "ethereum" | "hyperliquid" => {}
         other => {
             return Err(AppError::bad_request(format!(
-                "Unsupported chain: {other}. Supported chains: solana, ethereum, hyperliquid"
+                "Unsupported chain: {other}. Supported chains: solana, ethereum, hyperliquid. \
+                 Or use 'network' parameter with a network ID like 'solana-mainnet'."
+            )));
+        }
+    }
+
+    // Fail closed: when an explicit network is provided, the provider
+    // registry MUST resolve it. Otherwise we'd silently fall back to legacy
+    // constructors and fetch from the wrong network (e.g. requesting
+    // "base-mainnet" but fetching Ethereum mainnet data).
+    if let Some(ref net) = payload.network {
+        let resolved =
+            NetworkContext::from_registry(&state.provider_registry, &NetworkId::new(net.clone()));
+        if resolved.is_none() {
+            return Err(AppError::bad_request(format!(
+                "network '{}' is not configured",
+                net
             )));
         }
     }
@@ -1188,6 +1245,7 @@ async fn trigger_ingest(
     let state_clone = Arc::clone(&state);
     let wallet = payload.wallet.clone();
     let callback_url = payload.callback_url.clone();
+    let explicit_network = payload.network.clone();
     let limit = state.config.ingest_limit;
     let user_id = payload.user_id.unwrap_or_else(Uuid::new_v4);
 
@@ -1203,12 +1261,6 @@ async fn trigger_ingest(
         }
 
         let result = async {
-            let checkpoint: Option<IndexerCheckpoint> = state_clone
-                .repo
-                .get_checkpoint(&chain, &wallet)
-                .await
-                .unwrap_or(None);
-
             // Parse chain enum for ensure_wallet_target
             let chain_enum = match chain.as_str() {
                 "solana" => Chain::Solana,
@@ -1217,38 +1269,141 @@ async fn trigger_ingest(
                 _ => unreachable!("chain validated before spawn"),
             };
 
-            // Ensure a V2 IndexTarget exists for this wallet (best-effort)
-            let target_id = match state_clone
-                .repo
-                .ensure_wallet_target(&chain_enum, &wallet, Some(user_id))
-                .await
-            {
-                Ok(target) => Some(target.id),
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        wallet = %wallet,
-                        "Failed to ensure V2 wallet target (V1 path unaffected)"
-                    );
-                    None
+            // Ensure a V2 IndexTarget exists for this wallet (best-effort).
+            // When an explicit network is provided (e.g. "base-mainnet"),
+            // use it so different EVM networks get distinct target rows
+            // instead of all collapsing to "ethereum-mainnet".
+            let target_id = if let Some(ref net) = explicit_network {
+                match state_clone
+                    .repo
+                    .ensure_wallet_target_for_network(net, &chain_enum, &wallet, Some(user_id))
+                    .await
+                {
+                    Ok(target) => Some(target.id),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            wallet = %wallet,
+                            network = %net,
+                            "Failed to ensure V2 wallet target (V1 path unaffected)"
+                        );
+                        None
+                    }
                 }
+            } else {
+                match state_clone
+                    .repo
+                    .ensure_wallet_target(&chain_enum, &wallet, Some(user_id))
+                    .await
+                {
+                    Ok(target) => Some(target.id),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            wallet = %wallet,
+                            "Failed to ensure V2 wallet target (V1 path unaffected)"
+                        );
+                        None
+                    }
+                }
+            };
+
+            // Resume path: when an explicit network is provided, use V2
+            // checkpoint (keyed by network + target) so different EVM networks
+            // get independent resume state. Do NOT fall back to V1 checkpoint
+            // when network is explicit — that would inherit resume state from
+            // a different EVM network (e.g. Ethereum mainnet checkpoint used
+            // for Base). When no V2 checkpoint exists, start from scratch.
+            let checkpoint: Option<IndexerCheckpoint> = if let (Some(ref net), Some(tid)) =
+                (&explicit_network, target_id)
+            {
+                let source = spectraplex_adapters::dual_write::chain_to_default_source(&chain_enum);
+                match state_clone.repo.get_checkpoint_v2(tid, net, source).await {
+                    Ok(Some(v2_cp)) => {
+                        info!(
+                            network = %net,
+                            wallet = %wallet,
+                            "Resuming from V2 checkpoint (network-scoped)"
+                        );
+                        Some(spectraplex_adapters::dual_write::v2_checkpoint_to_v1(
+                            &v2_cp,
+                            &chain_enum,
+                            &wallet,
+                        ))
+                    }
+                    Ok(None) => {
+                        info!(
+                            network = %net,
+                            wallet = %wallet,
+                            "No V2 checkpoint for explicit network, starting fresh"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            network = %net,
+                            wallet = %wallet,
+                            "V2 checkpoint lookup failed for explicit network, starting fresh"
+                        );
+                        None
+                    }
+                }
+            } else {
+                state_clone
+                    .repo
+                    .get_checkpoint(&chain, &wallet)
+                    .await
+                    .unwrap_or(None)
+            };
+
+            // Resolve network context: prefer explicit network, fall back to chain alias.
+            // FAIL CLOSED: when the caller provides an explicit network, the
+            // registry MUST resolve it. Silently falling back to legacy
+            // constructors would connect to the wrong network (e.g. requesting
+            // "base-mainnet" but fetching from Ethereum mainnet).
+            let net_ctx = if let Some(ref net) = explicit_network {
+                let ctx = NetworkContext::from_registry(
+                    &state_clone.provider_registry,
+                    &NetworkId::new(net.clone()),
+                );
+                if ctx.is_none() {
+                    anyhow::bail!(
+                        "network '{}' is not configured in the provider registry",
+                        net
+                    );
+                }
+                ctx
+            } else {
+                chain_to_network_id(&chain).and_then(|net_id| {
+                    NetworkContext::from_registry(&state_clone.provider_registry, &net_id)
+                })
             };
 
             let events: Vec<Transaction> = match chain.as_str() {
                 "hyperliquid" => {
-                    let adapter = HyperliquidAdapter::new();
+                    let adapter = match &net_ctx {
+                        Some(ctx) => HyperliquidAdapter::from_network_context(ctx),
+                        None => HyperliquidAdapter::new(),
+                    };
                     adapter
                         .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                         .await?
                 }
                 "ethereum" => {
-                    let adapter = EvmAdapter::new(&state_clone.config.evm_rpc_url)?;
+                    let adapter = match &net_ctx {
+                        Some(ctx) => EvmAdapter::from_network_context(ctx)?,
+                        None => EvmAdapter::new(&state_clone.config.evm_rpc_url)?,
+                    };
                     adapter
                         .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                         .await?
                 }
                 "solana" => {
-                    let adapter = SolanaAdapter::new(&state_clone.config.solana_rpc_url);
+                    let adapter = match &net_ctx {
+                        Some(ctx) => SolanaAdapter::from_network_context(ctx)?,
+                        None => SolanaAdapter::new(&state_clone.config.solana_rpc_url),
+                    };
                     adapter
                         .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                         .await?
@@ -1260,7 +1415,12 @@ async fn trigger_ingest(
                 if let Some(tid) = target_id {
                     state_clone
                         .repo
-                        .save_transactions_and_checkpoint_dual_write(&events, &cp, tid)
+                        .save_transactions_and_checkpoint_dual_write(
+                            &events,
+                            &cp,
+                            tid,
+                            explicit_network.as_deref(),
+                        )
                         .await?;
                 } else {
                     state_clone
@@ -1271,7 +1431,7 @@ async fn trigger_ingest(
             } else if let Some(tid) = target_id {
                 state_clone
                     .repo
-                    .save_transactions_dual_write(&events, tid)
+                    .save_transactions_dual_write(&events, tid, explicit_network.as_deref())
                     .await?;
             } else {
                 state_clone.repo.save_transactions(&events).await?;
@@ -1345,11 +1505,23 @@ async fn trigger_batch_ingest(
     for item in &payload.wallets {
         validate_wallet(&item.wallet)?;
         check_wallet_allowed(&item.wallet, &state.allowed_wallets)?;
-        match item.chain.as_str() {
+        // Resolve the effective chain: use `network` to derive chain when
+        // `chain` is empty, matching the same logic as `trigger_ingest`.
+        let effective_chain = if let Some(ref network) = item.network {
+            match network.as_str() {
+                n if n.starts_with("solana") => "solana",
+                n if n.starts_with("hypercore") || n.starts_with("hyperliquid") => "hyperliquid",
+                _ => "ethereum",
+            }
+        } else {
+            item.chain.as_str()
+        };
+        match effective_chain {
             "solana" | "ethereum" | "hyperliquid" => {}
             other => {
                 return Err(AppError::bad_request(format!(
-                    "Unsupported chain: {other}. Supported chains: solana, ethereum, hyperliquid"
+                    "Unsupported chain: {other}. Supported chains: solana, ethereum, hyperliquid. \
+                     Or use 'network' parameter with a network ID like 'solana-mainnet'."
                 )));
             }
         }
@@ -1359,6 +1531,7 @@ async fn trigger_batch_ingest(
     for item in payload.wallets {
         let single = Json(IngestRequest {
             chain: item.chain,
+            network: item.network,
             wallet: item.wallet,
             user_id: item.user_id,
             callback_url: item.callback_url,
@@ -1412,6 +1585,7 @@ async fn trigger_normalize(
 
     let state_clone = Arc::clone(&state);
     let wallet = payload.wallet.clone();
+    let explicit_network = payload.network.clone();
     let callback_url = payload.callback_url.clone();
 
     tokio::spawn(async move {
@@ -1452,10 +1626,15 @@ async fn trigger_normalize(
             let count = all_entries.len();
             state_clone.repo.save_ledger_entries(&all_entries).await?;
 
-            // Materialize V2 Silver datasets (best-effort)
+            // Materialize V2 Silver datasets (best-effort).
+            // When an explicit network is provided, use it.  Otherwise,
+            // materialize_silver_datasets resolves the actual network from
+            // existing Bronze raw_transactions rows — this is critical for
+            // L2/sidechain transactions whose V1 `chain` field maps to
+            // the wrong default network.
             state_clone
                 .repo
-                .materialize_silver_datasets(&txs)
+                .materialize_silver_datasets(&txs, explicit_network.as_deref())
                 .await;
 
             Ok::<usize, anyhow::Error>(count)
@@ -1708,7 +1887,14 @@ async fn get_wallet_stats(
 
 #[derive(Deserialize)]
 struct StartStreamRequest {
+    /// Chain name for backward compatibility (e.g. "solana", "hyperliquid").
+    /// Prefer `network` for new integrations.
+    #[serde(default)]
     chain: String,
+    /// Network ID (e.g. "solana-mainnet", "hypercore-mainnet").
+    /// When provided, takes precedence over `chain`.
+    #[serde(default)]
+    network: Option<String>,
     wallet: Option<String>,
 }
 
@@ -1716,17 +1902,66 @@ async fn start_stream(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<StartStreamRequest>,
 ) -> Result<Json<StreamInfo>, AppError> {
-    match payload.chain.as_str() {
+    // Resolve chain from network (preferred) or use chain directly (compat).
+    let chain_resolved = if let Some(ref network) = payload.network {
+        match network.as_str() {
+            n if n.starts_with("solana") => "solana".to_string(),
+            n if n.starts_with("hypercore") || n.starts_with("hyperliquid") => {
+                "hyperliquid".to_string()
+            }
+            _ => "ethereum".to_string(),
+        }
+    } else {
+        payload.chain.clone()
+    };
+
+    // Fail closed: when an explicit network is provided, the provider
+    // registry MUST resolve it. Otherwise we'd silently fall back to legacy
+    // constructors and stream from the wrong network.
+    if let Some(ref net) = payload.network {
+        let resolved =
+            NetworkContext::from_registry(&state.provider_registry, &NetworkId::new(net.clone()));
+        if resolved.is_none() {
+            return Err(AppError::bad_request(format!(
+                "network '{}' is not configured",
+                net
+            )));
+        }
+    }
+
+    // Resolve the effective network ID early: prefer explicit network, fall
+    // back to chain→network mapping. This ensures preflight capability
+    // checks consult the registry even when the caller sends only `chain`.
+    let resolved_network = payload
+        .network
+        .clone()
+        .or_else(|| chain_to_network_id(&chain_resolved).map(|n| n.as_str().to_string()));
+
+    match chain_resolved.as_str() {
         "solana" => {
-            if state
-                .config
-                .solana_grpc_url
-                .as_deref()
-                .filter(|u| !u.is_empty())
-                .is_none()
+            // Check for stream capability in registry, using the resolved
+            // network (not just the explicit payload.network).
+            let has_stream = resolved_network
+                .as_ref()
+                .and_then(|n| {
+                    NetworkContext::from_registry(
+                        &state.provider_registry,
+                        &NetworkId::new(n.clone()),
+                    )
+                })
+                .map(|ctx| ctx.has_capability(ProviderCapability::Stream))
+                .unwrap_or(false);
+
+            if !has_stream
+                && state
+                    .config
+                    .solana_grpc_url
+                    .as_deref()
+                    .filter(|u| !u.is_empty())
+                    .is_none()
             {
                 return Err(AppError::bad_request(
-                    "Solana gRPC URL not configured (set SOLANA_GRPC_URL)",
+                    "Solana gRPC URL not configured (set SOLANA_GRPC_URL or configure a provider with stream capability)",
                 ));
             }
         }
@@ -1763,7 +1998,7 @@ async fn start_stream(
     let cancel = CancellationToken::new();
     let tx_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let last_slot = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let chain = payload.chain.clone();
+    let chain = chain_resolved;
     let wallet = payload.wallet.clone();
 
     let cancel_clone = cancel.clone();
@@ -1772,11 +2007,23 @@ async fn start_stream(
     let repo = state.repo.clone();
     let state_clone = Arc::clone(&state);
 
+    // Resolve network context using the already-resolved network ID
+    let stream_net_ctx = resolved_network.as_ref().and_then(|net| {
+        NetworkContext::from_registry(&state.provider_registry, &NetworkId::new(net.clone()))
+    });
+
     match chain.as_str() {
         "solana" => {
-            let grpc_url = state.config.solana_grpc_url.clone().unwrap();
-            let grpc_token = state.config.solana_grpc_token.clone();
-            let adapter = SolanaGrpcAdapter::new(&grpc_url, grpc_token);
+            let adapter = match &stream_net_ctx {
+                Some(ctx) if ctx.has_capability(ProviderCapability::Stream) => {
+                    SolanaGrpcAdapter::from_network_context(ctx).map_err(AppError::internal)?
+                }
+                _ => {
+                    let grpc_url = state.config.solana_grpc_url.clone().unwrap();
+                    let grpc_token = state.config.solana_grpc_token.clone();
+                    SolanaGrpcAdapter::new(&grpc_url, grpc_token)
+                }
+            };
             let (mut rx, grpc_handle) = adapter.stream_transactions();
 
             tokio::spawn(async move {
@@ -1837,7 +2084,10 @@ async fn start_stream(
             let ws_wallet = hl_wallet.clone();
             let ws_stream_id = stream_id;
             let ws_handle = tokio::spawn(async move {
-                let client = HyperliquidWsClient::new();
+                let client = match &stream_net_ctx {
+                    Some(ctx) => HyperliquidWsClient::from_network_context(ctx),
+                    None => HyperliquidWsClient::new(),
+                };
                 let mut retry_count: u32 = 0;
                 const MAX_RETRIES: u32 = 10;
                 loop {
@@ -3834,9 +4084,11 @@ mod tests {
             ..AppConfig::default()
         };
         let allowed_wallets_set = config.allowed_wallets_set();
+        let provider_registry = config.provider_registry().unwrap();
         Arc::new(AppState {
             repo: Repository::new(pool),
             config,
+            provider_registry,
             allowed_wallets: allowed_wallets_set,
             jobs: RwLock::new(HashMap::new()),
             job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
@@ -4485,9 +4737,11 @@ mod tests {
             api_key: Some("secret".to_string()),
             ..AppConfig::default()
         };
+        let provider_registry = config.provider_registry().unwrap();
         let state = Arc::new(AppState {
             repo: Repository::new(pool),
             config,
+            provider_registry,
             allowed_wallets: None,
             jobs: RwLock::new(HashMap::new()),
             job_semaphore: Arc::new(Semaphore::new(1)),
@@ -5697,9 +5951,11 @@ mod tests {
             ..AppConfig::default()
         };
         let allowed_wallets_set = config.allowed_wallets_set();
+        let provider_registry = config.provider_registry().unwrap();
         let state = Arc::new(AppState {
             repo: Repository::new(pool),
             config,
+            provider_registry,
             allowed_wallets: allowed_wallets_set,
             jobs: RwLock::new(HashMap::new()),
             job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
@@ -8912,5 +9168,284 @@ mod tests {
             .unwrap()
             .last_used;
         assert!(second_used > first_used);
+    }
+
+    // -- P2: batch ingest network pass-through tests --
+
+    #[tokio::test]
+    async fn test_batch_ingest_with_network_field() {
+        // base-mainnet and arbitrum-mainnet are NOT in the default provider
+        // registry, so with fail-closed semantics they must be rejected.
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest/batch")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallets": [
+                        {"network": "base-mainnet", "wallet": "0xabc123"},
+                        {"network": "arbitrum-mainnet", "wallet": "0xdef456"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_msg = json["error"].as_str().unwrap();
+        assert!(
+            err_msg.contains("not configured"),
+            "expected 'not configured' in error: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_ingest_network_only_no_chain() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest/batch")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallets": [
+                        {"network": "solana-mainnet", "wallet": "abc123"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_batch_ingest_mixed_chain_and_network() {
+        // The second item uses base-mainnet which is NOT in the default
+        // registry, so the batch must be rejected (fail closed).
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest/batch")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallets": [
+                        {"chain": "solana", "wallet": "abc123"},
+                        {"network": "base-mainnet", "wallet": "0xdef456"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        // The first item (chain=solana) succeeds, but the second (network=base-mainnet)
+        // fails because base-mainnet is not configured. trigger_batch_ingest delegates
+        // to trigger_ingest per item, so the batch call itself returns the error from
+        // the failing item.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_msg = json["error"].as_str().unwrap();
+        assert!(
+            err_msg.contains("not configured"),
+            "expected 'not configured' in error: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_ingest_invalid_network_rejected() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest/batch")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallets": [
+                        {"wallet": "abc123"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        // Empty chain and no network -> rejected
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -- P1: IngestRequest deserialization with network --
+
+    #[test]
+    fn test_ingest_request_deserializes_network() {
+        let json = serde_json::json!({
+            "network": "base-mainnet",
+            "wallet": "0xabc"
+        });
+        let req: IngestRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.network, Some("base-mainnet".to_string()));
+        assert_eq!(req.chain, ""); // default
+        assert_eq!(req.wallet, "0xabc");
+    }
+
+    #[test]
+    fn test_ingest_request_deserializes_chain_only() {
+        let json = serde_json::json!({
+            "chain": "solana",
+            "wallet": "abc123"
+        });
+        let req: IngestRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.chain, "solana");
+        assert!(req.network.is_none());
+    }
+
+    // -- Fail-closed: explicit network must resolve from registry --
+
+    #[tokio::test]
+    async fn test_ingest_explicit_network_not_configured_returns_400() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "network": "base-mainnet",
+                    "wallet": "0xabc123"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_msg = json["error"].as_str().unwrap();
+        assert!(
+            err_msg.contains("not configured"),
+            "expected 'not configured' in error: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("base-mainnet"),
+            "expected network name in error: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ingest_no_network_uses_legacy_path() {
+        // Without an explicit network, the request should proceed (not be
+        // rejected). It will ultimately fail due to the fake DB pool, but
+        // the status should NOT be 400 for "not configured".
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana",
+                    "wallet": "abc123"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        // Should be accepted (pending job), not a 400 about network config
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_batch_ingest_explicit_network_not_configured_returns_400() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest/batch")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallets": [
+                        {"network": "base-mainnet", "wallet": "0xabc123"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_msg = json["error"].as_str().unwrap();
+        assert!(
+            err_msg.contains("not configured"),
+            "expected 'not configured' in error: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_start_explicit_network_not_configured_returns_400() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/stream/start")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "network": "solana-devnet",
+                    "wallet": "abc123"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_msg = json["error"].as_str().unwrap();
+        assert!(
+            err_msg.contains("not configured"),
+            "expected 'not configured' in error: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_start_no_network_uses_legacy_path() {
+        // Without an explicit network, the stream/start should not fail
+        // with "not configured". It may fail for other reasons (no gRPC URL),
+        // but those are expected legacy-path errors.
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/stream/start")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        // May be 400 for "gRPC URL not configured" but NOT for "network not configured"
+        if response.status() == StatusCode::BAD_REQUEST {
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let err_msg = json["error"].as_str().unwrap_or("");
+            assert!(
+                !err_msg.contains("not configured in"),
+                "legacy path should not fail with network-not-configured: {err_msg}"
+            );
+        }
     }
 }

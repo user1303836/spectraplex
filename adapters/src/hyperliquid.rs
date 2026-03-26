@@ -4,6 +4,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use spectraplex_core::connector::{ConnectorCapabilities, MarketFilterSpec};
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
+use spectraplex_core::provider::{NetworkContext, ProviderCapability};
 use spectraplex_core::v2::{
     ChainFamily, IndexTarget, IngestionBatch, RawTransaction, TargetKind, TargetMode,
 };
@@ -135,6 +136,36 @@ impl HyperliquidAdapter {
             client: Self::build_client(),
             base_url: base_url.to_string(),
             ws_url: Some(ws_url.to_string()),
+        }
+    }
+
+    /// Create a new adapter from a `NetworkContext`.
+    ///
+    /// Resolves the REST URL from the `Historical` capability for the
+    /// info API, and optionally the WS URL from the `Stream` capability.
+    /// Falls back to the hardcoded defaults if no providers are available,
+    /// preserving backward compatibility with the zero-arg constructor.
+    pub fn from_network_context(ctx: &NetworkContext) -> Self {
+        let base_url = ctx
+            .url(ProviderCapability::Historical)
+            .map(|u| {
+                // The provider URL is the base (e.g. "https://api.hyperliquid.xyz").
+                // The info endpoint appends /info. Normalize trailing slash.
+                let base = u.trim_end_matches('/');
+                if base.ends_with("/info") {
+                    base.to_string()
+                } else {
+                    format!("{base}/info")
+                }
+            })
+            .unwrap_or_else(|| HL_INFO_URL.to_string());
+
+        let ws_url = ctx.url(ProviderCapability::Stream).map(|u| u.to_string());
+
+        Self {
+            client: Self::build_client(),
+            base_url,
+            ws_url,
         }
     }
 
@@ -1471,5 +1502,109 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    // -- Construction from NetworkContext --
+
+    #[test]
+    fn test_from_network_context_with_both_providers() {
+        use spectraplex_core::config::{NetworkConfig, ProviderConfig};
+        use spectraplex_core::provider::{NetworkId, ProviderRegistry};
+        use std::collections::HashMap;
+
+        let mut networks = HashMap::new();
+        networks.insert(
+            "hypercore-mainnet".to_string(),
+            NetworkConfig { enabled: true },
+        );
+
+        let providers = vec![
+            ProviderConfig {
+                network: "hypercore-mainnet".to_string(),
+                kind: "rest".to_string(),
+                url: "https://api.hyperliquid.xyz".to_string(),
+                priority: Some(1),
+                capabilities: vec!["historical".to_string()],
+                token_env: None,
+                token: None,
+                headers: None,
+            },
+            ProviderConfig {
+                network: "hypercore-mainnet".to_string(),
+                kind: "ws".to_string(),
+                url: "wss://api.hyperliquid.xyz/ws".to_string(),
+                priority: Some(1),
+                capabilities: vec!["stream".to_string()],
+                token_env: None,
+                token: None,
+                headers: None,
+            },
+        ];
+
+        let registry = ProviderRegistry::from_config(&networks, &providers).unwrap();
+        let net = NetworkId::new("hypercore-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &net).unwrap();
+        let adapter = HyperliquidAdapter::from_network_context(&ctx);
+
+        assert_eq!(adapter.base_url, "https://api.hyperliquid.xyz/info");
+        assert_eq!(
+            adapter.ws_url.as_deref(),
+            Some("wss://api.hyperliquid.xyz/ws")
+        );
+    }
+
+    #[test]
+    fn test_from_network_context_defaults_without_providers() {
+        use spectraplex_core::config::NetworkConfig;
+        use spectraplex_core::provider::{NetworkId, ProviderRegistry};
+        use std::collections::HashMap;
+
+        let mut networks = HashMap::new();
+        networks.insert(
+            "hypercore-mainnet".to_string(),
+            NetworkConfig { enabled: true },
+        );
+
+        // No providers for this network
+        let registry = ProviderRegistry::from_config(&networks, &[]).unwrap();
+        let net = NetworkId::new("hypercore-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &net).unwrap();
+        let adapter = HyperliquidAdapter::from_network_context(&ctx);
+
+        // Falls back to hardcoded defaults
+        assert_eq!(adapter.base_url, HL_INFO_URL);
+        assert!(adapter.ws_url.is_none());
+    }
+
+    #[test]
+    fn test_from_network_context_url_ending_with_info() {
+        use spectraplex_core::config::{NetworkConfig, ProviderConfig};
+        use spectraplex_core::provider::{NetworkId, ProviderRegistry};
+        use std::collections::HashMap;
+
+        let mut networks = HashMap::new();
+        networks.insert(
+            "hypercore-mainnet".to_string(),
+            NetworkConfig { enabled: true },
+        );
+
+        let providers = vec![ProviderConfig {
+            network: "hypercore-mainnet".to_string(),
+            kind: "rest".to_string(),
+            url: "https://api.hyperliquid.xyz/info".to_string(),
+            priority: Some(1),
+            capabilities: vec!["historical".to_string()],
+            token_env: None,
+            token: None,
+            headers: None,
+        }];
+
+        let registry = ProviderRegistry::from_config(&networks, &providers).unwrap();
+        let net = NetworkId::new("hypercore-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &net).unwrap();
+        let adapter = HyperliquidAdapter::from_network_context(&ctx);
+
+        // Should not double-append /info
+        assert_eq!(adapter.base_url, "https://api.hyperliquid.xyz/info");
     }
 }

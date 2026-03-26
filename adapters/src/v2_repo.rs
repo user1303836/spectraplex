@@ -1560,6 +1560,44 @@ impl Repository {
         Ok(result)
     }
 
+    /// Batch-lookup the actual `network` stored in `raw_transactions` for a set of
+    /// `tx_hash` values, without requiring the caller to already know the network.
+    ///
+    /// Returns a map from `tx_hash` to a `Vec` of `(id, network)` pairs.  The same
+    /// `tx_hash` can legitimately exist on multiple networks (cross-chain replays,
+    /// L2 re-orgs, etc.), so callers MUST disambiguate using chain family or other
+    /// context rather than assuming a single match.
+    ///
+    /// This is the key method for the normalize path: V1 `Transaction` rows only
+    /// carry `chain: Chain`, not `network`, so we must consult Bronze to recover
+    /// the actual network before materializing Silver data.
+    pub async fn lookup_raw_tx_networks_by_hashes(
+        &self,
+        tx_hashes: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<(Uuid, String)>>> {
+        use sqlx::Row;
+        let mut result: std::collections::HashMap<String, Vec<(Uuid, String)>> =
+            std::collections::HashMap::with_capacity(tx_hashes.len());
+        for chunk in tx_hashes.chunks(Self::V2_BATCH_SIZE) {
+            let hashes: Vec<&str> = chunk.iter().map(|h| h.as_str()).collect();
+            let rows = sqlx::query(
+                "SELECT id, network, tx_hash \
+                 FROM raw_transactions \
+                 WHERE tx_hash = ANY($1::text[])",
+            )
+            .bind(&hashes)
+            .fetch_all(self.pool())
+            .await?;
+            for row in &rows {
+                let id: Uuid = row.try_get("id")?;
+                let network: String = row.try_get("network")?;
+                let tx_hash: String = row.try_get("tx_hash")?;
+                result.entry(tx_hash).or_default().push((id, network));
+            }
+        }
+        Ok(result)
+    }
+
     // -----------------------------------------------------------------------
     // TargetMatches
     // -----------------------------------------------------------------------

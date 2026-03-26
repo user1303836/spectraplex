@@ -17,6 +17,7 @@ use yellowstone_grpc_proto::prelude::{
 
 use spectraplex_core::connector::{Connector, ConnectorCapabilities};
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
+use spectraplex_core::provider::{NetworkContext, ProviderCapability};
 use spectraplex_core::v2::{
     ChainFamily, IndexTarget, IngestionBatch, RawTransaction, TargetKind, TargetMode,
 };
@@ -106,6 +107,29 @@ impl SolanaGrpcAdapter {
             config,
             checkpoint: SlotCheckpoint::new(),
         }
+    }
+
+    /// Create a new adapter from a `NetworkContext`.
+    ///
+    /// Resolves the `Stream` capability provider to obtain the gRPC
+    /// endpoint URL and optional auth token. Returns an error if no
+    /// suitable provider is available.
+    pub fn from_network_context(ctx: &NetworkContext) -> anyhow::Result<Self> {
+        let provider = ctx.provider(ProviderCapability::Stream).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no gRPC provider with 'stream' capability for network '{}'",
+                ctx.network
+            )
+        })?;
+
+        Ok(Self {
+            config: GrpcStreamConfig {
+                endpoint: provider.url.clone(),
+                x_token: provider.token.clone(),
+                ..Default::default()
+            },
+            checkpoint: SlotCheckpoint::new(),
+        })
     }
 
     pub fn set_program_ids(&mut self, program_ids: Vec<String>) {
@@ -1499,5 +1523,70 @@ mod tests {
 
         assert_eq!(filter.account_include.len(), 1);
         assert_eq!(filter.account_include[0], pda);
+    }
+
+    // -- Construction from NetworkContext --
+
+    #[test]
+    fn test_from_network_context() {
+        use spectraplex_core::config::{NetworkConfig, ProviderConfig};
+        use spectraplex_core::provider::{NetworkId, ProviderRegistry};
+
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "solana-mainnet".to_string(),
+            NetworkConfig { enabled: true },
+        );
+
+        let providers = vec![ProviderConfig {
+            network: "solana-mainnet".to_string(),
+            kind: "grpc".to_string(),
+            url: "https://yellowstone.example.com".to_string(),
+            priority: Some(1),
+            capabilities: vec!["stream".to_string()],
+            token_env: None,
+            token: Some("my-grpc-token".to_string()),
+            headers: None,
+        }];
+
+        let registry = ProviderRegistry::from_config(&networks, &providers).unwrap();
+        let net = NetworkId::new("solana-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &net).unwrap();
+        let adapter = SolanaGrpcAdapter::from_network_context(&ctx).unwrap();
+
+        assert_eq!(adapter.config.endpoint, "https://yellowstone.example.com");
+        assert_eq!(adapter.config.x_token.as_deref(), Some("my-grpc-token"));
+    }
+
+    #[test]
+    fn test_from_network_context_no_stream_fails() {
+        use spectraplex_core::config::{NetworkConfig, ProviderConfig};
+        use spectraplex_core::provider::{NetworkId, ProviderRegistry};
+
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            "solana-mainnet".to_string(),
+            NetworkConfig { enabled: true },
+        );
+
+        // Only historical, no stream
+        let providers = vec![ProviderConfig {
+            network: "solana-mainnet".to_string(),
+            kind: "rpc".to_string(),
+            url: "https://api.mainnet-beta.solana.com".to_string(),
+            priority: Some(1),
+            capabilities: vec!["historical".to_string()],
+            token_env: None,
+            token: None,
+            headers: None,
+        }];
+
+        let registry = ProviderRegistry::from_config(&networks, &providers).unwrap();
+        let net = NetworkId::new("solana-mainnet");
+        let ctx = NetworkContext::from_registry(&registry, &net).unwrap();
+        let result = SolanaGrpcAdapter::from_network_context(&ctx);
+
+        assert!(result.is_err());
+        assert!(result.err().unwrap().to_string().contains("stream"));
     }
 }
