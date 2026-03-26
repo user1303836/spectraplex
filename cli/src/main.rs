@@ -191,6 +191,18 @@ async fn main() -> anyhow::Result<()> {
                 })
             };
 
+            // Fail closed: when --network is explicit, the provider registry
+            // MUST resolve it. Silently falling back to --rpc / --grpc-url
+            // would connect to the wrong network (e.g. --network base-mainnet
+            // but --rpc points to Ethereum mainnet).
+            if network.is_some() && net_ctx.is_none() {
+                anyhow::bail!(
+                    "network '{}' is not configured in the provider registry. \
+                     Check spectraplex.toml or SPECTRAPLEX_* environment variables.",
+                    network.as_deref().unwrap()
+                );
+            }
+
             let user_id = user_id.unwrap_or_else(|| {
                 let id = Uuid::new_v4();
                 info!(user_id = %id, "No --user-id provided, auto-generated");
@@ -216,8 +228,10 @@ async fn main() -> anyhow::Result<()> {
 
                 // Resume path: when --network is provided, use V2 checkpoint
                 // (keyed by network + target) so different EVM networks get
-                // independent resume state. Fall back to V1 checkpoint only
-                // when --network is NOT provided or V2 lookup fails.
+                // independent resume state. Do NOT fall back to V1 checkpoint
+                // when network is explicit — that would inherit resume state
+                // from a different EVM network. When no V2 checkpoint exists,
+                // start from scratch (full backfill for that network).
                 let checkpoint = if let Some(ref p) = pool {
                     let repo = Repository::new(p.clone());
                     if let Some(ref net) = network {
@@ -257,29 +271,12 @@ async fn main() -> anyhow::Result<()> {
                             );
                             Some(cp)
                         } else {
-                            // Fall back to V1 checkpoint
-                            match repo.get_checkpoint(&chain, wallet).await? {
-                                Some(cp) => {
-                                    info!(
-                                        chain = %chain,
-                                        wallet = %wallet,
-                                        last_signature = ?cp.last_signature,
-                                        last_slot = ?cp.last_slot,
-                                        last_block = ?cp.last_block,
-                                        last_timestamp = ?cp.last_timestamp,
-                                        "Resuming from V1 checkpoint (V2 not found)"
-                                    );
-                                    Some(cp)
-                                }
-                                None => {
-                                    info!(
-                                        network = %net,
-                                        wallet = %wallet,
-                                        "No existing checkpoint, full ingestion"
-                                    );
-                                    None
-                                }
-                            }
+                            info!(
+                                network = %net,
+                                wallet = %wallet,
+                                "No V2 checkpoint for explicit network, starting fresh"
+                            );
+                            None
                         }
                     } else {
                         // No explicit network: use V1 checkpoint as before

@@ -1201,6 +1201,21 @@ async fn trigger_ingest(
         }
     }
 
+    // Fail closed: when an explicit network is provided, the provider
+    // registry MUST resolve it. Otherwise we'd silently fall back to legacy
+    // constructors and fetch from the wrong network (e.g. requesting
+    // "base-mainnet" but fetching Ethereum mainnet data).
+    if let Some(ref net) = payload.network {
+        let resolved =
+            NetworkContext::from_registry(&state.provider_registry, &NetworkId::new(net.clone()));
+        if resolved.is_none() {
+            return Err(AppError::bad_request(format!(
+                "network '{}' is not configured",
+                net
+            )));
+        }
+    }
+
     let permit = state
         .job_semaphore
         .clone()
@@ -1290,8 +1305,10 @@ async fn trigger_ingest(
 
             // Resume path: when an explicit network is provided, use V2
             // checkpoint (keyed by network + target) so different EVM networks
-            // get independent resume state. Fall back to V1 checkpoint only
-            // when network is NOT provided or V2 lookup fails.
+            // get independent resume state. Do NOT fall back to V1 checkpoint
+            // when network is explicit — that would inherit resume state from
+            // a different EVM network (e.g. Ethereum mainnet checkpoint used
+            // for Base). When no V2 checkpoint exists, start from scratch.
             let checkpoint: Option<IndexerCheckpoint> = if let (Some(ref net), Some(tid)) =
                 (&explicit_network, target_id)
             {
@@ -1310,25 +1327,21 @@ async fn trigger_ingest(
                         ))
                     }
                     Ok(None) => {
-                        // No V2 checkpoint; fall back to V1
-                        state_clone
-                            .repo
-                            .get_checkpoint(&chain, &wallet)
-                            .await
-                            .unwrap_or(None)
+                        info!(
+                            network = %net,
+                            wallet = %wallet,
+                            "No V2 checkpoint for explicit network, starting fresh"
+                        );
+                        None
                     }
                     Err(e) => {
                         warn!(
                             error = %e,
                             network = %net,
                             wallet = %wallet,
-                            "V2 checkpoint lookup failed, falling back to V1"
+                            "V2 checkpoint lookup failed for explicit network, starting fresh"
                         );
-                        state_clone
-                            .repo
-                            .get_checkpoint(&chain, &wallet)
-                            .await
-                            .unwrap_or(None)
+                        None
                     }
                 }
             } else {
@@ -1339,12 +1352,23 @@ async fn trigger_ingest(
                     .unwrap_or(None)
             };
 
-            // Resolve network context: prefer explicit network, fall back to chain alias
+            // Resolve network context: prefer explicit network, fall back to chain alias.
+            // FAIL CLOSED: when the caller provides an explicit network, the
+            // registry MUST resolve it. Silently falling back to legacy
+            // constructors would connect to the wrong network (e.g. requesting
+            // "base-mainnet" but fetching from Ethereum mainnet).
             let net_ctx = if let Some(ref net) = explicit_network {
-                NetworkContext::from_registry(
+                let ctx = NetworkContext::from_registry(
                     &state_clone.provider_registry,
                     &NetworkId::new(net.clone()),
-                )
+                );
+                if ctx.is_none() {
+                    anyhow::bail!(
+                        "network '{}' is not configured in the provider registry",
+                        net
+                    );
+                }
+                ctx
             } else {
                 chain_to_network_id(&chain).and_then(|net_id| {
                     NetworkContext::from_registry(&state_clone.provider_registry, &net_id)
@@ -1882,6 +1906,20 @@ async fn start_stream(
     } else {
         payload.chain.clone()
     };
+
+    // Fail closed: when an explicit network is provided, the provider
+    // registry MUST resolve it. Otherwise we'd silently fall back to legacy
+    // constructors and stream from the wrong network.
+    if let Some(ref net) = payload.network {
+        let resolved =
+            NetworkContext::from_registry(&state.provider_registry, &NetworkId::new(net.clone()));
+        if resolved.is_none() {
+            return Err(AppError::bad_request(format!(
+                "network '{}' is not configured",
+                net
+            )));
+        }
+    }
 
     // Resolve the effective network ID early: prefer explicit network, fall
     // back to chain→network mapping. This ensures preflight capability
@@ -9128,6 +9166,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_ingest_with_network_field() {
+        // base-mainnet and arbitrum-mainnet are NOT in the default provider
+        // registry, so with fail-closed semantics they must be rejected.
         let app = test_router();
         let req = axum::http::Request::builder()
             .method("POST")
@@ -9145,12 +9185,14 @@ mod tests {
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let jobs: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert_eq!(jobs.len(), 2);
-        assert_eq!(jobs[0]["state"], "pending");
-        assert_eq!(jobs[1]["state"], "pending");
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_msg = json["error"].as_str().unwrap();
+        assert!(
+            err_msg.contains("not configured"),
+            "expected 'not configured' in error: {err_msg}"
+        );
     }
 
     #[tokio::test]
@@ -9176,6 +9218,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_ingest_mixed_chain_and_network() {
+        // The second item uses base-mainnet which is NOT in the default
+        // registry, so the batch must be rejected (fail closed).
         let app = test_router();
         let req = axum::http::Request::builder()
             .method("POST")
@@ -9193,10 +9237,18 @@ mod tests {
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        // The first item (chain=solana) succeeds, but the second (network=base-mainnet)
+        // fails because base-mainnet is not configured. trigger_batch_ingest delegates
+        // to trigger_ingest per item, so the batch call itself returns the error from
+        // the failing item.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let jobs: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert_eq!(jobs.len(), 2);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_msg = json["error"].as_str().unwrap();
+        assert!(
+            err_msg.contains("not configured"),
+            "expected 'not configured' in error: {err_msg}"
+        );
     }
 
     #[tokio::test]
@@ -9244,5 +9296,148 @@ mod tests {
         let req: IngestRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.chain, "solana");
         assert!(req.network.is_none());
+    }
+
+    // -- Fail-closed: explicit network must resolve from registry --
+
+    #[tokio::test]
+    async fn test_ingest_explicit_network_not_configured_returns_400() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "network": "base-mainnet",
+                    "wallet": "0xabc123"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_msg = json["error"].as_str().unwrap();
+        assert!(
+            err_msg.contains("not configured"),
+            "expected 'not configured' in error: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("base-mainnet"),
+            "expected network name in error: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ingest_no_network_uses_legacy_path() {
+        // Without an explicit network, the request should proceed (not be
+        // rejected). It will ultimately fail due to the fake DB pool, but
+        // the status should NOT be 400 for "not configured".
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana",
+                    "wallet": "abc123"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        // Should be accepted (pending job), not a 400 about network config
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_batch_ingest_explicit_network_not_configured_returns_400() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/ingest/batch")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "wallets": [
+                        {"network": "base-mainnet", "wallet": "0xabc123"}
+                    ]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_msg = json["error"].as_str().unwrap();
+        assert!(
+            err_msg.contains("not configured"),
+            "expected 'not configured' in error: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_start_explicit_network_not_configured_returns_400() {
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/stream/start")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "network": "solana-devnet",
+                    "wallet": "abc123"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_msg = json["error"].as_str().unwrap();
+        assert!(
+            err_msg.contains("not configured"),
+            "expected 'not configured' in error: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_start_no_network_uses_legacy_path() {
+        // Without an explicit network, the stream/start should not fail
+        // with "not configured". It may fail for other reasons (no gRPC URL),
+        // but those are expected legacy-path errors.
+        let app = test_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/stream/start")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", TEST_API_KEY))
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "chain": "solana"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        // May be 400 for "gRPC URL not configured" but NOT for "network not configured"
+        if response.status() == StatusCode::BAD_REQUEST {
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let err_msg = json["error"].as_str().unwrap_or("");
+            assert!(
+                !err_msg.contains("not configured in"),
+                "legacy path should not fail with network-not-configured: {err_msg}"
+            );
+        }
     }
 }
