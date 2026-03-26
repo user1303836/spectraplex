@@ -543,6 +543,7 @@ pub struct ExportJob {
     pub updated_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    pub heartbeat_at: Option<DateTime<Utc>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,12 +1598,14 @@ mod tests {
             updated_at: now,
             started_at: None,
             completed_at: None,
+            heartbeat_at: None,
         };
         let json = serde_json::to_string(&job).unwrap();
         let back: ExportJob = serde_json::from_str(&json).unwrap();
         assert_eq!(back.dataset, "token_transfers");
         assert_eq!(back.format, "csv");
         assert_eq!(back.status, ExportJobStatus::Pending);
+        assert!(back.heartbeat_at.is_none());
     }
 
     #[test]

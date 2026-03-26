@@ -1328,6 +1328,7 @@ fn row_to_export_job(row: &sqlx::postgres::PgRow) -> anyhow::Result<ExportJob> {
         updated_at: row.try_get("updated_at")?,
         started_at: row.try_get("started_at")?,
         completed_at: row.try_get("completed_at")?,
+        heartbeat_at: row.try_get("heartbeat_at")?,
     })
 }
 
@@ -1391,6 +1392,10 @@ pub struct EnqueueIngestionJobParams<'a> {
 impl Repository {
     /// Batch size for V2 chunked inserts.
     const V2_BATCH_SIZE: usize = 500;
+
+    /// Threshold after which a claimed/running job with no heartbeat is
+    /// considered abandoned by a dead worker and eligible for reclaim.
+    const STALE_JOB_THRESHOLD_MINUTES: i64 = 5;
 
     // -----------------------------------------------------------------------
     // Networks
@@ -3095,26 +3100,59 @@ impl Repository {
     ///
     /// If `idempotency_key` is set and a job with that key already exists,
     /// the existing job is returned instead of creating a duplicate.
+    ///
+    /// Uses atomic `INSERT ... ON CONFLICT DO NOTHING` to avoid races
+    /// between concurrent enqueue requests sharing the same key.
     pub async fn enqueue_ingestion_job(
         &self,
         params: &EnqueueIngestionJobParams<'_>,
     ) -> anyhow::Result<IngestionJob> {
-        // If idempotency key is provided, check for existing job first.
-        if let Some(key) = params.idempotency_key {
+        let id = Uuid::new_v4();
+
+        if params.idempotency_key.is_some() {
+            // Atomic path: attempt insert; on conflict the unique partial
+            // index on idempotency_key causes DO NOTHING, returning zero
+            // rows.  We then SELECT the pre-existing row.
+            let maybe_row = sqlx::query(
+                "INSERT INTO ingestion_jobs \
+                 (id, target_id, network, mode, status, priority, idempotency_key, \
+                  requested_by, callback_url) \
+                 VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8) \
+                 ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL \
+                 DO NOTHING \
+                 RETURNING id, target_id, network, mode, status, priority, idempotency_key, \
+                           requested_by, callback_url, error_message, created_at, updated_at",
+            )
+            .bind(id)
+            .bind(params.target_id)
+            .bind(params.network)
+            .bind(params.mode)
+            .bind(params.priority)
+            .bind(params.idempotency_key)
+            .bind(params.requested_by)
+            .bind(params.callback_url)
+            .fetch_optional(self.pool())
+            .await?;
+
+            if let Some(row) = maybe_row {
+                // Insert succeeded (new row).
+                return row_to_ingestion_job(&row);
+            }
+
+            // Conflict: the idempotency key already exists.  Return the
+            // existing row.
             let existing = sqlx::query(
                 "SELECT id, target_id, network, mode, status, priority, idempotency_key, \
                  requested_by, callback_url, error_message, created_at, updated_at \
                  FROM ingestion_jobs WHERE idempotency_key = $1",
             )
-            .bind(key)
-            .fetch_optional(self.pool())
+            .bind(params.idempotency_key)
+            .fetch_one(self.pool())
             .await?;
-            if let Some(row) = existing {
-                return row_to_ingestion_job(&row);
-            }
+            return row_to_ingestion_job(&existing);
         }
 
-        let id = Uuid::new_v4();
+        // No idempotency key: plain insert.
         let row = sqlx::query(
             "INSERT INTO ingestion_jobs \
              (id, target_id, network, mode, status, priority, idempotency_key, \
@@ -3136,26 +3174,39 @@ impl Repository {
         row_to_ingestion_job(&row)
     }
 
-    /// Claim the next pending ingestion job using `FOR UPDATE SKIP LOCKED`.
+    /// Claim the next available ingestion job using `FOR UPDATE SKIP LOCKED`.
     ///
     /// Atomically transitions the job to `claimed` status and creates an
-    /// attempt record. Returns `None` if no pending jobs are available.
+    /// attempt record. Considers both `pending` jobs and stale
+    /// `claimed`/`running` jobs whose latest attempt heartbeat has exceeded
+    /// [`Self::STALE_JOB_THRESHOLD_MINUTES`], recovering work abandoned by
+    /// dead workers. Returns `None` if no claimable jobs are available.
     pub async fn claim_ingestion_job(
         &self,
         worker_id: &str,
     ) -> anyhow::Result<Option<IngestionJob>> {
         let mut tx = self.pool().begin().await?;
 
-        // Find and lock the highest-priority pending job.
+        // Find and lock the highest-priority claimable job.
+        // A job is claimable if it is pending, OR if it is claimed/running
+        // but its latest attempt heartbeat is stale (dead worker recovery).
         let maybe_row = sqlx::query(
-            "SELECT id, target_id, network, mode, status, priority, idempotency_key, \
-             requested_by, callback_url, error_message, created_at, updated_at \
-             FROM ingestion_jobs \
-             WHERE status = 'pending' \
-             ORDER BY priority DESC, created_at ASC \
+            "SELECT j.id, j.target_id, j.network, j.mode, j.status, j.priority, \
+                    j.idempotency_key, j.requested_by, j.callback_url, j.error_message, \
+                    j.created_at, j.updated_at \
+             FROM ingestion_jobs j \
+             WHERE j.status = 'pending' \
+                OR (j.status IN ('claimed', 'running') \
+                    AND NOT EXISTS ( \
+                        SELECT 1 FROM ingestion_job_attempts a \
+                        WHERE a.job_id = j.id AND a.finished_at IS NULL \
+                          AND a.heartbeat_at > NOW() - make_interval(mins => $1) \
+                    )) \
+             ORDER BY j.priority DESC, j.created_at ASC \
              LIMIT 1 \
-             FOR UPDATE SKIP LOCKED",
+             FOR UPDATE OF j SKIP LOCKED",
         )
+        .bind(Self::STALE_JOB_THRESHOLD_MINUTES)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -3165,6 +3216,16 @@ impl Repository {
         };
 
         let job_id: Uuid = row.try_get("id")?;
+
+        // Mark any open attempts from a previous (dead) worker as failed.
+        sqlx::query(
+            "UPDATE ingestion_job_attempts \
+             SET finished_at = NOW(), error_message = 'reclaimed: worker presumed dead' \
+             WHERE job_id = $1 AND finished_at IS NULL",
+        )
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await?;
 
         // Transition to claimed.
         sqlx::query(
@@ -3510,7 +3571,7 @@ impl Repository {
              VALUES ($1, $2, $3, $4, $5) \
              RETURNING id, dataset, format, filters, sink_config, status, \
                        worker_id, record_count, result_location, error_message, \
-                       created_at, updated_at, started_at, completed_at",
+                       created_at, updated_at, started_at, completed_at, heartbeat_at",
         )
         .bind(id)
         .bind(dataset)
@@ -3522,17 +3583,24 @@ impl Repository {
         row_to_export_job(&row)
     }
 
-    /// Claim the next pending export job using `FOR UPDATE SKIP LOCKED`.
+    /// Claim the next available export job using `FOR UPDATE SKIP LOCKED`.
+    ///
+    /// Considers both `pending` jobs and stale `running` jobs whose
+    /// `heartbeat_at` has exceeded [`Self::STALE_JOB_THRESHOLD_MINUTES`],
+    /// recovering work abandoned by dead workers.
     pub async fn claim_export_job(&self, worker_id: &str) -> anyhow::Result<Option<ExportJob>> {
         let mut tx = self.pool().begin().await?;
 
         let maybe_row = sqlx::query(
             "SELECT id FROM export_jobs \
              WHERE status = 'pending' \
+                OR (status = 'running' \
+                    AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - make_interval(mins => $1))) \
              ORDER BY created_at ASC \
              LIMIT 1 \
              FOR UPDATE SKIP LOCKED",
         )
+        .bind(Self::STALE_JOB_THRESHOLD_MINUTES)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -3545,7 +3613,9 @@ impl Repository {
 
         sqlx::query(
             "UPDATE export_jobs \
-             SET status = 'running', worker_id = $2, started_at = NOW(), updated_at = NOW() \
+             SET status = 'running', worker_id = $2, \
+                 started_at = COALESCE(started_at, NOW()), \
+                 heartbeat_at = NOW(), updated_at = NOW() \
              WHERE id = $1",
         )
         .bind(job_id)
@@ -3556,7 +3626,7 @@ impl Repository {
         let updated = sqlx::query(
             "SELECT id, dataset, format, filters, sink_config, status, \
              worker_id, record_count, result_location, error_message, \
-             created_at, updated_at, started_at, completed_at \
+             created_at, updated_at, started_at, completed_at, heartbeat_at \
              FROM export_jobs WHERE id = $1",
         )
         .bind(job_id)
@@ -3602,12 +3672,33 @@ impl Repository {
         Ok(())
     }
 
+    /// Record a heartbeat for an in-progress export job.
+    ///
+    /// Updates `heartbeat_at` and `updated_at` for the given job, but only
+    /// if the caller is the current `worker_id` owner (prevents a stale
+    /// worker from extending its lease after reclaim).
+    pub async fn heartbeat_export_job(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE export_jobs SET heartbeat_at = NOW(), updated_at = NOW() \
+             WHERE id = $1 AND worker_id = $2 AND status = 'running'",
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Get an export job by ID.
     pub async fn get_export_job(&self, id: Uuid) -> anyhow::Result<Option<ExportJob>> {
         let row = sqlx::query(
             "SELECT id, dataset, format, filters, sink_config, status, \
              worker_id, record_count, result_location, error_message, \
-             created_at, updated_at, started_at, completed_at \
+             created_at, updated_at, started_at, completed_at, heartbeat_at \
              FROM export_jobs WHERE id = $1",
         )
         .bind(id)
@@ -5459,5 +5550,43 @@ mod tests {
             _assert_send(repo.update_stream_cursor(Uuid::new_v4(), &cursor));
         }
         let _ = _check;
+    }
+
+    #[test]
+    fn repo_heartbeat_export_job_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.heartbeat_export_job(Uuid::new_v4(), "worker-1"));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn stale_job_threshold_is_positive() {
+        const { assert!(Repository::STALE_JOB_THRESHOLD_MINUTES > 0) };
+    }
+
+    #[test]
+    fn export_job_has_heartbeat_at_field() {
+        // Verify the ExportJob struct includes heartbeat_at, preventing
+        // accidental removal that would break dead-worker recovery.
+        let job = ExportJob {
+            id: Uuid::new_v4(),
+            dataset: "test".into(),
+            format: "json".into(),
+            filters: None,
+            sink_config: None,
+            status: ExportJobStatus::Pending,
+            worker_id: None,
+            record_count: None,
+            result_location: None,
+            error_message: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            heartbeat_at: None,
+        };
+        assert!(job.heartbeat_at.is_none());
     }
 }
