@@ -389,6 +389,200 @@ pub struct DatasetCompleteness {
 }
 
 // ---------------------------------------------------------------------------
+// Ingestion Job (Durable Control Plane)
+// ---------------------------------------------------------------------------
+
+/// Status of an ingestion job in the durable queue.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Display, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum IngestionJobStatus {
+    #[default]
+    Pending,
+    Claimed,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Ingestion mode for a queued job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum IngestionJobMode {
+    Backfill,
+    Incremental,
+}
+
+/// A queued ingestion work item stored in Postgres.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestionJob {
+    pub id: Uuid,
+    pub target_id: Option<Uuid>,
+    pub network: String,
+    pub mode: IngestionJobMode,
+    pub status: IngestionJobStatus,
+    pub priority: i32,
+    pub idempotency_key: Option<String>,
+    pub requested_by: Option<String>,
+    pub callback_url: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A single worker attempt on an ingestion job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestionJobAttempt {
+    pub id: Uuid,
+    pub job_id: Uuid,
+    pub worker_id: String,
+    pub attempt_num: i32,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub heartbeat_at: DateTime<Utc>,
+    pub error_message: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Stream Subscription (Durable Control Plane)
+// ---------------------------------------------------------------------------
+
+/// Desired lifecycle state for a stream subscription.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Display, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum StreamDesiredStatus {
+    #[default]
+    Active,
+    Paused,
+    Stopped,
+}
+
+/// Actual runtime state of a stream subscription.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Display, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum StreamActualStatus {
+    #[default]
+    Pending,
+    Running,
+    Paused,
+    Stopped,
+    Error,
+}
+
+/// Stream source type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum StreamSource {
+    Grpc,
+    Ws,
+    Rpc,
+}
+
+/// A durable stream subscription stored in Postgres.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamSubscription {
+    pub id: Uuid,
+    pub target_id: Option<Uuid>,
+    pub network: String,
+    pub source: StreamSource,
+    pub desired_status: StreamDesiredStatus,
+    pub actual_status: StreamActualStatus,
+    pub lease_owner: Option<String>,
+    pub heartbeat_at: Option<DateTime<Utc>>,
+    pub cursor_state: Option<serde_json::Value>,
+    pub config: Option<serde_json::Value>,
+    pub error_message: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
+// Export Job (Durable Control Plane)
+// ---------------------------------------------------------------------------
+
+/// Status of an export job.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Display, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ExportJobStatus {
+    #[default]
+    Pending,
+    Running,
+    Delivering,
+    Completed,
+    Failed,
+}
+
+/// A durable export job stored in Postgres.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportJob {
+    pub id: Uuid,
+    pub dataset: String,
+    pub format: String,
+    pub filters: Option<serde_json::Value>,
+    pub sink_config: Option<serde_json::Value>,
+    pub status: ExportJobStatus,
+    pub worker_id: Option<String>,
+    pub record_count: Option<i32>,
+    pub result_location: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub heartbeat_at: Option<DateTime<Utc>>,
+}
+
+// ---------------------------------------------------------------------------
+// Materialization Run (Durable Control Plane)
+// ---------------------------------------------------------------------------
+
+/// Status of a materialization run.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Display, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum MaterializationRunStatus {
+    #[default]
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+/// A durable materialization run tracking ETL provenance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializationRun {
+    pub id: Uuid,
+    pub dataset_name: String,
+    pub scope: Option<serde_json::Value>,
+    pub input_watermark: Option<i64>,
+    pub output_record_count: i64,
+    pub status: MaterializationRunStatus,
+    pub dataset_version_id: Option<Uuid>,
+    pub worker_id: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub error_message: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
 // Address normalization helpers
 // ---------------------------------------------------------------------------
 
@@ -1237,5 +1431,220 @@ mod tests {
         assert_eq!(back.trace_type, EvmTraceType::PrestateTracer);
         assert!(back.raw_trace.get("pre").is_some());
         assert!(back.raw_trace.get("post").is_some());
+    }
+
+    // -- Durable Control Plane types --
+
+    #[test]
+    fn ingestion_job_status_serde_roundtrip() {
+        for (variant, expected_str) in [
+            (IngestionJobStatus::Pending, "\"pending\""),
+            (IngestionJobStatus::Claimed, "\"claimed\""),
+            (IngestionJobStatus::Running, "\"running\""),
+            (IngestionJobStatus::Completed, "\"completed\""),
+            (IngestionJobStatus::Failed, "\"failed\""),
+            (IngestionJobStatus::Cancelled, "\"cancelled\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_str, "serialize {variant:?}");
+            let back: IngestionJobStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "deserialize {expected_str}");
+        }
+    }
+
+    #[test]
+    fn ingestion_job_status_default_is_pending() {
+        assert_eq!(IngestionJobStatus::default(), IngestionJobStatus::Pending);
+    }
+
+    #[test]
+    fn ingestion_job_mode_serde_roundtrip() {
+        for (variant, expected_str) in [
+            (IngestionJobMode::Backfill, "\"backfill\""),
+            (IngestionJobMode::Incremental, "\"incremental\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_str, "serialize {variant:?}");
+            let back: IngestionJobMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "deserialize {expected_str}");
+        }
+    }
+
+    #[test]
+    fn ingestion_job_serde_roundtrip() {
+        let now = Utc::now();
+        let job = IngestionJob {
+            id: Uuid::new_v4(),
+            target_id: Some(Uuid::new_v4()),
+            network: "solana-mainnet".to_string(),
+            mode: IngestionJobMode::Backfill,
+            status: IngestionJobStatus::Pending,
+            priority: 5,
+            idempotency_key: Some("dedup-key-123".to_string()),
+            requested_by: Some("api".to_string()),
+            callback_url: None,
+            error_message: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let json = serde_json::to_string(&job).unwrap();
+        let back: IngestionJob = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.network, "solana-mainnet");
+        assert_eq!(back.mode, IngestionJobMode::Backfill);
+        assert_eq!(back.status, IngestionJobStatus::Pending);
+        assert_eq!(back.priority, 5);
+    }
+
+    #[test]
+    fn stream_desired_status_serde_roundtrip() {
+        for (variant, expected_str) in [
+            (StreamDesiredStatus::Active, "\"active\""),
+            (StreamDesiredStatus::Paused, "\"paused\""),
+            (StreamDesiredStatus::Stopped, "\"stopped\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_str, "serialize {variant:?}");
+            let back: StreamDesiredStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "deserialize {expected_str}");
+        }
+    }
+
+    #[test]
+    fn stream_actual_status_serde_roundtrip() {
+        for (variant, expected_str) in [
+            (StreamActualStatus::Pending, "\"pending\""),
+            (StreamActualStatus::Running, "\"running\""),
+            (StreamActualStatus::Paused, "\"paused\""),
+            (StreamActualStatus::Stopped, "\"stopped\""),
+            (StreamActualStatus::Error, "\"error\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_str, "serialize {variant:?}");
+            let back: StreamActualStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "deserialize {expected_str}");
+        }
+    }
+
+    #[test]
+    fn stream_source_serde_roundtrip() {
+        for (variant, expected_str) in [
+            (StreamSource::Grpc, "\"grpc\""),
+            (StreamSource::Ws, "\"ws\""),
+            (StreamSource::Rpc, "\"rpc\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_str, "serialize {variant:?}");
+            let back: StreamSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "deserialize {expected_str}");
+        }
+    }
+
+    #[test]
+    fn stream_subscription_serde_roundtrip() {
+        let now = Utc::now();
+        let sub = StreamSubscription {
+            id: Uuid::new_v4(),
+            target_id: Some(Uuid::new_v4()),
+            network: "solana-mainnet".to_string(),
+            source: StreamSource::Grpc,
+            desired_status: StreamDesiredStatus::Active,
+            actual_status: StreamActualStatus::Running,
+            lease_owner: Some("worker-1".to_string()),
+            heartbeat_at: Some(now),
+            cursor_state: Some(serde_json::json!({"last_slot": 300})),
+            config: None,
+            error_message: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: StreamSubscription = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.source, StreamSource::Grpc);
+        assert_eq!(back.desired_status, StreamDesiredStatus::Active);
+        assert_eq!(back.actual_status, StreamActualStatus::Running);
+    }
+
+    #[test]
+    fn export_job_status_serde_roundtrip() {
+        for (variant, expected_str) in [
+            (ExportJobStatus::Pending, "\"pending\""),
+            (ExportJobStatus::Running, "\"running\""),
+            (ExportJobStatus::Delivering, "\"delivering\""),
+            (ExportJobStatus::Completed, "\"completed\""),
+            (ExportJobStatus::Failed, "\"failed\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_str, "serialize {variant:?}");
+            let back: ExportJobStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "deserialize {expected_str}");
+        }
+    }
+
+    #[test]
+    fn export_job_serde_roundtrip() {
+        let now = Utc::now();
+        let job = ExportJob {
+            id: Uuid::new_v4(),
+            dataset: "token_transfers".to_string(),
+            format: "csv".to_string(),
+            filters: Some(serde_json::json!({"network": "solana-mainnet"})),
+            sink_config: None,
+            status: ExportJobStatus::Pending,
+            worker_id: None,
+            record_count: None,
+            result_location: None,
+            error_message: None,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            completed_at: None,
+            heartbeat_at: None,
+        };
+        let json = serde_json::to_string(&job).unwrap();
+        let back: ExportJob = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.dataset, "token_transfers");
+        assert_eq!(back.format, "csv");
+        assert_eq!(back.status, ExportJobStatus::Pending);
+        assert!(back.heartbeat_at.is_none());
+    }
+
+    #[test]
+    fn materialization_run_status_serde_roundtrip() {
+        for (variant, expected_str) in [
+            (MaterializationRunStatus::Pending, "\"pending\""),
+            (MaterializationRunStatus::Running, "\"running\""),
+            (MaterializationRunStatus::Completed, "\"completed\""),
+            (MaterializationRunStatus::Failed, "\"failed\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected_str, "serialize {variant:?}");
+            let back: MaterializationRunStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant, "deserialize {expected_str}");
+        }
+    }
+
+    #[test]
+    fn materialization_run_serde_roundtrip() {
+        let now = Utc::now();
+        let run = MaterializationRun {
+            id: Uuid::new_v4(),
+            dataset_name: "token_transfers".to_string(),
+            scope: Some(serde_json::json!({"network": "solana-mainnet"})),
+            input_watermark: Some(1700000000),
+            output_record_count: 100,
+            status: MaterializationRunStatus::Completed,
+            dataset_version_id: Some(Uuid::new_v4()),
+            worker_id: Some("worker-1".to_string()),
+            started_at: Some(now),
+            finished_at: Some(now),
+            error_message: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let json = serde_json::to_string(&run).unwrap();
+        let back: MaterializationRun = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.dataset_name, "token_transfers");
+        assert_eq!(back.output_record_count, 100);
+        assert_eq!(back.status, MaterializationRunStatus::Completed);
     }
 }
