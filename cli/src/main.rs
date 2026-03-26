@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use spectraplex_adapters::{
+    dual_write::{chain_to_default_source, v2_checkpoint_to_v1},
     evm::EvmAdapter,
     evm_parser,
     hyperliquid::HyperliquidAdapter,
@@ -205,24 +206,104 @@ async fn main() -> anyhow::Result<()> {
             for wallet in &wallets {
                 info!(wallet = %wallet, chain = %chain, "Starting ingestion");
 
+                // Parse chain enum early for V2 checkpoint lookup
+                let chain_enum_for_cp = match chain.as_str() {
+                    "solana" => Chain::Solana,
+                    "ethereum" => Chain::Ethereum,
+                    "hyperliquid" => Chain::Hyperliquid,
+                    _ => unreachable!("unsupported chain filtered earlier"),
+                };
+
+                // Resume path: when --network is provided, use V2 checkpoint
+                // (keyed by network + target) so different EVM networks get
+                // independent resume state. Fall back to V1 checkpoint only
+                // when --network is NOT provided or V2 lookup fails.
                 let checkpoint = if let Some(ref p) = pool {
                     let repo = Repository::new(p.clone());
-                    match repo.get_checkpoint(&chain, wallet).await? {
-                        Some(cp) => {
+                    if let Some(ref net) = network {
+                        // Network-first: try V2 checkpoint scoped by network
+                        let v2_cp = {
+                            // Need target_id for V2 lookup; peek at existing target
+                            let target = repo
+                                .get_index_target_by_address(
+                                    spectraplex_core::v2::TargetKind::Wallet,
+                                    net,
+                                    wallet,
+                                )
+                                .await
+                                .ok()
+                                .flatten();
+                            if let Some(t) = target {
+                                let source = chain_to_default_source(&chain_enum_for_cp);
+                                repo.get_checkpoint_v2(t.id, net, source)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some(v2) = v2_cp {
+                            let cp = v2_checkpoint_to_v1(&v2, &chain_enum_for_cp, wallet);
                             info!(
-                                chain = %chain,
+                                network = %net,
                                 wallet = %wallet,
                                 last_signature = ?cp.last_signature,
                                 last_slot = ?cp.last_slot,
                                 last_block = ?cp.last_block,
                                 last_timestamp = ?cp.last_timestamp,
-                                "Resuming from checkpoint"
+                                "Resuming from V2 checkpoint (network-scoped)"
                             );
                             Some(cp)
+                        } else {
+                            // Fall back to V1 checkpoint
+                            match repo.get_checkpoint(&chain, wallet).await? {
+                                Some(cp) => {
+                                    info!(
+                                        chain = %chain,
+                                        wallet = %wallet,
+                                        last_signature = ?cp.last_signature,
+                                        last_slot = ?cp.last_slot,
+                                        last_block = ?cp.last_block,
+                                        last_timestamp = ?cp.last_timestamp,
+                                        "Resuming from V1 checkpoint (V2 not found)"
+                                    );
+                                    Some(cp)
+                                }
+                                None => {
+                                    info!(
+                                        network = %net,
+                                        wallet = %wallet,
+                                        "No existing checkpoint, full ingestion"
+                                    );
+                                    None
+                                }
+                            }
                         }
-                        None => {
-                            info!(chain = %chain, wallet = %wallet, "No existing checkpoint, full ingestion");
-                            None
+                    } else {
+                        // No explicit network: use V1 checkpoint as before
+                        match repo.get_checkpoint(&chain, wallet).await? {
+                            Some(cp) => {
+                                info!(
+                                    chain = %chain,
+                                    wallet = %wallet,
+                                    last_signature = ?cp.last_signature,
+                                    last_slot = ?cp.last_slot,
+                                    last_block = ?cp.last_block,
+                                    last_timestamp = ?cp.last_timestamp,
+                                    "Resuming from checkpoint"
+                                );
+                                Some(cp)
+                            }
+                            None => {
+                                info!(
+                                    chain = %chain,
+                                    wallet = %wallet,
+                                    "No existing checkpoint, full ingestion"
+                                );
+                                None
+                            }
                         }
                     }
                 } else {
@@ -364,7 +445,8 @@ async fn main() -> anyhow::Result<()> {
                         );
                     } else {
                         if let Some(tid) = target_id {
-                            repo.save_transactions_dual_write(&events, tid).await?;
+                            repo.save_transactions_dual_write(&events, tid, network.as_deref())
+                                .await?;
                         } else {
                             repo.save_transactions(&events).await?;
                         }
@@ -573,8 +655,10 @@ async fn main() -> anyhow::Result<()> {
                 let repo = Repository::new(p);
                 repo.save_ledger_entries(&all_entries).await?;
 
-                // Materialize V2 Silver datasets (best-effort)
-                repo.materialize_silver_datasets(&transactions).await;
+                // Materialize V2 Silver datasets (best-effort).
+                // Normalization operates on file-loaded transactions; the network
+                // was stamped during ingestion, so pass None to use chain defaults.
+                repo.materialize_silver_datasets(&transactions, None).await;
 
                 info!("Normalization complete");
             } else {

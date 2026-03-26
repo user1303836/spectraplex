@@ -1241,12 +1241,6 @@ async fn trigger_ingest(
         }
 
         let result = async {
-            let checkpoint: Option<IndexerCheckpoint> = state_clone
-                .repo
-                .get_checkpoint(&chain, &wallet)
-                .await
-                .unwrap_or(None);
-
             // Parse chain enum for ensure_wallet_target
             let chain_enum = match chain.as_str() {
                 "solana" => Chain::Solana,
@@ -1292,6 +1286,57 @@ async fn trigger_ingest(
                         None
                     }
                 }
+            };
+
+            // Resume path: when an explicit network is provided, use V2
+            // checkpoint (keyed by network + target) so different EVM networks
+            // get independent resume state. Fall back to V1 checkpoint only
+            // when network is NOT provided or V2 lookup fails.
+            let checkpoint: Option<IndexerCheckpoint> = if let (Some(ref net), Some(tid)) =
+                (&explicit_network, target_id)
+            {
+                let source = spectraplex_adapters::dual_write::chain_to_default_source(&chain_enum);
+                match state_clone.repo.get_checkpoint_v2(tid, net, source).await {
+                    Ok(Some(v2_cp)) => {
+                        info!(
+                            network = %net,
+                            wallet = %wallet,
+                            "Resuming from V2 checkpoint (network-scoped)"
+                        );
+                        Some(spectraplex_adapters::dual_write::v2_checkpoint_to_v1(
+                            &v2_cp,
+                            &chain_enum,
+                            &wallet,
+                        ))
+                    }
+                    Ok(None) => {
+                        // No V2 checkpoint; fall back to V1
+                        state_clone
+                            .repo
+                            .get_checkpoint(&chain, &wallet)
+                            .await
+                            .unwrap_or(None)
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            network = %net,
+                            wallet = %wallet,
+                            "V2 checkpoint lookup failed, falling back to V1"
+                        );
+                        state_clone
+                            .repo
+                            .get_checkpoint(&chain, &wallet)
+                            .await
+                            .unwrap_or(None)
+                    }
+                }
+            } else {
+                state_clone
+                    .repo
+                    .get_checkpoint(&chain, &wallet)
+                    .await
+                    .unwrap_or(None)
             };
 
             // Resolve network context: prefer explicit network, fall back to chain alias
@@ -1357,7 +1402,7 @@ async fn trigger_ingest(
             } else if let Some(tid) = target_id {
                 state_clone
                     .repo
-                    .save_transactions_dual_write(&events, tid)
+                    .save_transactions_dual_write(&events, tid, explicit_network.as_deref())
                     .await?;
             } else {
                 state_clone.repo.save_transactions(&events).await?;
@@ -1551,10 +1596,13 @@ async fn trigger_normalize(
             let count = all_entries.len();
             state_clone.repo.save_ledger_entries(&all_entries).await?;
 
-            // Materialize V2 Silver datasets (best-effort)
+            // Materialize V2 Silver datasets (best-effort).
+            // Normalization operates on pre-ingested transactions; the explicit
+            // network was already stamped during ingestion, so we pass None here
+            // to let each transaction's chain derive the default network.
             state_clone
                 .repo
-                .materialize_silver_datasets(&txs)
+                .materialize_silver_datasets(&txs, None)
                 .await;
 
             Ok::<usize, anyhow::Error>(count)
