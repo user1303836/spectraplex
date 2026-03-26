@@ -55,12 +55,22 @@ pub fn chain_to_default_source(chain: &Chain) -> &'static str {
 // Network resolution for normalize path
 // ---------------------------------------------------------------------------
 
+/// Map a V1 `Chain` enum to its V2 `ChainFamily` for disambiguation.
+fn chain_to_family(chain: &Chain) -> ChainFamily {
+    match chain {
+        Chain::Solana => ChainFamily::Solana,
+        Chain::Ethereum => ChainFamily::Evm,
+        Chain::Hyperliquid => ChainFamily::Hyperliquid,
+    }
+}
+
 /// Resolve the effective network for a V1 transaction during Silver
 /// materialization.
 ///
 /// Priority:
 /// 1. `explicit_network` — caller-provided override (e.g. from API/CLI request)
-/// 2. `bronze_network_map` — actual network from existing Bronze `raw_transactions` rows
+/// 2. `bronze_network_map` — actual network from existing Bronze `raw_transactions`
+///    rows, disambiguated by chain family when a tx_hash exists on multiple networks
 /// 3. `chain_to_default_network()` — last resort, derived from V1 `Chain` enum
 ///
 /// The third path is a lossy fallback: `Chain::Ethereum` maps to
@@ -71,13 +81,40 @@ pub fn chain_to_default_source(chain: &Chain) -> &'static str {
 pub fn resolve_effective_network(
     tx: &Transaction,
     explicit_network: Option<&str>,
-    bronze_network_map: &HashMap<String, String>,
+    bronze_network_map: &HashMap<String, Vec<String>>,
 ) -> (String, bool) {
     if let Some(n) = explicit_network {
         return (n.to_string(), false);
     }
-    if let Some(network) = bronze_network_map.get(&tx.tx_hash) {
-        return (network.clone(), false);
+    if let Some(networks) = bronze_network_map.get(&tx.tx_hash) {
+        if networks.len() == 1 {
+            return (networks[0].clone(), false);
+        }
+        // Multiple networks for the same tx_hash — disambiguate by chain family.
+        let expected_family = chain_to_family(&tx.chain);
+        let family_matches: Vec<&String> = networks
+            .iter()
+            .filter(|n| {
+                DatasetRegistry::chain_family_for_network(n) == Some(expected_family)
+            })
+            .collect();
+        if family_matches.len() == 1 {
+            return (family_matches[0].clone(), false);
+        }
+        // Still ambiguous within the same family (e.g., same hash on ethereum-mainnet
+        // and base-mainnet). Prefer the chain default as a tiebreaker among matches.
+        let default = chain_to_default_network(&tx.chain);
+        if family_matches.iter().any(|n| n.as_str() == default) {
+            return (default.to_string(), false);
+        }
+        // No default match — pick the first family match (deterministic via sort).
+        if let Some(first) = family_matches.into_iter().min() {
+            return (first.clone(), false);
+        }
+        // No family match at all — pick first network overall (sorted).
+        if let Some(first) = networks.iter().min() {
+            return (first.clone(), false);
+        }
     }
     (chain_to_default_network(&tx.chain).to_string(), true)
 }
@@ -574,7 +611,7 @@ impl Repository {
         //    which maps to "ethereum-mainnet" by default — but the original
         //    ingest may have been for "base-mainnet" or "arbitrum-mainnet".
         //    Bronze `raw_transactions` rows have the correct `network` field.
-        let bronze_network_map: HashMap<String, String> = if explicit_network.is_none() {
+        let bronze_network_map: HashMap<String, Vec<String>> = if explicit_network.is_none() {
             let all_hashes: Vec<String> = txs
                 .iter()
                 .map(|tx| tx.tx_hash.clone())
@@ -584,7 +621,11 @@ impl Repository {
             match self.lookup_raw_tx_networks_by_hashes(&all_hashes).await {
                 Ok(map) => map
                     .into_iter()
-                    .map(|(hash, (_id, network))| (hash, network))
+                    .map(|(hash, entries)| {
+                        let networks: Vec<String> =
+                            entries.into_iter().map(|(_id, network)| network).collect();
+                        (hash, networks)
+                    })
                     .collect(),
                 Err(e) => {
                     warn!(
@@ -1066,7 +1107,7 @@ impl Repository {
     /// Update dataset completeness for each (target, dataset, network) touched
     /// by the materialization run.
     ///
-    /// `bronze_network_map` provides `tx_hash -> actual_network` from Bronze
+    /// `bronze_network_map` provides `tx_hash -> [actual_networks]` from Bronze
     /// `raw_transactions` rows, used when `explicit_network` is `None` to avoid
     /// collapsing L2/sidechain transactions to the wrong default network.
     async fn update_silver_completeness(
@@ -1075,7 +1116,7 @@ impl Repository {
         dataset_versions: &HashMap<String, Uuid>,
         total_records: usize,
         explicit_network: Option<&str>,
-        bronze_network_map: &HashMap<String, String>,
+        bronze_network_map: &HashMap<String, Vec<String>>,
     ) {
         // Group transactions by (network, wallet_address) to resolve targets.
         let mut wallet_groups: HashMap<(String, String), Vec<&Transaction>> = HashMap::new();
@@ -2214,7 +2255,7 @@ mod tests {
     fn resolve_network_explicit_wins_over_bronze_and_chain_default() {
         let tx = make_eth_tx();
         let mut bronze_map = HashMap::new();
-        bronze_map.insert(tx.tx_hash.clone(), "base-mainnet".to_string());
+        bronze_map.insert(tx.tx_hash.clone(), vec!["base-mainnet".to_string()]);
 
         let (network, inferred) =
             resolve_effective_network(&tx, Some("arbitrum-mainnet"), &bronze_map);
@@ -2226,17 +2267,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_network_bronze_wins_over_chain_default() {
+    fn resolve_network_bronze_single_match_wins_over_chain_default() {
         let tx = make_eth_tx();
         let mut bronze_map = HashMap::new();
-        bronze_map.insert(tx.tx_hash.clone(), "base-mainnet".to_string());
+        bronze_map.insert(tx.tx_hash.clone(), vec!["base-mainnet".to_string()]);
 
         let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
         assert_eq!(network, "base-mainnet");
-        assert!(
-            !inferred,
-            "Bronze-resolved network should not be marked as inferred"
-        );
+        assert!(!inferred);
     }
 
     #[test]
@@ -2253,7 +2291,7 @@ mod tests {
     fn resolve_network_solana_from_bronze() {
         let tx = make_solana_tx();
         let mut bronze_map = HashMap::new();
-        bronze_map.insert(tx.tx_hash.clone(), "solana-mainnet".to_string());
+        bronze_map.insert(tx.tx_hash.clone(), vec!["solana-mainnet".to_string()]);
 
         let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
         assert_eq!(network, "solana-mainnet");
@@ -2272,12 +2310,9 @@ mod tests {
 
     #[test]
     fn resolve_network_evm_l2_not_collapsed_to_ethereum() {
-        // This is the core scenario from the bug report: a base-mainnet
-        // transaction ingested through the EVM adapter has Chain::Ethereum,
-        // but should resolve to "base-mainnet" via Bronze, not "ethereum-mainnet".
         let tx = make_eth_tx();
         let mut bronze_map = HashMap::new();
-        bronze_map.insert(tx.tx_hash.clone(), "base-mainnet".to_string());
+        bronze_map.insert(tx.tx_hash.clone(), vec!["base-mainnet".to_string()]);
 
         let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
         assert_eq!(network, "base-mainnet");
@@ -2300,5 +2335,53 @@ mod tests {
             inferred,
             "must flag as inferred so callers can log a warning"
         );
+    }
+
+    #[test]
+    fn resolve_network_multi_network_disambiguates_by_chain_family() {
+        // Same tx_hash exists on both ethereum-mainnet and solana-mainnet.
+        // A Chain::Ethereum tx should resolve to ethereum-mainnet.
+        let tx = make_eth_tx();
+        let mut bronze_map = HashMap::new();
+        bronze_map.insert(
+            tx.tx_hash.clone(),
+            vec!["solana-mainnet".to_string(), "ethereum-mainnet".to_string()],
+        );
+
+        let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
+        assert_eq!(network, "ethereum-mainnet");
+        assert!(!inferred);
+    }
+
+    #[test]
+    fn resolve_network_multi_evm_prefers_chain_default() {
+        // Same tx_hash on ethereum-mainnet and base-mainnet.
+        // Chain::Ethereum default is ethereum-mainnet, so it should win.
+        let tx = make_eth_tx();
+        let mut bronze_map = HashMap::new();
+        bronze_map.insert(
+            tx.tx_hash.clone(),
+            vec!["base-mainnet".to_string(), "ethereum-mainnet".to_string()],
+        );
+
+        let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
+        assert_eq!(network, "ethereum-mainnet");
+        assert!(!inferred);
+    }
+
+    #[test]
+    fn resolve_network_multi_evm_no_default_picks_deterministic() {
+        // Same tx_hash on base-mainnet and arbitrum-mainnet (no ethereum-mainnet).
+        // Should pick deterministically (alphabetical min).
+        let tx = make_eth_tx();
+        let mut bronze_map = HashMap::new();
+        bronze_map.insert(
+            tx.tx_hash.clone(),
+            vec!["base-mainnet".to_string(), "arbitrum-mainnet".to_string()],
+        );
+
+        let (network, inferred) = resolve_effective_network(&tx, None, &bronze_map);
+        assert_eq!(network, "arbitrum-mainnet", "should pick alphabetical min");
+        assert!(!inferred);
     }
 }

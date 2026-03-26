@@ -1563,10 +1563,10 @@ impl Repository {
     /// Batch-lookup the actual `network` stored in `raw_transactions` for a set of
     /// `tx_hash` values, without requiring the caller to already know the network.
     ///
-    /// Returns a map from `tx_hash` to `(id, network)`. When multiple Bronze rows
-    /// share the same `tx_hash` (different networks), the first one encountered wins
-    /// — the caller should treat collisions as a signal that the tx exists on
-    /// multiple networks and use additional context to disambiguate.
+    /// Returns a map from `tx_hash` to a `Vec` of `(id, network)` pairs.  The same
+    /// `tx_hash` can legitimately exist on multiple networks (cross-chain replays,
+    /// L2 re-orgs, etc.), so callers MUST disambiguate using chain family or other
+    /// context rather than assuming a single match.
     ///
     /// This is the key method for the normalize path: V1 `Transaction` rows only
     /// carry `chain: Chain`, not `network`, so we must consult Bronze to recover
@@ -1574,9 +1574,10 @@ impl Repository {
     pub async fn lookup_raw_tx_networks_by_hashes(
         &self,
         tx_hashes: &[String],
-    ) -> anyhow::Result<std::collections::HashMap<String, (Uuid, String)>> {
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<(Uuid, String)>>> {
         use sqlx::Row;
-        let mut result = std::collections::HashMap::with_capacity(tx_hashes.len());
+        let mut result: std::collections::HashMap<String, Vec<(Uuid, String)>> =
+            std::collections::HashMap::with_capacity(tx_hashes.len());
         for chunk in tx_hashes.chunks(Self::V2_BATCH_SIZE) {
             let hashes: Vec<&str> = chunk.iter().map(|h| h.as_str()).collect();
             let rows = sqlx::query(
@@ -1591,11 +1592,7 @@ impl Repository {
                 let id: Uuid = row.try_get("id")?;
                 let network: String = row.try_get("network")?;
                 let tx_hash: String = row.try_get("tx_hash")?;
-                // First row wins; if a tx_hash appears on multiple networks
-                // (unlikely but possible for cross-chain replays), we keep
-                // the first match.  Callers with an explicit_network should
-                // prefer lookup_raw_transaction_ids() which is network-scoped.
-                result.entry(tx_hash).or_insert((id, network));
+                result.entry(tx_hash).or_default().push((id, network));
             }
         }
         Ok(result)
