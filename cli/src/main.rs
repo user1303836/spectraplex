@@ -81,6 +81,13 @@ enum Commands {
 
         #[arg(short, long, default_value = "silver_ledger.jsonl")]
         output: PathBuf,
+
+        /// Optional V2 network identifier (e.g. "base-mainnet").
+        /// When provided, overrides the chain-derived default during Silver
+        /// materialization.  When omitted, the actual network is resolved
+        /// from existing Bronze raw_transactions rows.
+        #[arg(short, long)]
+        network: Option<String>,
     },
 
     /// Register a new index target
@@ -599,7 +606,11 @@ async fn main() -> anyhow::Result<()> {
                 info!(count = networks.len(), "Networks listed");
             }
         }
-        Commands::Normalize { input, output } => {
+        Commands::Normalize {
+            input,
+            output,
+            network,
+        } => {
             let input_str = input.to_string_lossy();
             let transactions = if input_str.starts_with("db:") {
                 let wallet = input_str.strip_prefix("db:").unwrap();
@@ -653,9 +664,11 @@ async fn main() -> anyhow::Result<()> {
                 repo.save_ledger_entries(&all_entries).await?;
 
                 // Materialize V2 Silver datasets (best-effort).
-                // Normalization operates on file-loaded transactions; the network
-                // was stamped during ingestion, so pass None to use chain defaults.
-                repo.materialize_silver_datasets(&transactions, None).await;
+                // When an explicit network is provided, use it.  Otherwise,
+                // materialize_silver_datasets resolves the actual network from
+                // existing Bronze raw_transactions rows.
+                repo.materialize_silver_datasets(&transactions, network.as_deref())
+                    .await;
 
                 info!("Normalization complete");
             } else {
@@ -916,9 +929,14 @@ mod tests {
     fn test_parse_normalize_defaults() {
         let cli = Cli::try_parse_from(["spectraplex", "normalize"]).unwrap();
         match cli.command {
-            Commands::Normalize { input, output } => {
+            Commands::Normalize {
+                input,
+                output,
+                network,
+            } => {
                 assert_eq!(input, PathBuf::from("bronze_transactions.jsonl"));
                 assert_eq!(output, PathBuf::from("silver_ledger.jsonl"));
+                assert!(network.is_none());
             }
             _ => panic!("expected Normalize command"),
         }
@@ -936,9 +954,38 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Normalize { input, output } => {
+            Commands::Normalize {
+                input,
+                output,
+                network,
+            } => {
                 assert_eq!(input, PathBuf::from("custom_input.jsonl"));
                 assert_eq!(output, PathBuf::from("custom_output.jsonl"));
+                assert!(network.is_none());
+            }
+            _ => panic!("expected Normalize command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_normalize_with_network() {
+        let cli = Cli::try_parse_from([
+            "spectraplex",
+            "normalize",
+            "--input",
+            "db:0xabc",
+            "--network",
+            "base-mainnet",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Normalize {
+                input,
+                output: _,
+                network,
+            } => {
+                assert_eq!(input, PathBuf::from("db:0xabc"));
+                assert_eq!(network.as_deref(), Some("base-mainnet"));
             }
             _ => panic!("expected Normalize command"),
         }

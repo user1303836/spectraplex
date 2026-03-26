@@ -542,6 +542,11 @@ struct BatchIngestRequest {
 #[derive(Deserialize)]
 struct NormalizeRequest {
     wallet: String,
+    /// Optional V2 network identifier (e.g. `"base-mainnet"`).  When provided,
+    /// overrides the chain-derived default during Silver materialization.  When
+    /// omitted, the normalize path resolves the actual network from existing
+    /// Bronze `raw_transactions` rows.
+    network: Option<String>,
     callback_url: Option<String>,
 }
 
@@ -1580,6 +1585,7 @@ async fn trigger_normalize(
 
     let state_clone = Arc::clone(&state);
     let wallet = payload.wallet.clone();
+    let explicit_network = payload.network.clone();
     let callback_url = payload.callback_url.clone();
 
     tokio::spawn(async move {
@@ -1621,12 +1627,14 @@ async fn trigger_normalize(
             state_clone.repo.save_ledger_entries(&all_entries).await?;
 
             // Materialize V2 Silver datasets (best-effort).
-            // Normalization operates on pre-ingested transactions; the explicit
-            // network was already stamped during ingestion, so we pass None here
-            // to let each transaction's chain derive the default network.
+            // When an explicit network is provided, use it.  Otherwise,
+            // materialize_silver_datasets resolves the actual network from
+            // existing Bronze raw_transactions rows — this is critical for
+            // L2/sidechain transactions whose V1 `chain` field maps to
+            // the wrong default network.
             state_clone
                 .repo
-                .materialize_silver_datasets(&txs, None)
+                .materialize_silver_datasets(&txs, explicit_network.as_deref())
                 .await;
 
             Ok::<usize, anyhow::Error>(count)
