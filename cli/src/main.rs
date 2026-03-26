@@ -299,26 +299,56 @@ async fn main() -> anyhow::Result<()> {
                         _ => unreachable!("unsupported chain filtered earlier"),
                     };
 
-                    // Ensure a V2 IndexTarget exists for this wallet (best-effort)
-                    let target_id = match repo
-                        .ensure_wallet_target(&chain_enum, wallet, Some(user_id))
-                        .await
-                    {
-                        Ok(target) => Some(target.id),
-                        Err(e) => {
-                            warn!(
-                                error = %e,
-                                wallet = %wallet,
-                                "Failed to ensure V2 wallet target (V1 path unaffected)"
-                            );
-                            None
+                    // Ensure a V2 IndexTarget exists for this wallet (best-effort).
+                    // When --network is provided, use it so different EVM networks
+                    // get distinct target rows.
+                    let target_id = if let Some(ref net) = network {
+                        match repo
+                            .ensure_wallet_target_for_network(
+                                net,
+                                &chain_enum,
+                                wallet,
+                                Some(user_id),
+                            )
+                            .await
+                        {
+                            Ok(target) => Some(target.id),
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    wallet = %wallet,
+                                    network = %net,
+                                    "Failed to ensure V2 wallet target (V1 path unaffected)"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        match repo
+                            .ensure_wallet_target(&chain_enum, wallet, Some(user_id))
+                            .await
+                        {
+                            Ok(target) => Some(target.id),
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    wallet = %wallet,
+                                    "Failed to ensure V2 wallet target (V1 path unaffected)"
+                                );
+                                None
+                            }
                         }
                     };
 
                     if let Some(cp) = build_checkpoint(&chain, wallet, &events) {
                         if let Some(tid) = target_id {
-                            repo.save_transactions_and_checkpoint_dual_write(&events, &cp, tid)
-                                .await?;
+                            repo.save_transactions_and_checkpoint_dual_write(
+                                &events,
+                                &cp,
+                                tid,
+                                network.as_deref(),
+                            )
+                            .await?;
                         } else {
                             repo.save_transactions_and_checkpoint(&events, &cp).await?;
                         }

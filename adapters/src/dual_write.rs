@@ -100,7 +100,24 @@ fn extract_block_number(chain: &Chain, metadata: &serde_json::Value) -> Option<i
 /// - EVM cursor: `{ last_block }`
 /// - HyperCore cursor: `{ last_timestamp }` (raw seconds)
 pub fn v1_checkpoint_to_v2(cp: &IndexerCheckpoint, target_id: Uuid) -> Checkpoint {
-    let network = chain_to_default_network(&cp.chain).to_string();
+    v1_checkpoint_to_v2_with_network(cp, target_id, None)
+}
+
+/// Convert a V1 checkpoint to V2, with an optional explicit network override.
+///
+/// When `explicit_network` is `Some`, it is used instead of the chain-derived
+/// default. This is critical for EVM networks like `base-mainnet` and
+/// `arbitrum-mainnet` that all map to `Chain::Ethereum` but need distinct
+/// checkpoint rows in the V2 `checkpoints` table.
+pub fn v1_checkpoint_to_v2_with_network(
+    cp: &IndexerCheckpoint,
+    target_id: Uuid,
+    explicit_network: Option<&str>,
+) -> Checkpoint {
+    let network = match explicit_network {
+        Some(n) => n.to_string(),
+        None => chain_to_default_network(&cp.chain).to_string(),
+    };
     let source = chain_to_default_source(&cp.chain).to_string();
 
     let cursor = build_v2_cursor(cp);
@@ -197,8 +214,42 @@ impl Repository {
         owner_id: Option<Uuid>,
     ) -> anyhow::Result<IndexTarget> {
         let network = chain_to_default_network(chain);
-        let chain_family = ChainFamily::from(chain.clone());
+        self.ensure_wallet_target_inner(
+            network,
+            ChainFamily::from(chain.clone()),
+            wallet_address,
+            owner_id,
+        )
+        .await
+    }
 
+    /// Like `ensure_wallet_target`, but uses an explicit network ID instead of
+    /// deriving it from `Chain`. This is needed for EVM networks like
+    /// `base-mainnet` and `arbitrum-mainnet` that all map to `Chain::Ethereum`
+    /// but must have distinct target rows.
+    pub async fn ensure_wallet_target_for_network(
+        &self,
+        network: &str,
+        chain: &Chain,
+        wallet_address: &str,
+        owner_id: Option<Uuid>,
+    ) -> anyhow::Result<IndexTarget> {
+        self.ensure_wallet_target_inner(
+            network,
+            ChainFamily::from(chain.clone()),
+            wallet_address,
+            owner_id,
+        )
+        .await
+    }
+
+    async fn ensure_wallet_target_inner(
+        &self,
+        network: &str,
+        chain_family: ChainFamily,
+        wallet_address: &str,
+        owner_id: Option<Uuid>,
+    ) -> anyhow::Result<IndexTarget> {
         // Check if target already exists
         if let Some(existing) = self
             .get_index_target_by_address(TargetKind::Wallet, network, wallet_address)
@@ -267,16 +318,21 @@ impl Repository {
     ///
     /// V1 write (`save_checkpoint`) executes first. V2 write
     /// (`upsert_checkpoint_v2`) is best-effort.
+    ///
+    /// When `explicit_network` is provided it overrides the chain-derived
+    /// default in the V2 checkpoint, ensuring different EVM networks
+    /// get distinct checkpoint rows.
     pub async fn save_checkpoint_dual_write(
         &self,
         checkpoint: &IndexerCheckpoint,
         target_id: Uuid,
+        explicit_network: Option<&str>,
     ) -> anyhow::Result<()> {
         // V1 write (authoritative)
         self.save_checkpoint(checkpoint).await?;
 
         // V2 write (best-effort)
-        let v2_cp = v1_checkpoint_to_v2(checkpoint, target_id);
+        let v2_cp = v1_checkpoint_to_v2_with_network(checkpoint, target_id, explicit_network);
         if let Err(e) = self.upsert_checkpoint_v2(&v2_cp).await {
             warn!(
                 error = %e,
@@ -292,11 +348,15 @@ impl Repository {
     ///
     /// V1 path uses `save_transactions_and_checkpoint` (atomic). V2 writes
     /// are best-effort and run after V1 succeeds.
+    ///
+    /// When `explicit_network` is provided it overrides the chain-derived
+    /// default in the V2 checkpoint.
     pub async fn save_transactions_and_checkpoint_dual_write(
         &self,
         txs: &[Transaction],
         checkpoint: &IndexerCheckpoint,
         target_id: Uuid,
+        explicit_network: Option<&str>,
     ) -> anyhow::Result<()> {
         // V1 write (authoritative, atomic)
         self.save_transactions_and_checkpoint(txs, checkpoint)
@@ -312,7 +372,7 @@ impl Repository {
             );
         }
 
-        let v2_cp = v1_checkpoint_to_v2(checkpoint, target_id);
+        let v2_cp = v1_checkpoint_to_v2_with_network(checkpoint, target_id, explicit_network);
         if let Err(e) = self.upsert_checkpoint_v2(&v2_cp).await {
             warn!(
                 error = %e,
@@ -1727,5 +1787,66 @@ mod tests {
             assert_eq!(m.raw_transaction_id, canonical_id);
             assert_eq!(m.target_id, target_id);
         }
+    }
+
+    // -- v1_checkpoint_to_v2_with_network tests --
+
+    #[test]
+    fn checkpoint_v2_with_explicit_network_overrides_default() {
+        let cp = IndexerCheckpoint {
+            chain: Chain::Ethereum,
+            wallet_address: "0xwallet".to_string(),
+            last_signature: Some("0xabc".to_string()),
+            last_slot: None,
+            last_block: Some(12345),
+            last_timestamp: Some(1700000000),
+        };
+        let target_id = Uuid::new_v4();
+
+        // Without explicit network: uses chain default
+        let v2_default = v1_checkpoint_to_v2(&cp, target_id);
+        assert_eq!(v2_default.network, "ethereum-mainnet");
+
+        // With explicit network: overrides to base-mainnet
+        let v2_override = v1_checkpoint_to_v2_with_network(&cp, target_id, Some("base-mainnet"));
+        assert_eq!(v2_override.network, "base-mainnet");
+        assert_eq!(v2_override.source, "rpc");
+        assert_eq!(v2_override.cursor["last_block"], 12345);
+    }
+
+    #[test]
+    fn checkpoint_v2_with_none_network_uses_default() {
+        let cp = IndexerCheckpoint {
+            chain: Chain::Solana,
+            wallet_address: "wallet".to_string(),
+            last_signature: Some("sig".to_string()),
+            last_slot: Some(100),
+            last_block: None,
+            last_timestamp: Some(1700000000),
+        };
+        let target_id = Uuid::new_v4();
+
+        let v2 = v1_checkpoint_to_v2_with_network(&cp, target_id, None);
+        assert_eq!(v2.network, "solana-mainnet");
+    }
+
+    #[test]
+    fn checkpoint_v2_arbitrum_network_distinct_from_ethereum() {
+        let cp = IndexerCheckpoint {
+            chain: Chain::Ethereum,
+            wallet_address: "0xwallet".to_string(),
+            last_signature: Some("0xabc".to_string()),
+            last_slot: None,
+            last_block: Some(50000),
+            last_timestamp: Some(1700000000),
+        };
+        let target_id = Uuid::new_v4();
+
+        let v2_arb = v1_checkpoint_to_v2_with_network(&cp, target_id, Some("arbitrum-mainnet"));
+        let v2_eth = v1_checkpoint_to_v2_with_network(&cp, target_id, None);
+
+        assert_eq!(v2_arb.network, "arbitrum-mainnet");
+        assert_eq!(v2_eth.network, "ethereum-mainnet");
+        assert_ne!(v2_arb.network, v2_eth.network);
     }
 }
