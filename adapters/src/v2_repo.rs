@@ -3321,6 +3321,17 @@ impl Repository {
         Ok(())
     }
 
+    /// Transition an ingestion job from `claimed` to `running`.
+    pub async fn mark_ingestion_job_running(&self, job_id: Uuid) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE ingestion_jobs SET status = 'running', updated_at = NOW() WHERE id = $1",
+        )
+        .bind(job_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
     /// Mark an ingestion job as completed.
     pub async fn complete_ingestion_job(&self, job_id: Uuid) -> anyhow::Result<()> {
         sqlx::query(
