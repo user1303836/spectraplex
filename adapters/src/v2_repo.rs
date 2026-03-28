@@ -3690,7 +3690,10 @@ impl Repository {
              (id, dataset, format, filters, sink_config) \
              VALUES ($1, $2, $3, $4, $5) \
              RETURNING id, dataset, format, filters, sink_config, status, \
-                       worker_id, record_count, result_location, error_message, \
+                       worker_id, record_count, result_location, \
+                       delivery_destination, error_message, \
+                       dataset_version_id, dataset_version, completeness_status, \
+                       completeness_coverage, last_ingestion_run_id, \
                        created_at, updated_at, started_at, completed_at, heartbeat_at",
         )
         .bind(id)
@@ -3745,7 +3748,10 @@ impl Repository {
 
         let updated = sqlx::query(
             "SELECT id, dataset, format, filters, sink_config, status, \
-             worker_id, record_count, result_location, error_message, \
+             worker_id, record_count, result_location, \
+             delivery_destination, error_message, \
+             dataset_version_id, dataset_version, completeness_status, \
+             completeness_coverage, last_ingestion_run_id, \
              created_at, updated_at, started_at, completed_at, heartbeat_at \
              FROM export_jobs WHERE id = $1",
         )
@@ -3845,7 +3851,10 @@ impl Repository {
     pub async fn get_export_job(&self, id: Uuid) -> anyhow::Result<Option<ExportJob>> {
         let row = sqlx::query(
             "SELECT id, dataset, format, filters, sink_config, status, \
-             worker_id, record_count, result_location, error_message, \
+             worker_id, record_count, result_location, \
+             delivery_destination, error_message, \
+             dataset_version_id, dataset_version, completeness_status, \
+             completeness_coverage, last_ingestion_run_id, \
              created_at, updated_at, started_at, completed_at, heartbeat_at \
              FROM export_jobs WHERE id = $1",
         )
