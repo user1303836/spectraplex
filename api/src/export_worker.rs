@@ -421,6 +421,7 @@ async fn execute_export_job(
 /// lease) the same as an error — logs a warning and returns `Err(())` so
 /// the caller can abort immediately without continuing to execute side
 /// effects on a reclaimed job.
+#[allow(clippy::too_many_arguments)]
 async fn update_or_abort(
     repo: &Repository,
     job_id: Uuid,
