@@ -3036,7 +3036,7 @@ async fn create_export_job(
         .await
         .map_err(|e| AppError::internal(format!("Failed to enqueue export job: {e}")))?;
 
-    let mut status = export_job_to_status(&job, &state.repo).await;
+    let mut status = export_job_to_status(&job);
     // Populate delivery_status for sink jobs
     if req.sink.is_some() {
         status.delivery_status = Some("pending".to_string());
@@ -3046,12 +3046,8 @@ async fn create_export_job(
 }
 
 /// Convert a durable ExportJob (from Postgres) into the API ExportJobStatus
-/// response, enriching with dataset version and completeness metadata from
-/// the repository when available.
-async fn export_job_to_status(
-    job: &ExportJob,
-    repo: &spectraplex_adapters::repo::Repository,
-) -> ExportJobStatus {
+/// response, reading persisted provenance fields directly from the job row.
+fn export_job_to_status(job: &ExportJob) -> ExportJobStatus {
     let state = match job.status {
         DurableExportJobStatus::Pending => JobState::Pending,
         DurableExportJobStatus::Running => JobState::Running,
@@ -3060,65 +3056,14 @@ async fn export_job_to_status(
         DurableExportJobStatus::Failed => JobState::Failed,
     };
 
-    // Reconstruct provenance metadata from dataset version/completeness
-    // tables, matching what the worker computed at export time.
-    let mut dataset_version_id = None;
-    let mut dataset_version = None;
-    let mut completeness_status = None;
-    let mut completeness_coverage = None;
-    let mut last_ingestion_run_id = None;
-
-    if let Ok(Some(dv)) = repo.get_active_dataset_version(&job.dataset).await {
-        dataset_version_id = Some(dv.id);
-        dataset_version = Some(dv.version);
-    }
-
-    // Parse target_id from filters for completeness lookup
-    let target_id = job
-        .filters
-        .as_ref()
-        .and_then(|f| f.get("target_id"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<uuid::Uuid>().ok());
-    let network = job
-        .filters
-        .as_ref()
-        .and_then(|f| f.get("network"))
-        .and_then(|v| v.as_str());
-
-    if let Ok(completeness_records) = repo
-        .list_completeness_filtered(&job.dataset, target_id, network)
-        .await
-    {
-        if !completeness_records.is_empty() {
-            use spectraplex_core::v2::CompletenessStatus as CS;
-            // Aggregate worst status across all completeness records
-            let has_partial = completeness_records
-                .iter()
-                .any(|c| matches!(c.status, CS::Partial));
-            let all_complete = completeness_records
-                .iter()
-                .all(|c| matches!(c.status, CS::Complete));
-            completeness_status = Some(
-                if all_complete {
-                    "complete"
-                } else if has_partial {
-                    "partial"
-                } else {
-                    "incomplete"
-                }
-                .to_string(),
-            );
-            completeness_coverage = Some(serde_json::json!({
-                "records": completeness_records.len(),
-            }));
-            // Use the most recent run_id from completeness records
-            last_ingestion_run_id = completeness_records
-                .iter()
-                .filter_map(|c| c.last_ingestion_run_id)
-                .next();
-        }
-    }
+    // For sink-backed jobs, use delivery_destination; for non-sink jobs, use result_location.
+    let delivered_to = if job.sink_config.is_some() {
+        job.delivery_destination
+            .clone()
+            .or_else(|| job.result_location.clone())
+    } else {
+        job.result_location.clone()
+    };
 
     ExportJobStatus {
         id: job.id,
@@ -3127,7 +3072,7 @@ async fn export_job_to_status(
         format: job.format.clone(),
         record_count: job.record_count.map(|n| n as usize),
         message: job.error_message.clone(),
-        delivered_to: job.result_location.clone(),
+        delivered_to,
         delivery_status: if job.sink_config.is_some() {
             Some(match job.status {
                 DurableExportJobStatus::Completed => "delivered".to_string(),
@@ -3137,13 +3082,13 @@ async fn export_job_to_status(
         } else {
             None
         },
-        dataset_version_id,
-        dataset_version,
-        completeness_status,
-        completeness_coverage,
+        dataset_version_id: job.dataset_version_id,
+        dataset_version: job.dataset_version,
+        completeness_status: job.completeness_status.clone(),
+        completeness_coverage: job.completeness_coverage.clone(),
         started_at: job.started_at,
         completed_at: job.completed_at,
-        last_ingestion_run_id,
+        last_ingestion_run_id: job.last_ingestion_run_id,
     }
 }
 
@@ -3410,7 +3355,7 @@ async fn get_export_job_status(
         .await
         .map_err(|e| AppError::internal(format!("Failed to fetch export job: {e}")))?;
     match job {
-        Some(j) => Ok(Json(export_job_to_status(&j, &state.repo).await)),
+        Some(j) => Ok(Json(export_job_to_status(&j))),
         None => Err(AppError::not_found("Export job not found")),
     }
 }

@@ -1323,7 +1323,13 @@ fn row_to_export_job(row: &sqlx::postgres::PgRow) -> anyhow::Result<ExportJob> {
         worker_id: row.try_get("worker_id")?,
         record_count: row.try_get("record_count")?,
         result_location: row.try_get("result_location")?,
+        delivery_destination: row.try_get("delivery_destination").unwrap_or(None),
         error_message: row.try_get("error_message")?,
+        dataset_version_id: row.try_get("dataset_version_id").unwrap_or(None),
+        dataset_version: row.try_get("dataset_version").unwrap_or(None),
+        completeness_status: row.try_get("completeness_status").unwrap_or(None),
+        completeness_coverage: row.try_get("completeness_coverage").unwrap_or(None),
+        last_ingestion_run_id: row.try_get("last_ingestion_run_id").unwrap_or(None),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         started_at: row.try_get("started_at")?,
@@ -3758,6 +3764,7 @@ impl Repository {
     /// so that a stale worker whose lease was reclaimed cannot clobber the new
     /// owner's progress.  Returns `Ok(true)` when the row was updated, or
     /// `Ok(false)` when the lease was lost (row not matched).
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_export_job_status(
         &self,
         job_id: Uuid,
@@ -3766,6 +3773,12 @@ impl Repository {
         result_location: Option<&str>,
         error_message: Option<&str>,
         worker_id: &str,
+        delivery_destination: Option<&str>,
+        dataset_version_id: Option<Uuid>,
+        dataset_version: Option<i32>,
+        completeness_status: Option<&str>,
+        completeness_coverage: Option<&serde_json::Value>,
+        last_ingestion_run_id: Option<Uuid>,
     ) -> anyhow::Result<bool> {
         let completed_at = if status == "completed" || status == "failed" {
             Some(Utc::now())
@@ -3779,6 +3792,12 @@ impl Repository {
                  result_location = COALESCE($4, result_location), \
                  error_message = COALESCE($5, error_message), \
                  completed_at = COALESCE($6, completed_at), \
+                 delivery_destination = COALESCE($8, delivery_destination), \
+                 dataset_version_id = COALESCE($9, dataset_version_id), \
+                 dataset_version = COALESCE($10, dataset_version), \
+                 completeness_status = COALESCE($11, completeness_status), \
+                 completeness_coverage = COALESCE($12, completeness_coverage), \
+                 last_ingestion_run_id = COALESCE($13, last_ingestion_run_id), \
                  updated_at = NOW() \
              WHERE id = $1 AND worker_id = $7 AND status IN ('running', 'delivering')",
         )
@@ -3789,6 +3808,12 @@ impl Repository {
         .bind(error_message)
         .bind(completed_at)
         .bind(worker_id)
+        .bind(delivery_destination)
+        .bind(dataset_version_id)
+        .bind(dataset_version)
+        .bind(completeness_status)
+        .bind(completeness_coverage)
+        .bind(last_ingestion_run_id)
         .execute(self.pool())
         .await?;
         Ok(result.rows_affected() > 0)
@@ -5610,6 +5635,12 @@ mod tests {
                 Some("/tmp/out.csv"),
                 None,
                 "worker-1",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
             ));
         }
         let _ = _check;
@@ -5704,7 +5735,13 @@ mod tests {
             worker_id: None,
             record_count: None,
             result_location: None,
+            delivery_destination: None,
             error_message: None,
+            dataset_version_id: None,
+            dataset_version: None,
+            completeness_status: None,
+            completeness_coverage: None,
+            last_ingestion_run_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             started_at: None,

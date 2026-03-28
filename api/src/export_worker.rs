@@ -142,7 +142,20 @@ async fn execute_export_job(
             let err_msg = format!("Invalid export format: {}", job.format);
             error!(job_id = %job_id, error = %err_msg, "Export job failed");
             if let Err(e) = repo
-                .update_export_job_status(job_id, "failed", None, None, Some(&err_msg), worker_id)
+                .update_export_job_status(
+                    job_id,
+                    "failed",
+                    None,
+                    None,
+                    Some(&err_msg),
+                    worker_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .await
             {
                 error!(job_id = %job_id, error = %e, "Failed to mark job failed");
@@ -172,6 +185,13 @@ async fn execute_export_job(
         Ok((body, record_count, _export_meta)) => {
             let has_sink = job.sink_config.is_some();
 
+            // Extract provenance fields from export metadata for persistence.
+            let prov_dv_id = _export_meta.dataset_version_id;
+            let prov_dv = _export_meta.dataset_version;
+            let prov_cs = _export_meta.completeness_status.as_deref();
+            let prov_cc = _export_meta.completeness_coverage.as_ref();
+            let prov_lri = _export_meta.last_ingestion_run_id;
+
             // Determine file extension from format.
             let ext = match format {
                 ExportFormat::Jsonl => "jsonl",
@@ -191,6 +211,12 @@ async fn execute_export_job(
                     None,
                     Some(&err_msg),
                     worker_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 )
                 .await;
                 heartbeat_cancel.cancel();
@@ -209,6 +235,12 @@ async fn execute_export_job(
                     None,
                     Some(&err_msg),
                     worker_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 )
                 .await;
                 heartbeat_cancel.cancel();
@@ -228,6 +260,12 @@ async fn execute_export_job(
                     Some(&result_location),
                     None,
                     worker_id,
+                    None,
+                    prov_dv_id,
+                    prov_dv,
+                    prov_cs,
+                    prov_cc,
+                    prov_lri,
                 )
                 .await
                 {
@@ -250,7 +288,7 @@ async fn execute_export_job(
                                 format: job.format.clone(),
                                 record_count,
                                 dataset_version_id: _export_meta.dataset_version_id,
-                                completeness_status: _export_meta.completeness_status,
+                                completeness_status: _export_meta.completeness_status.clone(),
                             };
                             match sink.deliver(&body, &delivery_meta).await {
                                 Ok(receipt) => Ok(receipt.destination),
@@ -281,16 +319,15 @@ async fn execute_export_job(
                 };
 
                 match delivery_result {
-                    Ok(_destination) => {
+                    Ok(destination) => {
                         info!(
                             job_id = %job_id,
                             record_count,
-                            destination = %_destination,
+                            destination = %destination,
                             "Export job completed with sink delivery"
                         );
                         // Keep result_location as the on-disk file path for download.
-                        // The sink destination is not stored in result_location to
-                        // avoid breaking download_export().
+                        // The sink destination is stored in delivery_destination.
                         let _ = update_or_abort(
                             repo,
                             job_id,
@@ -299,6 +336,12 @@ async fn execute_export_job(
                             Some(&result_location),
                             None,
                             worker_id,
+                            Some(&destination),
+                            prov_dv_id,
+                            prov_dv,
+                            prov_cs,
+                            prov_cc,
+                            prov_lri,
                         )
                         .await;
                     }
@@ -312,6 +355,12 @@ async fn execute_export_job(
                             Some(&result_location),
                             Some(&err_msg),
                             worker_id,
+                            None,
+                            prov_dv_id,
+                            prov_dv,
+                            prov_cs,
+                            prov_cc,
+                            prov_lri,
                         )
                         .await;
                     }
@@ -332,6 +381,12 @@ async fn execute_export_job(
                     Some(&result_location),
                     None,
                     worker_id,
+                    None,
+                    prov_dv_id,
+                    prov_dv,
+                    prov_cs,
+                    prov_cc,
+                    prov_lri,
                 )
                 .await;
             }
@@ -347,6 +402,12 @@ async fn execute_export_job(
                 None,
                 Some(&err_msg),
                 worker_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
             )
             .await;
         }
@@ -368,6 +429,12 @@ async fn update_or_abort(
     result_location: Option<&str>,
     error_message: Option<&str>,
     worker_id: &str,
+    delivery_destination: Option<&str>,
+    dataset_version_id: Option<Uuid>,
+    dataset_version: Option<i32>,
+    completeness_status: Option<&str>,
+    completeness_coverage: Option<&serde_json::Value>,
+    last_ingestion_run_id: Option<Uuid>,
 ) -> Result<(), ()> {
     match repo
         .update_export_job_status(
@@ -377,6 +444,12 @@ async fn update_or_abort(
             result_location,
             error_message,
             worker_id,
+            delivery_destination,
+            dataset_version_id,
+            dataset_version,
+            completeness_status,
+            completeness_coverage,
+            last_ingestion_run_id,
         )
         .await
     {

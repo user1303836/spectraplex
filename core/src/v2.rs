@@ -538,7 +538,21 @@ pub struct ExportJob {
     pub worker_id: Option<String>,
     pub record_count: Option<i32>,
     pub result_location: Option<String>,
+    /// Delivery destination for sink-backed exports (webhook URL, local path).
+    /// Separate from `result_location` so downloads can use the on-disk path
+    /// while the API can report where the data was actually delivered.
+    pub delivery_destination: Option<String>,
     pub error_message: Option<String>,
+    /// Provenance: dataset version ID at the time the export was produced.
+    pub dataset_version_id: Option<Uuid>,
+    /// Provenance: dataset version number at export time.
+    pub dataset_version: Option<i32>,
+    /// Provenance: aggregated completeness status at export time.
+    pub completeness_status: Option<String>,
+    /// Provenance: completeness coverage metadata at export time (JSON).
+    pub completeness_coverage: Option<serde_json::Value>,
+    /// Provenance: most recent ingestion run ID at export time.
+    pub last_ingestion_run_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
@@ -1593,7 +1607,13 @@ mod tests {
             worker_id: None,
             record_count: None,
             result_location: None,
+            delivery_destination: None,
             error_message: None,
+            dataset_version_id: None,
+            dataset_version: None,
+            completeness_status: None,
+            completeness_coverage: None,
+            last_ingestion_run_id: None,
             created_at: now,
             updated_at: now,
             started_at: None,
