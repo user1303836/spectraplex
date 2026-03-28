@@ -3752,6 +3752,12 @@ impl Repository {
     }
 
     /// Update the status (and optional fields) of an export job.
+    ///
+    /// The caller must supply the `worker_id` that currently owns the lease.
+    /// The UPDATE is guarded by `AND worker_id = $7 AND status IN ('running', 'delivering')`
+    /// so that a stale worker whose lease was reclaimed cannot clobber the new
+    /// owner's progress.  Returns `Ok(true)` when the row was updated, or
+    /// `Ok(false)` when the lease was lost (row not matched).
     pub async fn update_export_job_status(
         &self,
         job_id: Uuid,
@@ -3759,21 +3765,22 @@ impl Repository {
         record_count: Option<i32>,
         result_location: Option<&str>,
         error_message: Option<&str>,
-    ) -> anyhow::Result<()> {
+        worker_id: &str,
+    ) -> anyhow::Result<bool> {
         let completed_at = if status == "completed" || status == "failed" {
             Some(Utc::now())
         } else {
             None
         };
 
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE export_jobs \
              SET status = $2, record_count = COALESCE($3, record_count), \
                  result_location = COALESCE($4, result_location), \
                  error_message = COALESCE($5, error_message), \
                  completed_at = COALESCE($6, completed_at), \
                  updated_at = NOW() \
-             WHERE id = $1",
+             WHERE id = $1 AND worker_id = $7 AND status IN ('running', 'delivering')",
         )
         .bind(job_id)
         .bind(status)
@@ -3781,9 +3788,10 @@ impl Repository {
         .bind(result_location)
         .bind(error_message)
         .bind(completed_at)
+        .bind(worker_id)
         .execute(self.pool())
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Record a heartbeat for an in-progress export job.
@@ -5601,6 +5609,7 @@ mod tests {
                 Some(42),
                 Some("/tmp/out.csv"),
                 None,
+                "worker-1",
             ));
         }
         let _ = _check;
