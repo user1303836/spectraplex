@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 // These items are defined in main.rs and need to be pub(crate) for this
 // module to use them.  The parent task will adjust visibility.
-use crate::{build_sink, run_export_job, ExportMetadata};
+use crate::{build_sink, run_export_job};
 
 /// How often the worker polls for new jobs when idle.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -163,11 +163,13 @@ async fn execute_export_job(
     )
     .await;
 
-    // Stop heartbeat.
-    heartbeat_cancel.cancel();
+    // NOTE: Heartbeat stays alive through file write, sink delivery, and
+    // final status update. Stopping it early would let claim_export_job()
+    // reclaim a "delivering" job that is still actively writing/delivering,
+    // causing duplicate deliveries and conflicting final states.
 
     match result {
-        Ok((body, record_count, export_meta)) => {
+        Ok((body, record_count, _export_meta)) => {
             let has_sink = job.sink_config.is_some();
 
             // Determine file extension from format.
@@ -181,16 +183,17 @@ async fn execute_export_job(
             if let Err(e) = tokio::fs::create_dir_all(&exports_dir).await {
                 let err_msg = format!("Failed to create exports directory: {e}");
                 error!(job_id = %job_id, error = %err_msg, "Export job failed");
-                let _ = repo
-                    .update_export_job_status(
-                        job_id,
-                        "failed",
-                        None,
-                        None,
-                        Some(&err_msg),
-                        worker_id,
-                    )
-                    .await;
+                let _ = update_or_abort(
+                    repo,
+                    job_id,
+                    "failed",
+                    None,
+                    None,
+                    Some(&err_msg),
+                    worker_id,
+                )
+                .await;
+                heartbeat_cancel.cancel();
                 return;
             }
 
@@ -198,36 +201,41 @@ async fn execute_export_job(
             if let Err(e) = tokio::fs::write(&file_path, &body).await {
                 let err_msg = format!("Failed to write export file: {e}");
                 error!(job_id = %job_id, error = %err_msg, "Export job failed");
-                let _ = repo
-                    .update_export_job_status(
-                        job_id,
-                        "failed",
-                        None,
-                        None,
-                        Some(&err_msg),
-                        worker_id,
-                    )
-                    .await;
+                let _ = update_or_abort(
+                    repo,
+                    job_id,
+                    "failed",
+                    None,
+                    None,
+                    Some(&err_msg),
+                    worker_id,
+                )
+                .await;
+                heartbeat_cancel.cancel();
                 return;
             }
 
+            // Canonical on-disk artifact path — always preserved for download.
             let result_location = format!("exports/{}.{}", job_id, ext);
 
             if has_sink {
-                // Transition to 'delivering' state before attempting sink delivery.
-                if let Err(e) = repo
-                    .update_export_job_status(
-                        job_id,
-                        "delivering",
-                        Some(record_count as i32),
-                        Some(&result_location),
-                        None,
-                        worker_id,
-                    )
-                    .await
+                // Transition to 'delivering'. If Ok(false), lease was lost.
+                match update_or_abort(
+                    repo,
+                    job_id,
+                    "delivering",
+                    Some(record_count as i32),
+                    Some(&result_location),
+                    None,
+                    worker_id,
+                )
+                .await
                 {
-                    error!(job_id = %job_id, error = %e, "Failed to transition to delivering");
-                    return;
+                    Ok(()) => {}
+                    Err(()) => {
+                        heartbeat_cancel.cancel();
+                        return;
+                    }
                 }
 
                 // Attempt sink delivery.
@@ -241,8 +249,8 @@ async fn execute_export_job(
                                 dataset: job.dataset.clone(),
                                 format: job.format.clone(),
                                 record_count,
-                                dataset_version_id: export_meta.dataset_version_id,
-                                completeness_status: export_meta.completeness_status,
+                                dataset_version_id: _export_meta.dataset_version_id,
+                                completeness_status: _export_meta.completeness_status,
                             };
                             match sink.deliver(&body, &delivery_meta).await {
                                 Ok(receipt) => Ok(receipt.destination),
@@ -273,42 +281,39 @@ async fn execute_export_job(
                 };
 
                 match delivery_result {
-                    Ok(destination) => {
+                    Ok(_destination) => {
                         info!(
                             job_id = %job_id,
                             record_count,
-                            destination = %destination,
+                            destination = %_destination,
                             "Export job completed with sink delivery"
                         );
-                        if let Err(e) = repo
-                            .update_export_job_status(
-                                job_id,
-                                "completed",
-                                Some(record_count as i32),
-                                Some(&destination),
-                                None,
-                                worker_id,
-                            )
-                            .await
-                        {
-                            error!(job_id = %job_id, error = %e, "Failed to mark job completed");
-                        }
+                        // Keep result_location as the on-disk file path for download.
+                        // The sink destination is not stored in result_location to
+                        // avoid breaking download_export().
+                        let _ = update_or_abort(
+                            repo,
+                            job_id,
+                            "completed",
+                            Some(record_count as i32),
+                            Some(&result_location),
+                            None,
+                            worker_id,
+                        )
+                        .await;
                     }
                     Err(err_msg) => {
                         error!(job_id = %job_id, error = %err_msg, "Sink delivery failed");
-                        if let Err(e) = repo
-                            .update_export_job_status(
-                                job_id,
-                                "failed",
-                                Some(record_count as i32),
-                                Some(&result_location),
-                                Some(&err_msg),
-                                worker_id,
-                            )
-                            .await
-                        {
-                            error!(job_id = %job_id, error = %e, "Failed to mark job failed");
-                        }
+                        let _ = update_or_abort(
+                            repo,
+                            job_id,
+                            "failed",
+                            Some(record_count as i32),
+                            Some(&result_location),
+                            Some(&err_msg),
+                            worker_id,
+                        )
+                        .await;
                     }
                 }
             } else {
@@ -319,30 +324,74 @@ async fn execute_export_job(
                     result_location = %result_location,
                     "Export job completed"
                 );
-                if let Err(e) = repo
-                    .update_export_job_status(
-                        job_id,
-                        "completed",
-                        Some(record_count as i32),
-                        Some(&result_location),
-                        None,
-                        worker_id,
-                    )
-                    .await
-                {
-                    error!(job_id = %job_id, error = %e, "Failed to mark job completed");
-                }
+                let _ = update_or_abort(
+                    repo,
+                    job_id,
+                    "completed",
+                    Some(record_count as i32),
+                    Some(&result_location),
+                    None,
+                    worker_id,
+                )
+                .await;
             }
         }
         Err(e) => {
             let err_msg = format!("Export failed: {e}");
             error!(job_id = %job_id, error = %err_msg, "Export job failed");
-            if let Err(e2) = repo
-                .update_export_job_status(job_id, "failed", None, None, Some(&err_msg), worker_id)
-                .await
-            {
-                error!(job_id = %job_id, error = %e2, "Failed to mark job failed");
-            }
+            let _ = update_or_abort(
+                repo,
+                job_id,
+                "failed",
+                None,
+                None,
+                Some(&err_msg),
+                worker_id,
+            )
+            .await;
+        }
+    }
+
+    // Stop heartbeat after all writes and status updates are done.
+    heartbeat_cancel.cancel();
+}
+
+/// Wrapper around `update_export_job_status` that treats `Ok(false)` (lost
+/// lease) the same as an error — logs a warning and returns `Err(())` so
+/// the caller can abort immediately without continuing to execute side
+/// effects on a reclaimed job.
+async fn update_or_abort(
+    repo: &Repository,
+    job_id: Uuid,
+    status: &str,
+    record_count: Option<i32>,
+    result_location: Option<&str>,
+    error_message: Option<&str>,
+    worker_id: &str,
+) -> Result<(), ()> {
+    match repo
+        .update_export_job_status(
+            job_id,
+            status,
+            record_count,
+            result_location,
+            error_message,
+            worker_id,
+        )
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            warn!(
+                job_id = %job_id,
+                status,
+                "Lease lost — job was reclaimed by another worker; aborting"
+            );
+            Err(())
+        }
+        Err(e) => {
+            error!(job_id = %job_id, error = %e, "Failed to update export job status");
+            Err(())
         }
     }
 }
