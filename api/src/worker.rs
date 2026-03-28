@@ -14,9 +14,7 @@ use spectraplex_adapters::repo::{build_checkpoint, Repository};
 use spectraplex_adapters::solana::SolanaAdapter;
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
-use spectraplex_core::provider::{
-    chain_to_network_id, NetworkContext, NetworkId, ProviderRegistry,
-};
+use spectraplex_core::provider::{NetworkContext, NetworkId, ProviderRegistry};
 use spectraplex_core::v2::IngestionJob;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -89,10 +87,10 @@ async fn execute_job(
     let job_id = job.id;
 
     // Transition claimed -> running.
-    if let Err(e) = repo.mark_ingestion_job_running(job_id).await {
+    if let Err(e) = repo.mark_ingestion_job_running(job_id, worker_id).await {
         error!(job_id = %job_id, error = %e, "Failed to mark job running");
         let _ = repo
-            .fail_ingestion_job(job_id, &format!("failed to mark running: {e}"))
+            .fail_ingestion_job(job_id, worker_id, &format!("failed to mark running: {e}"))
             .await;
         return;
     }
@@ -157,7 +155,7 @@ async fn execute_job(
                 )
                 .await;
             // Mark job complete.
-            if let Err(e) = repo.complete_ingestion_job(job_id).await {
+            if let Err(e) = repo.complete_ingestion_job(job_id, worker_id).await {
                 error!(job_id = %job_id, error = %e, "Failed to mark job completed");
             }
             // Fire callback if present.
@@ -185,7 +183,7 @@ async fn execute_job(
                 )
                 .await;
             // Mark job failed.
-            if let Err(e2) = repo.fail_ingestion_job(job_id, &err_msg).await {
+            if let Err(e2) = repo.fail_ingestion_job(job_id, worker_id, &err_msg).await {
                 error!(job_id = %job_id, error = %e2, "Failed to mark job failed");
             }
             // Fire callback if present.
@@ -235,7 +233,11 @@ async fn run_ingestion(
 
     let target_id = job.target_id;
 
-    // Resolve V2 checkpoint for resume.
+    // Resolve V2 checkpoint for resume. For durable jobs we require a V2
+    // network-scoped checkpoint. Falling back to the V1 chain-scoped
+    // checkpoint is unsafe for EVM networks because "ethereum" checkpoints
+    // are shared across Ethereum/Base/Arbitrum and would resume from the
+    // wrong chain's cursor.
     let checkpoint = if let Some(tid) = target_id {
         let source = chain_to_default_source(&chain);
         match repo.get_checkpoint_v2(tid, &job.network, source).await {
@@ -250,41 +252,39 @@ async fn run_ingestion(
                 ))
             }
             Ok(None) => {
-                // Fall back to V1 checkpoint.
-                repo.get_checkpoint(chain_str, &wallet)
-                    .await
-                    .unwrap_or(None)
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
+                info!(
                     network = %job.network,
                     wallet = %wallet,
-                    "V2 checkpoint lookup failed, trying V1"
+                    "No V2 checkpoint found; starting from scratch"
                 );
-                repo.get_checkpoint(chain_str, &wallet)
-                    .await
-                    .unwrap_or(None)
+                None
+            }
+            Err(e) => {
+                // Surface the error rather than silently falling back.
+                anyhow::bail!(
+                    "V2 checkpoint lookup failed for network={}, wallet={}: {e}",
+                    job.network,
+                    wallet
+                );
             }
         }
     } else {
-        repo.get_checkpoint(chain_str, &wallet)
-            .await
-            .unwrap_or(None)
+        None
     };
 
-    // Resolve network context from registry.
-    let net_ctx = {
-        let ctx =
-            NetworkContext::from_registry(provider_registry, &NetworkId::new(job.network.clone()));
-        if ctx.is_none() {
-            // Fall back to chain-derived network.
-            chain_to_network_id(chain_str)
-                .and_then(|net_id| NetworkContext::from_registry(provider_registry, &net_id))
-        } else {
-            ctx
-        }
-    };
+    // Resolve network context from registry. Fail-closed: if the requested
+    // network is not configured in the provider registry, reject the job
+    // rather than silently falling back to a different chain's RPC endpoint.
+    let net_ctx =
+        NetworkContext::from_registry(provider_registry, &NetworkId::new(job.network.clone()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "network '{}' is not configured in the provider registry; \
+             cannot execute ingestion job {}",
+                    job.network,
+                    job.id
+                )
+            })?;
 
     let limit = config.ingest_limit;
     let user_id = job
@@ -295,28 +295,19 @@ async fn run_ingestion(
 
     let events: Vec<Transaction> = match chain {
         Chain::Hyperliquid => {
-            let adapter = match &net_ctx {
-                Some(ctx) => HyperliquidAdapter::from_network_context(ctx),
-                None => HyperliquidAdapter::new(),
-            };
+            let adapter = HyperliquidAdapter::from_network_context(&net_ctx);
             adapter
                 .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                 .await?
         }
         Chain::Ethereum => {
-            let adapter = match &net_ctx {
-                Some(ctx) => EvmAdapter::from_network_context(ctx)?,
-                None => EvmAdapter::new(&config.evm_rpc_url)?,
-            };
+            let adapter = EvmAdapter::from_network_context(&net_ctx)?;
             adapter
                 .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                 .await?
         }
         Chain::Solana => {
-            let adapter = match &net_ctx {
-                Some(ctx) => SolanaAdapter::from_network_context(ctx)?,
-                None => SolanaAdapter::new(&config.solana_rpc_url),
-            };
+            let adapter = SolanaAdapter::from_network_context(&net_ctx)?;
             adapter
                 .fetch_history(&wallet, limit, user_id, checkpoint.as_ref())
                 .await?

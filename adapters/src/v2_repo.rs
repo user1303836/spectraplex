@@ -3322,9 +3322,33 @@ impl Repository {
     }
 
     /// Transition an ingestion job from `claimed` to `running`.
-    pub async fn mark_ingestion_job_running(&self, job_id: Uuid) -> anyhow::Result<()> {
+    ///
+    /// Only succeeds if `worker_id` owns the current open attempt, preventing
+    /// a stale worker from mutating a job after lease recovery.
+    pub async fn mark_ingestion_job_running(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+    ) -> anyhow::Result<()> {
+        // Verify the caller owns the current open attempt.
+        let has_lease = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS( \
+                SELECT 1 FROM ingestion_job_attempts \
+                WHERE job_id = $1 AND worker_id = $2 AND finished_at IS NULL \
+            )",
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .fetch_one(self.pool())
+        .await?;
+
+        if !has_lease {
+            anyhow::bail!("worker {worker_id} does not own the current attempt for job {job_id}");
+        }
+
         sqlx::query(
-            "UPDATE ingestion_jobs SET status = 'running', updated_at = NOW() WHERE id = $1",
+            "UPDATE ingestion_jobs SET status = 'running', updated_at = NOW() \
+             WHERE id = $1 AND status = 'claimed'",
         )
         .bind(job_id)
         .execute(self.pool())
@@ -3333,21 +3357,50 @@ impl Repository {
     }
 
     /// Mark an ingestion job as completed.
-    pub async fn complete_ingestion_job(&self, job_id: Uuid) -> anyhow::Result<()> {
+    ///
+    /// Only succeeds if `worker_id` owns the current open attempt. This
+    /// prevents a stale worker from completing a job that was reclaimed by
+    /// another worker after lease recovery.
+    pub async fn complete_ingestion_job(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+    ) -> anyhow::Result<()> {
+        // Verify the caller owns the current open attempt.
+        let has_lease = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS( \
+                SELECT 1 FROM ingestion_job_attempts \
+                WHERE job_id = $1 AND worker_id = $2 AND finished_at IS NULL \
+            )",
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .fetch_one(self.pool())
+        .await?;
+
+        if !has_lease {
+            anyhow::bail!(
+                "worker {worker_id} does not own the current attempt for job {job_id} \
+                 (job may have been reclaimed); refusing to complete"
+            );
+        }
+
         sqlx::query(
             "UPDATE ingestion_jobs \
              SET status = 'completed', updated_at = NOW() \
-             WHERE id = $1",
+             WHERE id = $1 AND status IN ('claimed', 'running')",
         )
         .bind(job_id)
         .execute(self.pool())
         .await?;
 
+        // Only close *this* worker's attempt, not all open attempts.
         sqlx::query(
             "UPDATE ingestion_job_attempts SET finished_at = NOW() \
-             WHERE job_id = $1 AND finished_at IS NULL",
+             WHERE job_id = $1 AND worker_id = $2 AND finished_at IS NULL",
         )
         .bind(job_id)
+        .bind(worker_id)
         .execute(self.pool())
         .await?;
 
@@ -3355,23 +3408,52 @@ impl Repository {
     }
 
     /// Mark an ingestion job as failed with an error message.
-    pub async fn fail_ingestion_job(&self, job_id: Uuid, error: &str) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE ingestion_jobs \
-             SET status = 'failed', error_message = $2, updated_at = NOW() \
-             WHERE id = $1",
+    ///
+    /// Only succeeds if `worker_id` owns the current open attempt.
+    pub async fn fail_ingestion_job(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        // Verify the caller owns the current open attempt.
+        let has_lease = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS( \
+                SELECT 1 FROM ingestion_job_attempts \
+                WHERE job_id = $1 AND worker_id = $2 AND finished_at IS NULL \
+            )",
         )
         .bind(job_id)
+        .bind(worker_id)
+        .fetch_one(self.pool())
+        .await?;
+
+        if !has_lease {
+            anyhow::bail!(
+                "worker {worker_id} does not own the current attempt for job {job_id} \
+                 (job may have been reclaimed); refusing to mark failed"
+            );
+        }
+
+        sqlx::query(
+            "UPDATE ingestion_jobs \
+             SET status = 'failed', error_message = $3, updated_at = NOW() \
+             WHERE id = $1 AND status IN ('claimed', 'running')",
+        )
+        .bind(job_id)
+        .bind(worker_id)
         .bind(error)
         .execute(self.pool())
         .await?;
 
+        // Only close *this* worker's attempt.
         sqlx::query(
             "UPDATE ingestion_job_attempts \
-             SET finished_at = NOW(), error_message = $2 \
-             WHERE job_id = $1 AND finished_at IS NULL",
+             SET finished_at = NOW(), error_message = $3 \
+             WHERE job_id = $1 AND worker_id = $2 AND finished_at IS NULL",
         )
         .bind(job_id)
+        .bind(worker_id)
         .bind(error)
         .execute(self.pool())
         .await?;
@@ -5416,7 +5498,7 @@ mod tests {
     fn repo_complete_ingestion_job_is_send() {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
-            _assert_send(repo.complete_ingestion_job(Uuid::new_v4()));
+            _assert_send(repo.complete_ingestion_job(Uuid::new_v4(), "worker-1"));
         }
         let _ = _check;
     }
@@ -5425,7 +5507,7 @@ mod tests {
     fn repo_fail_ingestion_job_is_send() {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
-            _assert_send(repo.fail_ingestion_job(Uuid::new_v4(), "boom"));
+            _assert_send(repo.fail_ingestion_job(Uuid::new_v4(), "worker-1", "boom"));
         }
         let _ = _check;
     }

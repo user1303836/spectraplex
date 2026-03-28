@@ -1499,26 +1499,29 @@ async fn get_job_status(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<Uuid>,
 ) -> Result<Json<JobStatus>, AppError> {
-    // Check durable ingestion jobs in Postgres first.
-    match state.repo.get_ingestion_job(job_id).await {
-        Ok(Some(job)) => {
-            return Ok(Json(JobStatus {
-                id: job.id,
-                state: ingestion_status_to_job_state(job.status),
-                message: job.error_message,
-            }));
-        }
-        Ok(None) => {}
-        Err(e) => {
-            warn!(job_id = %job_id, error = %e, "Failed to query ingestion job from Postgres");
+    // Check in-memory normalize jobs first (instant, never errors).
+    {
+        let jobs = state.normalize_jobs.read().await;
+        if let Some(entry) = jobs.get(&job_id) {
+            return Ok(Json(entry.status.clone()));
         }
     }
 
-    // Fall back to in-memory normalize jobs.
-    let jobs = state.normalize_jobs.read().await;
-    match jobs.get(&job_id) {
-        Some(entry) => Ok(Json(entry.status.clone())),
-        None => Err(AppError::not_found(format!("Job {} not found", job_id))),
+    // Check durable ingestion jobs in Postgres. If Postgres is unavailable
+    // we surface the error rather than returning a misleading 404.
+    match state.repo.get_ingestion_job(job_id).await {
+        Ok(Some(job)) => Ok(Json(JobStatus {
+            id: job.id,
+            state: ingestion_status_to_job_state(job.status),
+            message: job.error_message,
+        })),
+        Ok(None) => Err(AppError::not_found(format!("Job {} not found", job_id))),
+        Err(e) => {
+            error!(job_id = %job_id, error = %e, "Failed to query ingestion job from Postgres");
+            Err(AppError::internal(format!(
+                "Failed to query job status from database: {e}"
+            )))
+        }
     }
 }
 
@@ -4118,6 +4121,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_job_status_not_found() {
+        // Without a live Postgres, the handler checks in-memory normalize_jobs
+        // (empty), then falls through to `get_ingestion_job` which errors
+        // because there is no database. The correct behavior is 500 (database
+        // unavailable), not a misleading 404.
         let app = test_router();
         let job_id = Uuid::new_v4();
         let req = axum::http::Request::builder()
@@ -4126,7 +4133,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
