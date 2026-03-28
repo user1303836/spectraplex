@@ -3323,78 +3323,68 @@ impl Repository {
 
     /// Transition an ingestion job from `claimed` to `running`.
     ///
-    /// Only succeeds if `worker_id` owns the current open attempt, preventing
-    /// a stale worker from mutating a job after lease recovery.
+    /// Atomically verifies that `worker_id` owns the current open attempt
+    /// inside the same UPDATE statement, preventing TOCTOU races where a
+    /// stale worker passes a separate ownership check just before another
+    /// worker reclaims the job.
     pub async fn mark_ingestion_job_running(
         &self,
         job_id: Uuid,
         worker_id: &str,
     ) -> anyhow::Result<()> {
-        // Verify the caller owns the current open attempt.
-        let has_lease = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS( \
-                SELECT 1 FROM ingestion_job_attempts \
-                WHERE job_id = $1 AND worker_id = $2 AND finished_at IS NULL \
-            )",
+        let result = sqlx::query(
+            "UPDATE ingestion_jobs SET status = 'running', updated_at = NOW() \
+             WHERE id = $1 AND status = 'claimed' \
+             AND EXISTS( \
+                 SELECT 1 FROM ingestion_job_attempts \
+                 WHERE job_id = $1 AND worker_id = $2 AND finished_at IS NULL \
+             )",
         )
         .bind(job_id)
         .bind(worker_id)
-        .fetch_one(self.pool())
-        .await?;
-
-        if !has_lease {
-            anyhow::bail!("worker {worker_id} does not own the current attempt for job {job_id}");
-        }
-
-        sqlx::query(
-            "UPDATE ingestion_jobs SET status = 'running', updated_at = NOW() \
-             WHERE id = $1 AND status = 'claimed'",
-        )
-        .bind(job_id)
         .execute(self.pool())
         .await?;
+
+        if result.rows_affected() == 0 {
+            anyhow::bail!(
+                "worker {worker_id} does not own the current attempt for job {job_id} \
+                 (job may have been reclaimed or is not in 'claimed' status)"
+            );
+        }
         Ok(())
     }
 
     /// Mark an ingestion job as completed.
     ///
-    /// Only succeeds if `worker_id` owns the current open attempt. This
-    /// prevents a stale worker from completing a job that was reclaimed by
-    /// another worker after lease recovery.
+    /// Atomically verifies that `worker_id` owns the current open attempt
+    /// inside the same UPDATE statement, preventing TOCTOU races.
     pub async fn complete_ingestion_job(
         &self,
         job_id: Uuid,
         worker_id: &str,
     ) -> anyhow::Result<()> {
-        // Verify the caller owns the current open attempt.
-        let has_lease = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS( \
-                SELECT 1 FROM ingestion_job_attempts \
-                WHERE job_id = $1 AND worker_id = $2 AND finished_at IS NULL \
-            )",
+        let result = sqlx::query(
+            "UPDATE ingestion_jobs \
+             SET status = 'completed', updated_at = NOW() \
+             WHERE id = $1 AND status IN ('claimed', 'running') \
+             AND EXISTS( \
+                 SELECT 1 FROM ingestion_job_attempts \
+                 WHERE job_id = $1 AND worker_id = $2 AND finished_at IS NULL \
+             )",
         )
         .bind(job_id)
         .bind(worker_id)
-        .fetch_one(self.pool())
+        .execute(self.pool())
         .await?;
 
-        if !has_lease {
+        if result.rows_affected() == 0 {
             anyhow::bail!(
                 "worker {worker_id} does not own the current attempt for job {job_id} \
                  (job may have been reclaimed); refusing to complete"
             );
         }
 
-        sqlx::query(
-            "UPDATE ingestion_jobs \
-             SET status = 'completed', updated_at = NOW() \
-             WHERE id = $1 AND status IN ('claimed', 'running')",
-        )
-        .bind(job_id)
-        .execute(self.pool())
-        .await?;
-
-        // Only close *this* worker's attempt, not all open attempts.
+        // Close *this* worker's attempt.
         sqlx::query(
             "UPDATE ingestion_job_attempts SET finished_at = NOW() \
              WHERE job_id = $1 AND worker_id = $2 AND finished_at IS NULL",
@@ -3409,36 +3399,22 @@ impl Repository {
 
     /// Mark an ingestion job as failed with an error message.
     ///
-    /// Only succeeds if `worker_id` owns the current open attempt.
+    /// Atomically verifies that `worker_id` owns the current open attempt
+    /// inside the same UPDATE statement, preventing TOCTOU races.
     pub async fn fail_ingestion_job(
         &self,
         job_id: Uuid,
         worker_id: &str,
         error: &str,
     ) -> anyhow::Result<()> {
-        // Verify the caller owns the current open attempt.
-        let has_lease = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS( \
-                SELECT 1 FROM ingestion_job_attempts \
-                WHERE job_id = $1 AND worker_id = $2 AND finished_at IS NULL \
-            )",
-        )
-        .bind(job_id)
-        .bind(worker_id)
-        .fetch_one(self.pool())
-        .await?;
-
-        if !has_lease {
-            anyhow::bail!(
-                "worker {worker_id} does not own the current attempt for job {job_id} \
-                 (job may have been reclaimed); refusing to mark failed"
-            );
-        }
-
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE ingestion_jobs \
              SET status = 'failed', error_message = $3, updated_at = NOW() \
-             WHERE id = $1 AND status IN ('claimed', 'running')",
+             WHERE id = $1 AND status IN ('claimed', 'running') \
+             AND EXISTS( \
+                 SELECT 1 FROM ingestion_job_attempts \
+                 WHERE job_id = $1 AND worker_id = $2 AND finished_at IS NULL \
+             )",
         )
         .bind(job_id)
         .bind(worker_id)
@@ -3446,7 +3422,14 @@ impl Repository {
         .execute(self.pool())
         .await?;
 
-        // Only close *this* worker's attempt.
+        if result.rows_affected() == 0 {
+            anyhow::bail!(
+                "worker {worker_id} does not own the current attempt for job {job_id} \
+                 (job may have been reclaimed); refusing to mark failed"
+            );
+        }
+
+        // Close *this* worker's attempt.
         sqlx::query(
             "UPDATE ingestion_job_attempts \
              SET finished_at = NOW(), error_message = $3 \
