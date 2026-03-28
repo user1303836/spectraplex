@@ -3585,17 +3585,99 @@ impl Repository {
     }
 
     /// Release a stream subscription lease, setting actual_status to stopped.
-    pub async fn release_stream_lease(&self, subscription_id: Uuid) -> anyhow::Result<()> {
-        sqlx::query(
+    ///
+    /// Ownership-aware: only clears the lease if `worker_id` matches the
+    /// current `lease_owner`, preventing a stale worker from releasing
+    /// another worker's active lease. Returns `true` if the release
+    /// succeeded, `false` if the lease was already held by someone else.
+    pub async fn release_stream_lease(
+        &self,
+        subscription_id: Uuid,
+        worker_id: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
             "UPDATE stream_subscriptions \
              SET lease_owner = NULL, actual_status = 'stopped', \
                  heartbeat_at = NULL, updated_at = NOW() \
+             WHERE id = $1 AND lease_owner = $2",
+        )
+        .bind(subscription_id)
+        .bind(worker_id)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Update `desired_status` for a stream subscription by ID.
+    ///
+    /// Used by stop_stream to express user intent without needing the
+    /// full upsert key (target_id, network, source).
+    pub async fn set_stream_desired_status(
+        &self,
+        subscription_id: Uuid,
+        desired_status: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE stream_subscriptions \
+             SET desired_status = $2, updated_at = NOW() \
              WHERE id = $1",
         )
         .bind(subscription_id)
+        .bind(desired_status)
         .execute(self.pool())
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Transition a stream subscription to error state with ownership check.
+    ///
+    /// Sets `actual_status = 'error'`, records the error message, and clears
+    /// the lease. Only succeeds if the caller owns the lease.
+    pub async fn fail_stream_subscription(
+        &self,
+        subscription_id: Uuid,
+        worker_id: &str,
+        error_message: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE stream_subscriptions \
+             SET actual_status = 'error', error_message = $3, \
+                 lease_owner = NULL, heartbeat_at = NULL, updated_at = NOW() \
+             WHERE id = $1 AND lease_owner = $2",
+        )
+        .bind(subscription_id)
+        .bind(worker_id)
+        .bind(error_message)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// List stream subscriptions that are eligible to be claimed.
+    ///
+    /// Returns subscriptions where `desired_status = 'active'` and either
+    /// no lease owner or the heartbeat has gone stale. The orchestrator
+    /// should then attempt `claim_stream_lease` for each returned row.
+    pub async fn list_claimable_stream_subscriptions(
+        &self,
+        limit: i64,
+    ) -> anyhow::Result<Vec<StreamSubscription>> {
+        let rows = sqlx::query(
+            "SELECT id, target_id, network, source, desired_status, actual_status, \
+             lease_owner, heartbeat_at, cursor_state, config, error_message, \
+             created_at, updated_at \
+             FROM stream_subscriptions \
+             WHERE desired_status = 'active' \
+               AND (lease_owner IS NULL \
+                    OR heartbeat_at < NOW() - make_interval(mins => $1)) \
+             ORDER BY created_at ASC \
+             LIMIT $2",
+        )
+        .bind(Self::STALE_JOB_THRESHOLD_MINUTES)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_stream_subscription).collect()
     }
 
     /// Update the cursor state for a stream subscription.
@@ -5592,7 +5674,34 @@ mod tests {
     fn repo_release_stream_lease_is_send() {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
-            _assert_send(repo.release_stream_lease(Uuid::new_v4()));
+            _assert_send(repo.release_stream_lease(Uuid::new_v4(), "worker-1"));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_set_stream_desired_status_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.set_stream_desired_status(Uuid::new_v4(), "stopped"));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_fail_stream_subscription_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.fail_stream_subscription(Uuid::new_v4(), "worker-1", "boom"));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_list_claimable_stream_subscriptions_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.list_claimable_stream_subscriptions(10));
         }
         let _ = _check;
     }
