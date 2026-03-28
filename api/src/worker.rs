@@ -357,15 +357,14 @@ fn network_to_source(network: &str) -> String {
     }
 }
 
-/// Best-effort callback delivery. Logs failures but does not propagate errors.
+/// Best-effort callback delivery using the SSRF-safe client. Pins DNS at
+/// send time and disables redirects to prevent DNS rebinding and
+/// redirect-based SSRF, matching the protections in `fire_callback`.
 async fn fire_callback_best_effort(url: &str, payload: &serde_json::Value) {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
+    let client = match crate::build_ssrf_safe_client(url, Duration::from_secs(10)).await {
         Ok(c) => c,
         Err(e) => {
-            warn!(error = %e, url, "Failed to build HTTP client for callback");
+            warn!(error = %e, url, "Rejected callback URL at delivery time (SSRF protection)");
             return;
         }
     };

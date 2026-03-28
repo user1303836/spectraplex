@@ -679,7 +679,10 @@ fn validate_wallet(wallet: &str) -> Result<(), AppError> {
 ///
 /// Returns `Err` if DNS resolution fails, yields no addresses, or any
 /// resolved address is private/loopback.
-async fn build_ssrf_safe_client(url: &str, timeout: Duration) -> Result<reqwest::Client, String> {
+pub(crate) async fn build_ssrf_safe_client(
+    url: &str,
+    timeout: Duration,
+) -> Result<reqwest::Client, String> {
     let parsed: reqwest::Url = url.parse().map_err(|e| format!("invalid URL: {e}"))?;
 
     let host = parsed
