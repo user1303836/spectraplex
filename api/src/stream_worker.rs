@@ -303,8 +303,25 @@ async fn run_solana_grpc_stream(
                         }
                     }
                     None => {
-                        info!(subscription_id = %sub_id, "gRPC stream channel closed");
-                        break;
+                        // Channel closed = gRPC task ended.  This is NOT a clean
+                        // cancellation — the adapter died or the remote closed the
+                        // connection.  Return an error so the worker marks the
+                        // subscription as failed instead of silently recycling it.
+                        warn!(subscription_id = %sub_id, "gRPC stream channel closed unexpectedly");
+
+                        // Flush remaining batch before failing
+                        if !batch.is_empty() {
+                            if let Err(e) = repo.save_transactions(&batch).await {
+                                error!(subscription_id = %sub_id, error = %e, "Failed to flush final batch");
+                            }
+                            let cursor = serde_json::json!({
+                                "tx_count": tx_count,
+                                "last_slot": last_slot,
+                            });
+                            let _ = repo.update_stream_cursor(sub_id, &cursor).await;
+                        }
+                        grpc_handle.abort();
+                        return Err(anyhow::anyhow!("gRPC stream channel closed unexpectedly"));
                     }
                 }
             }
@@ -459,8 +476,21 @@ async fn run_hyperliquid_ws_stream(
                         }
                     }
                     None => {
-                        info!(subscription_id = %sub_id, "Hyperliquid WS channel closed");
-                        break;
+                        // Channel closed = WS task ended (retries exhausted or
+                        // fatal error).  NOT a clean cancellation — fail the
+                        // subscription so it doesn't silently recycle.
+                        warn!(subscription_id = %sub_id, "Hyperliquid WS channel closed (retries exhausted)");
+
+                        // Flush remaining batch before failing
+                        if !batch.is_empty() {
+                            if let Err(e) = repo.save_transactions(&batch).await {
+                                error!(subscription_id = %sub_id, error = %e, "Failed to flush final HL batch");
+                            }
+                            let cursor = serde_json::json!({ "tx_count": tx_count });
+                            let _ = repo.update_stream_cursor(sub_id, &cursor).await;
+                        }
+                        ws_handle.abort();
+                        return Err(anyhow::anyhow!("Hyperliquid WS stream closed (retries exhausted)"));
                     }
                 }
             }

@@ -1813,10 +1813,75 @@ async fn start_stream(
 
     let network = resolved_network.unwrap_or_else(|| chain_resolved.clone());
 
+    // Resolve or create a V2 IndexTarget so the subscription anchors to a
+    // real row.  Wallet-backed streams (Hyperliquid) get a wallet target;
+    // targetless streams (Solana gRPC) use a "program" target that represents
+    // the global stream endpoint for that network.
+    let target_id = match chain_resolved.as_str() {
+        "hyperliquid" => {
+            let wallet = sub_config
+                .as_ref()
+                .and_then(|c| c.get("wallet").and_then(|w| w.as_str()))
+                .unwrap_or("");
+            let chain_enum = Chain::Hyperliquid;
+            let target = state
+                .repo
+                .ensure_wallet_target_for_network(&network, &chain_enum, wallet, None)
+                .await
+                .map_err(AppError::internal)?;
+            target.id
+        }
+        "solana" => {
+            // For global Solana gRPC streams, create a program-type target
+            // keyed on the network.  The address is a sentinel so the unique
+            // index on (kind, network, address) prevents duplicates.
+            let sentinel = "__global_grpc_stream__";
+            let target = match state
+                .repo
+                .get_index_target_by_address(TargetKind::Program, &network, sentinel)
+                .await
+                .map_err(AppError::internal)?
+            {
+                Some(t) => t,
+                None => {
+                    let now = chrono::Utc::now();
+                    let t = IndexTarget {
+                        id: Uuid::new_v4(),
+                        kind: TargetKind::Program,
+                        network: network.clone(),
+                        chain_family: ChainFamily::Solana,
+                        address: Some(sentinel.to_string()),
+                        filter_spec: None,
+                        mode: TargetMode::Both,
+                        label: Some("Global gRPC stream".to_string()),
+                        owner_id: None,
+                        created_at: now,
+                        updated_at: now,
+                    };
+                    state
+                        .repo
+                        .create_index_target(&t)
+                        .await
+                        .map_err(AppError::internal)?
+                }
+            };
+            target.id
+        }
+        _ => unreachable!("unsupported chains rejected above"),
+    };
+
     // Upsert the durable subscription — the orchestrator will pick it up.
+    // Anchored to target_id so the unique index (target_id, network, source)
+    // prevents duplicate subscriptions.
     let sub = state
         .repo
-        .upsert_stream_subscription(None, &network, source_str, "active", sub_config.as_ref())
+        .upsert_stream_subscription(
+            Some(target_id),
+            &network,
+            source_str,
+            "active",
+            sub_config.as_ref(),
+        )
         .await
         .map_err(AppError::internal)?;
 
