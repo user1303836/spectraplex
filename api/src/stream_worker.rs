@@ -13,9 +13,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use spectraplex_adapters::hyperliquid_ws::HyperliquidWsClient;
 use spectraplex_adapters::repo::Repository;
+use spectraplex_adapters::solana_grpc::SolanaGrpcAdapter;
 use spectraplex_core::config::AppConfig;
-use spectraplex_core::provider::ProviderRegistry;
+use spectraplex_core::models::{Chain, Transaction};
+use spectraplex_core::provider::{NetworkContext, NetworkId, ProviderCapability, ProviderRegistry};
+use spectraplex_core::v2::{StreamSource, StreamSubscription};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -33,6 +37,12 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 /// Maximum number of subscriptions to claim per poll cycle.
 const MAX_CLAIM_BATCH: i64 = 10;
 
+/// Flush batch every N transactions.
+const BATCH_SIZE: usize = 100;
+
+/// Flush batch every N seconds.
+const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
 /// State for a locally-running stream task.
 struct ActiveStream {
     cancel: CancellationToken,
@@ -47,9 +57,9 @@ struct ActiveStream {
 /// 4. On restart, re-claims stale subscriptions from dead workers
 pub fn spawn_stream_orchestrator(
     repo: Repository,
-    _config: Arc<AppConfig>,
-    _provider_registry: Arc<ProviderRegistry>,
-    _stream_semaphore: Arc<Semaphore>,
+    config: Arc<AppConfig>,
+    provider_registry: Arc<ProviderRegistry>,
+    stream_semaphore: Arc<Semaphore>,
     worker_id: String,
 ) {
     tokio::spawn(async move {
@@ -62,7 +72,14 @@ pub fn spawn_stream_orchestrator(
         loop {
             tokio::select! {
                 _ = poll_interval.tick() => {
-                    poll_and_claim(&repo, &worker_id, &mut active_streams).await;
+                    poll_and_claim(
+                        &repo,
+                        &config,
+                        &provider_registry,
+                        &stream_semaphore,
+                        &worker_id,
+                        &mut active_streams,
+                    ).await;
                 }
                 _ = reconcile_interval.tick() => {
                     reconcile(&repo, &worker_id, &mut active_streams).await;
@@ -75,10 +92,16 @@ pub fn spawn_stream_orchestrator(
 /// Poll for claimable subscriptions and attempt to claim them.
 async fn poll_and_claim(
     repo: &Repository,
+    config: &Arc<AppConfig>,
+    provider_registry: &Arc<ProviderRegistry>,
+    stream_semaphore: &Arc<Semaphore>,
     worker_id: &str,
     active_streams: &mut HashMap<Uuid, ActiveStream>,
 ) {
-    let claimable = match repo.list_claimable_stream_subscriptions(MAX_CLAIM_BATCH).await {
+    let claimable = match repo
+        .list_claimable_stream_subscriptions(MAX_CLAIM_BATCH)
+        .await
+    {
         Ok(subs) => subs,
         Err(e) => {
             debug!(error = %e, "Failed to list claimable stream subscriptions");
@@ -92,6 +115,15 @@ async fn poll_and_claim(
             continue;
         }
 
+        // Acquire a semaphore permit for local concurrency limiting.
+        let permit = match stream_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                debug!("Stream semaphore full, skipping claim cycle");
+                return;
+            }
+        };
+
         match repo.claim_stream_lease(sub.id, worker_id).await {
             Ok(true) => {
                 info!(
@@ -102,51 +134,368 @@ async fn poll_and_claim(
                 );
 
                 let cancel = CancellationToken::new();
-                active_streams.insert(sub.id, ActiveStream {
-                    cancel: cancel.clone(),
-                });
+                active_streams.insert(
+                    sub.id,
+                    ActiveStream {
+                        cancel: cancel.clone(),
+                    },
+                );
 
-                // TODO(task-2): Spawn the actual stream task here.
-                // For now, just start a heartbeat-only placeholder task.
-                let repo_clone = repo.clone();
-                let wid = worker_id.to_string();
-                let sub_id = sub.id;
-                let cancel_clone = cancel.clone();
-                tokio::spawn(async move {
-                    let mut hb = tokio::time::interval(HEARTBEAT_INTERVAL);
-                    loop {
-                        tokio::select! {
-                            _ = cancel_clone.cancelled() => {
-                                info!(subscription_id = %sub_id, "Stream task cancelled");
-                                break;
-                            }
-                            _ = hb.tick() => {
-                                match repo_clone.heartbeat_stream(sub_id, &wid).await {
-                                    Ok(true) => {
-                                        debug!(subscription_id = %sub_id, "Stream heartbeat OK");
-                                    }
-                                    Ok(false) => {
-                                        warn!(subscription_id = %sub_id, "Stream lease lost (heartbeat rejected)");
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        error!(subscription_id = %sub_id, error = %e, "Stream heartbeat error");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
+                spawn_stream_task(
+                    repo.clone(),
+                    config.clone(),
+                    provider_registry.clone(),
+                    sub,
+                    cancel,
+                    worker_id.to_string(),
+                    permit,
+                );
             }
             Ok(false) => {
                 // Someone else claimed it first — race is expected.
                 debug!(subscription_id = %sub.id, "Stream subscription already claimed by another worker");
+                drop(permit);
             }
             Err(e) => {
                 error!(subscription_id = %sub.id, error = %e, "Failed to claim stream lease");
+                drop(permit);
             }
         }
     }
+}
+
+/// Spawn a stream task that runs the appropriate adapter, heartbeats, and
+/// flushes transaction batches.
+fn spawn_stream_task(
+    repo: Repository,
+    config: Arc<AppConfig>,
+    provider_registry: Arc<ProviderRegistry>,
+    sub: StreamSubscription,
+    cancel: CancellationToken,
+    worker_id: String,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let sub_id = sub.id;
+    tokio::spawn(async move {
+        let _permit = _permit; // hold permit until task ends
+
+        let result = match sub.source {
+            StreamSource::Grpc => {
+                run_solana_grpc_stream(
+                    &repo,
+                    &config,
+                    &provider_registry,
+                    &sub,
+                    &cancel,
+                    &worker_id,
+                )
+                .await
+            }
+            StreamSource::Ws => {
+                run_hyperliquid_ws_stream(&repo, &provider_registry, &sub, &cancel, &worker_id)
+                    .await
+            }
+            StreamSource::Rpc => {
+                // RPC streaming not yet implemented
+                Err(anyhow::anyhow!("RPC stream source not yet implemented"))
+            }
+        };
+
+        if let Err(e) = result {
+            error!(subscription_id = %sub_id, error = %e, "Stream task failed");
+            if let Err(fail_err) = repo
+                .fail_stream_subscription(sub_id, &worker_id, &e.to_string())
+                .await
+            {
+                error!(subscription_id = %sub_id, error = %fail_err, "Failed to mark subscription as errored");
+            }
+        } else {
+            // Clean exit (cancelled) — release the lease
+            if let Err(e) = repo.release_stream_lease(sub_id, &worker_id).await {
+                error!(subscription_id = %sub_id, error = %e, "Failed to release stream lease");
+            }
+        }
+
+        info!(subscription_id = %sub_id, "Stream task ended");
+    });
+}
+
+/// Run a Solana gRPC stream for a subscription.
+async fn run_solana_grpc_stream(
+    repo: &Repository,
+    config: &Arc<AppConfig>,
+    provider_registry: &Arc<ProviderRegistry>,
+    sub: &StreamSubscription,
+    cancel: &CancellationToken,
+    worker_id: &str,
+) -> anyhow::Result<()> {
+    let net_ctx =
+        NetworkContext::from_registry(provider_registry, &NetworkId::new(sub.network.clone()));
+
+    let adapter = match &net_ctx {
+        Some(ctx) if ctx.has_capability(ProviderCapability::Stream) => {
+            SolanaGrpcAdapter::from_network_context(ctx)?
+        }
+        _ => {
+            let grpc_url = config
+                .solana_grpc_url
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("No Solana gRPC URL configured"))?;
+            let grpc_token = config.solana_grpc_token.clone();
+            SolanaGrpcAdapter::new(grpc_url, grpc_token)
+        }
+    };
+
+    let (mut rx, grpc_handle) = adapter.stream_transactions();
+    let sub_id = sub.id;
+
+    let mut batch: Vec<Transaction> = Vec::new();
+    let mut last_flush = tokio::time::Instant::now();
+    let mut tx_count: u64 = cursor_tx_count(sub);
+    let mut last_slot: u64 = cursor_last_slot(sub);
+    let mut hb = tokio::time::interval(HEARTBEAT_INTERVAL);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!(subscription_id = %sub_id, "Solana stream cancelled");
+                break;
+            }
+            _ = hb.tick() => {
+                match repo.heartbeat_stream(sub_id, worker_id).await {
+                    Ok(true) => {
+                        debug!(subscription_id = %sub_id, "Stream heartbeat OK");
+                    }
+                    Ok(false) => {
+                        warn!(subscription_id = %sub_id, "Stream lease lost (heartbeat rejected)");
+                        grpc_handle.abort();
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        error!(subscription_id = %sub_id, error = %e, "Stream heartbeat error");
+                    }
+                }
+            }
+            maybe_tx = rx.recv() => {
+                match maybe_tx {
+                    Some(tx) => {
+                        if let Some(slot) = tx.raw_metadata.get("slot").and_then(|v| v.as_u64()) {
+                            last_slot = slot;
+                        }
+                        batch.push(tx);
+                        tx_count += 1;
+
+                        if batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL {
+                            if let Err(e) = repo.save_transactions(&batch).await {
+                                error!(subscription_id = %sub_id, error = %e, "Failed to save streamed transactions");
+                            }
+                            batch.clear();
+                            last_flush = tokio::time::Instant::now();
+
+                            // Update cursor state periodically
+                            let cursor = serde_json::json!({
+                                "tx_count": tx_count,
+                                "last_slot": last_slot,
+                            });
+                            if let Err(e) = repo.update_stream_cursor(sub_id, &cursor).await {
+                                warn!(subscription_id = %sub_id, error = %e, "Failed to update cursor");
+                            }
+                        }
+                    }
+                    None => {
+                        info!(subscription_id = %sub_id, "gRPC stream channel closed");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Flush remaining batch
+    if !batch.is_empty() {
+        if let Err(e) = repo.save_transactions(&batch).await {
+            error!(subscription_id = %sub_id, error = %e, "Failed to flush final batch");
+        }
+        let cursor = serde_json::json!({
+            "tx_count": tx_count,
+            "last_slot": last_slot,
+        });
+        let _ = repo.update_stream_cursor(sub_id, &cursor).await;
+    }
+
+    grpc_handle.abort();
+    Ok(())
+}
+
+/// Run a Hyperliquid WebSocket stream for a subscription.
+async fn run_hyperliquid_ws_stream(
+    repo: &Repository,
+    provider_registry: &Arc<ProviderRegistry>,
+    sub: &StreamSubscription,
+    cancel: &CancellationToken,
+    worker_id: &str,
+) -> anyhow::Result<()> {
+    let wallet = sub
+        .config
+        .as_ref()
+        .and_then(|c| c.get("wallet").and_then(|w| w.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("Missing wallet in subscription config"))?
+        .to_string();
+
+    let net_ctx =
+        NetworkContext::from_registry(provider_registry, &NetworkId::new(sub.network.clone()));
+
+    let client = match &net_ctx {
+        Some(ctx) => HyperliquidWsClient::from_network_context(ctx),
+        None => HyperliquidWsClient::new(),
+    };
+
+    let sub_id = sub.id;
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<serde_json::Value>(1000);
+
+    // Spawn WS connection task with retry logic
+    let ws_cancel = cancel.clone();
+    let ws_wallet = wallet.clone();
+    let ws_handle = tokio::spawn(async move {
+        let mut retry_count: u32 = 0;
+        const MAX_RETRIES: u32 = 10;
+        loop {
+            let ws_wallet_ref = ws_wallet.clone();
+            let sender_ref = sender.clone();
+            tokio::select! {
+                result = client.subscribe_user(&ws_wallet_ref, |msg| {
+                    let channel = msg.channel.as_deref().unwrap_or("");
+                    if channel == "subscriptionResponse" || channel.is_empty() {
+                        return;
+                    }
+                    if let Some(data) = msg.data {
+                        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = sender_ref.try_send(data) {
+                            warn!(subscription_id = %sub_id, "Hyperliquid WS channel full, message dropped");
+                        }
+                    }
+                }) => {
+                    if let Err(e) = result {
+                        error!(subscription_id = %sub_id, error = %e, "Hyperliquid WebSocket error");
+                    }
+                    if ws_cancel.is_cancelled() {
+                        break;
+                    }
+                    retry_count += 1;
+                    if retry_count > MAX_RETRIES {
+                        error!(subscription_id = %sub_id, "Exceeded max retries ({MAX_RETRIES}), stopping Hyperliquid WS stream");
+                        break;
+                    }
+                    let backoff = Duration::from_secs(2u64.saturating_pow(retry_count.min(6)));
+                    warn!(subscription_id = %sub_id, retry = retry_count, max = MAX_RETRIES,
+                        "Hyperliquid WebSocket disconnected, reconnecting in {:?}", backoff);
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = ws_cancel.cancelled() => { break; }
+                    }
+                }
+                _ = ws_cancel.cancelled() => {
+                    info!(subscription_id = %sub_id, "Hyperliquid stream cancelled");
+                    break;
+                }
+            }
+        }
+    });
+
+    let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, wallet.as_bytes());
+    let mut batch: Vec<Transaction> = Vec::new();
+    let mut last_flush = tokio::time::Instant::now();
+    let mut tx_count: u64 = cursor_tx_count(sub);
+    let mut hb = tokio::time::interval(HEARTBEAT_INTERVAL);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!(subscription_id = %sub_id, "Hyperliquid stream cancelled");
+                break;
+            }
+            _ = hb.tick() => {
+                match repo.heartbeat_stream(sub_id, worker_id).await {
+                    Ok(true) => {
+                        debug!(subscription_id = %sub_id, "Stream heartbeat OK");
+                    }
+                    Ok(false) => {
+                        warn!(subscription_id = %sub_id, "Stream lease lost (heartbeat rejected)");
+                        ws_handle.abort();
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        error!(subscription_id = %sub_id, error = %e, "Stream heartbeat error");
+                    }
+                }
+            }
+            msg = receiver.recv() => {
+                match msg {
+                    Some(data) => {
+                        let tx = Transaction {
+                            id: Uuid::new_v4(),
+                            user_id,
+                            wallet_address: wallet.clone(),
+                            timestamp: chrono::Utc::now().timestamp(),
+                            tx_hash: format!("hl-ws-{}", Uuid::new_v4()),
+                            chain: Chain::Hyperliquid,
+                            raw_metadata: data,
+                        };
+                        batch.push(tx);
+                        tx_count += 1;
+
+                        if batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL {
+                            if let Err(e) = repo.save_transactions(&batch).await {
+                                error!(subscription_id = %sub_id, error = %e, "Failed to save HL stream batch");
+                            }
+                            batch.clear();
+                            last_flush = tokio::time::Instant::now();
+
+                            let cursor = serde_json::json!({
+                                "tx_count": tx_count,
+                            });
+                            if let Err(e) = repo.update_stream_cursor(sub_id, &cursor).await {
+                                warn!(subscription_id = %sub_id, error = %e, "Failed to update cursor");
+                            }
+                        }
+                    }
+                    None => {
+                        info!(subscription_id = %sub_id, "Hyperliquid WS channel closed");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Flush remaining batch
+    if !batch.is_empty() {
+        if let Err(e) = repo.save_transactions(&batch).await {
+            error!(subscription_id = %sub_id, error = %e, "Failed to flush final HL batch");
+        }
+        let cursor = serde_json::json!({ "tx_count": tx_count });
+        let _ = repo.update_stream_cursor(sub_id, &cursor).await;
+    }
+
+    ws_handle.abort();
+    Ok(())
+}
+
+/// Extract tx_count from cursor_state JSON, default 0.
+fn cursor_tx_count(sub: &StreamSubscription) -> u64 {
+    sub.cursor_state
+        .as_ref()
+        .and_then(|c| c.get("tx_count"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
+/// Extract last_slot from cursor_state JSON, default 0.
+fn cursor_last_slot(sub: &StreamSubscription) -> u64 {
+    sub.cursor_state
+        .as_ref()
+        .and_then(|c| c.get("last_slot"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
 }
 
 /// Reconcile locally-running streams against durable state.
