@@ -3631,8 +3631,15 @@ impl Repository {
 
     /// Transition a stream subscription to error state with ownership check.
     ///
-    /// Sets `actual_status = 'error'`, records the error message, and clears
-    /// the lease. Only succeeds if the caller owns the lease.
+    /// Sets `actual_status = 'error'` **and** `desired_status = 'stopped'`,
+    /// records the error message, and clears the lease. Only succeeds if
+    /// the caller owns the lease.
+    ///
+    /// Setting `desired_status = 'stopped'` is critical: without it the row
+    /// stays `desired_status = 'active'` with no lease owner, which makes it
+    /// immediately claimable again and turns a fatal failure into a tight
+    /// retry loop. The user must explicitly re-activate the subscription
+    /// after investigating the error.
     pub async fn fail_stream_subscription(
         &self,
         subscription_id: Uuid,
@@ -3641,7 +3648,8 @@ impl Repository {
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE stream_subscriptions \
-             SET actual_status = 'error', error_message = $3, \
+             SET actual_status = 'error', desired_status = 'stopped', \
+                 error_message = $3, \
                  lease_owner = NULL, heartbeat_at = NULL, updated_at = NOW() \
              WHERE id = $1 AND lease_owner = $2",
         )
