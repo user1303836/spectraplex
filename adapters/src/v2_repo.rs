@@ -1354,7 +1354,7 @@ fn row_to_materialization_run(row: &sqlx::postgres::PgRow) -> anyhow::Result<Mat
         worker_id: row.try_get("worker_id")?,
         started_at: row.try_get("started_at")?,
         finished_at: row.try_get("finished_at")?,
-        heartbeat_at: row.try_get("heartbeat_at").unwrap_or(None),
+        heartbeat_at: row.try_get("heartbeat_at")?,
         error_message: row.try_get("error_message")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,

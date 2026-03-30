@@ -326,7 +326,11 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Start the durable materialization worker loop.
-    materialize_worker::spawn_materialize_worker(repo.clone(), worker_cancel.clone());
+    materialize_worker::spawn_materialize_worker(
+        repo.clone(),
+        Arc::clone(&shared_state.job_semaphore),
+        worker_cancel.clone(),
+    );
 
     // Start the durable stream subscription orchestrator.
     let stream_worker_id = format!("stream-worker-{}", Uuid::new_v4());
