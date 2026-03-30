@@ -1,4 +1,5 @@
 mod export_worker;
+mod materialize_worker;
 mod stream_worker;
 mod worker;
 
@@ -12,10 +13,7 @@ use axum::{
 };
 use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
-use spectraplex_adapters::{
-    evm_parser, hyperliquid_parser, repo::Repository, solana_parser,
-    v2_repo::EnqueueIngestionJobParams,
-};
+use spectraplex_adapters::{repo::Repository, v2_repo::EnqueueIngestionJobParams};
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::connector::validate_target;
 use spectraplex_core::materializer::{
@@ -31,7 +29,7 @@ use spectraplex_core::provider::{
 use spectraplex_core::v2::{
     normalize_evm_address, normalize_solana_address, ChainFamily, DatasetCompleteness,
     DatasetVersion, ExportJob, ExportJobStatus as DurableExportJobStatus, IndexTarget,
-    IngestionJobStatus, Network, TargetKind, TargetMode,
+    IngestionJobStatus, MaterializationRunStatus, Network, TargetKind, TargetMode,
 };
 use sqlx::postgres::PgPoolOptions;
 use std::collections::{HashMap, HashSet};
@@ -39,7 +37,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
-use tokio::sync::{Mutex as TokioMutex, RwLock, Semaphore};
+use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
@@ -185,16 +183,8 @@ struct AppState {
     allowed_wallets: Option<HashSet<String>>,
     /// Semaphore for in-process tasks (normalize, export).
     job_semaphore: Arc<Semaphore>,
-    /// In-memory tracking for normalize jobs (not yet durably queued).
-    normalize_jobs: RwLock<HashMap<Uuid, NormalizeJobEntry>>,
     stream_semaphore: Arc<Semaphore>,
     rate_limiter: Arc<RateLimiter>,
-}
-
-/// In-memory entry for normalize jobs.
-struct NormalizeJobEntry {
-    status: JobStatus,
-    finished_at: Option<Instant>,
 }
 
 #[derive(Serialize)]
@@ -206,18 +196,6 @@ struct StreamInfo {
     uptime_secs: u64,
     transactions_ingested: u64,
     last_slot: u64,
-}
-
-const JOB_TTL_SECS: u64 = 3600; // 1 hour
-const JOB_CLEANUP_INTERVAL_SECS: u64 = 300; // 5 minutes
-
-impl AppState {
-    /// Remove completed/failed normalize jobs older than JOB_TTL_SECS.
-    async fn prune_stale_normalize_jobs(&self) {
-        let mut jobs = self.normalize_jobs.write().await;
-        let cutoff = Instant::now() - std::time::Duration::from_secs(JOB_TTL_SECS);
-        jobs.retain(|_, entry| entry.finished_at.is_none_or(|finished| finished > cutoff));
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -323,7 +301,6 @@ async fn main() -> anyhow::Result<()> {
         provider_registry: provider_registry.clone(),
         allowed_wallets,
         job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
-        normalize_jobs: RwLock::new(HashMap::new()),
         stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
         rate_limiter: Arc::new(RateLimiter::new(
             RATE_LIMIT_CAPACITY,
@@ -348,6 +325,13 @@ async fn main() -> anyhow::Result<()> {
         worker_cancel.clone(),
     );
 
+    // Start the durable materialization worker loop.
+    materialize_worker::spawn_materialize_worker(
+        repo.clone(),
+        Arc::clone(&shared_state.job_semaphore),
+        worker_cancel.clone(),
+    );
+
     // Start the durable stream subscription orchestrator.
     let stream_worker_id = format!("stream-worker-{}", Uuid::new_v4());
     stream_worker::spawn_stream_orchestrator(
@@ -357,21 +341,6 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&shared_state.stream_semaphore),
         stream_worker_id,
     );
-
-    // Background task: periodically prune stale in-memory job entries so
-    // completed/failed entries don't accumulate indefinitely.
-    {
-        let state = Arc::clone(&shared_state);
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(JOB_CLEANUP_INTERVAL_SECS));
-            interval.tick().await; // first tick completes immediately
-            loop {
-                interval.tick().await;
-                state.prune_stale_normalize_jobs().await;
-            }
-        });
-    }
 
     let protected = Router::new()
         .route("/v1/ingest", post(trigger_ingest))
@@ -709,7 +678,7 @@ pub(crate) async fn build_ssrf_safe_client(
         .map_err(|e| format!("failed to build HTTP client: {e}"))
 }
 
-async fn fire_callback(url: &str, payload: &serde_json::Value) {
+pub(crate) async fn fire_callback(url: &str, payload: &serde_json::Value) {
     const MAX_RETRIES: u32 = 3;
     const BASE_DELAY_MS: u64 = 500;
 
@@ -1368,119 +1337,24 @@ async fn trigger_normalize(
         validate_callback_url(url).await?;
     }
 
-    let permit = state
-        .job_semaphore
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| AppError::service_unavailable("Too many concurrent jobs"))?;
-
-    let job_id = Uuid::new_v4();
-    let job = JobStatus {
-        id: job_id,
-        state: JobState::Pending,
-        message: None,
-    };
-
-    state.normalize_jobs.write().await.insert(
-        job_id,
-        NormalizeJobEntry {
-            status: job.clone(),
-            finished_at: None,
-        },
-    );
-
-    let state_clone = Arc::clone(&state);
-    let wallet = payload.wallet.clone();
-    let explicit_network = payload.network.clone();
-    let callback_url = payload.callback_url.clone();
-
-    tokio::spawn(async move {
-        let _permit = permit;
-        {
-            let mut jobs = state_clone.normalize_jobs.write().await;
-            if let Some(entry) = jobs.get_mut(&job_id) {
-                entry.status.state = JobState::Running;
-            } else {
-                warn!(job_id = %job_id, "Normalize job entry missing when setting running state");
-            }
-        }
-
-        let result = async {
-            let txs = state_clone.repo.get_transactions_by_wallet(&wallet).await?;
-
-            let mut all_entries = Vec::new();
-            for tx in &txs {
-                let result = match tx.chain {
-                    spectraplex_core::models::Chain::Solana => {
-                        solana_parser::parse_solana_transaction(tx)
-                    }
-                    spectraplex_core::models::Chain::Hyperliquid => {
-                        hyperliquid_parser::parse_hyperliquid_transaction(tx)
-                    }
-                    spectraplex_core::models::Chain::Ethereum => {
-                        evm_parser::parse_evm_transaction(tx)
-                    }
-                };
-                match result {
-                    Ok(entries) => all_entries.extend(entries),
-                    Err(e) => {
-                        error!(tx_hash = %tx.tx_hash, error = %e, "Skipping unparseable transaction");
-                    }
-                }
-            }
-
-            let count = all_entries.len();
-            state_clone.repo.save_ledger_entries(&all_entries).await?;
-
-            state_clone
-                .repo
-                .materialize_silver_datasets(&txs, explicit_network.as_deref())
-                .await;
-
-            Ok::<usize, anyhow::Error>(count)
-        }
-        .await;
-
-        let (final_state, final_message) = {
-            let mut jobs = state_clone.normalize_jobs.write().await;
-            if let Some(entry) = jobs.get_mut(&job_id) {
-                match result {
-                    Ok(count) => {
-                        info!(job_id = %job_id, count, "Normalization completed");
-                        entry.status.state = JobState::Completed;
-                        entry.status.message = Some(format!("Normalized {} ledger entries", count));
-                    }
-                    Err(e) => {
-                        error!(job_id = %job_id, error = %e, "Normalization failed");
-                        entry.status.state = JobState::Failed;
-                        entry.status.message = Some(e.to_string());
-                    }
-                }
-                entry.finished_at = Some(Instant::now());
-                let s = serde_json::to_value(&entry.status.state).ok();
-                let m = entry.status.message.clone();
-                (s, m)
-            } else {
-                (None, None)
-            }
-        };
-
-        if let Some(ref url) = callback_url {
-            let payload = serde_json::json!({
-                "job_id": job_id,
-                "state": final_state,
-                "wallet": wallet,
-                "message": final_message,
-            });
-            fire_callback(url, &payload).await;
-        }
-
-        state_clone.prune_stale_normalize_jobs().await;
+    // Build scope with wallet, optional network, and optional callback_url
+    // so the background worker has everything it needs to execute and deliver.
+    let scope = serde_json::json!({
+        "wallet": &payload.wallet,
+        "network": payload.network,
+        "callback_url": payload.callback_url,
     });
 
-    info!(job_id = %job_id, "Normalization job queued");
+    // Enqueue only — the background materialize_worker will claim and execute.
+    let run = state
+        .repo
+        .create_materialization_run("normalize", Some(&scope), None, None, None)
+        .await
+        .map_err(|e| AppError::internal(format!("Failed to create materialization run: {e}")))?;
+
+    info!(job_id = %run.id, "Normalization job enqueued (durable)");
     Ok(Json(JobStatus {
-        id: job_id,
+        id: run.id,
         state: JobState::Pending,
         message: Some("Job queued".to_string()),
     }))
@@ -1490,23 +1364,45 @@ async fn get_job_status(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<Uuid>,
 ) -> Result<Json<JobStatus>, AppError> {
-    // Check in-memory normalize jobs first (instant, never errors).
-    {
-        let jobs = state.normalize_jobs.read().await;
-        if let Some(entry) = jobs.get(&job_id) {
-            return Ok(Json(entry.status.clone()));
-        }
-    }
-
-    // Check durable ingestion jobs in Postgres. If Postgres is unavailable
-    // we surface the error rather than returning a misleading 404.
+    // Check durable ingestion jobs in Postgres first.
     match state.repo.get_ingestion_job(job_id).await {
         Ok(Some(job)) => Ok(Json(JobStatus {
             id: job.id,
             state: ingestion_status_to_job_state(job.status),
             message: job.error_message,
         })),
-        Ok(None) => Err(AppError::not_found(format!("Job {} not found", job_id))),
+        Ok(None) => {
+            // Not an ingestion job — check materialization runs.
+            match state.repo.get_materialization_run(job_id).await {
+                Ok(Some(run)) => {
+                    let state_val = match run.status {
+                        MaterializationRunStatus::Pending => JobState::Pending,
+                        MaterializationRunStatus::Running => JobState::Running,
+                        MaterializationRunStatus::Completed => JobState::Completed,
+                        MaterializationRunStatus::Failed => JobState::Failed,
+                    };
+                    let message = if run.status == MaterializationRunStatus::Failed {
+                        run.error_message
+                    } else if run.status == MaterializationRunStatus::Completed {
+                        Some(format!("Normalized {} records", run.output_record_count))
+                    } else {
+                        None
+                    };
+                    Ok(Json(JobStatus {
+                        id: run.id,
+                        state: state_val,
+                        message,
+                    }))
+                }
+                Ok(None) => Err(AppError::not_found(format!("Job {} not found", job_id))),
+                Err(e) => {
+                    error!(job_id = %job_id, error = %e, "Failed to query materialization run from Postgres");
+                    Err(AppError::internal(format!(
+                        "Failed to query job status from database: {e}"
+                    )))
+                }
+            }
+        }
         Err(e) => {
             error!(job_id = %job_id, error = %e, "Failed to query ingestion job from Postgres");
             Err(AppError::internal(format!(
@@ -3720,7 +3616,6 @@ mod tests {
             provider_registry,
             allowed_wallets: allowed_wallets_set,
             job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
-            normalize_jobs: RwLock::new(HashMap::new()),
             stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
             rate_limiter: Arc::new(RateLimiter::new(
                 RATE_LIMIT_CAPACITY,
@@ -3908,10 +3803,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_job_status_not_found() {
-        // Without a live Postgres, the handler checks in-memory normalize_jobs
-        // (empty), then falls through to `get_ingestion_job` which errors
-        // because there is no database. The correct behavior is 500 (database
-        // unavailable), not a misleading 404.
+        // Without a live Postgres, the handler tries `get_ingestion_job` which
+        // errors because there is no database. The correct behavior is 500
+        // (database unavailable), not a misleading 404.
         let app = test_router();
         let job_id = Uuid::new_v4();
         let req = axum::http::Request::builder()
@@ -3921,40 +3815,6 @@ mod tests {
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn test_job_status_found() {
-        // Uses the normalize_jobs in-memory fallback path since the test
-        // does not have a real Postgres connection.
-        let state = test_state();
-        let job_id = Uuid::new_v4();
-        state.normalize_jobs.write().await.insert(
-            job_id,
-            NormalizeJobEntry {
-                status: JobStatus {
-                    id: job_id,
-                    state: JobState::Completed,
-                    message: Some("done".to_string()),
-                },
-                finished_at: Some(Instant::now()),
-            },
-        );
-
-        let app = test_router_with_state(Arc::clone(&state));
-
-        let req = axum::http::Request::builder()
-            .uri(format!("/v1/jobs/{}", job_id))
-            .header("authorization", format!("Bearer {}", TEST_API_KEY))
-            .body(Body::empty())
-            .unwrap();
-        let response = app.oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(job["state"], "completed");
-        assert_eq!(job["message"], "done");
     }
 
     #[tokio::test]
@@ -4044,81 +3904,6 @@ mod tests {
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert!(response.status().is_client_error());
-    }
-
-    #[tokio::test]
-    async fn test_prune_stale_normalize_jobs() {
-        let state = test_state();
-        let old_id = Uuid::new_v4();
-        let new_id = Uuid::new_v4();
-
-        state.normalize_jobs.write().await.insert(
-            old_id,
-            NormalizeJobEntry {
-                status: JobStatus {
-                    id: old_id,
-                    state: JobState::Completed,
-                    message: None,
-                },
-                finished_at: Some(
-                    Instant::now() - std::time::Duration::from_secs(JOB_TTL_SECS + 1),
-                ),
-            },
-        );
-        state.normalize_jobs.write().await.insert(
-            new_id,
-            NormalizeJobEntry {
-                status: JobStatus {
-                    id: new_id,
-                    state: JobState::Running,
-                    message: None,
-                },
-                finished_at: None,
-            },
-        );
-
-        state.prune_stale_normalize_jobs().await;
-
-        let jobs = state.normalize_jobs.read().await;
-        assert!(!jobs.contains_key(&old_id));
-        assert!(jobs.contains_key(&new_id));
-    }
-
-    #[tokio::test]
-    async fn test_background_cleanup_prunes_normalize_maps() {
-        let state = test_state();
-        let old_job = Uuid::new_v4();
-        let fresh_job = Uuid::new_v4();
-
-        let expired = Instant::now() - std::time::Duration::from_secs(JOB_TTL_SECS + 1);
-
-        state.normalize_jobs.write().await.insert(
-            old_job,
-            NormalizeJobEntry {
-                status: JobStatus {
-                    id: old_job,
-                    state: JobState::Completed,
-                    message: None,
-                },
-                finished_at: Some(expired),
-            },
-        );
-        state.normalize_jobs.write().await.insert(
-            fresh_job,
-            NormalizeJobEntry {
-                status: JobStatus {
-                    id: fresh_job,
-                    state: JobState::Running,
-                    message: None,
-                },
-                finished_at: None,
-            },
-        );
-
-        state.prune_stale_normalize_jobs().await;
-
-        assert!(!state.normalize_jobs.read().await.contains_key(&old_job));
-        assert!(state.normalize_jobs.read().await.contains_key(&fresh_job));
     }
 
     #[test]
@@ -4349,7 +4134,6 @@ mod tests {
             provider_registry,
             allowed_wallets: None,
             job_semaphore: Arc::new(Semaphore::new(1)),
-            normalize_jobs: RwLock::new(HashMap::new()),
             stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
             rate_limiter: Arc::new(RateLimiter::new(
                 RATE_LIMIT_CAPACITY,
@@ -4357,11 +4141,9 @@ mod tests {
             )),
         });
 
-        // Hold the single permit so the next normalize request is guaranteed
-        // to get 503. Ingestion jobs now enqueue into Postgres and are not
-        // subject to an in-process semaphore.
-        let _held_permit = state.job_semaphore.clone().acquire_owned().await.unwrap();
-
+        // trigger_normalize is now enqueue-only (no semaphore — the background
+        // worker handles concurrency). Without a live DB, the handler returns
+        // 500 when it tries to insert the materialization_runs row.
         let app = test_router_with_state(Arc::clone(&state));
         let req = axum::http::Request::builder()
             .method("POST")
@@ -4376,7 +4158,7 @@ mod tests {
             ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
@@ -5532,7 +5314,6 @@ mod tests {
             provider_registry,
             allowed_wallets: allowed_wallets_set,
             job_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
-            normalize_jobs: RwLock::new(HashMap::new()),
             stream_semaphore: Arc::new(Semaphore::new(0)),
             rate_limiter: Arc::new(RateLimiter::new(
                 RATE_LIMIT_CAPACITY,
