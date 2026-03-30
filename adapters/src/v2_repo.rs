@@ -4002,7 +4002,7 @@ impl Repository {
                  heartbeat_at = NOW(), updated_at = NOW() \
              WHERE id = $1 \
                AND (status = 'pending' \
-                    OR (status = 'running' AND heartbeat_at < NOW() - INTERVAL '5 minutes'))",
+                    OR (status = 'running' AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - INTERVAL '5 minutes')))",
         )
         .bind(run_id)
         .bind(worker_id)
@@ -4036,17 +4036,20 @@ impl Repository {
         worker_id: &str,
         output_record_count: i64,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE materialization_runs \
              SET status = 'completed', output_record_count = $2, \
                  finished_at = NOW(), updated_at = NOW() \
-             WHERE id = $1 AND worker_id = $3",
+             WHERE id = $1 AND worker_id = $3 AND status = 'running'",
         )
         .bind(run_id)
         .bind(output_record_count)
         .bind(worker_id)
         .execute(self.pool())
         .await?;
+        if result.rows_affected() == 0 {
+            anyhow::bail!("complete_materialization_run: 0 rows affected (ownership lost or invalid state) for run_id={run_id}");
+        }
         Ok(())
     }
 
@@ -4057,17 +4060,20 @@ impl Repository {
         worker_id: &str,
         error: &str,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE materialization_runs \
              SET status = 'failed', error_message = $2, \
                  finished_at = NOW(), updated_at = NOW() \
-             WHERE id = $1 AND worker_id = $3",
+             WHERE id = $1 AND worker_id = $3 AND status = 'running'",
         )
         .bind(run_id)
         .bind(error)
         .bind(worker_id)
         .execute(self.pool())
         .await?;
+        if result.rows_affected() == 0 {
+            anyhow::bail!("fail_materialization_run: 0 rows affected (ownership lost or invalid state) for run_id={run_id}");
+        }
         Ok(())
     }
 
@@ -4086,6 +4092,27 @@ impl Repository {
         .fetch_optional(self.pool())
         .await?;
         row.as_ref().map(row_to_materialization_run).transpose()
+    }
+
+    /// List materialization runs that are claimable: pending or stale-heartbeat running.
+    pub async fn list_claimable_materialization_runs(
+        &self,
+        limit: i64,
+    ) -> anyhow::Result<Vec<MaterializationRun>> {
+        let rows = sqlx::query(
+            "SELECT id, dataset_name, scope, input_watermark, output_record_count, \
+             status, dataset_version_id, worker_id, started_at, finished_at, \
+             heartbeat_at, error_message, created_at, updated_at \
+             FROM materialization_runs \
+             WHERE status = 'pending' \
+                OR (status = 'running' AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - INTERVAL '5 minutes')) \
+             ORDER BY created_at ASC \
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_materialization_run).collect()
     }
 }
 
@@ -5886,6 +5913,15 @@ mod tests {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
             _assert_send(repo.get_materialization_run(Uuid::new_v4()));
+        }
+        let _ = _check;
+    }
+
+    #[test]
+    fn repo_list_claimable_materialization_runs_is_send() {
+        fn _assert_send<F: std::future::Future + Send>(_: F) {}
+        fn _check(repo: &Repository) {
+            _assert_send(repo.list_claimable_materialization_runs(5));
         }
         let _ = _check;
     }

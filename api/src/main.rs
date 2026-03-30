@@ -1,4 +1,5 @@
 mod export_worker;
+mod materialize_worker;
 mod stream_worker;
 mod worker;
 
@@ -326,6 +327,9 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&shared_state.job_semaphore),
         worker_cancel.clone(),
     );
+
+    // Start the durable materialization worker loop.
+    materialize_worker::spawn_materialize_worker(repo.clone(), worker_cancel.clone());
 
     // Start the durable stream subscription orchestrator.
     let stream_worker_id = format!("stream-worker-{}", Uuid::new_v4());
@@ -1348,11 +1352,16 @@ async fn trigger_normalize(
     let job_id = run.id;
 
     // Claim the run immediately so it transitions pending -> running.
-    state
+    let claimed = state
         .repo
         .claim_materialization_run(job_id, &worker_id)
         .await
         .map_err(|e| AppError::internal(format!("Failed to claim materialization run: {e}")))?;
+    if !claimed {
+        return Err(AppError::internal(
+            "Failed to claim materialization run: claim returned false",
+        ));
+    }
 
     let state_clone = Arc::clone(&state);
     let wallet = payload.wallet.clone();
@@ -1366,6 +1375,8 @@ async fn trigger_normalize(
         // Spawn a heartbeat task that ticks every 30s.
         let hb_cancel = CancellationToken::new();
         let hb_token = hb_cancel.clone();
+        let lease_lost = CancellationToken::new();
+        let lease_lost_inner = lease_lost.clone();
         let hb_repo = state_clone.repo.clone();
         let hb_run_id = job_id;
         let hb_wid = wid.clone();
@@ -1375,8 +1386,16 @@ async fn trigger_normalize(
                 tokio::select! {
                     _ = hb_token.cancelled() => break,
                     _ = interval.tick() => {
-                        if let Err(e) = hb_repo.heartbeat_materialization_run(hb_run_id, &hb_wid).await {
-                            warn!("heartbeat failed: {e}");
+                        match hb_repo.heartbeat_materialization_run(hb_run_id, &hb_wid).await {
+                            Ok(true) => {} // still own the lease
+                            Ok(false) => {
+                                warn!(job_id = %hb_run_id, "Lease lost for materialization run");
+                                lease_lost_inner.cancel();
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("heartbeat failed: {e}");
+                            }
                         }
                     }
                 }
@@ -1422,6 +1441,12 @@ async fn trigger_normalize(
         // Stop the heartbeat.
         hb_cancel.cancel();
         hb_task.abort();
+
+        // If the lease was lost, skip terminal DB updates and callbacks.
+        if lease_lost.is_cancelled() {
+            warn!(job_id = %job_id, "Lease lost, skipping terminal update and callback");
+            return;
+        }
 
         let (final_state, final_message) = match result {
             Ok(count) => {
@@ -1469,8 +1494,8 @@ async fn trigger_normalize(
     info!(job_id = %job_id, "Normalization job started (durable)");
     Ok(Json(JobStatus {
         id: job_id,
-        state: JobState::Pending,
-        message: Some("Job queued".to_string()),
+        state: JobState::Running,
+        message: Some("Job running".to_string()),
     }))
 }
 
