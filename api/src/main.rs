@@ -14,7 +14,7 @@ use axum::{
 use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
 use spectraplex_adapters::{
-    evm_parser, hyperliquid_parser, repo::Repository, solana_parser,
+    repo::Repository,
     v2_repo::EnqueueIngestionJobParams,
 };
 use spectraplex_core::config::AppConfig;
@@ -677,7 +677,7 @@ pub(crate) async fn build_ssrf_safe_client(
         .map_err(|e| format!("failed to build HTTP client: {e}"))
 }
 
-async fn fire_callback(url: &str, payload: &serde_json::Value) {
+pub(crate) async fn fire_callback(url: &str, payload: &serde_json::Value) {
     const MAX_RETRIES: u32 = 3;
     const BASE_DELAY_MS: u64 = 500;
 
@@ -1336,166 +1336,26 @@ async fn trigger_normalize(
         validate_callback_url(url).await?;
     }
 
-    let permit = state
-        .job_semaphore
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| AppError::service_unavailable("Too many concurrent jobs"))?;
-
-    let scope = serde_json::json!({"wallet": &payload.wallet, "network": payload.network});
-    let worker_id = format!("mat-{}", Uuid::new_v4());
-    let run = state
-        .repo
-        .create_materialization_run("normalize", Some(&scope), None, None, Some(&worker_id))
-        .await
-        .map_err(|e| AppError::internal(format!("Failed to create materialization run: {e}")))?;
-    let job_id = run.id;
-
-    // Claim the run immediately so it transitions pending -> running.
-    let claimed = state
-        .repo
-        .claim_materialization_run(job_id, &worker_id)
-        .await
-        .map_err(|e| AppError::internal(format!("Failed to claim materialization run: {e}")))?;
-    if !claimed {
-        return Err(AppError::internal(
-            "Failed to claim materialization run: claim returned false",
-        ));
-    }
-
-    let state_clone = Arc::clone(&state);
-    let wallet = payload.wallet.clone();
-    let explicit_network = payload.network.clone();
-    let callback_url = payload.callback_url.clone();
-    let wid = worker_id.clone();
-
-    tokio::spawn(async move {
-        let _permit = permit;
-
-        // Spawn a heartbeat task that ticks every 30s.
-        let hb_cancel = CancellationToken::new();
-        let hb_token = hb_cancel.clone();
-        let lease_lost = CancellationToken::new();
-        let lease_lost_inner = lease_lost.clone();
-        let hb_repo = state_clone.repo.clone();
-        let hb_run_id = job_id;
-        let hb_wid = wid.clone();
-        let hb_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                tokio::select! {
-                    _ = hb_token.cancelled() => break,
-                    _ = interval.tick() => {
-                        match hb_repo.heartbeat_materialization_run(hb_run_id, &hb_wid).await {
-                            Ok(true) => {} // still own the lease
-                            Ok(false) => {
-                                warn!(job_id = %hb_run_id, "Lease lost for materialization run");
-                                lease_lost_inner.cancel();
-                                break;
-                            }
-                            Err(e) => {
-                                warn!("heartbeat failed: {e}");
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        let result = async {
-            let txs = state_clone.repo.get_transactions_by_wallet(&wallet).await?;
-
-            let mut all_entries = Vec::new();
-            for tx in &txs {
-                let result = match tx.chain {
-                    spectraplex_core::models::Chain::Solana => {
-                        solana_parser::parse_solana_transaction(tx)
-                    }
-                    spectraplex_core::models::Chain::Hyperliquid => {
-                        hyperliquid_parser::parse_hyperliquid_transaction(tx)
-                    }
-                    spectraplex_core::models::Chain::Ethereum => {
-                        evm_parser::parse_evm_transaction(tx)
-                    }
-                };
-                match result {
-                    Ok(entries) => all_entries.extend(entries),
-                    Err(e) => {
-                        error!(tx_hash = %tx.tx_hash, error = %e, "Skipping unparseable transaction");
-                    }
-                }
-            }
-
-            let count = all_entries.len();
-            state_clone.repo.save_ledger_entries(&all_entries).await?;
-
-            state_clone
-                .repo
-                .materialize_silver_datasets(&txs, explicit_network.as_deref())
-                .await;
-
-            Ok::<usize, anyhow::Error>(count)
-        }
-        .await;
-
-        // Stop the heartbeat.
-        hb_cancel.cancel();
-        hb_task.abort();
-
-        // If the lease was lost, skip terminal DB updates and callbacks.
-        if lease_lost.is_cancelled() {
-            warn!(job_id = %job_id, "Lease lost, skipping terminal update and callback");
-            return;
-        }
-
-        let (final_state, final_message) = match result {
-            Ok(count) => {
-                info!(job_id = %job_id, count, "Normalization completed");
-                if let Err(e) = state_clone
-                    .repo
-                    .complete_materialization_run(job_id, &wid, count as i64)
-                    .await
-                {
-                    error!(job_id = %job_id, error = %e, "Failed to mark materialization run completed");
-                }
-                (
-                    serde_json::to_value(&JobState::Completed).ok(),
-                    Some(format!("Normalized {} ledger entries", count)),
-                )
-            }
-            Err(e) => {
-                error!(job_id = %job_id, error = %e, "Normalization failed");
-                let error_message = e.to_string();
-                if let Err(db_err) = state_clone
-                    .repo
-                    .fail_materialization_run(job_id, &wid, &error_message)
-                    .await
-                {
-                    error!(job_id = %job_id, error = %db_err, "Failed to mark materialization run failed");
-                }
-                (
-                    serde_json::to_value(&JobState::Failed).ok(),
-                    Some(error_message),
-                )
-            }
-        };
-
-        if let Some(ref url) = callback_url {
-            let payload = serde_json::json!({
-                "job_id": job_id,
-                "state": final_state,
-                "wallet": wallet,
-                "message": final_message,
-            });
-            fire_callback(url, &payload).await;
-        }
+    // Build scope with wallet, optional network, and optional callback_url
+    // so the background worker has everything it needs to execute and deliver.
+    let scope = serde_json::json!({
+        "wallet": &payload.wallet,
+        "network": payload.network,
+        "callback_url": payload.callback_url,
     });
 
-    info!(job_id = %job_id, "Normalization job started (durable)");
+    // Enqueue only — the background materialize_worker will claim and execute.
+    let run = state
+        .repo
+        .create_materialization_run("normalize", Some(&scope), None, None, None)
+        .await
+        .map_err(|e| AppError::internal(format!("Failed to create materialization run: {e}")))?;
+
+    info!(job_id = %run.id, "Normalization job enqueued (durable)");
     Ok(Json(JobStatus {
-        id: job_id,
-        state: JobState::Running,
-        message: Some("Job running".to_string()),
+        id: run.id,
+        state: JobState::Pending,
+        message: Some("Job queued".to_string()),
     }))
 }
 
@@ -4280,11 +4140,9 @@ mod tests {
             )),
         });
 
-        // Hold the single permit so the next normalize request is guaranteed
-        // to get 503. Ingestion jobs now enqueue into Postgres and are not
-        // subject to an in-process semaphore.
-        let _held_permit = state.job_semaphore.clone().acquire_owned().await.unwrap();
-
+        // trigger_normalize is now enqueue-only (no semaphore — the background
+        // worker handles concurrency). Without a live DB, the handler returns
+        // 500 when it tries to insert the materialization_runs row.
         let app = test_router_with_state(Arc::clone(&state));
         let req = axum::http::Request::builder()
             .method("POST")
@@ -4299,7 +4157,7 @@ mod tests {
             ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

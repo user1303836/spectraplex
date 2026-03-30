@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use crate::fire_callback;
 use spectraplex_adapters::{evm_parser, hyperliquid_parser, repo::Repository, solana_parser};
 use spectraplex_core::models::Chain;
 use tokio_util::sync::CancellationToken;
@@ -67,8 +68,8 @@ async fn worker_tick(repo: &Repository, worker_id: &str) {
 
         info!(run_id = %run.id, worker_id = %worker_id, "Claimed materialization run");
 
-        // Extract wallet and network from scope JSON.
-        let (wallet, network) = match &run.scope {
+        // Extract wallet, network, and callback_url from scope JSON.
+        let (wallet, network, callback_url) = match &run.scope {
             Some(scope) => {
                 let w = scope
                     .get("wallet")
@@ -79,7 +80,11 @@ async fn worker_tick(repo: &Repository, worker_id: &str) {
                     .get("network")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                (w, n)
+                let cb = scope
+                    .get("callback_url")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                (w, n, cb)
             }
             None => {
                 let _ = repo
@@ -126,8 +131,9 @@ async fn worker_tick(repo: &Repository, worker_id: &str) {
             }
         });
 
-        // Execute normalize work.
-        let result = execute_normalize(repo, &wallet, network.as_deref()).await;
+        // Execute normalize work — pass lease_lost so side effects are
+        // skipped if the lease is reclaimed mid-execution.
+        let result = execute_normalize(repo, &wallet, network.as_deref(), &lease_lost).await;
 
         // Stop heartbeat.
         hb_cancel.cancel();
@@ -138,7 +144,7 @@ async fn worker_tick(repo: &Repository, worker_id: &str) {
             continue;
         }
 
-        match result {
+        let (final_state, final_message) = match result {
             Ok(count) => {
                 info!(run_id = %run.id, count, "Materialization run completed (worker)");
                 if let Err(e) = repo
@@ -147,26 +153,42 @@ async fn worker_tick(repo: &Repository, worker_id: &str) {
                 {
                     error!(run_id = %run.id, error = %e, "Failed to mark run completed");
                 }
+                ("completed", format!("Normalized {} ledger entries", count))
             }
             Err(e) => {
-                error!(run_id = %run.id, error = %e, "Materialization run failed (worker)");
-                if let Err(db_err) = repo
-                    .fail_materialization_run(run.id, worker_id, &e.to_string())
-                    .await
-                {
+                let msg = e.to_string();
+                error!(run_id = %run.id, error = %msg, "Materialization run failed (worker)");
+                if let Err(db_err) = repo.fail_materialization_run(run.id, worker_id, &msg).await {
                     error!(run_id = %run.id, error = %db_err, "Failed to mark run failed");
                 }
+                ("failed", msg)
             }
+        };
+
+        // Fire durable callback if one was persisted in scope.
+        if let Some(ref url) = callback_url {
+            let payload = serde_json::json!({
+                "job_id": run.id,
+                "state": final_state,
+                "wallet": wallet,
+                "message": final_message,
+            });
+            fire_callback(url, &payload).await;
         }
     }
 }
 
-/// Core normalize logic shared between the API handler spawned task and the
-/// background worker.
+/// Core normalize logic used by the background worker.
+///
+/// Accepts a `lease_lost` token that is checked before each side-effecting
+/// operation (`save_ledger_entries`, `materialize_silver_datasets`). If the
+/// lease has been reclaimed by another worker while we were parsing, we bail
+/// early instead of producing duplicate writes.
 pub(crate) async fn execute_normalize(
     repo: &Repository,
     wallet: &str,
     network: Option<&str>,
+    lease_lost: &CancellationToken,
 ) -> anyhow::Result<usize> {
     let txs = repo.get_transactions_by_wallet(wallet).await?;
 
@@ -185,8 +207,21 @@ pub(crate) async fn execute_normalize(
         }
     }
 
+    // Check lease before persisting side effects — if we lost the lease
+    // during parsing, another worker may already be running. Persisting
+    // now would duplicate ledger entries (fresh UUIDs each run) and
+    // re-trigger Silver materialization.
+    if lease_lost.is_cancelled() {
+        anyhow::bail!("lease lost before persisting side effects");
+    }
+
     let count = all_entries.len();
     repo.save_ledger_entries(&all_entries).await?;
+
+    if lease_lost.is_cancelled() {
+        anyhow::bail!("lease lost before Silver materialization");
+    }
+
     repo.materialize_silver_datasets(&txs, network).await;
     Ok(count)
 }
