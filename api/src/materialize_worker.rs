@@ -65,8 +65,10 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
         let permit = match job_semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                // At capacity, stop claiming more runs this tick.
-                break;
+                // At capacity — sleep before returning so we don't hot-loop
+                // on list_claimable while all permits are held.
+                tokio::time::sleep(POLL_INTERVAL).await;
+                return;
             }
         };
 
