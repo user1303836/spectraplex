@@ -1338,22 +1338,50 @@ async fn trigger_normalize(
         .try_acquire_owned()
         .map_err(|_| AppError::service_unavailable("Too many concurrent jobs"))?;
 
-    let network_str = payload.network.as_deref().unwrap_or("unknown");
-    let scope = serde_json::json!({"wallet": &payload.wallet, "network": network_str});
+    let scope = serde_json::json!({"wallet": &payload.wallet, "network": payload.network});
+    let worker_id = format!("mat-{}", Uuid::new_v4());
     let run = state
         .repo
-        .create_materialization_run("normalize", Some(&scope), None, None, None)
+        .create_materialization_run("normalize", Some(&scope), None, None, Some(&worker_id))
         .await
         .map_err(|e| AppError::internal(format!("Failed to create materialization run: {e}")))?;
     let job_id = run.id;
+
+    // Claim the run immediately so it transitions pending -> running.
+    state
+        .repo
+        .claim_materialization_run(job_id, &worker_id)
+        .await
+        .map_err(|e| AppError::internal(format!("Failed to claim materialization run: {e}")))?;
 
     let state_clone = Arc::clone(&state);
     let wallet = payload.wallet.clone();
     let explicit_network = payload.network.clone();
     let callback_url = payload.callback_url.clone();
+    let wid = worker_id.clone();
 
     tokio::spawn(async move {
         let _permit = permit;
+
+        // Spawn a heartbeat task that ticks every 30s.
+        let hb_cancel = CancellationToken::new();
+        let hb_token = hb_cancel.clone();
+        let hb_repo = state_clone.repo.clone();
+        let hb_run_id = job_id;
+        let hb_wid = wid.clone();
+        let hb_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = hb_token.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(e) = hb_repo.heartbeat_materialization_run(hb_run_id, &hb_wid).await {
+                            warn!("heartbeat failed: {e}");
+                        }
+                    }
+                }
+            }
+        });
 
         let result = async {
             let txs = state_clone.repo.get_transactions_by_wallet(&wallet).await?;
@@ -1391,12 +1419,16 @@ async fn trigger_normalize(
         }
         .await;
 
+        // Stop the heartbeat.
+        hb_cancel.cancel();
+        hb_task.abort();
+
         let (final_state, final_message) = match result {
             Ok(count) => {
                 info!(job_id = %job_id, count, "Normalization completed");
                 if let Err(e) = state_clone
                     .repo
-                    .complete_materialization_run(job_id, count as i64)
+                    .complete_materialization_run(job_id, &wid, count as i64)
                     .await
                 {
                     error!(job_id = %job_id, error = %e, "Failed to mark materialization run completed");
@@ -1411,7 +1443,7 @@ async fn trigger_normalize(
                 let error_message = e.to_string();
                 if let Err(db_err) = state_clone
                     .repo
-                    .fail_materialization_run(job_id, &error_message)
+                    .fail_materialization_run(job_id, &wid, &error_message)
                     .await
                 {
                     error!(job_id = %job_id, error = %db_err, "Failed to mark materialization run failed");
@@ -1437,7 +1469,7 @@ async fn trigger_normalize(
     info!(job_id = %job_id, "Normalization job started (durable)");
     Ok(Json(JobStatus {
         id: job_id,
-        state: JobState::Running,
+        state: JobState::Pending,
         message: Some("Job queued".to_string()),
     }))
 }
