@@ -7,7 +7,10 @@
 
 use std::time::Duration;
 
-use spectraplex_adapters::dual_write::chain_to_default_source;
+use spectraplex_adapters::dual_write::{
+    build_target_matches, chain_to_default_source, v1_checkpoint_to_v2_with_network,
+    v1_tx_to_v2_raw,
+};
 use spectraplex_adapters::evm::EvmAdapter;
 use spectraplex_adapters::hyperliquid::HyperliquidAdapter;
 use spectraplex_adapters::repo::{build_checkpoint, Repository};
@@ -16,6 +19,8 @@ use spectraplex_core::config::AppConfig;
 use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
 use spectraplex_core::provider::{NetworkContext, NetworkId, ProviderRegistry};
 use spectraplex_core::v2::IngestionJob;
+use spectraplex_core::v2::RawTransaction;
+use std::collections::HashSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -136,7 +141,7 @@ async fn execute_job(
     }
 
     // Execute the actual ingestion.
-    let result = run_ingestion(repo, config, provider_registry, job).await;
+    let result = run_ingestion(repo, config, provider_registry, job, run_id).await;
 
     // Stop heartbeat.
     heartbeat_cancel.cancel();
@@ -209,6 +214,7 @@ async fn run_ingestion(
     config: &AppConfig,
     provider_registry: &ProviderRegistry,
     job: &IngestionJob,
+    run_id: Uuid,
 ) -> anyhow::Result<usize> {
     // Resolve chain family from network.
     let chain = network_to_chain(&job.network)?;
@@ -316,19 +322,53 @@ async fn run_ingestion(
 
     let count = events.len();
 
-    // Persist transactions + checkpoint.
-    if let Some(cp) = build_checkpoint(chain_str, &wallet, &events) {
+    // --- V2 AUTHORITATIVE WRITES (fail-closed) ---
+
+    // Convert V1 txs to V2 RawTransactions
+    let v2_records: Vec<RawTransaction> = events
+        .iter()
+        .map(|tx| {
+            let mut raw = v1_tx_to_v2_raw(tx, Some(&job.network));
+            raw.ingestion_run_id = Some(run_id); // stamp run provenance
+            raw
+        })
+        .collect();
+
+    // Deduplicate by (network, tx_hash) — same tx may appear from different calls
+    let mut seen = HashSet::new();
+    let v2_deduped: Vec<RawTransaction> = v2_records
+        .into_iter()
+        .filter(|r| seen.insert((r.network.clone(), r.tx_hash.clone())))
+        .collect();
+
+    // Write raw_transactions (authoritative)
+    let canonical_ids = repo
+        .upsert_raw_transactions_returning_ids(&v2_deduped)
+        .await?;
+
+    // Write target_matches (authoritative)
+    if let Some(tid) = target_id {
+        let matches = build_target_matches(tid, &canonical_ids);
+        repo.save_target_matches(&matches).await?;
+    }
+
+    // Write V2 checkpoint (authoritative)
+    if let Some(ref v1_cp) = build_checkpoint(chain_str, &wallet, &events) {
         if let Some(tid) = target_id {
-            repo.save_transactions_and_checkpoint_dual_write(&events, &cp, tid, Some(&job.network))
-                .await?;
-        } else {
-            repo.save_transactions_and_checkpoint(&events, &cp).await?;
+            let v2_cp = v1_checkpoint_to_v2_with_network(v1_cp, tid, Some(&job.network));
+            repo.upsert_checkpoint_v2(&v2_cp).await?;
         }
-    } else if let Some(tid) = target_id {
-        repo.save_transactions_dual_write(&events, tid, Some(&job.network))
-            .await?;
-    } else {
-        repo.save_transactions(&events).await?;
+    }
+
+    // --- V1 COMPATIBILITY PROJECTION (best-effort, logged but non-fatal) ---
+
+    if let Err(e) = repo.save_transactions(&events).await {
+        warn!(job_id = %job.id, error = %e, "V1 compat: save_transactions failed (non-fatal)");
+    }
+    if let Some(ref v1_cp) = build_checkpoint(chain_str, &wallet, &events) {
+        if let Err(e) = repo.save_checkpoint(v1_cp).await {
+            warn!(job_id = %job.id, error = %e, "V1 compat: save_checkpoint failed (non-fatal)");
+        }
     }
 
     Ok(count)

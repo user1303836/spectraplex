@@ -160,6 +160,24 @@ pub fn v1_tx_to_v2_raw(tx: &Transaction, explicit_network: Option<&str>) -> RawT
     }
 }
 
+/// Convert a V2 `RawTransaction` back to a V1 `Transaction` for compatibility
+/// projection.
+///
+/// Used in the V2-authoritative ingestion path to write best-effort V1
+/// `transactions` rows so downstream consumers that still read the V1 schema
+/// continue to work during the migration window.
+pub fn v2_raw_to_v1_tx(raw: &RawTransaction, wallet: &str, chain: Chain) -> Transaction {
+    Transaction {
+        id: Uuid::new_v4(),
+        user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, wallet.as_bytes()),
+        wallet_address: wallet.to_string(),
+        timestamp: raw.timestamp,
+        tx_hash: raw.tx_hash.clone(),
+        chain,
+        raw_metadata: raw.raw_metadata.clone(),
+    }
+}
+
 /// Extract `block_number` from raw_metadata based on chain.
 ///
 /// - Solana: `raw_metadata["slot"]`
