@@ -288,8 +288,9 @@ async fn run_solana_grpc_stream(
                         batch.push(tx);
                         tx_count += 1;
 
-                        if batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL {
-                            flush_stream_batch(repo, &batch, &sub.network, sub.target_id, sub_id).await;
+                        if (batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL)
+                            && flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id).await
+                        {
                             batch.clear();
                             last_flush = tokio::time::Instant::now();
 
@@ -312,7 +313,7 @@ async fn run_solana_grpc_stream(
 
                         // Flush remaining batch before failing
                         if !batch.is_empty() {
-                            flush_stream_batch(repo, &batch, &sub.network, sub.target_id, sub_id).await;
+                            flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id).await;
                             let cursor = serde_json::json!({
                                 "tx_count": tx_count,
                                 "last_slot": last_slot,
@@ -329,7 +330,7 @@ async fn run_solana_grpc_stream(
 
     // Flush remaining batch
     if !batch.is_empty() {
-        flush_stream_batch(repo, &batch, &sub.network, sub.target_id, sub_id).await;
+        flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id).await;
         let cursor = serde_json::json!({
             "tx_count": tx_count,
             "last_slot": last_slot,
@@ -457,8 +458,9 @@ async fn run_hyperliquid_ws_stream(
                         batch.push(tx);
                         tx_count += 1;
 
-                        if batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL {
-                            flush_stream_batch(repo, &batch, &sub.network, sub.target_id, sub_id).await;
+                        if (batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL)
+                            && flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id).await
+                        {
                             batch.clear();
                             last_flush = tokio::time::Instant::now();
 
@@ -478,7 +480,7 @@ async fn run_hyperliquid_ws_stream(
 
                         // Flush remaining batch before failing
                         if !batch.is_empty() {
-                            flush_stream_batch(repo, &batch, &sub.network, sub.target_id, sub_id).await;
+                            flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id).await;
                             let cursor = serde_json::json!({ "tx_count": tx_count });
                             let _ = repo.update_stream_cursor(sub_id, &cursor).await;
                         }
@@ -492,7 +494,7 @@ async fn run_hyperliquid_ws_stream(
 
     // Flush remaining batch
     if !batch.is_empty() {
-        flush_stream_batch(repo, &batch, &sub.network, sub.target_id, sub_id).await;
+        flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id).await;
         let cursor = serde_json::json!({ "tx_count": tx_count });
         let _ = repo.update_stream_cursor(sub_id, &cursor).await;
     }
@@ -508,23 +510,28 @@ async fn run_hyperliquid_ws_stream(
 /// 3. Write `target_matches` if a target_id is present
 /// 4. Best-effort V1 compat via `save_transactions`
 ///
-/// Errors are logged but never propagated — streams should not die on transient
-/// DB failures (unlike backfill jobs which fail-closed).
+/// Returns `true` if the V2 upsert succeeded (callers should clear the batch),
+/// `false` if it failed (callers should retain the batch for retry).
 async fn flush_stream_batch(
     repo: &Repository,
     batch: &[Transaction],
     network: &str,
+    source: &str,
     target_id: Option<Uuid>,
     sub_id: Uuid,
-) {
+) -> bool {
     if batch.is_empty() {
-        return;
+        return true;
     }
 
     // V2 authoritative
     let v2_batch: Vec<RawTransaction> = batch
         .iter()
-        .map(|tx| v1_tx_to_v2_raw(tx, Some(network)))
+        .map(|tx| {
+            let mut raw = v1_tx_to_v2_raw(tx, Some(network));
+            raw.source = source.to_string();
+            raw
+        })
         .collect();
     let mut seen = HashSet::new();
     let v2_deduped: Vec<RawTransaction> = v2_batch
@@ -554,6 +561,17 @@ async fn flush_stream_batch(
                 error = %e,
                 "Failed to upsert V2 raw_transactions"
             );
+
+            // V1 compat (best-effort) — still attempt even on V2 failure
+            if let Err(e) = repo.save_transactions(batch).await {
+                warn!(
+                    subscription_id = %sub_id,
+                    error = %e,
+                    "V1 compat: save_transactions failed (non-fatal)"
+                );
+            }
+
+            return false;
         }
     }
 
@@ -565,6 +583,8 @@ async fn flush_stream_batch(
             "V1 compat: save_transactions failed (non-fatal)"
         );
     }
+
+    true
 }
 
 /// Extract tx_count from cursor_state JSON, default 0.
