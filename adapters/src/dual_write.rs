@@ -166,10 +166,15 @@ pub fn v1_tx_to_v2_raw(tx: &Transaction, explicit_network: Option<&str>) -> RawT
 /// Used in the V2-authoritative ingestion path to write best-effort V1
 /// `transactions` rows so downstream consumers that still read the V1 schema
 /// continue to work during the migration window.
-pub fn v2_raw_to_v1_tx(raw: &RawTransaction, wallet: &str, chain: Chain) -> Transaction {
+pub fn v2_raw_to_v1_tx(
+    raw: &RawTransaction,
+    wallet: &str,
+    chain: Chain,
+    user_id: Option<Uuid>,
+) -> Transaction {
     Transaction {
         id: Uuid::new_v4(),
-        user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, wallet.as_bytes()),
+        user_id: user_id.unwrap_or_else(|| Uuid::new_v5(&Uuid::NAMESPACE_URL, wallet.as_bytes())),
         wallet_address: wallet.to_string(),
         timestamp: raw.timestamp,
         tx_hash: raw.tx_hash.clone(),

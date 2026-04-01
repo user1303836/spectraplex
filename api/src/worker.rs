@@ -136,12 +136,13 @@ async fn execute_job(
         error_message: None,
         cursor_state: None,
     };
-    if let Err(e) = repo.create_ingestion_run(&run).await {
-        warn!(job_id = %job_id, error = %e, "Failed to create ingestion run (non-fatal)");
+    let run_created = repo.create_ingestion_run(&run).await.is_ok();
+    if !run_created {
+        warn!(job_id = %job_id, "Failed to create ingestion run; raw_transactions will not carry ingestion_run_id");
     }
 
     // Execute the actual ingestion.
-    let result = run_ingestion(repo, config, provider_registry, job, run_id).await;
+    let result = run_ingestion(repo, config, provider_registry, job, run_id, run_created).await;
 
     // Stop heartbeat.
     heartbeat_cancel.cancel();
@@ -215,6 +216,7 @@ async fn run_ingestion(
     provider_registry: &ProviderRegistry,
     job: &IngestionJob,
     run_id: Uuid,
+    run_created: bool,
 ) -> anyhow::Result<usize> {
     // Resolve chain family from network.
     let chain = network_to_chain(&job.network)?;
@@ -329,7 +331,11 @@ async fn run_ingestion(
         .iter()
         .map(|tx| {
             let mut raw = v1_tx_to_v2_raw(tx, Some(&job.network));
-            raw.ingestion_run_id = Some(run_id); // stamp run provenance
+            // Only stamp ingestion_run_id if the run row was created;
+            // otherwise the FK would reject the insert.
+            if run_created {
+                raw.ingestion_run_id = Some(run_id);
+            }
             raw
         })
         .collect();
@@ -361,13 +367,21 @@ async fn run_ingestion(
     }
 
     // --- V1 COMPATIBILITY PROJECTION (best-effort, logged but non-fatal) ---
+    //
+    // Only advance the V1 checkpoint if save_transactions succeeded. If the
+    // V1 transaction write fails (even partially), advancing the checkpoint
+    // would cause legacy readers to skip those transactions permanently on
+    // the next incremental run.
 
-    if let Err(e) = repo.save_transactions(&events).await {
-        warn!(job_id = %job.id, error = %e, "V1 compat: save_transactions failed (non-fatal)");
+    let v1_txs_ok = repo.save_transactions(&events).await.is_ok();
+    if !v1_txs_ok {
+        warn!(job_id = %job.id, "V1 compat: save_transactions failed, skipping V1 checkpoint (non-fatal)");
     }
-    if let Some(ref v1_cp) = build_checkpoint(chain_str, &wallet, &events) {
-        if let Err(e) = repo.save_checkpoint(v1_cp).await {
-            warn!(job_id = %job.id, error = %e, "V1 compat: save_checkpoint failed (non-fatal)");
+    if v1_txs_ok {
+        if let Some(ref v1_cp) = build_checkpoint(chain_str, &wallet, &events) {
+            if let Err(e) = repo.save_checkpoint(v1_cp).await {
+                warn!(job_id = %job.id, error = %e, "V1 compat: save_checkpoint failed (non-fatal)");
+            }
         }
     }
 
