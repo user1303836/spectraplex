@@ -321,7 +321,7 @@ pub(crate) async fn execute_normalize(
     // When Bronze-driven, we override the caller-supplied network and wallet
     // with authoritative values from the ingestion run/target.
     let mut effective_network: Option<String> = network.map(|s| s.to_string());
-    let mut effective_wallet: String = wallet.to_string();
+    let effective_wallet: String;
 
     let txs = if let Some(run_id) = ingestion_run_id {
         // Bronze-driven: fetch raw_transactions for this specific ingestion run
