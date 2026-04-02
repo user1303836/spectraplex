@@ -4140,9 +4140,10 @@ impl Repository {
 
     /// Upsert watermark after successful materialization.
     ///
-    /// Uses a monotonicity guard: the watermark is only advanced when the new
-    /// `last_processed_at` (NOW()) is newer than the existing one. Two concurrent
-    /// runs that complete out of order will therefore not regress the watermark.
+    /// Uses a monotonicity guard based on ingestion run start time: the
+    /// watermark is only advanced when the new run started after the run
+    /// currently recorded. This prevents out-of-order completions from
+    /// regressing the watermark to an older Bronze position.
     pub async fn upsert_dataset_watermark(
         &self,
         dataset_name: &str,
@@ -4155,12 +4156,14 @@ impl Repository {
              (dataset_name, scope, last_ingestion_run_id, last_raw_transaction_id, last_processed_at) \
              VALUES ($1, $2, $3, $4, NOW()) \
              ON CONFLICT (dataset_name, scope) DO UPDATE SET \
-                 last_ingestion_run_id = COALESCE(EXCLUDED.last_ingestion_run_id, dataset_watermarks.last_ingestion_run_id), \
+                 last_ingestion_run_id = EXCLUDED.last_ingestion_run_id, \
                  last_raw_transaction_id = COALESCE(EXCLUDED.last_raw_transaction_id, dataset_watermarks.last_raw_transaction_id), \
                  last_processed_at = NOW(), \
                  updated_at = NOW() \
-             WHERE dataset_watermarks.last_processed_at IS NULL \
-                OR dataset_watermarks.last_processed_at < NOW()",
+             WHERE dataset_watermarks.last_ingestion_run_id IS NULL \
+                OR (SELECT started_at FROM ingestion_runs WHERE id = EXCLUDED.last_ingestion_run_id) \
+                   > COALESCE((SELECT started_at FROM ingestion_runs WHERE id = dataset_watermarks.last_ingestion_run_id), \
+                              '1970-01-01'::timestamptz)",
         )
         .bind(dataset_name)
         .bind(scope)
