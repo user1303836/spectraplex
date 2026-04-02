@@ -172,8 +172,13 @@ pub fn v2_raw_to_v1_tx(
     chain: Chain,
     user_id: Option<Uuid>,
 ) -> Transaction {
+    // Reuse raw.id as the V1 Transaction.id. v1_tx_to_v2_raw copies
+    // tx.id -> raw.id during dual-write, so this round-trips correctly
+    // and matches the compat transactions row already persisted by the
+    // backfill worker. This also makes retries idempotent since the
+    // same raw.id always produces the same ledger entry IDs.
     Transaction {
-        id: Uuid::new_v4(),
+        id: raw.id,
         user_id: user_id.unwrap_or_else(|| Uuid::new_v5(&Uuid::NAMESPACE_URL, wallet.as_bytes())),
         wallet_address: wallet.to_string(),
         timestamp: raw.timestamp,

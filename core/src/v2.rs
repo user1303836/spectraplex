@@ -598,6 +598,24 @@ pub struct MaterializationRun {
 }
 
 // ---------------------------------------------------------------------------
+// Dataset Watermark
+// ---------------------------------------------------------------------------
+
+/// Tracks the last-processed position for each materialization dataset + scope,
+/// enabling Bronze-range-driven incremental materialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetWatermark {
+    pub id: Uuid,
+    pub dataset_name: String,
+    pub scope: Option<serde_json::Value>,
+    pub last_ingestion_run_id: Option<Uuid>,
+    pub last_raw_transaction_id: Option<Uuid>,
+    pub last_processed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
 // Address normalization helpers
 // ---------------------------------------------------------------------------
 

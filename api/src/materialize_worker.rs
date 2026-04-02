@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::fire_callback;
+use spectraplex_adapters::dual_write::v2_raw_to_v1_tx;
 use spectraplex_adapters::{evm_parser, hyperliquid_parser, repo::Repository, solana_parser};
 use spectraplex_core::models::Chain;
 use tokio::sync::Semaphore;
@@ -86,8 +87,8 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
 
         info!(run_id = %run.id, worker_id = %worker_id, "Claimed materialization run");
 
-        // Extract wallet, network, and callback_url from scope JSON.
-        let (wallet, network, callback_url) = match &run.scope {
+        // Extract wallet, network, callback_url, and optional ingestion_run_id from scope JSON.
+        let (wallet, network, callback_url, ingestion_run_id) = match &run.scope {
             Some(scope) => {
                 let w = scope
                     .get("wallet")
@@ -102,7 +103,11 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
                     .get("callback_url")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                (w, n, cb)
+                let run_id = scope
+                    .get("ingestion_run_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok());
+                (w, n, cb, run_id)
             }
             None => {
                 let _ = repo
@@ -160,8 +165,14 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
 
             // Execute normalize work — pass lease_lost so side effects are
             // skipped if the lease is reclaimed mid-execution.
-            let result =
-                execute_normalize(&task_repo, &wallet, network.as_deref(), &lease_lost).await;
+            let result = execute_normalize(
+                &task_repo,
+                &wallet,
+                network.as_deref(),
+                ingestion_run_id,
+                &lease_lost,
+            )
+            .await;
 
             // Check lease_lost BEFORE writing terminal state. If the lease was
             // lost (either detected by heartbeat or by execute_normalize's own
@@ -184,6 +195,52 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
                         .await
                     {
                         Ok(()) => {
+                            // Upsert dataset watermark after successful materialization.
+                            // When Bronze-driven, resolve the authoritative wallet/network
+                            // from the ingestion run so watermarks don't fork across EVM
+                            // case variants or caller-supplied mismatches.
+                            if let Some(irun_id) = ingestion_run_id {
+                                // Resolve authoritative wallet/network from the
+                                // ingestion run. Skip the watermark entirely if
+                                // the lookup fails — we must not write a watermark
+                                // under non-authoritative scope values.
+                                let wm_resolved = match task_repo.get_ingestion_run(irun_id).await {
+                                    Ok(Some(irun)) => {
+                                        let w = if let Some(tid) = irun.target_id {
+                                            task_repo
+                                                .get_index_target(tid)
+                                                .await
+                                                .ok()
+                                                .flatten()
+                                                .and_then(|t| t.address)
+                                        } else {
+                                            None
+                                        };
+                                        w.map(|wallet_addr| (wallet_addr, irun.network.clone()))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((wm_wallet, wm_network)) = wm_resolved {
+                                    let scope_json = serde_json::json!({
+                                        "network": wm_network,
+                                        "wallet": wm_wallet,
+                                    });
+                                    if let Err(e) = task_repo
+                                        .upsert_dataset_watermark(
+                                            "normalize",
+                                            Some(&scope_json),
+                                            Some(irun_id),
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        warn!(run_id = %run_id, error = %e, "Failed to upsert dataset watermark (non-fatal)");
+                                    }
+                                } else {
+                                    warn!(run_id = %run_id, "Could not resolve authoritative scope for watermark — skipping");
+                                }
+                            }
+
                             // Terminal write succeeded — safe to fire callback.
                             (
                                 Some("completed"),
@@ -258,9 +315,93 @@ pub(crate) async fn execute_normalize(
     repo: &Repository,
     wallet: &str,
     network: Option<&str>,
+    ingestion_run_id: Option<Uuid>,
     lease_lost: &CancellationToken,
 ) -> anyhow::Result<usize> {
-    let txs = repo.get_transactions_by_wallet(wallet).await?;
+    // When Bronze-driven, we override the caller-supplied network and wallet
+    // with authoritative values from the ingestion run/target.
+    let mut effective_network: Option<String> = network.map(|s| s.to_string());
+    let effective_wallet: String;
+
+    let txs = if let Some(run_id) = ingestion_run_id {
+        // Bronze-driven: fetch raw_transactions for this specific ingestion run
+        // and convert V2 RawTransaction -> V1 Transaction for existing parsers.
+        //
+        // Safety: validate that the ingestion_run exists and its target address
+        // matches the caller-supplied wallet. Fail-closed: if any lookup fails
+        // or the run/target is missing, we bail rather than silently proceeding.
+        let irun = repo
+            .get_ingestion_run(run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("ingestion_run {} not found", run_id))?;
+        let tid = irun
+            .target_id
+            .ok_or_else(|| anyhow::anyhow!("ingestion_run {} has no target_id", run_id))?;
+        let target = repo.get_index_target(tid).await?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "index_target {} for ingestion_run {} not found",
+                tid,
+                run_id
+            )
+        })?;
+        let target_addr = target.address.ok_or_else(|| {
+            anyhow::anyhow!(
+                "index_target {} for ingestion_run {} has no address",
+                tid,
+                run_id
+            )
+        })?;
+        if target_addr.is_empty() {
+            anyhow::bail!(
+                "index_target {} for ingestion_run {} has empty address",
+                tid,
+                run_id
+            );
+        }
+        if !addrs_match(&target_addr, wallet) {
+            anyhow::bail!(
+                "ingestion_run {} belongs to target wallet {}, not {}",
+                run_id,
+                target_addr,
+                wallet
+            );
+        }
+        // Use the authoritative wallet address from the target for deterministic
+        // ID generation and watermark keying, preventing EVM case-variant forks.
+        effective_wallet = target_addr;
+
+        // Override network with the ingestion run's authoritative value.
+        effective_network = Some(irun.network.clone());
+
+        let raw_txs = repo.get_raw_transactions_by_run(run_id).await?;
+        if raw_txs.is_empty() {
+            // Empty Bronze range is a valid outcome (e.g. zero new transactions
+            // for this ingestion). Return empty vec — do NOT fall back to the
+            // legacy wallet scan, which would rematerialize stale historical
+            // data and produce duplicate ledger/silver output.
+            info!(
+                run_id = %run_id,
+                "Bronze-driven materialization: no raw transactions found for run, returning 0 records"
+            );
+            Vec::new()
+        } else {
+            info!(
+                run_id = %run_id,
+                raw_count = raw_txs.len(),
+                "Bronze-driven materialization: fetched raw transactions"
+            );
+            raw_txs
+                .iter()
+                .filter_map(|r| {
+                    let chain = network_to_chain(&r.network).ok()?;
+                    Some(v2_raw_to_v1_tx(r, &effective_wallet, chain, None))
+                })
+                .collect()
+        }
+    } else {
+        // Legacy fallback: wallet-scoped V1 scan
+        repo.get_transactions_by_wallet(wallet).await?
+    };
 
     let mut all_entries = Vec::new();
     for tx in &txs {
@@ -285,6 +426,14 @@ pub(crate) async fn execute_normalize(
         anyhow::bail!("lease lost before persisting side effects");
     }
 
+    // When Bronze-driven, the V1 `transactions` rows don't exist yet — we
+    // synthesized them from RawTransaction. Persist them so downstream joins
+    // (ledger_entries.transaction_id -> transactions.id) work correctly.
+    // Uses ON CONFLICT DO NOTHING so this is idempotent.
+    if ingestion_run_id.is_some() && !txs.is_empty() {
+        repo.save_transactions(&txs).await?;
+    }
+
     let count = all_entries.len();
     repo.save_ledger_entries(&all_entries).await?;
 
@@ -292,6 +441,30 @@ pub(crate) async fn execute_normalize(
         anyhow::bail!("lease lost before Silver materialization");
     }
 
-    repo.materialize_silver_datasets(&txs, network).await;
+    repo.materialize_silver_datasets(&txs, effective_network.as_deref())
+        .await;
     Ok(count)
+}
+
+/// Chain-aware address comparison: case-insensitive for EVM (0x-prefixed),
+/// exact match for everything else (Solana base58 is case-sensitive).
+fn addrs_match(a: &str, b: &str) -> bool {
+    let is_evm = a.starts_with("0x") || a.starts_with("0X");
+    if is_evm {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// Derive the V1 `Chain` enum from a V2 network ID.
+fn network_to_chain(network: &str) -> anyhow::Result<Chain> {
+    if network.starts_with("solana") {
+        Ok(Chain::Solana)
+    } else if network.starts_with("hypercore") || network.starts_with("hyperliquid") {
+        Ok(Chain::Hyperliquid)
+    } else {
+        // Everything else is EVM (ethereum, base, arbitrum, polygon, etc.)
+        Ok(Chain::Ethereum)
+    }
 }
