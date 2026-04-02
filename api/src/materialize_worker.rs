@@ -196,10 +196,31 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
                     {
                         Ok(()) => {
                             // Upsert dataset watermark after successful materialization.
+                            // When Bronze-driven, resolve the authoritative wallet/network
+                            // from the ingestion run so watermarks don't fork across EVM
+                            // case variants or caller-supplied mismatches.
                             if let Some(irun_id) = ingestion_run_id {
+                                let (wm_wallet, wm_network) =
+                                    match task_repo.get_ingestion_run(irun_id).await {
+                                        Ok(Some(irun)) => {
+                                            let w = if let Some(tid) = irun.target_id {
+                                                task_repo
+                                                    .get_index_target(tid)
+                                                    .await
+                                                    .ok()
+                                                    .flatten()
+                                                    .and_then(|t| t.address)
+                                                    .unwrap_or_else(|| wallet.clone())
+                                            } else {
+                                                wallet.clone()
+                                            };
+                                            (w, Some(irun.network.clone()))
+                                        }
+                                        _ => (wallet.clone(), network.clone()),
+                                    };
                                 let scope_json = serde_json::json!({
-                                    "network": network,
-                                    "wallet": wallet,
+                                    "network": wm_network,
+                                    "wallet": wm_wallet,
                                 });
                                 if let Err(e) = task_repo
                                     .upsert_dataset_watermark(
@@ -291,9 +312,10 @@ pub(crate) async fn execute_normalize(
     ingestion_run_id: Option<Uuid>,
     lease_lost: &CancellationToken,
 ) -> anyhow::Result<usize> {
-    // When Bronze-driven, we override the caller-supplied network with the
-    // ingestion run's authoritative network to prevent mismatches.
+    // When Bronze-driven, we override the caller-supplied network and wallet
+    // with authoritative values from the ingestion run/target.
     let mut effective_network: Option<String> = network.map(|s| s.to_string());
+    let mut effective_wallet: String = wallet.to_string();
 
     let txs = if let Some(run_id) = ingestion_run_id {
         // Bronze-driven: fetch raw_transactions for this specific ingestion run
@@ -306,24 +328,41 @@ pub(crate) async fn execute_normalize(
             .get_ingestion_run(run_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("ingestion_run {} not found", run_id))?;
-        if let Some(tid) = irun.target_id {
-            let target = repo.get_index_target(tid).await?.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "index_target {} for ingestion_run {} not found",
-                    tid,
-                    run_id
-                )
-            })?;
-            let target_addr = target.address.unwrap_or_default();
-            if !target_addr.is_empty() && !addrs_match(&target_addr, wallet) {
-                anyhow::bail!(
-                    "ingestion_run {} belongs to target wallet {}, not {}",
-                    run_id,
-                    target_addr,
-                    wallet
-                );
-            }
+        let tid = irun
+            .target_id
+            .ok_or_else(|| anyhow::anyhow!("ingestion_run {} has no target_id", run_id))?;
+        let target = repo.get_index_target(tid).await?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "index_target {} for ingestion_run {} not found",
+                tid,
+                run_id
+            )
+        })?;
+        let target_addr = target.address.ok_or_else(|| {
+            anyhow::anyhow!(
+                "index_target {} for ingestion_run {} has no address",
+                tid,
+                run_id
+            )
+        })?;
+        if target_addr.is_empty() {
+            anyhow::bail!(
+                "index_target {} for ingestion_run {} has empty address",
+                tid,
+                run_id
+            );
         }
+        if !addrs_match(&target_addr, wallet) {
+            anyhow::bail!(
+                "ingestion_run {} belongs to target wallet {}, not {}",
+                run_id,
+                target_addr,
+                wallet
+            );
+        }
+        // Use the authoritative wallet address from the target for deterministic
+        // ID generation and watermark keying, preventing EVM case-variant forks.
+        effective_wallet = target_addr;
 
         // Override network with the ingestion run's authoritative value.
         effective_network = Some(irun.network.clone());
@@ -349,7 +388,7 @@ pub(crate) async fn execute_normalize(
                 .iter()
                 .filter_map(|r| {
                     let chain = network_to_chain(&r.network).ok()?;
-                    Some(v2_raw_to_v1_tx(r, wallet, chain, None))
+                    Some(v2_raw_to_v1_tx(r, &effective_wallet, chain, None))
                 })
                 .collect()
         }
