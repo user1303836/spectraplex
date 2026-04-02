@@ -295,23 +295,38 @@ pub(crate) async fn execute_normalize(
         // Bronze-driven: fetch raw_transactions for this specific ingestion run
         // and convert V2 RawTransaction -> V1 Transaction for existing parsers.
         //
-        // We do NOT use the caller-supplied wallet to stamp the V1 projections.
-        // Instead, the wallet from the scope is validated below — but the raw
-        // transactions are target-agnostic (no wallet_address), so the V1
-        // projection uses the scope wallet purely for the V1 schema requirement.
-        // The raw data itself is trusted because it was written by the authoritative
-        // ingestion worker.
+        // Safety: validate that the ingestion_run's target address matches the
+        // caller-supplied wallet so we never project another wallet's Bronze
+        // rows into this wallet's ledger/silver data.
+        if let Some(irun) = repo.get_ingestion_run(run_id).await? {
+            if let Some(tid) = irun.target_id {
+                if let Ok(Some(target)) = repo.get_index_target(tid).await {
+                    let target_addr = target.address.unwrap_or_default();
+                    if !target_addr.is_empty()
+                        && target_addr.to_lowercase() != wallet.to_lowercase()
+                    {
+                        anyhow::bail!(
+                            "ingestion_run {} belongs to target wallet {}, not {}",
+                            run_id,
+                            target_addr,
+                            wallet
+                        );
+                    }
+                }
+            }
+        }
+
         let raw_txs = repo.get_raw_transactions_by_run(run_id).await?;
         if raw_txs.is_empty() {
-            // No raw transactions for this run — likely the run was created but
-            // raw_transactions were not stamped with this run_id (e.g. run creation
-            // failed transiently). Fall back to legacy path rather than silently
-            // reporting success with zero records.
+            // Empty Bronze range is a valid outcome (e.g. zero new transactions
+            // for this ingestion). Return empty vec — do NOT fall back to the
+            // legacy wallet scan, which would rematerialize stale historical
+            // data and produce duplicate ledger/silver output.
             info!(
                 run_id = %run_id,
-                "Bronze-driven materialization: no raw transactions found for run, falling back to wallet scan"
+                "Bronze-driven materialization: no raw transactions found for run, returning 0 records"
             );
-            repo.get_transactions_by_wallet(wallet).await?
+            Vec::new()
         } else {
             info!(
                 run_id = %run_id,
