@@ -291,30 +291,42 @@ pub(crate) async fn execute_normalize(
     ingestion_run_id: Option<Uuid>,
     lease_lost: &CancellationToken,
 ) -> anyhow::Result<usize> {
+    // When Bronze-driven, we override the caller-supplied network with the
+    // ingestion run's authoritative network to prevent mismatches.
+    let mut effective_network: Option<String> = network.map(|s| s.to_string());
+
     let txs = if let Some(run_id) = ingestion_run_id {
         // Bronze-driven: fetch raw_transactions for this specific ingestion run
         // and convert V2 RawTransaction -> V1 Transaction for existing parsers.
         //
-        // Safety: validate that the ingestion_run's target address matches the
-        // caller-supplied wallet so we never project another wallet's Bronze
-        // rows into this wallet's ledger/silver data.
-        if let Some(irun) = repo.get_ingestion_run(run_id).await? {
-            if let Some(tid) = irun.target_id {
-                if let Ok(Some(target)) = repo.get_index_target(tid).await {
-                    let target_addr = target.address.unwrap_or_default();
-                    if !target_addr.is_empty()
-                        && target_addr.to_lowercase() != wallet.to_lowercase()
-                    {
-                        anyhow::bail!(
-                            "ingestion_run {} belongs to target wallet {}, not {}",
-                            run_id,
-                            target_addr,
-                            wallet
-                        );
-                    }
-                }
+        // Safety: validate that the ingestion_run exists and its target address
+        // matches the caller-supplied wallet. Fail-closed: if any lookup fails
+        // or the run/target is missing, we bail rather than silently proceeding.
+        let irun = repo
+            .get_ingestion_run(run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("ingestion_run {} not found", run_id))?;
+        if let Some(tid) = irun.target_id {
+            let target = repo.get_index_target(tid).await?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "index_target {} for ingestion_run {} not found",
+                    tid,
+                    run_id
+                )
+            })?;
+            let target_addr = target.address.unwrap_or_default();
+            if !target_addr.is_empty() && !addrs_match(&target_addr, wallet) {
+                anyhow::bail!(
+                    "ingestion_run {} belongs to target wallet {}, not {}",
+                    run_id,
+                    target_addr,
+                    wallet
+                );
             }
         }
+
+        // Override network with the ingestion run's authoritative value.
+        effective_network = Some(irun.network.clone());
 
         let raw_txs = repo.get_raw_transactions_by_run(run_id).await?;
         if raw_txs.is_empty() {
@@ -376,8 +388,20 @@ pub(crate) async fn execute_normalize(
         anyhow::bail!("lease lost before Silver materialization");
     }
 
-    repo.materialize_silver_datasets(&txs, network).await;
+    repo.materialize_silver_datasets(&txs, effective_network.as_deref())
+        .await;
     Ok(count)
+}
+
+/// Chain-aware address comparison: case-insensitive for EVM (0x-prefixed),
+/// exact match for everything else (Solana base58 is case-sensitive).
+fn addrs_match(a: &str, b: &str) -> bool {
+    let is_evm = a.starts_with("0x") || a.starts_with("0X");
+    if is_evm {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
 }
 
 /// Derive the V1 `Chain` enum from a V2 network ID.

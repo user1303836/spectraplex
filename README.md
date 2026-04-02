@@ -25,7 +25,7 @@ cargo run --bin spectraplex-cli -- --db-url postgresql://localhost/spectraplex i
   --chain solana --wallet <WALLET_ADDRESS> --rpc https://api.mainnet-beta.solana.com --limit 10
 ```
 
-Requires Rust (stable) and PostgreSQL 14+. Docker handles Postgres if you don't have one running.
+Requires Rust (stable) and PostgreSQL 15+. Docker handles Postgres if you don't have one running.
 
 ## Features
 

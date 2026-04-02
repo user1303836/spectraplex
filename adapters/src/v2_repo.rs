@@ -4139,6 +4139,10 @@ impl Repository {
     }
 
     /// Upsert watermark after successful materialization.
+    ///
+    /// Uses a monotonicity guard: the watermark is only advanced when the new
+    /// `last_processed_at` (NOW()) is newer than the existing one. Two concurrent
+    /// runs that complete out of order will therefore not regress the watermark.
     pub async fn upsert_dataset_watermark(
         &self,
         dataset_name: &str,
@@ -4154,7 +4158,9 @@ impl Repository {
                  last_ingestion_run_id = COALESCE(EXCLUDED.last_ingestion_run_id, dataset_watermarks.last_ingestion_run_id), \
                  last_raw_transaction_id = COALESCE(EXCLUDED.last_raw_transaction_id, dataset_watermarks.last_raw_transaction_id), \
                  last_processed_at = NOW(), \
-                 updated_at = NOW()",
+                 updated_at = NOW() \
+             WHERE dataset_watermarks.last_processed_at IS NULL \
+                OR dataset_watermarks.last_processed_at < NOW()",
         )
         .bind(dataset_name)
         .bind(scope)

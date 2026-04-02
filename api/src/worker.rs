@@ -160,15 +160,15 @@ async fn execute_job(
                     None,
                 )
                 .await;
-            // Mark job complete.
+            // Mark job complete. If this fails (e.g. lease reclaimed), do NOT
+            // proceed to auto-enqueue materialization — the new owner will handle it.
             if let Err(e) = repo.complete_ingestion_job(job_id, worker_id).await {
-                error!(job_id = %job_id, error = %e, "Failed to mark job completed");
-            }
-            // Auto-trigger materialization on successful ingestion.
-            // Only enqueue a Bronze-driven run if the ingestion_run was actually
-            // created — otherwise raw_transactions won't carry this run_id and
-            // the materialize worker would find zero rows.
-            if run_created {
+                error!(job_id = %job_id, error = %e, "Failed to mark job completed — skipping auto-materialization");
+            } else if run_created {
+                // Auto-trigger materialization on successful ingestion.
+                // Only enqueue a Bronze-driven run if the ingestion_run was actually
+                // created — otherwise raw_transactions won't carry this run_id and
+                // the materialize worker would find zero rows.
                 if let Some(tid) = job.target_id {
                     match repo.get_index_target(tid).await {
                         Ok(Some(target)) => {
@@ -200,7 +200,7 @@ async fn execute_job(
                         }
                     }
                 }
-            } // if run_created
+            }
 
             // Fire callback if present.
             if let Some(ref url) = job.callback_url {

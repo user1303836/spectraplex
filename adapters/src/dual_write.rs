@@ -172,8 +172,13 @@ pub fn v2_raw_to_v1_tx(
     chain: Chain,
     user_id: Option<Uuid>,
 ) -> Transaction {
+    // Derive a deterministic V1 id from (raw_transaction_id, wallet) so that
+    // retries/replays of the same Bronze data produce the same Transaction.id.
+    // This prevents duplicate ledger rows when save_ledger_entries dedupes
+    // on ON CONFLICT (id) DO NOTHING.
+    let id_seed = format!("{}:{}", raw.id, wallet);
     Transaction {
-        id: Uuid::new_v4(),
+        id: Uuid::new_v5(&Uuid::NAMESPACE_URL, id_seed.as_bytes()),
         user_id: user_id.unwrap_or_else(|| Uuid::new_v5(&Uuid::NAMESPACE_URL, wallet.as_bytes())),
         wallet_address: wallet.to_string(),
         timestamp: raw.timestamp,
