@@ -426,6 +426,14 @@ pub(crate) async fn execute_normalize(
         anyhow::bail!("lease lost before persisting side effects");
     }
 
+    // When Bronze-driven, the V1 `transactions` rows don't exist yet — we
+    // synthesized them from RawTransaction. Persist them so downstream joins
+    // (ledger_entries.transaction_id -> transactions.id) work correctly.
+    // Uses ON CONFLICT DO NOTHING so this is idempotent.
+    if ingestion_run_id.is_some() && !txs.is_empty() {
+        repo.save_transactions(&txs).await?;
+    }
+
     let count = all_entries.len();
     repo.save_ledger_entries(&all_entries).await?;
 
