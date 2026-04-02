@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::fire_callback;
+use spectraplex_adapters::dual_write::v2_raw_to_v1_tx;
 use spectraplex_adapters::{evm_parser, hyperliquid_parser, repo::Repository, solana_parser};
 use spectraplex_core::models::Chain;
 use tokio::sync::Semaphore;
@@ -86,8 +87,8 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
 
         info!(run_id = %run.id, worker_id = %worker_id, "Claimed materialization run");
 
-        // Extract wallet, network, and callback_url from scope JSON.
-        let (wallet, network, callback_url) = match &run.scope {
+        // Extract wallet, network, callback_url, and optional ingestion_run_id from scope JSON.
+        let (wallet, network, callback_url, ingestion_run_id) = match &run.scope {
             Some(scope) => {
                 let w = scope
                     .get("wallet")
@@ -102,7 +103,11 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
                     .get("callback_url")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                (w, n, cb)
+                let run_id = scope
+                    .get("ingestion_run_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok());
+                (w, n, cb, run_id)
             }
             None => {
                 let _ = repo
@@ -160,8 +165,14 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
 
             // Execute normalize work — pass lease_lost so side effects are
             // skipped if the lease is reclaimed mid-execution.
-            let result =
-                execute_normalize(&task_repo, &wallet, network.as_deref(), &lease_lost).await;
+            let result = execute_normalize(
+                &task_repo,
+                &wallet,
+                network.as_deref(),
+                ingestion_run_id,
+                &lease_lost,
+            )
+            .await;
 
             // Check lease_lost BEFORE writing terminal state. If the lease was
             // lost (either detected by heartbeat or by execute_normalize's own
@@ -184,6 +195,25 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
                         .await
                     {
                         Ok(()) => {
+                            // Upsert dataset watermark after successful materialization.
+                            if let Some(irun_id) = ingestion_run_id {
+                                let scope_json = serde_json::json!({
+                                    "network": network,
+                                    "wallet": wallet,
+                                });
+                                if let Err(e) = task_repo
+                                    .upsert_dataset_watermark(
+                                        "normalize",
+                                        Some(&scope_json),
+                                        Some(irun_id),
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    warn!(run_id = %run_id, error = %e, "Failed to upsert dataset watermark (non-fatal)");
+                                }
+                            }
+
                             // Terminal write succeeded — safe to fire callback.
                             (
                                 Some("completed"),
@@ -258,9 +288,29 @@ pub(crate) async fn execute_normalize(
     repo: &Repository,
     wallet: &str,
     network: Option<&str>,
+    ingestion_run_id: Option<Uuid>,
     lease_lost: &CancellationToken,
 ) -> anyhow::Result<usize> {
-    let txs = repo.get_transactions_by_wallet(wallet).await?;
+    let txs = if let Some(run_id) = ingestion_run_id {
+        // Bronze-driven: fetch raw_transactions for this specific ingestion run
+        // and convert V2 RawTransaction -> V1 Transaction for existing parsers.
+        let raw_txs = repo.get_raw_transactions_by_run(run_id).await?;
+        info!(
+            run_id = %run_id,
+            raw_count = raw_txs.len(),
+            "Bronze-driven materialization: fetched raw transactions"
+        );
+        raw_txs
+            .iter()
+            .filter_map(|r| {
+                let chain = network_to_chain(&r.network).ok()?;
+                Some(v2_raw_to_v1_tx(r, wallet, chain, None))
+            })
+            .collect()
+    } else {
+        // Legacy fallback: wallet-scoped V1 scan
+        repo.get_transactions_by_wallet(wallet).await?
+    };
 
     let mut all_entries = Vec::new();
     for tx in &txs {
@@ -294,4 +344,16 @@ pub(crate) async fn execute_normalize(
 
     repo.materialize_silver_datasets(&txs, network).await;
     Ok(count)
+}
+
+/// Derive the V1 `Chain` enum from a V2 network ID.
+fn network_to_chain(network: &str) -> anyhow::Result<Chain> {
+    if network.starts_with("solana") {
+        Ok(Chain::Solana)
+    } else if network.starts_with("hypercore") || network.starts_with("hyperliquid") {
+        Ok(Chain::Hyperliquid)
+    } else {
+        // Everything else is EVM (ethereum, base, arbitrum, polygon, etc.)
+        Ok(Chain::Ethereum)
+    }
 }

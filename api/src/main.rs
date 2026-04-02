@@ -516,6 +516,10 @@ struct NormalizeRequest {
     /// Bronze `raw_transactions` rows.
     network: Option<String>,
     callback_url: Option<String>,
+    /// Optional ingestion run ID. When provided, the materialize worker uses
+    /// Bronze-range-driven execution — fetching raw_transactions for that
+    /// specific run instead of the legacy wallet-scoped V1 scan.
+    ingestion_run_id: Option<Uuid>,
 }
 
 const DEFAULT_PAGE_LIMIT: i64 = 50;
@@ -1343,6 +1347,7 @@ async fn trigger_normalize(
         "wallet": &payload.wallet,
         "network": payload.network,
         "callback_url": payload.callback_url,
+        "ingestion_run_id": payload.ingestion_run_id,
     });
 
     // Enqueue only — the background materialize_worker will claim and execute.

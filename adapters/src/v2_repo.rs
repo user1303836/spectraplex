@@ -11,8 +11,8 @@ use spectraplex_core::materializer::{
 };
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
-    DatasetVersionStatus, EvmTraceType, ExportJob, ExportJobStatus, IndexTarget, IngestionJob,
-    IngestionJobMode, IngestionJobStatus, IngestionRun, MaterializationRun,
+    DatasetVersionStatus, DatasetWatermark, EvmTraceType, ExportJob, ExportJobStatus, IndexTarget,
+    IngestionJob, IngestionJobMode, IngestionJobStatus, IngestionRun, MaterializationRun,
     MaterializationRunStatus, Network, RawEvmTrace, RawTransaction, StreamActualStatus,
     StreamDesiredStatus, StreamSource, StreamSubscription, TargetKind, TargetMatch, TargetMode,
 };
@@ -4114,6 +4114,69 @@ impl Repository {
         .await?;
         rows.iter().map(row_to_materialization_run).collect()
     }
+
+    // -----------------------------------------------------------------------
+    // Dataset Watermarks
+    // -----------------------------------------------------------------------
+
+    /// Get the watermark for a dataset + scope combination.
+    pub async fn get_dataset_watermark(
+        &self,
+        dataset_name: &str,
+        scope: Option<&serde_json::Value>,
+    ) -> anyhow::Result<Option<DatasetWatermark>> {
+        let row = sqlx::query(
+            "SELECT id, dataset_name, scope, last_ingestion_run_id, last_raw_transaction_id, \
+             last_processed_at, created_at, updated_at \
+             FROM dataset_watermarks \
+             WHERE dataset_name = $1 AND scope IS NOT DISTINCT FROM $2",
+        )
+        .bind(dataset_name)
+        .bind(scope)
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref().map(row_to_dataset_watermark).transpose()
+    }
+
+    /// Upsert watermark after successful materialization.
+    pub async fn upsert_dataset_watermark(
+        &self,
+        dataset_name: &str,
+        scope: Option<&serde_json::Value>,
+        last_run_id: Option<Uuid>,
+        last_raw_tx_id: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO dataset_watermarks \
+             (dataset_name, scope, last_ingestion_run_id, last_raw_transaction_id, last_processed_at) \
+             VALUES ($1, $2, $3, $4, NOW()) \
+             ON CONFLICT (dataset_name, scope) DO UPDATE SET \
+                 last_ingestion_run_id = COALESCE(EXCLUDED.last_ingestion_run_id, dataset_watermarks.last_ingestion_run_id), \
+                 last_raw_transaction_id = COALESCE(EXCLUDED.last_raw_transaction_id, dataset_watermarks.last_raw_transaction_id), \
+                 last_processed_at = NOW(), \
+                 updated_at = NOW()",
+        )
+        .bind(dataset_name)
+        .bind(scope)
+        .bind(last_run_id)
+        .bind(last_raw_tx_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+}
+
+fn row_to_dataset_watermark(row: &sqlx::postgres::PgRow) -> anyhow::Result<DatasetWatermark> {
+    Ok(DatasetWatermark {
+        id: row.try_get("id")?,
+        dataset_name: row.try_get("dataset_name")?,
+        scope: row.try_get("scope")?,
+        last_ingestion_run_id: row.try_get("last_ingestion_run_id")?,
+        last_raw_transaction_id: row.try_get("last_raw_transaction_id")?,
+        last_processed_at: row.try_get("last_processed_at")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
 }
 
 // ---------------------------------------------------------------------------

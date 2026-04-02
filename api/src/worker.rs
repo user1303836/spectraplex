@@ -164,6 +164,39 @@ async fn execute_job(
             if let Err(e) = repo.complete_ingestion_job(job_id, worker_id).await {
                 error!(job_id = %job_id, error = %e, "Failed to mark job completed");
             }
+            // Auto-trigger materialization on successful ingestion.
+            if let Some(tid) = job.target_id {
+                match repo.get_index_target(tid).await {
+                    Ok(Some(target)) => {
+                        let mat_scope = serde_json::json!({
+                            "wallet": target.address.unwrap_or_default(),
+                            "network": &job.network,
+                            "ingestion_run_id": run_id.to_string(),
+                        });
+                        if let Err(e) = repo
+                            .create_materialization_run(
+                                "normalize",
+                                Some(&mat_scope),
+                                None,
+                                None,
+                                None,
+                            )
+                            .await
+                        {
+                            warn!(job_id = %job_id, error = %e, "Failed to enqueue post-ingest materialization (non-fatal)");
+                        } else {
+                            info!(job_id = %job_id, "Enqueued post-ingest materialization run");
+                        }
+                    }
+                    Ok(None) => {
+                        warn!(job_id = %job_id, target_id = %tid, "Index target not found for post-ingest materialization");
+                    }
+                    Err(e) => {
+                        warn!(job_id = %job_id, error = %e, "Failed to fetch index target for post-ingest materialization");
+                    }
+                }
+            }
+
             // Fire callback if present.
             if let Some(ref url) = job.callback_url {
                 let payload = serde_json::json!({
