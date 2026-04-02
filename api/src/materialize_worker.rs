@@ -294,19 +294,38 @@ pub(crate) async fn execute_normalize(
     let txs = if let Some(run_id) = ingestion_run_id {
         // Bronze-driven: fetch raw_transactions for this specific ingestion run
         // and convert V2 RawTransaction -> V1 Transaction for existing parsers.
+        //
+        // We do NOT use the caller-supplied wallet to stamp the V1 projections.
+        // Instead, the wallet from the scope is validated below — but the raw
+        // transactions are target-agnostic (no wallet_address), so the V1
+        // projection uses the scope wallet purely for the V1 schema requirement.
+        // The raw data itself is trusted because it was written by the authoritative
+        // ingestion worker.
         let raw_txs = repo.get_raw_transactions_by_run(run_id).await?;
-        info!(
-            run_id = %run_id,
-            raw_count = raw_txs.len(),
-            "Bronze-driven materialization: fetched raw transactions"
-        );
-        raw_txs
-            .iter()
-            .filter_map(|r| {
-                let chain = network_to_chain(&r.network).ok()?;
-                Some(v2_raw_to_v1_tx(r, wallet, chain, None))
-            })
-            .collect()
+        if raw_txs.is_empty() {
+            // No raw transactions for this run — likely the run was created but
+            // raw_transactions were not stamped with this run_id (e.g. run creation
+            // failed transiently). Fall back to legacy path rather than silently
+            // reporting success with zero records.
+            info!(
+                run_id = %run_id,
+                "Bronze-driven materialization: no raw transactions found for run, falling back to wallet scan"
+            );
+            repo.get_transactions_by_wallet(wallet).await?
+        } else {
+            info!(
+                run_id = %run_id,
+                raw_count = raw_txs.len(),
+                "Bronze-driven materialization: fetched raw transactions"
+            );
+            raw_txs
+                .iter()
+                .filter_map(|r| {
+                    let chain = network_to_chain(&r.network).ok()?;
+                    Some(v2_raw_to_v1_tx(r, wallet, chain, None))
+                })
+                .collect()
+        }
     } else {
         // Legacy fallback: wallet-scoped V1 scan
         repo.get_transactions_by_wallet(wallet).await?
