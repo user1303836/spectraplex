@@ -13,13 +13,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::collections::HashSet;
+
+use spectraplex_adapters::dual_write::{build_target_matches, v1_tx_to_v2_raw};
 use spectraplex_adapters::hyperliquid_ws::HyperliquidWsClient;
 use spectraplex_adapters::repo::Repository;
 use spectraplex_adapters::solana_grpc::SolanaGrpcAdapter;
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::models::{Chain, Transaction};
 use spectraplex_core::provider::{NetworkContext, NetworkId, ProviderCapability, ProviderRegistry};
-use spectraplex_core::v2::{StreamSource, StreamSubscription};
+use spectraplex_core::v2::{RawTransaction, StreamSource, StreamSubscription};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -285,10 +288,9 @@ async fn run_solana_grpc_stream(
                         batch.push(tx);
                         tx_count += 1;
 
-                        if batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL {
-                            if let Err(e) = repo.save_transactions(&batch).await {
-                                error!(subscription_id = %sub_id, error = %e, "Failed to save streamed transactions");
-                            }
+                        if (batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL)
+                            && flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id).await
+                        {
                             batch.clear();
                             last_flush = tokio::time::Instant::now();
 
@@ -311,9 +313,7 @@ async fn run_solana_grpc_stream(
 
                         // Flush remaining batch before failing
                         if !batch.is_empty() {
-                            if let Err(e) = repo.save_transactions(&batch).await {
-                                error!(subscription_id = %sub_id, error = %e, "Failed to flush final batch");
-                            }
+                            flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id).await;
                             let cursor = serde_json::json!({
                                 "tx_count": tx_count,
                                 "last_slot": last_slot,
@@ -330,9 +330,7 @@ async fn run_solana_grpc_stream(
 
     // Flush remaining batch
     if !batch.is_empty() {
-        if let Err(e) = repo.save_transactions(&batch).await {
-            error!(subscription_id = %sub_id, error = %e, "Failed to flush final batch");
-        }
+        flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id).await;
         let cursor = serde_json::json!({
             "tx_count": tx_count,
             "last_slot": last_slot,
@@ -460,10 +458,9 @@ async fn run_hyperliquid_ws_stream(
                         batch.push(tx);
                         tx_count += 1;
 
-                        if batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL {
-                            if let Err(e) = repo.save_transactions(&batch).await {
-                                error!(subscription_id = %sub_id, error = %e, "Failed to save HL stream batch");
-                            }
+                        if (batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL)
+                            && flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id).await
+                        {
                             batch.clear();
                             last_flush = tokio::time::Instant::now();
 
@@ -483,9 +480,7 @@ async fn run_hyperliquid_ws_stream(
 
                         // Flush remaining batch before failing
                         if !batch.is_empty() {
-                            if let Err(e) = repo.save_transactions(&batch).await {
-                                error!(subscription_id = %sub_id, error = %e, "Failed to flush final HL batch");
-                            }
+                            flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id).await;
                             let cursor = serde_json::json!({ "tx_count": tx_count });
                             let _ = repo.update_stream_cursor(sub_id, &cursor).await;
                         }
@@ -499,15 +494,97 @@ async fn run_hyperliquid_ws_stream(
 
     // Flush remaining batch
     if !batch.is_empty() {
-        if let Err(e) = repo.save_transactions(&batch).await {
-            error!(subscription_id = %sub_id, error = %e, "Failed to flush final HL batch");
-        }
+        flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id).await;
         let cursor = serde_json::json!({ "tx_count": tx_count });
         let _ = repo.update_stream_cursor(sub_id, &cursor).await;
     }
 
     ws_handle.abort();
     Ok(())
+}
+
+/// Flush a batch of V1 transactions using the V2-first dual-write pattern.
+///
+/// 1. Convert V1 → V2 `RawTransaction`, dedup by (network, tx_hash)
+/// 2. Upsert into `raw_transactions` (authoritative V2 write)
+/// 3. Write `target_matches` if a target_id is present
+/// 4. Best-effort V1 compat via `save_transactions`
+///
+/// Returns `true` if the V2 upsert succeeded (callers should clear the batch),
+/// `false` if it failed (callers should retain the batch for retry).
+async fn flush_stream_batch(
+    repo: &Repository,
+    batch: &[Transaction],
+    network: &str,
+    source: &str,
+    target_id: Option<Uuid>,
+    sub_id: Uuid,
+) -> bool {
+    if batch.is_empty() {
+        return true;
+    }
+
+    // V2 authoritative
+    let v2_batch: Vec<RawTransaction> = batch
+        .iter()
+        .map(|tx| {
+            let mut raw = v1_tx_to_v2_raw(tx, Some(network));
+            raw.source = source.to_string();
+            raw
+        })
+        .collect();
+    let mut seen = HashSet::new();
+    let v2_deduped: Vec<RawTransaction> = v2_batch
+        .into_iter()
+        .filter(|r| seen.insert((r.network.clone(), r.tx_hash.clone())))
+        .collect();
+
+    match repo
+        .upsert_raw_transactions_returning_ids(&v2_deduped)
+        .await
+    {
+        Ok(canonical_ids) => {
+            if let Some(tid) = target_id {
+                let matches = build_target_matches(tid, &canonical_ids);
+                if let Err(e) = repo.save_target_matches(&matches).await {
+                    error!(
+                        subscription_id = %sub_id,
+                        error = %e,
+                        "Failed to save target matches"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            error!(
+                subscription_id = %sub_id,
+                error = %e,
+                "Failed to upsert V2 raw_transactions"
+            );
+
+            // V1 compat (best-effort) — still attempt even on V2 failure
+            if let Err(e) = repo.save_transactions(batch).await {
+                warn!(
+                    subscription_id = %sub_id,
+                    error = %e,
+                    "V1 compat: save_transactions failed (non-fatal)"
+                );
+            }
+
+            return false;
+        }
+    }
+
+    // V1 compat (best-effort)
+    if let Err(e) = repo.save_transactions(batch).await {
+        warn!(
+            subscription_id = %sub_id,
+            error = %e,
+            "V1 compat: save_transactions failed (non-fatal)"
+        );
+    }
+
+    true
 }
 
 /// Extract tx_count from cursor_state JSON, default 0.
