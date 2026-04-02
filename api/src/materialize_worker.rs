@@ -200,38 +200,44 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
                             // from the ingestion run so watermarks don't fork across EVM
                             // case variants or caller-supplied mismatches.
                             if let Some(irun_id) = ingestion_run_id {
-                                let (wm_wallet, wm_network) =
-                                    match task_repo.get_ingestion_run(irun_id).await {
-                                        Ok(Some(irun)) => {
-                                            let w = if let Some(tid) = irun.target_id {
-                                                task_repo
-                                                    .get_index_target(tid)
-                                                    .await
-                                                    .ok()
-                                                    .flatten()
-                                                    .and_then(|t| t.address)
-                                                    .unwrap_or_else(|| wallet.clone())
-                                            } else {
-                                                wallet.clone()
-                                            };
-                                            (w, Some(irun.network.clone()))
-                                        }
-                                        _ => (wallet.clone(), network.clone()),
-                                    };
-                                let scope_json = serde_json::json!({
-                                    "network": wm_network,
-                                    "wallet": wm_wallet,
-                                });
-                                if let Err(e) = task_repo
-                                    .upsert_dataset_watermark(
-                                        "normalize",
-                                        Some(&scope_json),
-                                        Some(irun_id),
-                                        None,
-                                    )
-                                    .await
-                                {
-                                    warn!(run_id = %run_id, error = %e, "Failed to upsert dataset watermark (non-fatal)");
+                                // Resolve authoritative wallet/network from the
+                                // ingestion run. Skip the watermark entirely if
+                                // the lookup fails — we must not write a watermark
+                                // under non-authoritative scope values.
+                                let wm_resolved = match task_repo.get_ingestion_run(irun_id).await {
+                                    Ok(Some(irun)) => {
+                                        let w = if let Some(tid) = irun.target_id {
+                                            task_repo
+                                                .get_index_target(tid)
+                                                .await
+                                                .ok()
+                                                .flatten()
+                                                .and_then(|t| t.address)
+                                        } else {
+                                            None
+                                        };
+                                        w.map(|wallet_addr| (wallet_addr, irun.network.clone()))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((wm_wallet, wm_network)) = wm_resolved {
+                                    let scope_json = serde_json::json!({
+                                        "network": wm_network,
+                                        "wallet": wm_wallet,
+                                    });
+                                    if let Err(e) = task_repo
+                                        .upsert_dataset_watermark(
+                                            "normalize",
+                                            Some(&scope_json),
+                                            Some(irun_id),
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        warn!(run_id = %run_id, error = %e, "Failed to upsert dataset watermark (non-fatal)");
+                                    }
+                                } else {
+                                    warn!(run_id = %run_id, "Could not resolve authoritative scope for watermark — skipping");
                                 }
                             }
 
