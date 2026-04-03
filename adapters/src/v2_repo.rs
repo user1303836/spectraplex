@@ -4,6 +4,16 @@
 //! `Repository` value they already hold for V1 wallet-scoped queries.
 
 use chrono::{DateTime, Utc};
+
+/// V2-backed wallet statistics returned by `get_wallet_stats_v2`.
+pub struct WalletStatsV2 {
+    pub tx_count: i64,
+    pub earliest_timestamp: Option<i64>,
+    pub latest_timestamp: Option<i64>,
+    pub network_count: i64,
+    pub unique_assets: i64,
+    pub per_network: Vec<(String, i64)>,
+}
 use spectraplex_core::materializer::{
     BalanceSnapshot, DatasetName, DecodedEvent, HlFillRecord, HlFundingPayment, HlPnlSummary,
     HlPositionChange, HlTradeHistory, NativeBalanceDelta, PoolSnapshot, ProtocolEvent,
@@ -4113,6 +4123,236 @@ impl Repository {
         .fetch_all(self.pool())
         .await?;
         rows.iter().map(row_to_materialization_run).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // V2-backed wallet reads (Workstream F compatibility cutover)
+    // -----------------------------------------------------------------------
+
+    /// Fetch transactions for a wallet from V2 Bronze (raw_transactions + target_matches).
+    /// Returns V2 RawTransaction rows matched to the wallet's target(s).
+    pub async fn get_wallet_transactions_v2(
+        &self,
+        wallet: &str,
+        limit: i64,
+        offset: i64,
+        from: Option<i64>,
+        to: Option<i64>,
+    ) -> anyhow::Result<Vec<RawTransaction>> {
+        let mut sql = String::from(
+            "SELECT DISTINCT rt.id, rt.network, rt.tx_hash, rt.timestamp, rt.block_number, \
+             rt.raw_metadata, rt.source, rt.ingestion_run_id, rt.ingested_at \
+             FROM raw_transactions rt \
+             JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
+             JOIN index_targets it ON it.id = tm.target_id \
+             WHERE it.address = $1 AND it.kind = 'wallet'",
+        );
+        let mut args = sqlx::postgres::PgArguments::default();
+        use sqlx::Arguments;
+        args.add(wallet.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut n: usize = 1;
+
+        if let Some(start) = from {
+            n += 1;
+            sql.push_str(&format!(" AND rt.timestamp >= ${n}"));
+            args.add(start).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        if let Some(end) = to {
+            n += 1;
+            sql.push_str(&format!(" AND rt.timestamp <= ${n}"));
+            args.add(end).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+
+        n += 1;
+        let lim_n = n;
+        n += 1;
+        let off_n = n;
+        sql.push_str(&format!(
+            " ORDER BY rt.timestamp ASC LIMIT ${lim_n} OFFSET ${off_n}"
+        ));
+        args.add(limit).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(offset).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_raw_transaction).collect()
+    }
+
+    /// Fetch a single transaction by wallet + tx_hash from V2 Bronze.
+    pub async fn get_wallet_transaction_by_hash_v2(
+        &self,
+        wallet: &str,
+        tx_hash: &str,
+    ) -> anyhow::Result<Option<RawTransaction>> {
+        let row = sqlx::query(
+            "SELECT DISTINCT rt.id, rt.network, rt.tx_hash, rt.timestamp, rt.block_number, \
+             rt.raw_metadata, rt.source, rt.ingestion_run_id, rt.ingested_at \
+             FROM raw_transactions rt \
+             JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
+             JOIN index_targets it ON it.id = tm.target_id \
+             WHERE it.address = $1 AND it.kind = 'wallet' AND rt.tx_hash = $2",
+        )
+        .bind(wallet)
+        .bind(tx_hash)
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref().map(row_to_raw_transaction).transpose()
+    }
+
+    /// Fetch ledger entries for a wallet from V2 wallet_ledger.
+    pub async fn get_wallet_ledger_v2(
+        &self,
+        wallet: &str,
+        limit: i64,
+        offset: i64,
+        from: Option<i64>,
+        to: Option<i64>,
+    ) -> anyhow::Result<Vec<WalletLedgerRecord>> {
+        let mut sql = String::from(
+            "SELECT id, raw_transaction_id, wallet_address, network, tx_hash, \
+             timestamp, entry_type, asset_symbol, amount, counterparty_address, \
+             fee_amount, fee_asset, cost_basis, proceeds, dataset_version_id, created_at \
+             FROM wallet_ledger WHERE wallet_address = $1",
+        );
+        let mut args = sqlx::postgres::PgArguments::default();
+        use sqlx::Arguments;
+        args.add(wallet.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut n: usize = 1;
+
+        if let Some(start) = from {
+            n += 1;
+            sql.push_str(&format!(" AND timestamp >= ${n}"));
+            args.add(start).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        if let Some(end) = to {
+            n += 1;
+            sql.push_str(&format!(" AND timestamp <= ${n}"));
+            args.add(end).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+
+        n += 1;
+        let lim_n = n;
+        n += 1;
+        let off_n = n;
+        sql.push_str(&format!(
+            " ORDER BY timestamp ASC LIMIT ${lim_n} OFFSET ${off_n}"
+        ));
+        args.add(limit).map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(offset).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_wallet_ledger_record).collect()
+    }
+
+    /// Aggregate current balances for a wallet from V2 wallet_ledger.
+    /// Optionally filter by point-in-time timestamp.
+    pub async fn get_wallet_balances_v2(
+        &self,
+        wallet: &str,
+        at: Option<i64>,
+    ) -> anyhow::Result<Vec<(String, bigdecimal::BigDecimal)>> {
+        let rows = if let Some(at_ts) = at {
+            sqlx::query(
+                "SELECT asset_symbol, SUM(amount) as balance \
+                 FROM wallet_ledger \
+                 WHERE wallet_address = $1 AND timestamp <= $2 \
+                 GROUP BY asset_symbol HAVING SUM(amount) != 0 \
+                 ORDER BY asset_symbol",
+            )
+            .bind(wallet)
+            .bind(at_ts)
+            .fetch_all(self.pool())
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT asset_symbol, SUM(amount) as balance \
+                 FROM wallet_ledger \
+                 WHERE wallet_address = $1 \
+                 GROUP BY asset_symbol HAVING SUM(amount) != 0 \
+                 ORDER BY asset_symbol",
+            )
+            .bind(wallet)
+            .fetch_all(self.pool())
+            .await?
+        };
+
+        use sqlx::Row;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String, _>("asset_symbol")?,
+                    row.try_get::<bigdecimal::BigDecimal, _>("balance")?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Get wallet stats from V2 tables (raw_transactions + target_matches + wallet_ledger).
+    pub async fn get_wallet_stats_v2(&self, wallet: &str) -> anyhow::Result<WalletStatsV2> {
+        use sqlx::Row;
+
+        // Transaction counts from raw_transactions via target_matches
+        let tx_row = sqlx::query(
+            "SELECT COUNT(DISTINCT rt.id) AS tx_count, \
+                    MIN(rt.timestamp) AS earliest_timestamp, \
+                    MAX(rt.timestamp) AS latest_timestamp, \
+                    COUNT(DISTINCT rt.network) AS network_count \
+             FROM raw_transactions rt \
+             JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
+             JOIN index_targets it ON it.id = tm.target_id \
+             WHERE it.address = $1 AND it.kind = 'wallet'",
+        )
+        .bind(wallet)
+        .fetch_one(self.pool())
+        .await?;
+
+        let tx_count: i64 = tx_row.try_get("tx_count")?;
+        let earliest_timestamp: Option<i64> = tx_row.try_get("earliest_timestamp")?;
+        let latest_timestamp: Option<i64> = tx_row.try_get("latest_timestamp")?;
+        let network_count: i64 = tx_row.try_get("network_count")?;
+
+        // Unique assets from wallet_ledger
+        let asset_row = sqlx::query(
+            "SELECT COUNT(DISTINCT asset_symbol) AS unique_assets \
+             FROM wallet_ledger WHERE wallet_address = $1",
+        )
+        .bind(wallet)
+        .fetch_one(self.pool())
+        .await?;
+        let unique_assets: i64 = asset_row.try_get("unique_assets")?;
+
+        // Per-network counts
+        let net_rows = sqlx::query(
+            "SELECT rt.network, COUNT(DISTINCT rt.id) AS count \
+             FROM raw_transactions rt \
+             JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
+             JOIN index_targets it ON it.id = tm.target_id \
+             WHERE it.address = $1 AND it.kind = 'wallet' \
+             GROUP BY rt.network ORDER BY rt.network",
+        )
+        .bind(wallet)
+        .fetch_all(self.pool())
+        .await?;
+
+        let per_network: Vec<(String, i64)> = net_rows
+            .iter()
+            .map(|r| {
+                Ok((
+                    r.try_get::<String, _>("network")?,
+                    r.try_get::<i64, _>("count")?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        Ok(WalletStatsV2 {
+            tx_count,
+            earliest_timestamp,
+            latest_timestamp,
+            network_count,
+            unique_assets,
+            per_network,
+        })
     }
 
     // -----------------------------------------------------------------------

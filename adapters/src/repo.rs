@@ -28,7 +28,7 @@ fn entry_type_to_str(entry_type: &EntryType) -> &'static str {
     }
 }
 
-fn str_to_entry_type(s: &str) -> anyhow::Result<EntryType> {
+pub fn str_to_entry_type(s: &str) -> anyhow::Result<EntryType> {
     match s {
         "trade" => Ok(EntryType::Trade),
         "fee" => Ok(EntryType::Fee),
