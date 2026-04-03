@@ -317,8 +317,9 @@ async fn run_solana_grpc_stream(
                                 "tx_count": tx_count,
                                 "last_slot": last_slot,
                             });
-                            flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id, Some(&cursor)).await;
-                            let _ = repo.update_stream_cursor(sub_id, &cursor).await;
+                            if flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id, Some(&cursor)).await {
+                                let _ = repo.update_stream_cursor(sub_id, &cursor).await;
+                            }
                         }
                         grpc_handle.abort();
                         return Err(anyhow::anyhow!("gRPC stream channel closed unexpectedly"));
@@ -334,7 +335,7 @@ async fn run_solana_grpc_stream(
             "tx_count": tx_count,
             "last_slot": last_slot,
         });
-        flush_stream_batch(
+        if flush_stream_batch(
             repo,
             &batch,
             &sub.network,
@@ -343,8 +344,10 @@ async fn run_solana_grpc_stream(
             sub_id,
             Some(&cursor),
         )
-        .await;
-        let _ = repo.update_stream_cursor(sub_id, &cursor).await;
+        .await
+        {
+            let _ = repo.update_stream_cursor(sub_id, &cursor).await;
+        }
     }
 
     grpc_handle.abort();
@@ -489,8 +492,9 @@ async fn run_hyperliquid_ws_stream(
                         // Flush remaining batch before failing
                         if !batch.is_empty() {
                             let cursor = serde_json::json!({ "tx_count": tx_count });
-                            flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id, Some(&cursor)).await;
-                            let _ = repo.update_stream_cursor(sub_id, &cursor).await;
+                            if flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id, Some(&cursor)).await {
+                                let _ = repo.update_stream_cursor(sub_id, &cursor).await;
+                            }
                         }
                         ws_handle.abort();
                         return Err(anyhow::anyhow!("Hyperliquid WS stream closed (retries exhausted)"));
@@ -503,7 +507,7 @@ async fn run_hyperliquid_ws_stream(
     // Flush remaining batch
     if !batch.is_empty() {
         let cursor = serde_json::json!({ "tx_count": tx_count });
-        flush_stream_batch(
+        if flush_stream_batch(
             repo,
             &batch,
             &sub.network,
@@ -512,8 +516,10 @@ async fn run_hyperliquid_ws_stream(
             sub_id,
             Some(&cursor),
         )
-        .await;
-        let _ = repo.update_stream_cursor(sub_id, &cursor).await;
+        .await
+        {
+            let _ = repo.update_stream_cursor(sub_id, &cursor).await;
+        }
     }
 
     ws_handle.abort();
