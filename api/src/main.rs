@@ -24,7 +24,7 @@ use spectraplex_core::materializer::{
     ProtocolActivity, ProtocolEvent, SinkConfig, SinkType, TraderAnalytics, TvlAnalytics,
     WalletLedgerRecord,
 };
-use spectraplex_core::models::{Chain, LedgerEntry, Transaction};
+use spectraplex_core::models::{Chain, EntryType, LedgerEntry, Transaction};
 use spectraplex_core::provider::{
     chain_to_network_id, NetworkContext, NetworkId, ProviderCapability, ProviderRegistry,
 };
@@ -1152,6 +1152,18 @@ fn check_wallet_allowed(wallet: &str, allowed: &Option<HashSet<String>>) -> Resu
     Ok(())
 }
 
+/// Convert a V2 RawTransaction to a V1 Transaction for compatibility responses.
+fn raw_tx_to_compat_tx(raw: &spectraplex_core::v2::RawTransaction, wallet: &str) -> Transaction {
+    let chain = if raw.network.starts_with("solana") {
+        Chain::Solana
+    } else if raw.network.starts_with("hypercore") || raw.network.starts_with("hyperliquid") {
+        Chain::Hyperliquid
+    } else {
+        Chain::Ethereum
+    };
+    v2_raw_to_v1_tx(raw, wallet, chain, None)
+}
+
 async fn trigger_ingest(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<IngestRequest>,
@@ -1440,11 +1452,15 @@ async fn get_transactions(
     validate_date_range(params.from, params.to)?;
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
-    let txs = state
+    let raw_txs = state
         .repo
-        .get_transactions_by_wallet_filtered(&wallet, limit, offset, params.from, params.to)
+        .get_wallet_transactions_v2(&wallet, limit, offset, params.from, params.to)
         .await
         .map_err(AppError::internal)?;
+    let txs: Vec<Transaction> = raw_txs
+        .iter()
+        .map(|r| raw_tx_to_compat_tx(r, &wallet))
+        .collect();
     Ok(Json(txs))
 }
 
@@ -1458,11 +1474,24 @@ async fn get_ledger(
     validate_date_range(params.from, params.to)?;
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
-    let entries = state
+    let records = state
         .repo
-        .get_ledger_entries_by_wallet_filtered(&wallet, limit, offset, params.from, params.to)
+        .get_wallet_ledger_v2(&wallet, limit, offset, params.from, params.to)
         .await
         .map_err(AppError::internal)?;
+    let entries: Vec<LedgerEntry> = records
+        .into_iter()
+        .map(|r| LedgerEntry {
+            id: r.id,
+            transaction_id: r.raw_transaction_id.unwrap_or(r.id),
+            user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, wallet.as_bytes()),
+            wallet_address: r.wallet_address,
+            asset_symbol: r.asset_symbol,
+            amount: r.amount,
+            entry_type: str_to_entry_type(&r.entry_type).unwrap_or(EntryType::Transfer),
+            fiat_value: r.cost_basis,
+        })
+        .collect();
     Ok(Json(entries))
 }
 
@@ -1502,11 +1531,24 @@ async fn export_ledger(
         )));
     }
 
-    let entries = state
+    let records = state
         .repo
-        .get_ledger_entries_by_wallet_filtered(&wallet, MAX_EXPORT_LIMIT, 0, params.from, params.to)
+        .get_wallet_ledger_v2(&wallet, MAX_EXPORT_LIMIT, 0, params.from, params.to)
         .await
         .map_err(AppError::internal)?;
+    let entries: Vec<LedgerEntry> = records
+        .into_iter()
+        .map(|r| LedgerEntry {
+            id: r.id,
+            transaction_id: r.raw_transaction_id.unwrap_or(r.id),
+            user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, wallet.as_bytes()),
+            wallet_address: r.wallet_address,
+            asset_symbol: r.asset_symbol,
+            amount: r.amount,
+            entry_type: str_to_entry_type(&r.entry_type).unwrap_or(EntryType::Transfer),
+            fiat_value: r.cost_basis,
+        })
+        .collect();
 
     match format {
         "csv" => {
@@ -1559,7 +1601,7 @@ async fn get_balances(
     check_wallet_allowed(&wallet, &state.allowed_wallets)?;
     let rows = state
         .repo
-        .get_balances(&wallet, params.at)
+        .get_wallet_balances_v2(&wallet, params.at)
         .await
         .map_err(AppError::internal)?;
     let balances: Vec<AssetBalance> = rows
@@ -1579,14 +1621,14 @@ async fn get_single_transaction(
     validate_wallet(&wallet)?;
     check_wallet_allowed(&wallet, &state.allowed_wallets)?;
 
-    let tx = state
+    let raw = state
         .repo
-        .get_transaction_by_hash(&wallet, &tx_hash)
+        .get_wallet_transaction_by_hash_v2(&wallet, &tx_hash)
         .await
         .map_err(AppError::internal)?;
 
-    match tx {
-        Some(tx) => Ok(Json(tx)),
+    match raw {
+        Some(r) => Ok(Json(raw_tx_to_compat_tx(&r, &wallet))),
         None => Err(AppError::not_found("Transaction not found")),
     }
 }
@@ -1600,7 +1642,7 @@ async fn get_wallet_stats(
 
     let stats = state
         .repo
-        .get_wallet_stats(&wallet)
+        .get_wallet_stats_v2(&wallet)
         .await
         .map_err(AppError::internal)?;
 
@@ -1608,12 +1650,15 @@ async fn get_wallet_stats(
         total_transactions: stats.tx_count,
         earliest_timestamp: stats.earliest_timestamp,
         latest_timestamp: stats.latest_timestamp,
-        total_chains: stats.chain_count,
+        total_chains: stats.network_count,
         unique_assets: stats.unique_assets,
         transactions_per_chain: stats
-            .per_chain
+            .per_network
             .into_iter()
-            .map(|(chain, count)| ChainTxCount { chain, count })
+            .map(|(network, count)| ChainTxCount {
+                chain: network,
+                count,
+            })
             .collect(),
     }))
 }
