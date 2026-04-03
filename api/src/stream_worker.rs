@@ -298,9 +298,9 @@ async fn run_solana_grpc_stream(
                             if flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id, Some(&cursor)).await {
                                 batch.clear();
                                 last_flush = tokio::time::Instant::now();
-                            }
-                            if let Err(e) = repo.update_stream_cursor(sub_id, &cursor).await {
-                                warn!(subscription_id = %sub_id, error = %e, "Failed to update cursor");
+                                if let Err(e) = repo.update_stream_cursor(sub_id, &cursor).await {
+                                    warn!(subscription_id = %sub_id, error = %e, "Failed to update cursor");
+                                }
                             }
                         }
                     }
@@ -474,9 +474,9 @@ async fn run_hyperliquid_ws_stream(
                             if flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id, Some(&cursor)).await {
                                 batch.clear();
                                 last_flush = tokio::time::Instant::now();
-                            }
-                            if let Err(e) = repo.update_stream_cursor(sub_id, &cursor).await {
-                                warn!(subscription_id = %sub_id, error = %e, "Failed to update cursor");
+                                if let Err(e) = repo.update_stream_cursor(sub_id, &cursor).await {
+                                    warn!(subscription_id = %sub_id, error = %e, "Failed to update cursor");
+                                }
                             }
                         }
                     }
@@ -605,8 +605,11 @@ async fn flush_stream_batch(
                     );
                 }
 
-                // Upsert V2 checkpoint from cursor state so backfill can resume
-                // from where the stream left off.
+                // Upsert V2 checkpoint from stream cursor state. This records
+                // stream progress in the V2 checkpoint table under the stream's
+                // source (grpc/ws). Backfill uses different sources (rpc/rest)
+                // with different cursor schemas, so these checkpoints track
+                // stream-specific progress rather than enabling cross-source resume.
                 if let Some(cursor) = cursor_state {
                     let v2_cp = Checkpoint {
                         id: Uuid::new_v5(
@@ -641,28 +644,36 @@ async fn flush_stream_batch(
                     )
                     .await;
 
-                // Auto-trigger materialization for this flush batch.
+                // Auto-trigger materialization for wallet-type targets only.
+                // Global/program streams (e.g. __global_grpc_stream__) do not
+                // have a meaningful wallet address and should not trigger
+                // wallet-scoped normalize runs.
                 if let Some(tid) = target_id {
                     match repo.get_index_target(tid).await {
                         Ok(Some(target)) => {
-                            let mat_scope = serde_json::json!({
-                                "wallet": target.address.unwrap_or_default(),
-                                "network": network,
-                                "ingestion_run_id": run_id.to_string(),
-                            });
-                            if let Err(e) = repo
-                                .create_materialization_run(
-                                    "normalize",
-                                    Some(&mat_scope),
-                                    None,
-                                    None,
-                                    None,
-                                )
-                                .await
+                            let wallet = target.address.unwrap_or_default();
+                            if !wallet.is_empty()
+                                && target.kind == spectraplex_core::v2::TargetKind::Wallet
                             {
-                                warn!(subscription_id = %sub_id, error = %e, "Failed to enqueue post-stream materialization (non-fatal)");
-                            } else {
-                                info!(subscription_id = %sub_id, run_id = %run_id, "Enqueued post-stream materialization run");
+                                let mat_scope = serde_json::json!({
+                                    "wallet": wallet,
+                                    "network": network,
+                                    "ingestion_run_id": run_id.to_string(),
+                                });
+                                if let Err(e) = repo
+                                    .create_materialization_run(
+                                        "normalize",
+                                        Some(&mat_scope),
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    warn!(subscription_id = %sub_id, error = %e, "Failed to enqueue post-stream materialization (non-fatal)");
+                                } else {
+                                    info!(subscription_id = %sub_id, run_id = %run_id, "Enqueued post-stream materialization run");
+                                }
                             }
                         }
                         Ok(None) => {
