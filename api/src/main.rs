@@ -1488,8 +1488,11 @@ async fn get_ledger(
             wallet_address: r.wallet_address,
             asset_symbol: r.asset_symbol,
             amount: r.amount,
-            entry_type: str_to_entry_type(&r.entry_type).unwrap_or(EntryType::Transfer),
-            fiat_value: r.cost_basis,
+            entry_type: match r.entry_type.as_str() {
+                "funding" => EntryType::Fee,
+                other => str_to_entry_type(other).unwrap_or(EntryType::Transfer),
+            },
+            fiat_value: r.proceeds.or(r.cost_basis),
         })
         .collect();
     Ok(Json(entries))
@@ -1545,8 +1548,11 @@ async fn export_ledger(
             wallet_address: r.wallet_address,
             asset_symbol: r.asset_symbol,
             amount: r.amount,
-            entry_type: str_to_entry_type(&r.entry_type).unwrap_or(EntryType::Transfer),
-            fiat_value: r.cost_basis,
+            entry_type: match r.entry_type.as_str() {
+                "funding" => EntryType::Fee,
+                other => str_to_entry_type(other).unwrap_or(EntryType::Transfer),
+            },
+            fiat_value: r.proceeds.or(r.cost_basis),
         })
         .collect();
 

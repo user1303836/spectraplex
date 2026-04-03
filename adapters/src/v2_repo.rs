@@ -4145,7 +4145,7 @@ impl Repository {
              FROM raw_transactions rt \
              JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
              JOIN index_targets it ON it.id = tm.target_id \
-             WHERE it.address = $1",
+             WHERE it.address = $1 AND it.kind = 'wallet'",
         );
         let mut args = sqlx::postgres::PgArguments::default();
         use sqlx::Arguments;
@@ -4190,7 +4190,7 @@ impl Repository {
              FROM raw_transactions rt \
              JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
              JOIN index_targets it ON it.id = tm.target_id \
-             WHERE it.address = $1 AND rt.tx_hash = $2",
+             WHERE it.address = $1 AND it.kind = 'wallet' AND rt.tx_hash = $2",
         )
         .bind(wallet)
         .bind(tx_hash)
@@ -4301,7 +4301,7 @@ impl Repository {
              FROM raw_transactions rt \
              JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
              JOIN index_targets it ON it.id = tm.target_id \
-             WHERE it.address = $1",
+             WHERE it.address = $1 AND it.kind = 'wallet'",
         )
         .bind(wallet)
         .fetch_one(self.pool())
@@ -4328,7 +4328,7 @@ impl Repository {
              FROM raw_transactions rt \
              JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
              JOIN index_targets it ON it.id = tm.target_id \
-             WHERE it.address = $1 \
+             WHERE it.address = $1 AND it.kind = 'wallet' \
              GROUP BY rt.network ORDER BY rt.network",
         )
         .bind(wallet)
