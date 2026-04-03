@@ -22,7 +22,9 @@ use spectraplex_adapters::solana_grpc::SolanaGrpcAdapter;
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::models::{Chain, Transaction};
 use spectraplex_core::provider::{NetworkContext, NetworkId, ProviderCapability, ProviderRegistry};
-use spectraplex_core::v2::{RawTransaction, StreamSource, StreamSubscription};
+use spectraplex_core::v2::{
+    Checkpoint, IngestionRun, RawTransaction, StreamSource, StreamSubscription,
+};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -288,17 +290,15 @@ async fn run_solana_grpc_stream(
                         batch.push(tx);
                         tx_count += 1;
 
-                        if (batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL)
-                            && flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id).await
-                        {
-                            batch.clear();
-                            last_flush = tokio::time::Instant::now();
-
-                            // Update cursor state periodically
+                        if batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL {
                             let cursor = serde_json::json!({
                                 "tx_count": tx_count,
                                 "last_slot": last_slot,
                             });
+                            if flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id, Some(&cursor)).await {
+                                batch.clear();
+                                last_flush = tokio::time::Instant::now();
+                            }
                             if let Err(e) = repo.update_stream_cursor(sub_id, &cursor).await {
                                 warn!(subscription_id = %sub_id, error = %e, "Failed to update cursor");
                             }
@@ -313,11 +313,11 @@ async fn run_solana_grpc_stream(
 
                         // Flush remaining batch before failing
                         if !batch.is_empty() {
-                            flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id).await;
                             let cursor = serde_json::json!({
                                 "tx_count": tx_count,
                                 "last_slot": last_slot,
                             });
+                            flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id, Some(&cursor)).await;
                             let _ = repo.update_stream_cursor(sub_id, &cursor).await;
                         }
                         grpc_handle.abort();
@@ -330,11 +330,20 @@ async fn run_solana_grpc_stream(
 
     // Flush remaining batch
     if !batch.is_empty() {
-        flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id).await;
         let cursor = serde_json::json!({
             "tx_count": tx_count,
             "last_slot": last_slot,
         });
+        flush_stream_batch(
+            repo,
+            &batch,
+            &sub.network,
+            "grpc",
+            sub.target_id,
+            sub_id,
+            Some(&cursor),
+        )
+        .await;
         let _ = repo.update_stream_cursor(sub_id, &cursor).await;
     }
 
@@ -458,15 +467,14 @@ async fn run_hyperliquid_ws_stream(
                         batch.push(tx);
                         tx_count += 1;
 
-                        if (batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL)
-                            && flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id).await
-                        {
-                            batch.clear();
-                            last_flush = tokio::time::Instant::now();
-
+                        if batch.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL {
                             let cursor = serde_json::json!({
                                 "tx_count": tx_count,
                             });
+                            if flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id, Some(&cursor)).await {
+                                batch.clear();
+                                last_flush = tokio::time::Instant::now();
+                            }
                             if let Err(e) = repo.update_stream_cursor(sub_id, &cursor).await {
                                 warn!(subscription_id = %sub_id, error = %e, "Failed to update cursor");
                             }
@@ -480,8 +488,8 @@ async fn run_hyperliquid_ws_stream(
 
                         // Flush remaining batch before failing
                         if !batch.is_empty() {
-                            flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id).await;
                             let cursor = serde_json::json!({ "tx_count": tx_count });
+                            flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id, Some(&cursor)).await;
                             let _ = repo.update_stream_cursor(sub_id, &cursor).await;
                         }
                         ws_handle.abort();
@@ -494,8 +502,17 @@ async fn run_hyperliquid_ws_stream(
 
     // Flush remaining batch
     if !batch.is_empty() {
-        flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id).await;
         let cursor = serde_json::json!({ "tx_count": tx_count });
+        flush_stream_batch(
+            repo,
+            &batch,
+            &sub.network,
+            "ws",
+            sub.target_id,
+            sub_id,
+            Some(&cursor),
+        )
+        .await;
         let _ = repo.update_stream_cursor(sub_id, &cursor).await;
     }
 
@@ -503,12 +520,17 @@ async fn run_hyperliquid_ws_stream(
     Ok(())
 }
 
-/// Flush a batch of V1 transactions using the V2-first dual-write pattern.
+/// Flush a batch of V1 transactions using the V2-first dual-write pattern
+/// with full Bronze lineage (ingestion run, checkpoint, materialization handoff).
 ///
-/// 1. Convert V1 → V2 `RawTransaction`, dedup by (network, tx_hash)
-/// 2. Upsert into `raw_transactions` (authoritative V2 write)
-/// 3. Write `target_matches` if a target_id is present
-/// 4. Best-effort V1 compat via `save_transactions`
+/// 1. Create an `IngestionRun` for this flush batch (mode="stream")
+/// 2. Convert V1 → V2 `RawTransaction`, stamp `ingestion_run_id`, dedup
+/// 3. Upsert into `raw_transactions` (authoritative V2 write)
+/// 4. Write `target_matches` if a target_id is present
+/// 5. Upsert V2 checkpoint from cursor state
+/// 6. Complete the ingestion run
+/// 7. Auto-trigger downstream materialization
+/// 8. Best-effort V1 compat via `save_transactions`
 ///
 /// Returns `true` if the V2 upsert succeeded (callers should clear the batch),
 /// `false` if it failed (callers should retain the batch for retry).
@@ -519,9 +541,33 @@ async fn flush_stream_batch(
     source: &str,
     target_id: Option<Uuid>,
     sub_id: Uuid,
+    cursor_state: Option<&serde_json::Value>,
 ) -> bool {
     if batch.is_empty() {
         return true;
+    }
+
+    // Create an ingestion run for this flush batch.
+    let run_id = Uuid::new_v4();
+    let run = IngestionRun {
+        id: run_id,
+        target_id,
+        network: network.to_string(),
+        source: source.to_string(),
+        mode: "stream".to_string(),
+        status: "running".to_string(),
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+        records_written: 0,
+        error_message: None,
+        cursor_state: cursor_state.cloned(),
+    };
+    let run_created = repo.create_ingestion_run(&run).await.is_ok();
+    if !run_created {
+        warn!(
+            subscription_id = %sub_id,
+            "Failed to create stream ingestion run; raw_transactions will not carry ingestion_run_id"
+        );
     }
 
     // V2 authoritative
@@ -530,6 +576,9 @@ async fn flush_stream_batch(
         .map(|tx| {
             let mut raw = v1_tx_to_v2_raw(tx, Some(network));
             raw.source = source.to_string();
+            if run_created {
+                raw.ingestion_run_id = Some(run_id);
+            }
             raw
         })
         .collect();
@@ -538,6 +587,8 @@ async fn flush_stream_batch(
         .into_iter()
         .filter(|r| seen.insert((r.network.clone(), r.tx_hash.clone())))
         .collect();
+
+    let record_count = v2_deduped.len() as i64;
 
     match repo
         .upsert_raw_transactions_returning_ids(&v2_deduped)
@@ -553,6 +604,75 @@ async fn flush_stream_batch(
                         "Failed to save target matches"
                     );
                 }
+
+                // Upsert V2 checkpoint from cursor state so backfill can resume
+                // from where the stream left off.
+                if let Some(cursor) = cursor_state {
+                    let v2_cp = Checkpoint {
+                        id: Uuid::new_v5(
+                            &Uuid::NAMESPACE_URL,
+                            format!("{}:{}:{}", tid, network, source).as_bytes(),
+                        ),
+                        target_id: tid,
+                        network: network.to_string(),
+                        source: source.to_string(),
+                        cursor: cursor.clone(),
+                        updated_at: chrono::Utc::now(),
+                    };
+                    if let Err(e) = repo.upsert_checkpoint_v2(&v2_cp).await {
+                        warn!(
+                            subscription_id = %sub_id,
+                            error = %e,
+                            "Failed to upsert V2 checkpoint (non-fatal)"
+                        );
+                    }
+                }
+            }
+
+            // Complete the ingestion run.
+            if run_created {
+                let _ = repo
+                    .update_ingestion_run_status(
+                        run_id,
+                        "completed",
+                        Some(chrono::Utc::now()),
+                        record_count,
+                        None,
+                    )
+                    .await;
+
+                // Auto-trigger materialization for this flush batch.
+                if let Some(tid) = target_id {
+                    match repo.get_index_target(tid).await {
+                        Ok(Some(target)) => {
+                            let mat_scope = serde_json::json!({
+                                "wallet": target.address.unwrap_or_default(),
+                                "network": network,
+                                "ingestion_run_id": run_id.to_string(),
+                            });
+                            if let Err(e) = repo
+                                .create_materialization_run(
+                                    "normalize",
+                                    Some(&mat_scope),
+                                    None,
+                                    None,
+                                    None,
+                                )
+                                .await
+                            {
+                                warn!(subscription_id = %sub_id, error = %e, "Failed to enqueue post-stream materialization (non-fatal)");
+                            } else {
+                                info!(subscription_id = %sub_id, run_id = %run_id, "Enqueued post-stream materialization run");
+                            }
+                        }
+                        Ok(None) => {
+                            warn!(subscription_id = %sub_id, target_id = %tid, "Index target not found for post-stream materialization");
+                        }
+                        Err(e) => {
+                            warn!(subscription_id = %sub_id, error = %e, "Failed to fetch index target for post-stream materialization");
+                        }
+                    }
+                }
             }
         }
         Err(e) => {
@@ -561,6 +681,19 @@ async fn flush_stream_batch(
                 error = %e,
                 "Failed to upsert V2 raw_transactions"
             );
+
+            // Fail the ingestion run if V2 write failed.
+            if run_created {
+                let _ = repo
+                    .update_ingestion_run_status(
+                        run_id,
+                        "failed",
+                        Some(chrono::Utc::now()),
+                        0,
+                        Some(&e.to_string()),
+                    )
+                    .await;
+            }
 
             // V1 compat (best-effort) — still attempt even on V2 failure
             if let Err(e) = repo.save_transactions(batch).await {
