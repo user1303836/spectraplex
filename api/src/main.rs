@@ -15,7 +15,7 @@ use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
 use spectraplex_adapters::dual_write::v2_raw_to_v1_tx;
 use spectraplex_adapters::repo::{str_to_entry_type, Repository};
-use spectraplex_adapters::v2_repo::{EnqueueIngestionJobParams, WalletStatsV2};
+use spectraplex_adapters::v2_repo::EnqueueIngestionJobParams;
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::connector::validate_target;
 use spectraplex_core::materializer::{
