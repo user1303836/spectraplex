@@ -1105,6 +1105,192 @@ impl Repository {
             .await;
     }
 
+    /// Materialize Silver datasets directly from Bronze `RawTransaction` rows,
+    /// without reconstructing V1 `Transaction` values.
+    ///
+    /// This is the Bronze-native materialization path used when `ingestion_run_id`
+    /// is available. It skips the V1 compatibility layer entirely.
+    pub async fn materialize_silver_from_bronze(
+        &self,
+        raw_txs: &[RawTransaction],
+        wallet_address: Option<&str>,
+    ) -> usize {
+        if raw_txs.is_empty() {
+            return 0;
+        }
+
+        let dataset_versions = self.resolve_silver_dataset_versions().await;
+
+        let mut all_token_transfers = Vec::new();
+        let mut all_native_balance_deltas = Vec::new();
+        let mut all_decoded_events = Vec::new();
+        let mut all_hl_fills = Vec::new();
+        let mut all_hl_funding = Vec::new();
+        let mut all_hl_positions = Vec::new();
+
+        for raw in raw_txs {
+            let network = raw.network.as_str();
+            let raw_tx_id = Some(raw.id);
+
+            if network.starts_with("solana") {
+                let mut transfers = crate::solana_parser::extract_solana_token_transfers(
+                    raw_tx_id,
+                    network,
+                    &raw.raw_metadata,
+                );
+                stamp_dataset_version_id(&mut transfers, &dataset_versions, "token_transfers");
+                all_token_transfers.extend(transfers);
+
+                let mut deltas = crate::solana_parser::extract_solana_native_balance_deltas(
+                    raw_tx_id,
+                    network,
+                    &raw.raw_metadata,
+                );
+                stamp_dataset_version_id(&mut deltas, &dataset_versions, "native_balance_deltas");
+                all_native_balance_deltas.extend(deltas);
+
+                let mut events = crate::solana_parser::extract_solana_decoded_events(
+                    raw_tx_id,
+                    network,
+                    &raw.raw_metadata,
+                );
+                stamp_dataset_version_id(&mut events, &dataset_versions, "decoded_events");
+                all_decoded_events.extend(events);
+            } else if network.starts_with("hypercore") || network.starts_with("hyperliquid") {
+                let wallet = wallet_address.unwrap_or("");
+                let mut transfers = crate::hyperliquid_parser::extract_hyperliquid_token_transfers(
+                    raw_tx_id,
+                    network,
+                    wallet,
+                    &raw.raw_metadata,
+                );
+                stamp_dataset_version_id(&mut transfers, &dataset_versions, "token_transfers");
+                all_token_transfers.extend(transfers);
+
+                let mut deltas =
+                    crate::hyperliquid_parser::extract_hyperliquid_native_balance_deltas(
+                        raw_tx_id,
+                        network,
+                        wallet,
+                        &raw.raw_metadata,
+                    );
+                stamp_dataset_version_id(&mut deltas, &dataset_versions, "native_balance_deltas");
+                all_native_balance_deltas.extend(deltas);
+
+                let mut fills = crate::hyperliquid_parser::extract_hl_fill_records(
+                    raw_tx_id,
+                    network,
+                    &raw.raw_metadata,
+                );
+                stamp_dataset_version_id(
+                    &mut fills,
+                    &dataset_versions,
+                    DatasetName::HlFills.as_sql_str(),
+                );
+                all_hl_fills.extend(fills);
+
+                let mut funding = crate::hyperliquid_parser::extract_hl_funding_payments(
+                    raw_tx_id,
+                    network,
+                    &raw.raw_metadata,
+                );
+                stamp_dataset_version_id(
+                    &mut funding,
+                    &dataset_versions,
+                    DatasetName::HlFunding.as_sql_str(),
+                );
+                all_hl_funding.extend(funding);
+
+                let mut positions = crate::hyperliquid_parser::extract_hl_position_changes(
+                    raw_tx_id,
+                    network,
+                    &raw.raw_metadata,
+                );
+                stamp_dataset_version_id(
+                    &mut positions,
+                    &dataset_versions,
+                    DatasetName::Positions.as_sql_str(),
+                );
+                all_hl_positions.extend(positions);
+            } else {
+                // EVM (ethereum, base, arbitrum, polygon, etc.)
+                let mut transfers = crate::evm_parser::extract_evm_token_transfers(
+                    raw_tx_id,
+                    network,
+                    &raw.raw_metadata,
+                );
+                stamp_dataset_version_id(&mut transfers, &dataset_versions, "token_transfers");
+                all_token_transfers.extend(transfers);
+
+                let mut events = crate::evm_parser::extract_evm_decoded_events(
+                    raw_tx_id,
+                    network,
+                    &raw.raw_metadata,
+                );
+                stamp_dataset_version_id(&mut events, &dataset_versions, "decoded_events");
+                all_decoded_events.extend(events);
+            }
+        }
+
+        let total = all_token_transfers.len()
+            + all_native_balance_deltas.len()
+            + all_decoded_events.len()
+            + all_hl_fills.len()
+            + all_hl_funding.len()
+            + all_hl_positions.len();
+
+        if total == 0 {
+            return 0;
+        }
+
+        // Write Silver records to the database.
+        if !all_token_transfers.is_empty() {
+            if let Err(e) = self.save_token_transfers(&all_token_transfers).await {
+                warn!(error = %e, count = all_token_transfers.len(), "Bronze-native Silver: token_transfers write failed");
+            }
+        }
+        if !all_native_balance_deltas.is_empty() {
+            if let Err(e) = self
+                .save_native_balance_deltas(&all_native_balance_deltas)
+                .await
+            {
+                warn!(error = %e, count = all_native_balance_deltas.len(), "Bronze-native Silver: native_balance_deltas write failed");
+            }
+        }
+        if !all_decoded_events.is_empty() {
+            if let Err(e) = self.save_decoded_events(&all_decoded_events).await {
+                warn!(error = %e, count = all_decoded_events.len(), "Bronze-native Silver: decoded_events write failed");
+            }
+        }
+        if !all_hl_fills.is_empty() {
+            if let Err(e) = self.save_hl_fill_records(&all_hl_fills).await {
+                warn!(error = %e, count = all_hl_fills.len(), "Bronze-native Silver: hl_fill_records write failed");
+            }
+        }
+        if !all_hl_funding.is_empty() {
+            if let Err(e) = self.save_hl_funding_payments(&all_hl_funding).await {
+                warn!(error = %e, count = all_hl_funding.len(), "Bronze-native Silver: hl_funding_payments write failed");
+            }
+        }
+        if !all_hl_positions.is_empty() {
+            if let Err(e) = self.save_hl_position_changes(&all_hl_positions).await {
+                warn!(error = %e, count = all_hl_positions.len(), "Bronze-native Silver: hl_position_changes write failed");
+            }
+        }
+
+        info!(
+            token_transfers = all_token_transfers.len(),
+            native_balance_deltas = all_native_balance_deltas.len(),
+            decoded_events = all_decoded_events.len(),
+            hl_fills = all_hl_fills.len(),
+            hl_funding = all_hl_funding.len(),
+            hl_positions = all_hl_positions.len(),
+            "Bronze-native Silver dataset materialization complete"
+        );
+
+        total
+    }
+
     /// Get or create dataset versions for each Silver dataset.
     ///
     /// Returns a map from canonical dataset name to the active DatasetVersion
