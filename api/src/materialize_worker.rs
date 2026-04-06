@@ -439,15 +439,3 @@ fn addrs_match(a: &str, b: &str) -> bool {
         a == b
     }
 }
-
-/// Derive the V1 `Chain` enum from a V2 network ID.
-fn network_to_chain(network: &str) -> anyhow::Result<Chain> {
-    if network.starts_with("solana") {
-        Ok(Chain::Solana)
-    } else if network.starts_with("hypercore") || network.starts_with("hyperliquid") {
-        Ok(Chain::Hyperliquid)
-    } else {
-        // Everything else is EVM (ethereum, base, arbitrum, polygon, etc.)
-        Ok(Chain::Ethereum)
-    }
-}
