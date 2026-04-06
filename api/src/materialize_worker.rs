@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::fire_callback;
-use spectraplex_adapters::dual_write::v2_raw_to_v1_tx;
 use spectraplex_adapters::{evm_parser, hyperliquid_parser, repo::Repository, solana_parser};
 use spectraplex_core::models::Chain;
 use tokio::sync::Semaphore;
@@ -318,12 +317,10 @@ pub(crate) async fn execute_normalize(
     ingestion_run_id: Option<Uuid>,
     lease_lost: &CancellationToken,
 ) -> anyhow::Result<usize> {
-    // When Bronze-driven, we override the caller-supplied network and wallet
-    // with authoritative values from the ingestion run/target.
-    let mut effective_network: Option<String> = network.map(|s| s.to_string());
+    // When Bronze-driven, we resolve the authoritative wallet from the target.
     let effective_wallet: String;
 
-    let txs = if let Some(run_id) = ingestion_run_id {
+    if let Some(run_id) = ingestion_run_id {
         // Bronze-driven: fetch raw_transactions for this specific ingestion run
         // and convert V2 RawTransaction -> V1 Transaction for existing parsers.
         //
@@ -370,38 +367,37 @@ pub(crate) async fn execute_normalize(
         // ID generation and watermark keying, preventing EVM case-variant forks.
         effective_wallet = target_addr;
 
-        // Override network with the ingestion run's authoritative value.
-        effective_network = Some(irun.network.clone());
-
         let raw_txs = repo.get_raw_transactions_by_run(run_id).await?;
         if raw_txs.is_empty() {
-            // Empty Bronze range is a valid outcome (e.g. zero new transactions
-            // for this ingestion). Return empty vec — do NOT fall back to the
-            // legacy wallet scan, which would rematerialize stale historical
-            // data and produce duplicate ledger/silver output.
             info!(
                 run_id = %run_id,
                 "Bronze-driven materialization: no raw transactions found for run, returning 0 records"
             );
-            Vec::new()
-        } else {
-            info!(
-                run_id = %run_id,
-                raw_count = raw_txs.len(),
-                "Bronze-driven materialization: fetched raw transactions"
-            );
-            raw_txs
-                .iter()
-                .filter_map(|r| {
-                    let chain = network_to_chain(&r.network).ok()?;
-                    Some(v2_raw_to_v1_tx(r, &effective_wallet, chain, None))
-                })
-                .collect()
+            return Ok(0);
         }
-    } else {
-        // Legacy fallback: wallet-scoped V1 scan
-        repo.get_transactions_by_wallet(wallet).await?
-    };
+
+        info!(
+            run_id = %run_id,
+            raw_count = raw_txs.len(),
+            "Bronze-driven materialization: fetched raw transactions"
+        );
+
+        // Check lease before persisting side effects.
+        if lease_lost.is_cancelled() {
+            anyhow::bail!("lease lost before persisting side effects");
+        }
+
+        // Bronze-native Silver materialization: extract Silver records directly
+        // from RawTransaction without reconstructing V1 Transaction values.
+        let count = repo
+            .materialize_silver_from_bronze(&raw_txs, Some(&effective_wallet))
+            .await;
+
+        return Ok(count);
+    }
+
+    // Legacy fallback: wallet-scoped V1 scan (no ingestion_run_id).
+    let txs = repo.get_transactions_by_wallet(wallet).await?;
 
     let mut all_entries = Vec::new();
     for tx in &txs {
@@ -418,20 +414,8 @@ pub(crate) async fn execute_normalize(
         }
     }
 
-    // Check lease before persisting side effects — if we lost the lease
-    // during parsing, another worker may already be running. Persisting
-    // now would duplicate ledger entries (fresh UUIDs each run) and
-    // re-trigger Silver materialization.
     if lease_lost.is_cancelled() {
         anyhow::bail!("lease lost before persisting side effects");
-    }
-
-    // When Bronze-driven, the V1 `transactions` rows don't exist yet — we
-    // synthesized them from RawTransaction. Persist them so downstream joins
-    // (ledger_entries.transaction_id -> transactions.id) work correctly.
-    // Uses ON CONFLICT DO NOTHING so this is idempotent.
-    if ingestion_run_id.is_some() && !txs.is_empty() {
-        repo.save_transactions(&txs).await?;
     }
 
     let count = all_entries.len();
@@ -441,8 +425,7 @@ pub(crate) async fn execute_normalize(
         anyhow::bail!("lease lost before Silver materialization");
     }
 
-    repo.materialize_silver_datasets(&txs, effective_network.as_deref())
-        .await;
+    repo.materialize_silver_datasets(&txs, network).await;
     Ok(count)
 }
 
@@ -454,17 +437,5 @@ fn addrs_match(a: &str, b: &str) -> bool {
         a.eq_ignore_ascii_case(b)
     } else {
         a == b
-    }
-}
-
-/// Derive the V1 `Chain` enum from a V2 network ID.
-fn network_to_chain(network: &str) -> anyhow::Result<Chain> {
-    if network.starts_with("solana") {
-        Ok(Chain::Solana)
-    } else if network.starts_with("hypercore") || network.starts_with("hyperliquid") {
-        Ok(Chain::Hyperliquid)
-    } else {
-        // Everything else is EVM (ethereum, base, arbitrum, polygon, etc.)
-        Ok(Chain::Ethereum)
     }
 }
