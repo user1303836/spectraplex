@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::fire_callback;
-use spectraplex_adapters::dual_write::v2_raw_to_v1_tx;
 use spectraplex_adapters::{evm_parser, hyperliquid_parser, repo::Repository, solana_parser};
 use spectraplex_core::models::Chain;
 use tokio::sync::Semaphore;
@@ -318,9 +317,7 @@ pub(crate) async fn execute_normalize(
     ingestion_run_id: Option<Uuid>,
     lease_lost: &CancellationToken,
 ) -> anyhow::Result<usize> {
-    // When Bronze-driven, we override the caller-supplied network and wallet
-    // with authoritative values from the ingestion run/target.
-    let mut effective_network: Option<String> = network.map(|s| s.to_string());
+    // When Bronze-driven, we resolve the authoritative wallet from the target.
     let effective_wallet: String;
 
     if let Some(run_id) = ingestion_run_id {
@@ -369,9 +366,6 @@ pub(crate) async fn execute_normalize(
         // Use the authoritative wallet address from the target for deterministic
         // ID generation and watermark keying, preventing EVM case-variant forks.
         effective_wallet = target_addr;
-
-        // Override network with the ingestion run's authoritative value.
-        effective_network = Some(irun.network.clone());
 
         let raw_txs = repo.get_raw_transactions_by_run(run_id).await?;
         if raw_txs.is_empty() {
@@ -431,8 +425,7 @@ pub(crate) async fn execute_normalize(
         anyhow::bail!("lease lost before Silver materialization");
     }
 
-    repo.materialize_silver_datasets(&txs, effective_network.as_deref())
-        .await;
+    repo.materialize_silver_datasets(&txs, network).await;
     Ok(count)
 }
 
