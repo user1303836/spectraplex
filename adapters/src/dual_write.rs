@@ -1288,6 +1288,13 @@ impl Repository {
             "Bronze-native Silver dataset materialization complete"
         );
 
+        // NOTE: dataset_completeness updates are handled at the worker level
+        // via watermark advancement, not inline here. The legacy
+        // materialize_silver_datasets path updates completeness from V1
+        // Transaction data which isn't available in this Bronze-native path.
+        // A dedicated Bronze-native completeness updater can be added as a
+        // follow-up once the completeness model is fully V2-aligned.
+
         total
     }
 
