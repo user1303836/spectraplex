@@ -34,7 +34,9 @@ use spectraplex_core::v2::{
     IngestionJobStatus, MaterializationRunStatus, Network, TargetKind, TargetMode,
 };
 use sqlx::postgres::PgPoolOptions;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -146,10 +148,20 @@ impl RateLimiter {
     }
 
     /// Try to consume one token for the given key. Returns `true` if allowed.
+    ///
+    /// The key is hashed before use as a map key so that raw API keys are never
+    /// stored in process memory (mitigates credential exposure via core dumps).
     async fn try_acquire(&self, key: &str) -> bool {
         let mut buckets = self.buckets.lock().await;
         let now = Instant::now();
         let cap = self.capacity as f64;
+
+        // Hash the key so we never store raw credentials in memory.
+        let hashed_key = {
+            let mut hasher = DefaultHasher::new();
+            key.hash(&mut hasher);
+            hasher.finish().to_string()
+        };
 
         // Evict stale entries when the map exceeds the threshold.
         if buckets.len() >= RATE_LIMIT_MAX_BUCKETS {
@@ -157,7 +169,7 @@ impl RateLimiter {
             buckets.retain(|_, b| b.last_used > cutoff);
         }
 
-        let bucket = buckets.entry(key.to_string()).or_insert(TokenBucket {
+        let bucket = buckets.entry(hashed_key).or_insert(TokenBucket {
             tokens: cap,
             last_refill: now,
             last_used: now,
