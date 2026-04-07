@@ -1288,7 +1288,23 @@ impl Repository {
             "Bronze-native Silver dataset materialization complete"
         );
 
-        // Update dataset completeness from Bronze data.
+        // Track per-dataset record counts for accurate completeness.
+        let mut dataset_counts: HashMap<&str, usize> = HashMap::new();
+        *dataset_counts.entry("token_transfers").or_default() += all_token_transfers.len();
+        *dataset_counts.entry("native_balance_deltas").or_default() +=
+            all_native_balance_deltas.len();
+        *dataset_counts.entry("decoded_events").or_default() += all_decoded_events.len();
+        *dataset_counts
+            .entry(DatasetName::HlFills.as_sql_str())
+            .or_default() += all_hl_fills.len();
+        *dataset_counts
+            .entry(DatasetName::HlFunding.as_sql_str())
+            .or_default() += all_hl_funding.len();
+        *dataset_counts
+            .entry(DatasetName::Positions.as_sql_str())
+            .or_default() += all_hl_positions.len();
+
+        // Update dataset completeness only for datasets that had records extracted.
         if let Some(wallet) = wallet_address {
             if !wallet.is_empty() {
                 let mut net_groups: HashMap<&str, Vec<&RawTransaction>> = HashMap::new();
@@ -1313,6 +1329,10 @@ impl Repository {
                     let run_id = group.iter().find_map(|r| r.ingestion_run_id);
 
                     for (name, vid) in &dataset_versions {
+                        let count = dataset_counts.get(name.as_str()).copied().unwrap_or(0);
+                        if count == 0 {
+                            continue; // Skip datasets with no records for this run.
+                        }
                         let dc = DatasetCompleteness {
                             id: Uuid::new_v5(
                                 &Uuid::NAMESPACE_URL,
@@ -1328,7 +1348,7 @@ impl Repository {
                             block_start,
                             block_end,
                             last_ingestion_run_id: run_id,
-                            records_count: total as i64,
+                            records_count: count as i64,
                             gap_ranges: None,
                             notes: None,
                             created_at: Utc::now(),
