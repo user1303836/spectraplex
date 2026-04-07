@@ -114,7 +114,7 @@ pub enum ProviderCapability {
 // ---------------------------------------------------------------------------
 
 /// A fully-resolved provider entry ready for connector use.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedProvider {
     /// Network this provider serves.
     pub network: NetworkId,
@@ -130,6 +130,20 @@ pub struct ResolvedProvider {
     pub token: Option<String>,
     /// Optional extra headers.
     pub headers: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for ResolvedProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedProvider")
+            .field("network", &self.network)
+            .field("kind", &self.kind)
+            .field("url", &self.url)
+            .field("priority", &self.priority)
+            .field("capabilities", &self.capabilities)
+            .field("token", &"[REDACTED]")
+            .field("headers", &self.headers)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
