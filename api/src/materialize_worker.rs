@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::fire_callback;
+use spectraplex_adapters::dual_write::BronzeSilverResult;
 use spectraplex_adapters::{evm_parser, hyperliquid_parser, repo::Repository, solana_parser};
 use spectraplex_core::models::Chain;
 use tokio::sync::Semaphore;
@@ -187,8 +188,14 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
             // the row isn't reclaimed by another worker during a transient DB
             // delay (FIX 1: heartbeat stops AFTER terminal write).
             let (callback_state, callback_message) = match result {
-                Ok(count) => {
-                    info!(run_id = %run_id, count, "Materialization run completed (worker)");
+                Ok(silver_result) => {
+                    let count = silver_result.total_written;
+                    info!(
+                        run_id = %run_id,
+                        written = count,
+                        failed = silver_result.total_failed,
+                        "Materialization run completed (worker)"
+                    );
                     match task_repo
                         .complete_materialization_run(run_id, &task_worker_id, count as i64)
                         .await
@@ -229,7 +236,7 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
                                             "normalize",
                                             Some(&scope_json),
                                             Some(irun_id),
-                                            None,
+                                            silver_result.last_raw_transaction_id,
                                         )
                                         .await
                                     {
@@ -243,7 +250,7 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
                             // Terminal write succeeded — safe to fire callback.
                             (
                                 Some("completed"),
-                                Some(format!("Normalized {} ledger entries", count)),
+                                Some(format!("Materialized {} Silver records", count)),
                             )
                         }
                         Err(e) => {
@@ -316,7 +323,7 @@ pub(crate) async fn execute_normalize(
     network: Option<&str>,
     ingestion_run_id: Option<Uuid>,
     lease_lost: &CancellationToken,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<BronzeSilverResult> {
     // When Bronze-driven, we resolve the authoritative wallet from the target.
     let effective_wallet: String;
 
@@ -373,7 +380,7 @@ pub(crate) async fn execute_normalize(
                 run_id = %run_id,
                 "Bronze-driven materialization: no raw transactions found for run, returning 0 records"
             );
-            return Ok(0);
+            return Ok(BronzeSilverResult::default());
         }
 
         info!(
@@ -389,11 +396,20 @@ pub(crate) async fn execute_normalize(
 
         // Bronze-native Silver materialization: extract Silver records directly
         // from RawTransaction without reconstructing V1 Transaction values.
-        let count = repo
+        let silver_result = repo
             .materialize_silver_from_bronze(&raw_txs, Some(&effective_wallet))
             .await;
 
-        return Ok(count);
+        if !silver_result.all_succeeded() {
+            warn!(
+                run_id = %run_id,
+                written = silver_result.total_written,
+                failed = silver_result.total_failed,
+                "Bronze-native Silver materialization had partial failures"
+            );
+        }
+
+        return Ok(silver_result);
     }
 
     // Legacy fallback: wallet-scoped V1 scan (no ingestion_run_id).
@@ -434,7 +450,10 @@ pub(crate) async fn execute_normalize(
             "Silver materialization completed with partial failures"
         );
     }
-    Ok(count)
+    Ok(BronzeSilverResult {
+        total_written: count,
+        ..Default::default()
+    })
 }
 
 /// Chain-aware address comparison: case-insensitive for EVM (0x-prefixed),
