@@ -31,11 +31,35 @@ Requires Rust (stable) and PostgreSQL 15+. Docker handles Postgres if you don't 
 
 **Ingest from any supported chain with a single command.** Point at a wallet, contract, or event filter and Spectraplex pulls raw transactions, logs, and fills into Bronze storage.
 
-**Normalize across chains automatically.** Raw data is materialized into canonical Silver datasets — token transfers, balance deltas, decoded events, fills, funding, and positions — regardless of which chain it came from.
+**Bronze-native Silver materialization.** Raw data is extracted directly into canonical Silver datasets — token transfers, balance deltas, decoded events, fills, funding, and positions — without V1 compatibility overhead.
+
+**Durable control plane.** Ingestion jobs, stream subscriptions, export jobs, and materialization runs are all Postgres-backed with worker loops, heartbeats, lease-based ownership, and restart recovery.
+
+**Real-time streaming with full lineage.** Solana gRPC and Hyperliquid WebSocket streams create ingestion runs, persist V2 checkpoints, and auto-trigger downstream materialization — the same lineage model as backfill.
 
 **Query and export structured datasets.** Silver and Gold datasets are available through a REST API with filtering, pagination, and async export to CSV, JSONL, local files, or webhooks.
 
+**V2-backed wallet reads.** Legacy wallet endpoints (`/v1/transactions/:wallet`, `/v1/ledger/:wallet`, etc.) are served from V2 tables behind unchanged response shapes.
+
 **Built-in analytics endpoints.** Trader PnL, market stats, protocol activity, and TVL queries ship out of the box.
+
+## Architecture
+
+Data flows through three tiers:
+
+```
+Ingestion → Bronze (raw_transactions) → Silver (token_transfers, etc.) → Gold (wallet_ledger, etc.)
+                ↓                              ↓
+         target_matches              dataset_completeness
+         ingestion_runs              dataset_versions
+         V2 checkpoints              dataset_watermarks
+```
+
+- **Bronze** is canonical and target-agnostic. Raw chain data lives in `raw_transactions` and is linked to `ingestion_runs` and `target_matches`.
+- **Silver** datasets are extracted directly from Bronze using chain-specific parsers. Every Silver row carries `raw_transaction_id` for provenance.
+- **Gold** datasets are derived from Silver for wallet, tax, forensics, and analytics use cases.
+
+All operational state — jobs, streams, exports, materialization runs — is durable in PostgreSQL. No runtime truth lives in in-memory maps.
 
 ## Supported Chains
 
@@ -49,8 +73,6 @@ Requires Rust (stable) and PostgreSQL 15+. Docker handles Postgres if you don't 
 | **Hyperliquid** | REST + WebSocket | `hypercore-mainnet` |
 
 ## Datasets
-
-Data flows through three tiers: **Bronze** (raw) → **Silver** (normalized) → **Gold** (derived).
 
 | Dataset | Tier | Description |
 |---------|------|-------------|
@@ -85,6 +107,8 @@ curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
   http://127.0.0.1:3000/v1/jobs/<JOB_ID>
 ```
 
+Ingestion jobs are durable — they persist across restarts and are claimed by background workers with heartbeat-based lease management.
+
 ### Real-Time Streaming
 
 ```bash
@@ -109,7 +133,7 @@ curl -X POST http://127.0.0.1:3000/v1/stream/<STREAM_ID>/stop \
   -H "Authorization: Bearer $SPECTRAPLEX_API_KEY"
 ```
 
-Hyperliquid streams subscribe to user fills, funding, and ledger updates via WebSocket with automatic reconnection.
+Stream subscriptions are durable and create `ingestion_runs` per flush batch with full Bronze lineage. Hyperliquid streams subscribe to user fills, funding, and ledger updates via WebSocket with automatic reconnection.
 
 ### Targets and Networks
 
@@ -150,7 +174,7 @@ curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
   http://127.0.0.1:3000/v1/export/jobs/<JOB_ID>/download
 ```
 
-Export jobs support optional sinks: `local_file` and `webhook`.
+Export jobs are durable with heartbeat-based worker execution. Supported sinks: `local_file` and `webhook`.
 
 ### Analytics
 
@@ -174,7 +198,7 @@ curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
 **Ingestion and job control:**
 `POST /v1/ingest` | `POST /v1/ingest/batch` | `POST /v1/normalize` | `GET /v1/jobs/:job_id` | `POST /v1/stream/start` | `POST /v1/stream/:stream_id/stop` | `GET /v1/streams`
 
-**Wallet endpoints:**
+**Wallet endpoints (V2-backed):**
 `GET /v1/transactions/:wallet` | `GET /v1/transactions/:wallet/:tx_hash` | `GET /v1/ledger/:wallet` | `GET /v1/export/:wallet` | `GET /v1/balances/:wallet` | `GET /v1/stats/:wallet`
 
 **Targets and networks:**
@@ -236,17 +260,17 @@ SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 EVM_RPC_URL=https://eth.llamarpc.com
 # Optional
 SOLANA_GRPC_URL=https://your-yellowstone-endpoint
-SOLANA_GRPC_TOKEN=your-token
+SOLANA_GRPC_TOKEN=your-grpc-token
 ```
 
 ## Project Layout
 
 ```
 spectraplex/
-├── core/         Shared models, config, traits
-├── adapters/     Chain adapters, parsers, repository layer
+├── core/         Shared models, config, dataset registry, traits
+├── adapters/     Chain adapters, parsers, dual-write layer, repository
 ├── cli/          CLI entry points
-├── api/          Axum HTTP API server
+├── api/          Axum HTTP API server + background workers
 └── migrations/   PostgreSQL schema and seed data
 ```
 
