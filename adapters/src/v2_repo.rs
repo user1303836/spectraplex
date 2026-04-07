@@ -378,14 +378,20 @@ pub fn build_target_match_insert(
     Ok((query, args))
 }
 
-/// Build the INSERT for a single `index_target` with ON CONFLICT DO NOTHING.
+/// Build an upsert for a single `index_target`.
+///
+/// Uses ON CONFLICT on (kind, network, address) to avoid duplicate insert
+/// errors when concurrent requests attempt to create the same target.
+/// On conflict, only `updated_at` is bumped; the existing row is kept.
 pub fn build_index_target_insert(
     t: &IndexTarget,
 ) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
     let query = String::from(
         "INSERT INTO index_targets \
          (id, kind, network, chain_family, address, filter_spec, mode, label, owner_id, created_at, updated_at) \
-         VALUES ($1, $2::target_kind_enum, $3, $4::chain_family_enum, $5, $6, $7::target_mode_enum, $8, $9, $10, $11)",
+         VALUES ($1, $2::target_kind_enum, $3, $4::chain_family_enum, $5, $6, $7::target_mode_enum, $8, $9, $10, $11) \
+         ON CONFLICT (kind, network, address) WHERE address IS NOT NULL DO UPDATE SET updated_at = NOW() \
+         RETURNING id, kind::text, network, chain_family::text, address, filter_spec, mode::text, label, owner_id, created_at, updated_at",
     );
     let mut args = sqlx::postgres::PgArguments::default();
     use sqlx::Arguments;

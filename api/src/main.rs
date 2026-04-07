@@ -342,6 +342,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(provider_registry),
         Arc::clone(&shared_state.stream_semaphore),
         stream_worker_id,
+        worker_cancel.clone(),
     );
 
     let protected = Router::new()

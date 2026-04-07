@@ -114,7 +114,7 @@ async fn execute_job(
                 _ = hb_cancel.cancelled() => { return; }
                 _ = interval.tick() => {
                     if let Err(e) = hb_repo.heartbeat_ingestion_job(hb_job_id, &hb_worker).await {
-                        warn!(job_id = %hb_job_id, error = %e, "Heartbeat failed");
+                        warn!(job_id = %hb_job_id, error = %e, "Ingestion heartbeat failed — lease may be stale");
                     }
                 }
             }

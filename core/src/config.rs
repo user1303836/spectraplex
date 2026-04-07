@@ -30,7 +30,7 @@ impl Default for NetworkConfig {
 /// A single provider endpoint definition.
 ///
 /// Used inside the `[[providers]]` TOML array.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     /// Network this provider serves (e.g. "solana-mainnet").
     pub network: String,
@@ -58,6 +58,21 @@ pub struct ProviderConfig {
     pub headers: Option<HashMap<String, String>>,
 }
 
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("network", &self.network)
+            .field("kind", &self.kind)
+            .field("url", &self.url)
+            .field("priority", &self.priority)
+            .field("capabilities", &self.capabilities)
+            .field("token_env", &"[REDACTED]")
+            .field("token", &"[REDACTED]")
+            .field("headers", &self.headers)
+            .finish()
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -66,7 +81,7 @@ fn default_true() -> bool {
 // AppConfig
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub port: u16,
     pub host: String,
@@ -109,6 +124,22 @@ pub struct AppConfig {
     /// Provider endpoint definitions.
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+}
+
+impl std::fmt::Debug for AppConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppConfig")
+            .field("port", &self.port)
+            .field("host", &self.host)
+            .field("database_url", &"[REDACTED]")
+            .field("pool_size", &self.pool_size)
+            .field("log_level", &self.log_level)
+            .field("api_key", &"[REDACTED]")
+            .field("solana_grpc_token", &"[REDACTED]")
+            .field("export_dir", &self.export_dir)
+            .field("evm_trace_enabled", &self.evm_trace_enabled)
+            .finish_non_exhaustive()
+    }
 }
 
 fn default_solana_rpc_url() -> String {

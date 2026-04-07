@@ -66,6 +66,7 @@ pub fn spawn_stream_orchestrator(
     provider_registry: Arc<ProviderRegistry>,
     stream_semaphore: Arc<Semaphore>,
     worker_id: String,
+    shutdown_token: CancellationToken,
 ) {
     tokio::spawn(async move {
         info!(worker_id = %worker_id, "Stream orchestrator started");
@@ -76,6 +77,10 @@ pub fn spawn_stream_orchestrator(
 
         loop {
             tokio::select! {
+                _ = shutdown_token.cancelled() => {
+                    info!(worker_id = %worker_id, "Stream orchestrator shutting down");
+                    break;
+                }
                 _ = poll_interval.tick() => {
                     poll_and_claim(
                         &repo,
@@ -91,6 +96,14 @@ pub fn spawn_stream_orchestrator(
                 }
             }
         }
+
+        // Graceful shutdown: cancel all active streams and release leases.
+        for (sub_id, stream) in active_streams.drain() {
+            info!(subscription_id = %sub_id, "Cancelling stream for shutdown");
+            stream.cancel.cancel();
+            let _ = repo.release_stream_lease(sub_id, &worker_id).await;
+        }
+        info!(worker_id = %worker_id, "Stream orchestrator stopped");
     });
 }
 
