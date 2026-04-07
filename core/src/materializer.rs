@@ -320,11 +320,20 @@ impl DatasetRegistry {
             || network.starts_with("base-")
             || network.starts_with("arbitrum-")
             || network.starts_with("hyperevm-")
+            || network.starts_with("optimism-")
+            || network.starts_with("polygon-")
+            || network.starts_with("scroll-")
+            || network.starts_with("zksync-")
+            || network.starts_with("linea-")
+            || network.starts_with("mantle-")
+            || network.starts_with("blast-")
         {
             Some(ChainFamily::Evm)
         } else if network.starts_with("hypercore-") {
             Some(ChainFamily::Hyperliquid)
         } else {
+            #[cfg(debug_assertions)]
+            eprintln!("[WARN] Unrecognized network prefix in chain_family_for_network: {network}");
             None
         }
     }

@@ -1243,38 +1243,70 @@ impl Repository {
             return 0;
         }
 
+        let mut success_count: usize = 0;
+
         // Write Silver records to the database.
         if !all_token_transfers.is_empty() {
-            if let Err(e) = self.save_token_transfers(&all_token_transfers).await {
-                warn!(error = %e, count = all_token_transfers.len(), "Bronze-native Silver: token_transfers write failed");
+            match self.save_token_transfers(&all_token_transfers).await {
+                Ok(()) => {
+                    success_count += all_token_transfers.len();
+                }
+                Err(e) => {
+                    warn!(error = %e, count = all_token_transfers.len(), "Bronze-native Silver: token_transfers write failed");
+                }
             }
         }
         if !all_native_balance_deltas.is_empty() {
-            if let Err(e) = self
+            match self
                 .save_native_balance_deltas(&all_native_balance_deltas)
                 .await
             {
-                warn!(error = %e, count = all_native_balance_deltas.len(), "Bronze-native Silver: native_balance_deltas write failed");
+                Ok(()) => {
+                    success_count += all_native_balance_deltas.len();
+                }
+                Err(e) => {
+                    warn!(error = %e, count = all_native_balance_deltas.len(), "Bronze-native Silver: native_balance_deltas write failed");
+                }
             }
         }
         if !all_decoded_events.is_empty() {
-            if let Err(e) = self.save_decoded_events(&all_decoded_events).await {
-                warn!(error = %e, count = all_decoded_events.len(), "Bronze-native Silver: decoded_events write failed");
+            match self.save_decoded_events(&all_decoded_events).await {
+                Ok(()) => {
+                    success_count += all_decoded_events.len();
+                }
+                Err(e) => {
+                    warn!(error = %e, count = all_decoded_events.len(), "Bronze-native Silver: decoded_events write failed");
+                }
             }
         }
         if !all_hl_fills.is_empty() {
-            if let Err(e) = self.save_hl_fill_records(&all_hl_fills).await {
-                warn!(error = %e, count = all_hl_fills.len(), "Bronze-native Silver: hl_fill_records write failed");
+            match self.save_hl_fill_records(&all_hl_fills).await {
+                Ok(()) => {
+                    success_count += all_hl_fills.len();
+                }
+                Err(e) => {
+                    warn!(error = %e, count = all_hl_fills.len(), "Bronze-native Silver: hl_fill_records write failed");
+                }
             }
         }
         if !all_hl_funding.is_empty() {
-            if let Err(e) = self.save_hl_funding_payments(&all_hl_funding).await {
-                warn!(error = %e, count = all_hl_funding.len(), "Bronze-native Silver: hl_funding_payments write failed");
+            match self.save_hl_funding_payments(&all_hl_funding).await {
+                Ok(()) => {
+                    success_count += all_hl_funding.len();
+                }
+                Err(e) => {
+                    warn!(error = %e, count = all_hl_funding.len(), "Bronze-native Silver: hl_funding_payments write failed");
+                }
             }
         }
         if !all_hl_positions.is_empty() {
-            if let Err(e) = self.save_hl_position_changes(&all_hl_positions).await {
-                warn!(error = %e, count = all_hl_positions.len(), "Bronze-native Silver: hl_position_changes write failed");
+            match self.save_hl_position_changes(&all_hl_positions).await {
+                Ok(()) => {
+                    success_count += all_hl_positions.len();
+                }
+                Err(e) => {
+                    warn!(error = %e, count = all_hl_positions.len(), "Bronze-native Silver: hl_position_changes write failed");
+                }
             }
         }
 
@@ -1367,7 +1399,7 @@ impl Repository {
             }
         }
 
-        total
+        success_count
     }
 
     /// Get or create dataset versions for each Silver dataset.

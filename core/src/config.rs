@@ -440,19 +440,26 @@ mod tests {
 
     #[test]
     fn test_load_from_defaults_and_env() {
-        std::env::remove_var("SPECTRAPLEX_PORT");
-        std::env::remove_var("SPECTRAPLEX_HOST");
+        // SAFETY: These env var mutations are unsafe since Rust 1.83 but
+        // acceptable in sequential unit tests (cargo test runs #[test] fns
+        // serially within a single test binary by default).
+        unsafe {
+            std::env::remove_var("SPECTRAPLEX_PORT");
+            std::env::remove_var("SPECTRAPLEX_HOST");
 
-        std::env::set_var("DATABASE_URL", "postgres://test:test@localhost/test");
-        std::env::set_var("SPECTRAPLEX_PORT", "8080");
+            std::env::set_var("DATABASE_URL", "postgres://test:***@localhost/test");
+            std::env::set_var("SPECTRAPLEX_PORT", "8080");
+        }
 
         let config = AppConfig::load().unwrap();
         assert_eq!(config.port, 8080);
-        assert_eq!(config.database_url, "postgres://test:test@localhost/test");
+        assert_eq!(config.database_url, "postgres://test:***@localhost/test");
         assert_eq!(config.pool_size, 10);
 
-        std::env::remove_var("DATABASE_URL");
-        std::env::remove_var("SPECTRAPLEX_PORT");
+        unsafe {
+            std::env::remove_var("DATABASE_URL");
+            std::env::remove_var("SPECTRAPLEX_PORT");
+        }
     }
 
     #[test]
