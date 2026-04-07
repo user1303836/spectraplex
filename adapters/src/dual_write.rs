@@ -20,6 +20,58 @@ use uuid::Uuid;
 use crate::repo::Repository;
 
 // ---------------------------------------------------------------------------
+// Silver materialization result tracking (#210)
+// ---------------------------------------------------------------------------
+
+/// Tracks per-dataset success/failure counts for Silver materialization.
+///
+/// Returned by `materialize_silver_datasets` so callers can observe partial
+/// failures without aborting the entire job.
+#[derive(Debug, Clone, Default)]
+pub struct SilverMaterializationResult {
+    pub token_transfers_written: usize,
+    pub token_transfers_failed: usize,
+    pub native_balance_deltas_written: usize,
+    pub native_balance_deltas_failed: usize,
+    pub decoded_events_written: usize,
+    pub decoded_events_failed: usize,
+    pub hl_fills_written: usize,
+    pub hl_fills_failed: usize,
+    pub hl_funding_written: usize,
+    pub hl_funding_failed: usize,
+    pub hl_positions_written: usize,
+    pub hl_positions_failed: usize,
+    pub skipped_ambiguous: usize,
+}
+
+impl SilverMaterializationResult {
+    /// Total number of records successfully written across all datasets.
+    pub fn total_written(&self) -> usize {
+        self.token_transfers_written
+            + self.native_balance_deltas_written
+            + self.decoded_events_written
+            + self.hl_fills_written
+            + self.hl_funding_written
+            + self.hl_positions_written
+    }
+
+    /// Total number of records that failed to write across all datasets.
+    pub fn total_failed(&self) -> usize {
+        self.token_transfers_failed
+            + self.native_balance_deltas_failed
+            + self.decoded_events_failed
+            + self.hl_fills_failed
+            + self.hl_funding_failed
+            + self.hl_positions_failed
+    }
+
+    /// True when every dataset write succeeded (no failures).
+    pub fn all_succeeded(&self) -> bool {
+        self.total_failed() == 0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Chain → Network / Source mapping  (Rollout Plan Section 2.4)
 // ---------------------------------------------------------------------------
 
@@ -627,14 +679,16 @@ impl Repository {
     /// back to `chain_to_default_network()` — and logs a warning when it does.
     ///
     /// V2 Silver writes are best-effort: failures are logged but never abort
-    /// the V1 normalization path.
+    /// the V1 normalization path.  Returns a [`SilverMaterializationResult`]
+    /// with per-dataset success/failure counts so callers can surface errors.
     pub async fn materialize_silver_datasets(
         &self,
         txs: &[Transaction],
         explicit_network: Option<&str>,
-    ) {
+    ) -> SilverMaterializationResult {
+        let mut result = SilverMaterializationResult::default();
         if txs.is_empty() {
-            return;
+            return result;
         }
 
         // 0. When no explicit network is provided, consult Bronze to recover
@@ -678,7 +732,6 @@ impl Repository {
         // network.  Callers should re-run normalize with --network to provide
         // explicit context for skipped transactions.
         let mut resolved_networks: HashMap<String, String> = HashMap::new(); // tx_hash → network
-        let mut skipped = 0usize;
         for tx in txs {
             let (network, was_inferred) =
                 resolve_effective_network(tx, explicit_network, &bronze_network_map);
@@ -691,14 +744,14 @@ impl Repository {
                      inferred — skipping this transaction. Re-run normalize with \
                      --network to provide explicit context."
                 );
-                skipped += 1;
+                result.skipped_ambiguous += 1;
                 continue;
             }
             resolved_networks.insert(tx.tx_hash.clone(), network);
         }
-        if skipped > 0 {
+        if result.skipped_ambiguous > 0 {
             warn!(
-                skipped,
+                skipped = result.skipped_ambiguous,
                 total = txs.len(),
                 "Silver materialization: skipped transactions with ambiguous network"
             );
@@ -1021,88 +1074,140 @@ impl Repository {
             + all_hl_positions.len();
 
         if total == 0 {
-            return;
+            return result;
         }
 
-        // 4. Write Silver records to the database.
+        // 4. Write Silver records to the database, tracking per-dataset outcomes.
         if !all_token_transfers.is_empty() {
+            let count = all_token_transfers.len();
             if let Err(e) = self.save_token_transfers(&all_token_transfers).await {
                 warn!(
                     error = %e,
-                    count = all_token_transfers.len(),
+                    count,
                     "Silver materialization: token_transfers write failed"
                 );
+                result.token_transfers_failed = count;
+            } else {
+                result.token_transfers_written = count;
             }
         }
 
         if !all_native_balance_deltas.is_empty() {
+            let count = all_native_balance_deltas.len();
             if let Err(e) = self
                 .save_native_balance_deltas(&all_native_balance_deltas)
                 .await
             {
                 warn!(
                     error = %e,
-                    count = all_native_balance_deltas.len(),
+                    count,
                     "Silver materialization: native_balance_deltas write failed"
                 );
+                result.native_balance_deltas_failed = count;
+            } else {
+                result.native_balance_deltas_written = count;
             }
         }
 
         if !all_decoded_events.is_empty() {
+            let count = all_decoded_events.len();
             if let Err(e) = self.save_decoded_events(&all_decoded_events).await {
                 warn!(
                     error = %e,
-                    count = all_decoded_events.len(),
+                    count,
                     "Silver materialization: decoded_events write failed"
                 );
+                result.decoded_events_failed = count;
+            } else {
+                result.decoded_events_written = count;
             }
         }
 
         if !all_hl_fills.is_empty() {
+            let count = all_hl_fills.len();
             if let Err(e) = self.save_hl_fill_records(&all_hl_fills).await {
                 warn!(
                     error = %e,
-                    count = all_hl_fills.len(),
+                    count,
                     "Silver materialization: hl_fill_records write failed"
                 );
+                result.hl_fills_failed = count;
+            } else {
+                result.hl_fills_written = count;
             }
         }
 
         if !all_hl_funding.is_empty() {
+            let count = all_hl_funding.len();
             if let Err(e) = self.save_hl_funding_payments(&all_hl_funding).await {
                 warn!(
                     error = %e,
-                    count = all_hl_funding.len(),
+                    count,
                     "Silver materialization: hl_funding_payments write failed"
                 );
+                result.hl_funding_failed = count;
+            } else {
+                result.hl_funding_written = count;
             }
         }
 
         if !all_hl_positions.is_empty() {
+            let count = all_hl_positions.len();
             if let Err(e) = self.save_hl_position_changes(&all_hl_positions).await {
                 warn!(
                     error = %e,
-                    count = all_hl_positions.len(),
+                    count,
                     "Silver materialization: hl_position_changes write failed"
                 );
+                result.hl_positions_failed = count;
+            } else {
+                result.hl_positions_written = count;
             }
         }
 
-        info!(
-            token_transfers = all_token_transfers.len(),
-            native_balance_deltas = all_native_balance_deltas.len(),
-            decoded_events = all_decoded_events.len(),
-            hl_fills = all_hl_fills.len(),
-            hl_funding = all_hl_funding.len(),
-            hl_positions = all_hl_positions.len(),
-            "Silver dataset materialization complete"
-        );
+        // Log aggregate outcome prominently.
+        let failed = result.total_failed();
+        let written = result.total_written();
+        if failed > 0 {
+            warn!(
+                written,
+                failed,
+                skipped = result.skipped_ambiguous,
+                token_transfers_ok = result.token_transfers_written,
+                token_transfers_err = result.token_transfers_failed,
+                native_balance_deltas_ok = result.native_balance_deltas_written,
+                native_balance_deltas_err = result.native_balance_deltas_failed,
+                decoded_events_ok = result.decoded_events_written,
+                decoded_events_err = result.decoded_events_failed,
+                hl_fills_ok = result.hl_fills_written,
+                hl_fills_err = result.hl_fills_failed,
+                hl_funding_ok = result.hl_funding_written,
+                hl_funding_err = result.hl_funding_failed,
+                hl_positions_ok = result.hl_positions_written,
+                hl_positions_err = result.hl_positions_failed,
+                "Silver dataset materialization completed with failures"
+            );
+        } else {
+            info!(
+                written,
+                skipped = result.skipped_ambiguous,
+                token_transfers = result.token_transfers_written,
+                native_balance_deltas = result.native_balance_deltas_written,
+                decoded_events = result.decoded_events_written,
+                hl_fills = result.hl_fills_written,
+                hl_funding = result.hl_funding_written,
+                hl_positions = result.hl_positions_written,
+                "Silver dataset materialization complete"
+            );
+        }
 
         // 5. Update dataset completeness metadata.
         //    Group by (chain, wallet_address) to resolve targets, then update
         //    completeness for each (target, dataset, network) combination.
         self.update_silver_completeness(txs, &dataset_versions, total, &resolved_networks)
             .await;
+
+        result
     }
 
     /// Materialize Silver datasets directly from Bronze `RawTransaction` rows,

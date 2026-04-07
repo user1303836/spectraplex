@@ -101,10 +101,14 @@ async fn execute_job(
     }
 
     // Spawn a heartbeat task that runs until we signal completion.
+    // If the heartbeat detects the lease was reclaimed (Ok(false)),
+    // it cancels lease_lost so the main task can abort.
     let heartbeat_cancel = CancellationToken::new();
+    let lease_lost = CancellationToken::new();
     let hb_repo = repo.clone();
     let hb_worker = worker_id.to_string();
     let hb_cancel = heartbeat_cancel.clone();
+    let hb_lease_lost = lease_lost.clone();
     let hb_job_id = job_id;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -113,8 +117,16 @@ async fn execute_job(
             tokio::select! {
                 _ = hb_cancel.cancelled() => { return; }
                 _ = interval.tick() => {
-                    if let Err(e) = hb_repo.heartbeat_ingestion_job(hb_job_id, &hb_worker).await {
-                        warn!(job_id = %hb_job_id, error = %e, "Ingestion heartbeat failed — lease may be stale");
+                    match hb_repo.heartbeat_ingestion_job(hb_job_id, &hb_worker).await {
+                        Ok(true) => {} // lease still valid
+                        Ok(false) => {
+                            warn!(job_id = %hb_job_id, "Ingestion heartbeat rejected — lease reclaimed by another worker");
+                            hb_lease_lost.cancel();
+                            return;
+                        }
+                        Err(e) => {
+                            warn!(job_id = %hb_job_id, error = %e, "Ingestion heartbeat failed — lease may be stale");
+                        }
                     }
                 }
             }
@@ -146,6 +158,13 @@ async fn execute_job(
 
     // Stop heartbeat.
     heartbeat_cancel.cancel();
+
+    // If lease was lost during execution, skip terminal state updates
+    // to avoid conflicting with the worker that reclaimed the job.
+    if lease_lost.is_cancelled() {
+        warn!(job_id = %job_id, "Lease lost during ingestion — skipping terminal state update");
+        return;
+    }
 
     match result {
         Ok(count) => {

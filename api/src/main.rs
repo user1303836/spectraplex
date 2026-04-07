@@ -932,11 +932,11 @@ async fn validate_sink_config(config: &SinkConfig, export_dir: &str) -> Result<(
 /// `export_dir`. Rejects path traversal, absolute paths outside the root,
 /// and symlink-based escapes.
 ///
-/// **TOCTOU note**: This check canonicalizes at validation time, but the
-/// actual write happens later in `LocalFileSink::deliver`. A symlink
-/// created between validation and write could bypass this check.  Full
-/// mitigation would require O_NOFOLLOW or chroot, which is impractical
-/// here; the canonicalization check is defense-in-depth.
+/// **TOCTOU note**: This check canonicalizes at validation time; the actual
+/// write happens later via `write_no_follow()` which opens files with
+/// `O_NOFOLLOW`, refusing to follow symlinks at write time. Together with
+/// this validation, the two layers provide defense-in-depth against symlink
+/// attacks (#220).
 fn validate_export_file_path(path: &str, export_dir: &str) -> Result<(), AppError> {
     use std::path::Path;
 
@@ -1029,7 +1029,7 @@ impl ExportSink for LocalFileSink {
                 .map_err(|e| format!("Failed to create directory for {}: {e}", self.path))?;
         }
 
-        tokio::fs::write(&self.path, data)
+        write_no_follow(&self.path, data)
             .await
             .map_err(|e| format!("Failed to write to {}: {e}", self.path))?;
 
@@ -1040,6 +1040,29 @@ impl ExportSink for LocalFileSink {
             delivered_at: chrono::Utc::now(),
         })
     }
+}
+
+/// Opens a file for writing with `O_NOFOLLOW` to prevent symlink-following
+/// attacks (TOCTOU mitigation for #220). If the target path is a symlink the
+/// open will fail with `ELOOP` instead of silently following it.
+pub(crate) async fn write_no_follow(path: &str, data: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = path.to_owned();
+    let data = data.to_vec();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        file.write_all(&data)?;
+        file.flush()?;
+        Ok(())
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// POSTs export data to an HTTP(S) webhook URL.

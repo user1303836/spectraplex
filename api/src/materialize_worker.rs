@@ -425,7 +425,15 @@ pub(crate) async fn execute_normalize(
         anyhow::bail!("lease lost before Silver materialization");
     }
 
-    repo.materialize_silver_datasets(&txs, network).await;
+    let silver_result = repo.materialize_silver_datasets(&txs, network).await;
+    if !silver_result.all_succeeded() {
+        warn!(
+            written = silver_result.total_written(),
+            failed = silver_result.total_failed(),
+            skipped = silver_result.skipped_ambiguous,
+            "Silver materialization completed with partial failures"
+        );
+    }
     Ok(count)
 }
 
