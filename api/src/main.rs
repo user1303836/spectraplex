@@ -8220,13 +8220,24 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limiter_last_used_updated() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
         let limiter = RateLimiter::new(10, 1.0);
         limiter.try_acquire("ts-key").await;
+
+        // The rate limiter hashes keys, so we need the hashed version to inspect.
+        let hashed_key = {
+            let mut hasher = DefaultHasher::new();
+            "ts-key".hash(&mut hasher);
+            hasher.finish().to_string()
+        };
+
         let first_used = limiter
             .buckets
             .lock()
             .await
-            .get("ts-key")
+            .get(&hashed_key)
             .unwrap()
             .last_used;
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -8235,7 +8246,7 @@ mod tests {
             .buckets
             .lock()
             .await
-            .get("ts-key")
+            .get(&hashed_key)
             .unwrap()
             .last_used;
         assert!(second_used > first_used);
