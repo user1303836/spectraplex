@@ -31,6 +31,9 @@ use uuid::Uuid;
 
 use crate::repo::Repository;
 
+/// Maximum allowed LIMIT for V2 repository queries to prevent unbounded result sets.
+const MAX_QUERY_LIMIT: i64 = 10_000;
+
 // ---------------------------------------------------------------------------
 // Enum ↔ SQL string helpers
 // ---------------------------------------------------------------------------
@@ -1173,6 +1176,7 @@ pub fn build_dataset_filter_query(
     limit: i64,
     offset: i64,
 ) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+    let limit = limit.min(MAX_QUERY_LIMIT);
     let mut sql = format!("SELECT {select_cols} FROM {table_name} dt");
     let mut args = sqlx::postgres::PgArguments::default();
     let mut n: usize = 0;
@@ -4145,6 +4149,7 @@ impl Repository {
         from: Option<i64>,
         to: Option<i64>,
     ) -> anyhow::Result<Vec<RawTransaction>> {
+        let limit = limit.min(MAX_QUERY_LIMIT);
         let mut sql = String::from(
             "SELECT DISTINCT rt.id, rt.network, rt.tx_hash, rt.timestamp, rt.block_number, \
              rt.raw_metadata, rt.source, rt.ingestion_run_id, rt.ingested_at \
@@ -4214,6 +4219,7 @@ impl Repository {
         from: Option<i64>,
         to: Option<i64>,
     ) -> anyhow::Result<Vec<WalletLedgerRecord>> {
+        let limit = limit.min(MAX_QUERY_LIMIT);
         let mut sql = String::from(
             "SELECT id, raw_transaction_id, wallet_address, network, tx_hash, \
              timestamp, entry_type, asset_symbol, amount, counterparty_address, \

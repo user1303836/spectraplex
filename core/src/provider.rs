@@ -730,7 +730,10 @@ mod tests {
 
     #[test]
     fn registry_token_env_resolution() {
-        std::env::set_var("TEST_GRPC_TOKEN_XYZ", "my-secret-token");
+        // SAFETY: env var mutation is unsafe since Rust 1.83, acceptable in sequential tests.
+        unsafe {
+            std::env::set_var("TEST_GRPC_TOKEN_XYZ", "my-secret-token");
+        }
 
         let mut networks = HashMap::new();
         networks.insert("test".to_string(), NetworkConfig { enabled: true });
@@ -751,14 +754,19 @@ mod tests {
         let p = registry.resolve(&net, ProviderCapability::Stream).unwrap();
         assert_eq!(p.token.as_deref(), Some("my-secret-token"));
 
-        std::env::remove_var("TEST_GRPC_TOKEN_XYZ");
+        unsafe {
+            std::env::remove_var("TEST_GRPC_TOKEN_XYZ");
+        }
     }
 
     #[test]
     fn registry_direct_token_takes_precedence_over_env() {
         // Set an env var, but also provide a direct token value.
         // The direct value should win.
-        std::env::set_var("TEST_GRPC_TOKEN_PRECEDENCE", "env-value");
+        // SAFETY: env var mutation is unsafe since Rust 1.83, acceptable in sequential tests.
+        unsafe {
+            std::env::set_var("TEST_GRPC_TOKEN_PRECEDENCE", "env-value");
+        }
 
         let mut networks = HashMap::new();
         networks.insert("test".to_string(), NetworkConfig { enabled: true });
@@ -779,13 +787,18 @@ mod tests {
         let p = registry.resolve(&net, ProviderCapability::Stream).unwrap();
         assert_eq!(p.token.as_deref(), Some("direct-value"));
 
-        std::env::remove_var("TEST_GRPC_TOKEN_PRECEDENCE");
+        unsafe {
+            std::env::remove_var("TEST_GRPC_TOKEN_PRECEDENCE");
+        }
     }
 
     #[test]
     fn registry_token_env_missing_is_none() {
         // Ensure the var does not exist.
-        std::env::remove_var("DEFINITELY_NOT_SET_TOKEN_ABC123");
+        // SAFETY: env var mutation is unsafe since Rust 1.83, acceptable in sequential tests.
+        unsafe {
+            std::env::remove_var("DEFINITELY_NOT_SET_TOKEN_ABC123");
+        }
 
         let mut networks = HashMap::new();
         networks.insert("test".to_string(), NetworkConfig { enabled: true });
