@@ -2820,6 +2820,66 @@ impl Repository {
     // Gold-tier: wallet_ledger and balance_history (P5-W1)
     // -----------------------------------------------------------------------
 
+    /// Upsert wallet_ledger records. Uses ON CONFLICT DO NOTHING on the primary key
+    /// to maintain idempotency.
+    pub async fn save_wallet_ledger_records(
+        &self,
+        records: &[WalletLedgerRecord],
+    ) -> anyhow::Result<()> {
+        for chunk in records.chunks(500) {
+            let mut query_builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+                "INSERT INTO wallet_ledger (id, raw_transaction_id, wallet_address, network, tx_hash, \
+                 timestamp, entry_type, asset_symbol, amount, counterparty_address, \
+                 fee_amount, fee_asset, cost_basis, proceeds, dataset_version_id, created_at) ",
+            );
+            query_builder.push_values(chunk, |mut b, r| {
+                b.push_bind(r.id)
+                    .push_bind(r.raw_transaction_id)
+                    .push_bind(&r.wallet_address)
+                    .push_bind(&r.network)
+                    .push_bind(&r.tx_hash)
+                    .push_bind(r.timestamp)
+                    .push_bind(&r.entry_type)
+                    .push_bind(&r.asset_symbol)
+                    .push_bind(&r.amount)
+                    .push_bind(&r.counterparty_address)
+                    .push_bind(&r.fee_amount)
+                    .push_bind(&r.fee_asset)
+                    .push_bind(&r.cost_basis)
+                    .push_bind(&r.proceeds)
+                    .push_bind(r.dataset_version_id)
+                    .push_bind(r.created_at);
+            });
+            query_builder.push(" ON CONFLICT (id) DO NOTHING");
+            query_builder.build().execute(self.pool()).await?;
+        }
+        Ok(())
+    }
+
+    /// Upsert balance_history records.
+    pub async fn save_balance_snapshots(&self, records: &[BalanceSnapshot]) -> anyhow::Result<()> {
+        for chunk in records.chunks(500) {
+            let mut query_builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+                "INSERT INTO balance_history (id, wallet_address, asset_symbol, network, \
+                 timestamp, balance, tx_hash, dataset_version_id, created_at) ",
+            );
+            query_builder.push_values(chunk, |mut b, r| {
+                b.push_bind(r.id)
+                    .push_bind(&r.wallet_address)
+                    .push_bind(&r.asset_symbol)
+                    .push_bind(&r.network)
+                    .push_bind(r.timestamp)
+                    .push_bind(&r.balance)
+                    .push_bind(&r.tx_hash)
+                    .push_bind(r.dataset_version_id)
+                    .push_bind(r.created_at);
+            });
+            query_builder.push(" ON CONFLICT (id) DO NOTHING");
+            query_builder.build().execute(self.pool()).await?;
+        }
+        Ok(())
+    }
+
     /// Query wallet_ledger records with optional wallet, network, and time-window filters.
     #[allow(clippy::too_many_arguments)]
     pub async fn query_wallet_ledger_records(

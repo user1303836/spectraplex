@@ -380,6 +380,12 @@ impl DatasetRegistry {
         ]
     }
 
+    /// Returns the Gold datasets that need version tracking during
+    /// Gold materialization from Silver.
+    pub fn gold_materializable() -> &'static [DatasetName] {
+        &[DatasetName::WalletLedger, DatasetName::BalanceHistory]
+    }
+
     /// Check whether a canonical name string is a known queryable dataset.
     pub fn is_queryable(name: &str) -> bool {
         Self::queryable().iter().any(|ds| ds.as_sql_str() == name)

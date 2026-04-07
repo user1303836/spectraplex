@@ -6,14 +6,18 @@
 //!
 //! V2 writes are best-effort: failures are logged but never abort the V1 path.
 
+use bigdecimal::BigDecimal;
 use chrono::Utc;
-use spectraplex_core::materializer::{DatasetName, DatasetRegistry};
+use spectraplex_core::materializer::{
+    BalanceSnapshot, DatasetName, DatasetRegistry, HlFillRecord, HlFundingPayment,
+    NativeBalanceDelta, TokenTransfer, WalletLedgerRecord,
+};
 use spectraplex_core::models::{Chain, IndexerCheckpoint, Transaction};
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
     DatasetVersionStatus, IndexTarget, RawTransaction, TargetKind, TargetMatch, TargetMode,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -32,12 +36,25 @@ pub struct BronzeSilverResult {
     pub last_raw_transaction_id: Option<uuid::Uuid>,
     /// The latest raw_transaction timestamp in the input batch.
     pub last_timestamp: Option<i64>,
+    /// Gold wallet_ledger records successfully written.
+    pub gold_wallet_ledger_written: usize,
+    /// Gold balance_history records successfully written.
+    pub gold_balance_history_written: usize,
 }
 
 impl BronzeSilverResult {
     pub fn all_succeeded(&self) -> bool {
         self.total_failed == 0
     }
+}
+
+/// Result of Gold materialization from Silver.
+#[derive(Debug, Clone, Default)]
+pub struct GoldMaterializationResult {
+    pub wallet_ledger_written: usize,
+    pub wallet_ledger_failed: usize,
+    pub balance_history_written: usize,
+    pub balance_history_failed: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -1476,6 +1493,30 @@ impl Repository {
             "Bronze-native Silver dataset materialization complete"
         );
 
+        // --- Gold materialization from Silver ---
+        if let Some(wallet) = wallet_address {
+            if !wallet.is_empty() {
+                let gold_result = self
+                    .materialize_gold_from_silver(
+                        raw_txs,
+                        wallet,
+                        &all_token_transfers,
+                        &all_native_balance_deltas,
+                        &all_hl_fills,
+                        &all_hl_funding,
+                    )
+                    .await;
+                result.gold_wallet_ledger_written = gold_result.wallet_ledger_written;
+                result.gold_balance_history_written = gold_result.balance_history_written;
+
+                info!(
+                    wallet_ledger = gold_result.wallet_ledger_written,
+                    balance_history = gold_result.balance_history_written,
+                    "Gold materialization from Silver complete"
+                );
+            }
+        }
+
         // Track per-dataset record counts for accurate completeness.
         let mut dataset_counts: HashMap<&str, usize> = HashMap::new();
         *dataset_counts.entry("token_transfers").or_default() += all_token_transfers.len();
@@ -1607,6 +1648,355 @@ impl Repository {
         versions
     }
 
+    /// Get or create dataset versions for each Gold dataset.
+    async fn resolve_gold_dataset_versions(&self) -> HashMap<String, Uuid> {
+        let mut versions = HashMap::new();
+        for ds in DatasetRegistry::gold_materializable() {
+            let name = ds.as_sql_str();
+            match self.get_active_dataset_version(name).await {
+                Ok(Some(dv)) => {
+                    versions.insert(name.to_string(), dv.id);
+                }
+                Ok(None) => {
+                    let dv = DatasetVersion {
+                        id: Uuid::new_v4(),
+                        dataset_name: name.to_string(),
+                        version: 1,
+                        parser_hash: None,
+                        created_at: Utc::now(),
+                        notes: Some("Auto-created during Gold materialization".to_string()),
+                        status: DatasetVersionStatus::Active,
+                    };
+                    match self.create_dataset_version(&dv).await {
+                        Ok(()) => {
+                            versions.insert(name.to_string(), dv.id);
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                dataset = %name,
+                                "Failed to create Gold dataset version"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        dataset = %name,
+                        "Failed to look up Gold dataset version"
+                    );
+                }
+            }
+        }
+        versions
+    }
+
+    /// Derive Gold records (wallet_ledger, balance_history) from Silver data.
+    ///
+    /// Called after Silver records have been written. Produces wallet-scoped
+    /// Gold records using deterministic UUIDs for idempotency.
+    pub async fn materialize_gold_from_silver(
+        &self,
+        raw_txs: &[RawTransaction],
+        wallet_address: &str,
+        token_transfers: &[TokenTransfer],
+        native_deltas: &[NativeBalanceDelta],
+        hl_fills: &[HlFillRecord],
+        hl_funding: &[HlFundingPayment],
+    ) -> GoldMaterializationResult {
+        let mut result = GoldMaterializationResult::default();
+
+        if wallet_address.is_empty() {
+            return result;
+        }
+
+        let gold_versions = self.resolve_gold_dataset_versions().await;
+        let wl_version_id = gold_versions
+            .get(DatasetName::WalletLedger.as_sql_str())
+            .copied();
+        let bh_version_id = gold_versions
+            .get(DatasetName::BalanceHistory.as_sql_str())
+            .copied();
+
+        // Build lookup map: raw_transaction_id -> &RawTransaction
+        let raw_tx_map: HashMap<Uuid, &RawTransaction> =
+            raw_txs.iter().map(|r| (r.id, r)).collect();
+
+        let wallet_norm = normalize_address_for_comparison(wallet_address);
+        let now = Utc::now();
+
+        let mut ledger_records: Vec<WalletLedgerRecord> = Vec::new();
+
+        // --- Token transfers ---
+        for transfer in token_transfers {
+            let from_match =
+                normalize_address_for_comparison(&transfer.from_address) == wallet_norm;
+            let to_match = normalize_address_for_comparison(&transfer.to_address) == wallet_norm;
+
+            if !from_match && !to_match {
+                continue;
+            }
+
+            let raw_tx_id = transfer.raw_transaction_id;
+            let raw_tx = raw_tx_id.and_then(|id| raw_tx_map.get(&id));
+            let tx_hash = raw_tx.map(|r| r.tx_hash.clone()).unwrap_or_default();
+            let timestamp = raw_tx.map(|r| r.timestamp).unwrap_or(0);
+
+            let asset_symbol = transfer
+                .token_symbol
+                .clone()
+                .unwrap_or_else(|| transfer.token_address.clone());
+
+            if from_match {
+                let key = format!(
+                    "wl:{}:{}:out",
+                    raw_tx_id.map(|u| u.to_string()).unwrap_or_default(),
+                    transfer.transfer_index
+                );
+                ledger_records.push(WalletLedgerRecord {
+                    id: Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()),
+                    raw_transaction_id: raw_tx_id,
+                    wallet_address: wallet_address.to_string(),
+                    network: transfer.network.clone(),
+                    tx_hash: tx_hash.clone(),
+                    timestamp,
+                    entry_type: "transfer".to_string(),
+                    asset_symbol: asset_symbol.clone(),
+                    amount: -transfer.amount.clone(),
+                    counterparty_address: Some(transfer.to_address.clone()),
+                    fee_amount: None,
+                    fee_asset: None,
+                    cost_basis: None,
+                    proceeds: None,
+                    dataset_version_id: wl_version_id,
+                    created_at: now,
+                });
+            }
+
+            if to_match {
+                let key = format!(
+                    "wl:{}:{}:in",
+                    raw_tx_id.map(|u| u.to_string()).unwrap_or_default(),
+                    transfer.transfer_index
+                );
+                ledger_records.push(WalletLedgerRecord {
+                    id: Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()),
+                    raw_transaction_id: raw_tx_id,
+                    wallet_address: wallet_address.to_string(),
+                    network: transfer.network.clone(),
+                    tx_hash,
+                    timestamp,
+                    entry_type: "transfer".to_string(),
+                    asset_symbol,
+                    amount: transfer.amount.clone(),
+                    counterparty_address: Some(transfer.from_address.clone()),
+                    fee_amount: None,
+                    fee_asset: None,
+                    cost_basis: None,
+                    proceeds: None,
+                    dataset_version_id: wl_version_id,
+                    created_at: now,
+                });
+            }
+        }
+
+        // --- Native balance deltas ---
+        for delta in native_deltas {
+            if normalize_address_for_comparison(&delta.account_address) != wallet_norm {
+                continue;
+            }
+
+            let raw_tx_id = delta.raw_transaction_id;
+            let raw_tx = raw_tx_id.and_then(|id| raw_tx_map.get(&id));
+            let tx_hash = raw_tx.map(|r| r.tx_hash.clone()).unwrap_or_default();
+            let timestamp = raw_tx.map(|r| r.timestamp).unwrap_or(0);
+
+            let key = format!(
+                "wl:{}:native:{}",
+                raw_tx_id.map(|u| u.to_string()).unwrap_or_default(),
+                delta.account_address
+            );
+
+            let entry_type = if delta.is_fee_payer {
+                "fee"
+            } else {
+                "transfer"
+            };
+
+            let fee_amount = if delta.is_fee_payer {
+                // Fee is the absolute value of the delta for fee payers
+                Some(if delta.delta < BigDecimal::from(0) {
+                    -delta.delta.clone()
+                } else {
+                    delta.delta.clone()
+                })
+            } else {
+                None
+            };
+            let fee_asset = if delta.is_fee_payer {
+                Some(delta.native_token.clone())
+            } else {
+                None
+            };
+
+            ledger_records.push(WalletLedgerRecord {
+                id: Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()),
+                raw_transaction_id: raw_tx_id,
+                wallet_address: wallet_address.to_string(),
+                network: delta.network.clone(),
+                tx_hash,
+                timestamp,
+                entry_type: entry_type.to_string(),
+                asset_symbol: delta.native_token.clone(),
+                amount: delta.delta.clone(),
+                counterparty_address: None,
+                fee_amount,
+                fee_asset,
+                cost_basis: None,
+                proceeds: None,
+                dataset_version_id: wl_version_id,
+                created_at: now,
+            });
+        }
+
+        // --- HL fills ---
+        for fill in hl_fills {
+            let raw_tx_id = fill.raw_transaction_id;
+            let raw_tx = raw_tx_id.and_then(|id| raw_tx_map.get(&id));
+            let tx_hash = raw_tx.map(|r| r.tx_hash.clone()).unwrap_or_default();
+
+            let trade_id = fill.trade_id.unwrap_or(0);
+            let key = format!(
+                "wl:{}:fill:{}:{}",
+                raw_tx_id.map(|u| u.to_string()).unwrap_or_default(),
+                fill.coin,
+                trade_id
+            );
+
+            let amount = if fill.side == "B" {
+                fill.size.clone()
+            } else {
+                -fill.size.clone()
+            };
+
+            ledger_records.push(WalletLedgerRecord {
+                id: Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()),
+                raw_transaction_id: raw_tx_id,
+                wallet_address: wallet_address.to_string(),
+                network: fill.network.clone(),
+                tx_hash,
+                timestamp: fill.fill_time,
+                entry_type: "trade".to_string(),
+                asset_symbol: fill.coin.clone(),
+                amount,
+                counterparty_address: None,
+                fee_amount: fill.fee.clone(),
+                fee_asset: fill.fee_token.clone(),
+                cost_basis: None,
+                proceeds: None,
+                dataset_version_id: wl_version_id,
+                created_at: now,
+            });
+        }
+
+        // --- HL funding payments ---
+        for funding in hl_funding {
+            let raw_tx_id = funding.raw_transaction_id;
+            let raw_tx = raw_tx_id.and_then(|id| raw_tx_map.get(&id));
+            let tx_hash = raw_tx.map(|r| r.tx_hash.clone()).unwrap_or_default();
+
+            let key = format!(
+                "wl:{}:funding:{}:{}",
+                raw_tx_id.map(|u| u.to_string()).unwrap_or_default(),
+                funding.coin,
+                funding.payment_time
+            );
+
+            ledger_records.push(WalletLedgerRecord {
+                id: Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()),
+                raw_transaction_id: raw_tx_id,
+                wallet_address: wallet_address.to_string(),
+                network: funding.network.clone(),
+                tx_hash,
+                timestamp: funding.payment_time,
+                entry_type: "funding".to_string(),
+                asset_symbol: funding.coin.clone(),
+                amount: funding.amount.clone(),
+                counterparty_address: None,
+                fee_amount: None,
+                fee_asset: None,
+                cost_basis: None,
+                proceeds: None,
+                dataset_version_id: wl_version_id,
+                created_at: now,
+            });
+        }
+
+        // Write wallet_ledger records
+        if !ledger_records.is_empty() {
+            let n = ledger_records.len();
+            match self.save_wallet_ledger_records(&ledger_records).await {
+                Ok(()) => {
+                    result.wallet_ledger_written = n;
+                    info!(count = n, "Gold: wallet_ledger records written");
+                }
+                Err(e) => {
+                    result.wallet_ledger_failed = n;
+                    warn!(error = %e, count = n, "Gold: wallet_ledger write failed");
+                }
+            }
+        }
+
+        // --- Balance history (running balances) ---
+        // Sort ledger records by timestamp, then compute running balance per
+        // (wallet, asset_symbol, network).
+        ledger_records.sort_by_key(|r| r.timestamp);
+
+        let mut running_balances: BTreeMap<(String, String), BigDecimal> = BTreeMap::new();
+        let mut balance_snapshots: Vec<BalanceSnapshot> = Vec::new();
+
+        for rec in &ledger_records {
+            let balance_key = (rec.asset_symbol.clone(), rec.network.clone());
+            let balance = running_balances
+                .entry(balance_key)
+                .or_insert_with(|| BigDecimal::from(0));
+            *balance += &rec.amount;
+
+            let snap_key = format!(
+                "bh:{}:{}:{}:{}",
+                rec.wallet_address, rec.asset_symbol, rec.network, rec.id
+            );
+            balance_snapshots.push(BalanceSnapshot {
+                id: Uuid::new_v5(&Uuid::NAMESPACE_URL, snap_key.as_bytes()),
+                wallet_address: rec.wallet_address.clone(),
+                asset_symbol: rec.asset_symbol.clone(),
+                network: rec.network.clone(),
+                timestamp: rec.timestamp,
+                balance: balance.clone(),
+                tx_hash: rec.tx_hash.clone(),
+                dataset_version_id: bh_version_id,
+                created_at: now,
+            });
+        }
+
+        if !balance_snapshots.is_empty() {
+            let n = balance_snapshots.len();
+            match self.save_balance_snapshots(&balance_snapshots).await {
+                Ok(()) => {
+                    result.balance_history_written = n;
+                    info!(count = n, "Gold: balance_history records written");
+                }
+                Err(e) => {
+                    result.balance_history_failed = n;
+                    warn!(error = %e, count = n, "Gold: balance_history write failed");
+                }
+            }
+        }
+
+        result
+    }
+
     /// Update dataset completeness for each (target, dataset, network) touched
     /// by the materialization run.
     ///
@@ -1706,6 +2096,23 @@ impl Repository {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Address normalization helper
+// ---------------------------------------------------------------------------
+
+/// Normalize an address for case-insensitive comparison on EVM chains only.
+///
+/// EVM addresses (`0x`/`0X`-prefixed hex) are case-insensitive, so we lowercase
+/// them. All other address formats (Solana base58, etc.) are case-sensitive and
+/// must be preserved as-is.
+fn normalize_address_for_comparison(addr: &str) -> String {
+    if addr.starts_with("0x") || addr.starts_with("0X") {
+        addr.to_lowercase()
+    } else {
+        addr.to_string()
     }
 }
 
