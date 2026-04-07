@@ -1288,12 +1288,84 @@ impl Repository {
             "Bronze-native Silver dataset materialization complete"
         );
 
-        // NOTE: dataset_completeness updates are handled at the worker level
-        // via watermark advancement, not inline here. The legacy
-        // materialize_silver_datasets path updates completeness from V1
-        // Transaction data which isn't available in this Bronze-native path.
-        // A dedicated Bronze-native completeness updater can be added as a
-        // follow-up once the completeness model is fully V2-aligned.
+        // Track per-dataset record counts for accurate completeness.
+        let mut dataset_counts: HashMap<&str, usize> = HashMap::new();
+        *dataset_counts.entry("token_transfers").or_default() += all_token_transfers.len();
+        *dataset_counts.entry("native_balance_deltas").or_default() +=
+            all_native_balance_deltas.len();
+        *dataset_counts.entry("decoded_events").or_default() += all_decoded_events.len();
+        *dataset_counts
+            .entry(DatasetName::HlFills.as_sql_str())
+            .or_default() += all_hl_fills.len();
+        *dataset_counts
+            .entry(DatasetName::HlFunding.as_sql_str())
+            .or_default() += all_hl_funding.len();
+        *dataset_counts
+            .entry(DatasetName::Positions.as_sql_str())
+            .or_default() += all_hl_positions.len();
+
+        // Update dataset completeness only for datasets that had records extracted.
+        if let Some(wallet) = wallet_address {
+            if !wallet.is_empty() {
+                let mut net_groups: HashMap<&str, Vec<&RawTransaction>> = HashMap::new();
+                for raw in raw_txs {
+                    net_groups
+                        .entry(raw.network.as_str())
+                        .or_default()
+                        .push(raw);
+                }
+                for (network, group) in &net_groups {
+                    let target_id = match self
+                        .get_index_target_by_address(TargetKind::Wallet, network, wallet)
+                        .await
+                    {
+                        Ok(Some(t)) => t.id,
+                        _ => continue,
+                    };
+                    let coverage_start = group.iter().map(|r| r.timestamp).min();
+                    let coverage_end = group.iter().map(|r| r.timestamp).max();
+                    let block_start = group.iter().filter_map(|r| r.block_number).min();
+                    let block_end = group.iter().filter_map(|r| r.block_number).max();
+                    let run_id = group.iter().find_map(|r| r.ingestion_run_id);
+
+                    for (name, vid) in &dataset_versions {
+                        let count = dataset_counts.get(name.as_str()).copied().unwrap_or(0);
+                        if count == 0 {
+                            continue; // Skip datasets with no records for this run.
+                        }
+                        let dc = DatasetCompleteness {
+                            id: Uuid::new_v5(
+                                &Uuid::NAMESPACE_URL,
+                                format!("{}:{}:{}", target_id, name, network).as_bytes(),
+                            ),
+                            target_id,
+                            dataset_name: name.clone(),
+                            dataset_version_id: Some(*vid),
+                            network: network.to_string(),
+                            status: CompletenessStatus::Partial,
+                            coverage_start,
+                            coverage_end,
+                            block_start,
+                            block_end,
+                            last_ingestion_run_id: run_id,
+                            records_count: count as i64,
+                            gap_ranges: None,
+                            notes: None,
+                            created_at: Utc::now(),
+                            updated_at: Utc::now(),
+                        };
+                        if let Err(e) = self.upsert_dataset_completeness(&dc).await {
+                            warn!(
+                                error = %e,
+                                dataset = %name,
+                                network = %network,
+                                "Bronze-native: completeness upsert failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         total
     }
