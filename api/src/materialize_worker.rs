@@ -226,7 +226,13 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
                                     }
                                     _ => None,
                                 };
-                                if let Some((wm_wallet, wm_network)) = wm_resolved {
+                                if !silver_result.all_succeeded() {
+                                    warn!(
+                                        run_id = %run_id,
+                                        total_failed = silver_result.total_failed,
+                                        "Watermark not advanced due to partial Silver failures"
+                                    );
+                                } else if let Some((wm_wallet, wm_network)) = wm_resolved {
                                     let scope_json = serde_json::json!({
                                         "network": wm_network,
                                         "wallet": wm_wallet,
