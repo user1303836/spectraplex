@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 // These items are defined in main.rs and need to be pub(crate) for this
 // module to use them.  The parent task will adjust visibility.
-use crate::{build_sink, run_export_job};
+use crate::{build_sink, run_export_job, write_no_follow};
 
 /// How often the worker polls for new jobs when idle.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -224,7 +224,7 @@ async fn execute_export_job(
             }
 
             let file_path = format!("{}/{}.{}", exports_dir, job_id, ext);
-            if let Err(e) = tokio::fs::write(&file_path, &body).await {
+            if let Err(e) = write_no_follow(&file_path, &body).await {
                 let err_msg = format!("Failed to write export file: {e}");
                 error!(job_id = %job_id, error = %err_msg, "Export job failed");
                 let _ = update_or_abort(

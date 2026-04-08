@@ -228,14 +228,80 @@ fn wei_to_eth(wei: u128) -> BigDecimal {
 /// Defaults to 18 for unknown tokens.
 fn token_decimals(contract_address: &str) -> u32 {
     match contract_address.to_lowercase().as_str() {
-        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" => 6, // USDC
-        "0xdac17f958d2ee523a2206206994597c13d831ec7" => 6, // USDT
-        "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599" => 8, // WBTC
+        // ---------------------------------------------------------------
+        // USDC (6 decimals) — multi-chain deployments
+        // ---------------------------------------------------------------
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" => 6, // USDC – Ethereum
+        "0xaf88d065e77c8cc2239327c5edb3a432268e5831" => 6, // USDC – Arbitrum (native)
+        "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8" => 6, // USDC.e – Arbitrum (bridged)
+        "0x0b2c639c533813f4aa9d7837caf62653d097ff85" => 6, // USDC – Optimism (native)
+        "0x7f5c764cbc14f9669b88837ca1490cca17c31607" => 6, // USDC.e – Optimism (bridged)
+        "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359" => 6, // USDC – Polygon (native)
+        "0x2791bca1f2de4661ed88a30c99a7a9449aa84174" => 6, // USDC.e – Polygon (bridged)
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => 6, // USDC – Base (native)
+        "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca" => 6, // USDbC – Base (bridged)
+        "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e" => 6, // USDC – Avalanche (native)
+        "0xa7d7079b0fead91f3e65f86e8915cb59c1a4c664" => 6, // USDC.e – Avalanche (bridged)
+
+        // ---------------------------------------------------------------
+        // USDT (6 decimals) — multi-chain deployments
+        // ---------------------------------------------------------------
+        "0xdac17f958d2ee523a2206206994597c13d831ec7" => 6, // USDT – Ethereum
+        "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9" => 6, // USDT – Arbitrum
+        "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58" => 6, // USDT – Optimism
+        "0xc2132d05d31c914a87c6611c10748aeb04b58e8f" => 6, // USDT – Polygon
+        "0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7" => 6, // USDT – Avalanche
+
+        // ---------------------------------------------------------------
+        // WBTC (8 decimals)
+        // ---------------------------------------------------------------
+        "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599" => 8, // WBTC – Ethereum
+        "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f" => 8, // WBTC – Arbitrum
+        "0x68f180fcce6836688e9084f035309e29bf0a2095" => 8, // WBTC – Optimism
+        "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6" => 8, // WBTC – Polygon
+        "0x50b7545627a5162f82a992c33b87adc75187b218" => 8, // WBTC – Avalanche
+
+        // ---------------------------------------------------------------
+        // 18-decimal tokens – Ethereum mainnet
+        // ---------------------------------------------------------------
         "0x6b175474e89094c44da98b954eedeac495271d0f" => 18, // DAI
         "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2" => 18, // WETH
         "0x514910771af9ca656af840dff83e8264ecf986ca" => 18, // LINK
         "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984" => 18, // UNI
         "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce" => 18, // SHIB
+        "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9" => 18, // AAVE
+        "0xc00e94cb662c3520282e6f5717214004a7f26888" => 18, // COMP
+        "0x9f8f72aa9304c8b593d555f12ef6589cc3a579a2" => 18, // MKR
+        "0xc011a73ee8576fb46f5e1c5751ca3b9fe0af2a6f" => 18, // SNX
+        "0xd533a949740bb3306d119cc777fa900ba034cd52" => 18, // CRV
+        "0x6b3595068778dd592e39a122f4f5a5cf09c90fe2" => 18, // SUSHI
+        "0x0bc529c00c6401aef6d220be8c6ea1667f6ad93e" => 18, // YFI
+        "0xba100000625a3754423978a60c9317c58a424e3d" => 18, // BAL
+        "0x7d1afa7b718fb893db30a3abc0cfc608aacfebb0" => 18, // MATIC (Ethereum)
+        "0x4d224452801aced8b2f0aebe155379bb5d594381" => 18, // APE
+        "0x5a98fcbea516cf06857215779fd812ca3bef1b32" => 18, // LDO
+        "0xd33526068d116ce69f19a9ee46f0bd304f21a51f" => 18, // RPL
+        "0x3432b6a60d23ca0dfca7761b7ab56459d9c964d0" => 18, // FXS
+        "0x4e3fbd56cd56c3e72c1403e103b45db9da5b9d2b" => 18, // CVX
+        "0x853d955acef822db058eb8505911ed77f175b99e" => 18, // FRAX
+        "0x5f98805a4e8be255a32880fdec7f6728c6568ba0" => 18, // LUSD
+        "0x57ab1ec28d129707052df4df418d58a2d46d5f51" => 18, // sUSD
+
+        // ---------------------------------------------------------------
+        // DAI – multi-chain deployments (18 decimals)
+        // ---------------------------------------------------------------
+        "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1" => 18, // DAI – Arbitrum & Optimism
+        "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063" => 18, // DAI – Polygon
+        "0xd586e7f844cea2f87f50152665bcbc2c279d8d70" => 18, // DAI.e – Avalanche
+
+        // ---------------------------------------------------------------
+        // WETH – L2 deployments (18 decimals)
+        // ---------------------------------------------------------------
+        "0x82af49447d8a07e3bd95bd0d56f35241523fbab1" => 18, // WETH – Arbitrum
+        "0x4200000000000000000000000000000000000006" => 18, // WETH – Optimism & Base
+        "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619" => 18, // WETH – Polygon
+        "0x49d5c2bdffac6ce2bfdb6fd9b3c6573c5b1d790a" => 18, // WETH.e – Avalanche
+
         _ => 18,
     }
 }
@@ -244,14 +310,68 @@ fn token_decimals(contract_address: &str) -> u32 {
 /// Falls back to the contract address for unknown tokens.
 fn token_symbol(contract_address: &str) -> String {
     match contract_address.to_lowercase().as_str() {
+        // USDC — multi-chain
         "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" => "USDC".to_string(),
+        "0xaf88d065e77c8cc2239327c5edb3a432268e5831" => "USDC".to_string(),
+        "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8" => "USDC.e".to_string(),
+        "0x0b2c639c533813f4aa9d7837caf62653d097ff85" => "USDC".to_string(),
+        "0x7f5c764cbc14f9669b88837ca1490cca17c31607" => "USDC.e".to_string(),
+        "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359" => "USDC".to_string(),
+        "0x2791bca1f2de4661ed88a30c99a7a9449aa84174" => "USDC.e".to_string(),
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => "USDC".to_string(),
+        "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca" => "USDbC".to_string(),
+        "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e" => "USDC".to_string(),
+        "0xa7d7079b0fead91f3e65f86e8915cb59c1a4c664" => "USDC.e".to_string(),
+
+        // USDT — multi-chain
         "0xdac17f958d2ee523a2206206994597c13d831ec7" => "USDT".to_string(),
+        "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9" => "USDT".to_string(),
+        "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58" => "USDT".to_string(),
+        "0xc2132d05d31c914a87c6611c10748aeb04b58e8f" => "USDT".to_string(),
+        "0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7" => "USDT".to_string(),
+
+        // WBTC — multi-chain
         "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599" => "WBTC".to_string(),
+        "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f" => "WBTC".to_string(),
+        "0x68f180fcce6836688e9084f035309e29bf0a2095" => "WBTC".to_string(),
+        "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6" => "WBTC".to_string(),
+        "0x50b7545627a5162f82a992c33b87adc75187b218" => "WBTC".to_string(),
+
+        // 18-decimal tokens — Ethereum mainnet
         "0x6b175474e89094c44da98b954eedeac495271d0f" => "DAI".to_string(),
         "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2" => "WETH".to_string(),
         "0x514910771af9ca656af840dff83e8264ecf986ca" => "LINK".to_string(),
         "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984" => "UNI".to_string(),
         "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce" => "SHIB".to_string(),
+        "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9" => "AAVE".to_string(),
+        "0xc00e94cb662c3520282e6f5717214004a7f26888" => "COMP".to_string(),
+        "0x9f8f72aa9304c8b593d555f12ef6589cc3a579a2" => "MKR".to_string(),
+        "0xc011a73ee8576fb46f5e1c5751ca3b9fe0af2a6f" => "SNX".to_string(),
+        "0xd533a949740bb3306d119cc777fa900ba034cd52" => "CRV".to_string(),
+        "0x6b3595068778dd592e39a122f4f5a5cf09c90fe2" => "SUSHI".to_string(),
+        "0x0bc529c00c6401aef6d220be8c6ea1667f6ad93e" => "YFI".to_string(),
+        "0xba100000625a3754423978a60c9317c58a424e3d" => "BAL".to_string(),
+        "0x7d1afa7b718fb893db30a3abc0cfc608aacfebb0" => "MATIC".to_string(),
+        "0x4d224452801aced8b2f0aebe155379bb5d594381" => "APE".to_string(),
+        "0x5a98fcbea516cf06857215779fd812ca3bef1b32" => "LDO".to_string(),
+        "0xd33526068d116ce69f19a9ee46f0bd304f21a51f" => "RPL".to_string(),
+        "0x3432b6a60d23ca0dfca7761b7ab56459d9c964d0" => "FXS".to_string(),
+        "0x4e3fbd56cd56c3e72c1403e103b45db9da5b9d2b" => "CVX".to_string(),
+        "0x853d955acef822db058eb8505911ed77f175b99e" => "FRAX".to_string(),
+        "0x5f98805a4e8be255a32880fdec7f6728c6568ba0" => "LUSD".to_string(),
+        "0x57ab1ec28d129707052df4df418d58a2d46d5f51" => "sUSD".to_string(),
+
+        // DAI — multi-chain
+        "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1" => "DAI".to_string(),
+        "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063" => "DAI".to_string(),
+        "0xd586e7f844cea2f87f50152665bcbc2c279d8d70" => "DAI.e".to_string(),
+
+        // WETH — L2 deployments
+        "0x82af49447d8a07e3bd95bd0d56f35241523fbab1" => "WETH".to_string(),
+        "0x4200000000000000000000000000000000000006" => "WETH".to_string(),
+        "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619" => "WETH".to_string(),
+        "0x49d5c2bdffac6ce2bfdb6fd9b3c6573c5b1d790a" => "WETH.e".to_string(),
+
         _ => contract_address.to_string(),
     }
 }

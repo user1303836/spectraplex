@@ -34,7 +34,9 @@ use spectraplex_core::v2::{
     IngestionJobStatus, MaterializationRunStatus, Network, TargetKind, TargetMode,
 };
 use sqlx::postgres::PgPoolOptions;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -146,10 +148,20 @@ impl RateLimiter {
     }
 
     /// Try to consume one token for the given key. Returns `true` if allowed.
+    ///
+    /// The key is hashed before use as a map key so that raw API keys are never
+    /// stored in process memory (mitigates credential exposure via core dumps).
     async fn try_acquire(&self, key: &str) -> bool {
         let mut buckets = self.buckets.lock().await;
         let now = Instant::now();
         let cap = self.capacity as f64;
+
+        // Hash the key so we never store raw credentials in memory.
+        let hashed_key = {
+            let mut hasher = DefaultHasher::new();
+            key.hash(&mut hasher);
+            hasher.finish().to_string()
+        };
 
         // Evict stale entries when the map exceeds the threshold.
         if buckets.len() >= RATE_LIMIT_MAX_BUCKETS {
@@ -157,7 +169,7 @@ impl RateLimiter {
             buckets.retain(|_, b| b.last_used > cutoff);
         }
 
-        let bucket = buckets.entry(key.to_string()).or_insert(TokenBucket {
+        let bucket = buckets.entry(hashed_key).or_insert(TokenBucket {
             tokens: cap,
             last_refill: now,
             last_used: now,
@@ -920,11 +932,11 @@ async fn validate_sink_config(config: &SinkConfig, export_dir: &str) -> Result<(
 /// `export_dir`. Rejects path traversal, absolute paths outside the root,
 /// and symlink-based escapes.
 ///
-/// **TOCTOU note**: This check canonicalizes at validation time, but the
-/// actual write happens later in `LocalFileSink::deliver`. A symlink
-/// created between validation and write could bypass this check.  Full
-/// mitigation would require O_NOFOLLOW or chroot, which is impractical
-/// here; the canonicalization check is defense-in-depth.
+/// **TOCTOU note**: This check canonicalizes at validation time; the actual
+/// write happens later via `write_no_follow()` which opens files with
+/// `O_NOFOLLOW`, refusing to follow symlinks at write time. Together with
+/// this validation, the two layers provide defense-in-depth against symlink
+/// attacks (#220).
 fn validate_export_file_path(path: &str, export_dir: &str) -> Result<(), AppError> {
     use std::path::Path;
 
@@ -1017,7 +1029,7 @@ impl ExportSink for LocalFileSink {
                 .map_err(|e| format!("Failed to create directory for {}: {e}", self.path))?;
         }
 
-        tokio::fs::write(&self.path, data)
+        write_no_follow(&self.path, data)
             .await
             .map_err(|e| format!("Failed to write to {}: {e}", self.path))?;
 
@@ -1028,6 +1040,29 @@ impl ExportSink for LocalFileSink {
             delivered_at: chrono::Utc::now(),
         })
     }
+}
+
+/// Opens a file for writing with `O_NOFOLLOW` to prevent symlink-following
+/// attacks (TOCTOU mitigation for #220). If the target path is a symlink the
+/// open will fail with `ELOOP` instead of silently following it.
+pub(crate) async fn write_no_follow(path: &str, data: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = path.to_owned();
+    let data = data.to_vec();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        file.write_all(&data)?;
+        file.flush()?;
+        Ok(())
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// POSTs export data to an HTTP(S) webhook URL.
@@ -8185,13 +8220,24 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limiter_last_used_updated() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
         let limiter = RateLimiter::new(10, 1.0);
         limiter.try_acquire("ts-key").await;
+
+        // The rate limiter hashes keys, so we need the hashed version to inspect.
+        let hashed_key = {
+            let mut hasher = DefaultHasher::new();
+            "ts-key".hash(&mut hasher);
+            hasher.finish().to_string()
+        };
+
         let first_used = limiter
             .buckets
             .lock()
             .await
-            .get("ts-key")
+            .get(&hashed_key)
             .unwrap()
             .last_used;
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -8200,7 +8246,7 @@ mod tests {
             .buckets
             .lock()
             .await
-            .get("ts-key")
+            .get(&hashed_key)
             .unwrap()
             .last_used;
         assert!(second_used > first_used);

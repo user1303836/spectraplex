@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use strum::{Display, EnumString};
+use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 
 use crate::config::{NetworkConfig, ProviderConfig};
 
@@ -91,7 +91,9 @@ pub enum ProviderKind {
 ///
 /// Connectors request a (network, capability) pair and the registry resolves
 /// the best available provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumIter, EnumString,
+)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum ProviderCapability {
@@ -350,19 +352,10 @@ impl NetworkContext {
             return None;
         }
 
-        let all_capabilities = [
-            ProviderCapability::Historical,
-            ProviderCapability::Balances,
-            ProviderCapability::Stream,
-            ProviderCapability::Logs,
-            ProviderCapability::Receipts,
-            ProviderCapability::DebugTraceTransaction,
-        ];
-
         let mut providers = HashMap::new();
-        for cap in &all_capabilities {
-            if let Some(p) = registry.resolve(network, *cap) {
-                providers.insert(*cap, p.clone());
+        for cap in ProviderCapability::iter() {
+            if let Some(p) = registry.resolve(network, cap) {
+                providers.insert(cap, p.clone());
             }
         }
 

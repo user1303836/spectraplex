@@ -667,8 +667,17 @@ async fn main() -> anyhow::Result<()> {
                 // When an explicit network is provided, use it.  Otherwise,
                 // materialize_silver_datasets resolves the actual network from
                 // existing Bronze raw_transactions rows.
-                repo.materialize_silver_datasets(&transactions, network.as_deref())
+                let silver_result = repo
+                    .materialize_silver_datasets(&transactions, network.as_deref())
                     .await;
+                if !silver_result.all_succeeded() {
+                    warn!(
+                        written = silver_result.total_written(),
+                        failed = silver_result.total_failed(),
+                        skipped = silver_result.skipped_ambiguous,
+                        "Silver materialization completed with partial failures"
+                    );
+                }
 
                 info!("Normalization complete");
             } else {

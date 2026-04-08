@@ -3330,13 +3330,13 @@ impl Repository {
         &self,
         job_id: Uuid,
         worker_id: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         sqlx::query("UPDATE ingestion_jobs SET updated_at = NOW() WHERE id = $1")
             .bind(job_id)
             .execute(self.pool())
             .await?;
 
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE ingestion_job_attempts SET heartbeat_at = NOW() \
              WHERE job_id = $1 AND worker_id = $2 AND finished_at IS NULL",
         )
@@ -3345,7 +3345,8 @@ impl Repository {
         .execute(self.pool())
         .await?;
 
-        Ok(())
+        // If no rows were updated, the lease was reclaimed by another worker.
+        Ok(result.rows_affected() > 0)
     }
 
     /// Transition an ingestion job from `claimed` to `running`.
