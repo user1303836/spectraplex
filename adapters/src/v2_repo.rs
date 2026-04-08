@@ -2850,7 +2850,16 @@ impl Repository {
                     .push_bind(r.dataset_version_id)
                     .push_bind(r.created_at);
             });
-            query_builder.push(" ON CONFLICT (id) DO NOTHING");
+            query_builder.push(
+                " ON CONFLICT (id) DO UPDATE SET \
+                 amount = EXCLUDED.amount, \
+                 counterparty_address = EXCLUDED.counterparty_address, \
+                 fee_amount = EXCLUDED.fee_amount, \
+                 fee_asset = EXCLUDED.fee_asset, \
+                 cost_basis = EXCLUDED.cost_basis, \
+                 proceeds = EXCLUDED.proceeds, \
+                 dataset_version_id = EXCLUDED.dataset_version_id",
+            );
             query_builder.build().execute(self.pool()).await?;
         }
         Ok(())
@@ -2874,7 +2883,11 @@ impl Repository {
                     .push_bind(r.dataset_version_id)
                     .push_bind(r.created_at);
             });
-            query_builder.push(" ON CONFLICT (id) DO NOTHING");
+            query_builder.push(
+                " ON CONFLICT (id) DO UPDATE SET \
+                 balance = EXCLUDED.balance, \
+                 dataset_version_id = EXCLUDED.dataset_version_id",
+            );
             query_builder.build().execute(self.pool()).await?;
         }
         Ok(())

@@ -9,15 +9,15 @@
 use bigdecimal::BigDecimal;
 use chrono::Utc;
 use spectraplex_core::materializer::{
-    BalanceSnapshot, DatasetName, DatasetRegistry, HlFillRecord, HlFundingPayment,
-    NativeBalanceDelta, TokenTransfer, WalletLedgerRecord,
+    DatasetName, DatasetRegistry, HlFillRecord, HlFundingPayment, NativeBalanceDelta,
+    TokenTransfer, WalletLedgerRecord,
 };
 use spectraplex_core::models::{Chain, IndexerCheckpoint, Transaction};
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
     DatasetVersionStatus, IndexTarget, RawTransaction, TargetKind, TargetMatch, TargetMode,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -1715,9 +1715,7 @@ impl Repository {
         let wl_version_id = gold_versions
             .get(DatasetName::WalletLedger.as_sql_str())
             .copied();
-        let bh_version_id = gold_versions
-            .get(DatasetName::BalanceHistory.as_sql_str())
-            .copied();
+        // NOTE: bh_version_id unused — balance_history skipped in this PR (see below).
 
         // Build lookup map: raw_transaction_id -> &RawTransaction
         let raw_tx_map: HashMap<Uuid, &RawTransaction> =
@@ -1750,8 +1748,9 @@ impl Repository {
 
             if from_match {
                 let key = format!(
-                    "wl:{}:{}:out",
+                    "wl:{}:{}:{}:out",
                     raw_tx_id.map(|u| u.to_string()).unwrap_or_default(),
+                    transfer.token_address,
                     transfer.transfer_index
                 );
                 ledger_records.push(WalletLedgerRecord {
@@ -1776,8 +1775,9 @@ impl Repository {
 
             if to_match {
                 let key = format!(
-                    "wl:{}:{}:in",
+                    "wl:{}:{}:{}:in",
                     raw_tx_id.map(|u| u.to_string()).unwrap_or_default(),
+                    transfer.token_address,
                     transfer.transfer_index
                 );
                 ledger_records.push(WalletLedgerRecord {
@@ -1920,8 +1920,8 @@ impl Repository {
                 network: funding.network.clone(),
                 tx_hash,
                 timestamp: funding.payment_time,
-                entry_type: "funding".to_string(),
-                asset_symbol: funding.coin.clone(),
+                entry_type: format!("funding:{}", funding.coin),
+                asset_symbol: "USDC".to_string(),
                 amount: funding.amount.clone(),
                 counterparty_address: None,
                 fee_amount: None,
@@ -1948,51 +1948,12 @@ impl Repository {
             }
         }
 
-        // --- Balance history (running balances) ---
-        // Sort ledger records by timestamp, then compute running balance per
-        // (wallet, asset_symbol, network).
-        ledger_records.sort_by_key(|r| r.timestamp);
-
-        let mut running_balances: BTreeMap<(String, String), BigDecimal> = BTreeMap::new();
-        let mut balance_snapshots: Vec<BalanceSnapshot> = Vec::new();
-
-        for rec in &ledger_records {
-            let balance_key = (rec.asset_symbol.clone(), rec.network.clone());
-            let balance = running_balances
-                .entry(balance_key)
-                .or_insert_with(|| BigDecimal::from(0));
-            *balance += &rec.amount;
-
-            let snap_key = format!(
-                "bh:{}:{}:{}:{}",
-                rec.wallet_address, rec.asset_symbol, rec.network, rec.id
-            );
-            balance_snapshots.push(BalanceSnapshot {
-                id: Uuid::new_v5(&Uuid::NAMESPACE_URL, snap_key.as_bytes()),
-                wallet_address: rec.wallet_address.clone(),
-                asset_symbol: rec.asset_symbol.clone(),
-                network: rec.network.clone(),
-                timestamp: rec.timestamp,
-                balance: balance.clone(),
-                tx_hash: rec.tx_hash.clone(),
-                dataset_version_id: bh_version_id,
-                created_at: now,
-            });
-        }
-
-        if !balance_snapshots.is_empty() {
-            let n = balance_snapshots.len();
-            match self.save_balance_snapshots(&balance_snapshots).await {
-                Ok(()) => {
-                    result.balance_history_written = n;
-                    info!(count = n, "Gold: balance_history records written");
-                }
-                Err(e) => {
-                    result.balance_history_failed = n;
-                    warn!(error = %e, count = n, "Gold: balance_history write failed");
-                }
-            }
-        }
+        // TODO: balance_history requires seeding running_balances from the DB's
+        // last known balance per (wallet, asset, network) before computing
+        // incremental snapshots.  Without that seed the running totals restart
+        // from zero on every ingestion batch, producing incorrect data.
+        // Skipping balance_history generation in this PR — will be added in a
+        // follow-up PR that reads the latest snapshot from the DB first.
 
         result
     }
