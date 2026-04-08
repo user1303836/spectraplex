@@ -19,6 +19,27 @@ use uuid::Uuid;
 
 use crate::repo::Repository;
 
+/// Result of Bronze-native Silver materialization.
+#[derive(Debug, Clone, Default)]
+pub struct BronzeSilverResult {
+    /// Total records successfully written across all Silver datasets.
+    pub total_written: usize,
+    /// Total records that failed to write.
+    pub total_failed: usize,
+    /// Per-dataset record counts (written successfully).
+    pub per_dataset: std::collections::HashMap<String, usize>,
+    /// The latest raw_transaction ID in the input batch (for watermark tracking).
+    pub last_raw_transaction_id: Option<uuid::Uuid>,
+    /// The latest raw_transaction timestamp in the input batch.
+    pub last_timestamp: Option<i64>,
+}
+
+impl BronzeSilverResult {
+    pub fn all_succeeded(&self) -> bool {
+        self.total_failed == 0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Silver materialization result tracking (#210)
 // ---------------------------------------------------------------------------
@@ -1219,10 +1240,16 @@ impl Repository {
         &self,
         raw_txs: &[RawTransaction],
         wallet_address: Option<&str>,
-    ) -> usize {
+    ) -> BronzeSilverResult {
         if raw_txs.is_empty() {
-            return 0;
+            return BronzeSilverResult::default();
         }
+
+        let mut result = BronzeSilverResult {
+            last_raw_transaction_id: raw_txs.iter().max_by_key(|r| r.timestamp).map(|r| r.id),
+            last_timestamp: raw_txs.iter().map(|r| r.timestamp).max(),
+            ..Default::default()
+        };
 
         let dataset_versions = self.resolve_silver_dataset_versions().await;
 
@@ -1345,72 +1372,96 @@ impl Repository {
             + all_hl_positions.len();
 
         if total == 0 {
-            return 0;
+            return result;
         }
-
-        let mut success_count: usize = 0;
 
         // Write Silver records to the database.
         if !all_token_transfers.is_empty() {
+            let n = all_token_transfers.len();
             match self.save_token_transfers(&all_token_transfers).await {
                 Ok(()) => {
-                    success_count += all_token_transfers.len();
+                    result.total_written += n;
+                    result.per_dataset.insert("token_transfers".to_string(), n);
                 }
                 Err(e) => {
-                    warn!(error = %e, count = all_token_transfers.len(), "Bronze-native Silver: token_transfers write failed");
+                    result.total_failed += n;
+                    warn!(error = %e, count = n, "Bronze-native Silver: token_transfers write failed");
                 }
             }
         }
         if !all_native_balance_deltas.is_empty() {
+            let n = all_native_balance_deltas.len();
             match self
                 .save_native_balance_deltas(&all_native_balance_deltas)
                 .await
             {
                 Ok(()) => {
-                    success_count += all_native_balance_deltas.len();
+                    result.total_written += n;
+                    result
+                        .per_dataset
+                        .insert("native_balance_deltas".to_string(), n);
                 }
                 Err(e) => {
-                    warn!(error = %e, count = all_native_balance_deltas.len(), "Bronze-native Silver: native_balance_deltas write failed");
+                    result.total_failed += n;
+                    warn!(error = %e, count = n, "Bronze-native Silver: native_balance_deltas write failed");
                 }
             }
         }
         if !all_decoded_events.is_empty() {
+            let n = all_decoded_events.len();
             match self.save_decoded_events(&all_decoded_events).await {
                 Ok(()) => {
-                    success_count += all_decoded_events.len();
+                    result.total_written += n;
+                    result.per_dataset.insert("decoded_events".to_string(), n);
                 }
                 Err(e) => {
-                    warn!(error = %e, count = all_decoded_events.len(), "Bronze-native Silver: decoded_events write failed");
+                    result.total_failed += n;
+                    warn!(error = %e, count = n, "Bronze-native Silver: decoded_events write failed");
                 }
             }
         }
         if !all_hl_fills.is_empty() {
+            let n = all_hl_fills.len();
             match self.save_hl_fill_records(&all_hl_fills).await {
                 Ok(()) => {
-                    success_count += all_hl_fills.len();
+                    result.total_written += n;
+                    result
+                        .per_dataset
+                        .insert(DatasetName::HlFills.as_sql_str().to_string(), n);
                 }
                 Err(e) => {
-                    warn!(error = %e, count = all_hl_fills.len(), "Bronze-native Silver: hl_fill_records write failed");
+                    result.total_failed += n;
+                    warn!(error = %e, count = n, "Bronze-native Silver: hl_fill_records write failed");
                 }
             }
         }
         if !all_hl_funding.is_empty() {
+            let n = all_hl_funding.len();
             match self.save_hl_funding_payments(&all_hl_funding).await {
                 Ok(()) => {
-                    success_count += all_hl_funding.len();
+                    result.total_written += n;
+                    result
+                        .per_dataset
+                        .insert(DatasetName::HlFunding.as_sql_str().to_string(), n);
                 }
                 Err(e) => {
-                    warn!(error = %e, count = all_hl_funding.len(), "Bronze-native Silver: hl_funding_payments write failed");
+                    result.total_failed += n;
+                    warn!(error = %e, count = n, "Bronze-native Silver: hl_funding_payments write failed");
                 }
             }
         }
         if !all_hl_positions.is_empty() {
+            let n = all_hl_positions.len();
             match self.save_hl_position_changes(&all_hl_positions).await {
                 Ok(()) => {
-                    success_count += all_hl_positions.len();
+                    result.total_written += n;
+                    result
+                        .per_dataset
+                        .insert(DatasetName::Positions.as_sql_str().to_string(), n);
                 }
                 Err(e) => {
-                    warn!(error = %e, count = all_hl_positions.len(), "Bronze-native Silver: hl_position_changes write failed");
+                    result.total_failed += n;
+                    warn!(error = %e, count = n, "Bronze-native Silver: hl_position_changes write failed");
                 }
             }
         }
@@ -1504,7 +1555,7 @@ impl Repository {
             }
         }
 
-        success_count
+        result
     }
 
     /// Get or create dataset versions for each Silver dataset.
