@@ -65,9 +65,9 @@ impl SilverMaterializationResult {
             + self.hl_positions_failed
     }
 
-    /// True when every dataset write succeeded (no failures).
+    /// True when every dataset write succeeded (no failures or ambiguous skips).
     pub fn all_succeeded(&self) -> bool {
-        self.total_failed() == 0
+        self.total_failed() == 0 && self.skipped_ambiguous == 0
     }
 }
 

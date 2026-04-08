@@ -278,7 +278,7 @@ fn token_decimals(contract_address: &str) -> u32 {
         "0x0bc529c00c6401aef6d220be8c6ea1667f6ad93e" => 18, // YFI
         "0xba100000625a3754423978a60c9317c58a424e3d" => 18, // BAL
         "0x7d1afa7b718fb893db30a3abc0cfc608aacfebb0" => 18, // MATIC (Ethereum)
-        "0x4e3decbb3645551b8a19f0ea1678079fcb33fb4c" => 18, // APE
+        "0x4d224452801aced8b2f0aebe155379bb5d594381" => 18, // APE
         "0x5a98fcbea516cf06857215779fd812ca3bef1b32" => 18, // LDO
         "0xd33526068d116ce69f19a9ee46f0bd304f21a51f" => 18, // RPL
         "0x3432b6a60d23ca0dfca7761b7ab56459d9c964d0" => 18, // FXS
@@ -293,7 +293,6 @@ fn token_decimals(contract_address: &str) -> u32 {
         "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1" => 18, // DAI – Arbitrum & Optimism
         "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063" => 18, // DAI – Polygon
         "0xd586e7f844cea2f87f50152665bcbc2c279d8d70" => 18, // DAI.e – Avalanche
-        "0x50b7545627a5162f82a992c33b87adc75187b219" => 18, // DAI – Base (placeholder)
 
         // ---------------------------------------------------------------
         // WETH – L2 deployments (18 decimals)
@@ -353,7 +352,7 @@ fn token_symbol(contract_address: &str) -> String {
         "0x0bc529c00c6401aef6d220be8c6ea1667f6ad93e" => "YFI".to_string(),
         "0xba100000625a3754423978a60c9317c58a424e3d" => "BAL".to_string(),
         "0x7d1afa7b718fb893db30a3abc0cfc608aacfebb0" => "MATIC".to_string(),
-        "0x4e3decbb3645551b8a19f0ea1678079fcb33fb4c" => "APE".to_string(),
+        "0x4d224452801aced8b2f0aebe155379bb5d594381" => "APE".to_string(),
         "0x5a98fcbea516cf06857215779fd812ca3bef1b32" => "LDO".to_string(),
         "0xd33526068d116ce69f19a9ee46f0bd304f21a51f" => "RPL".to_string(),
         "0x3432b6a60d23ca0dfca7761b7ab56459d9c964d0" => "FXS".to_string(),
@@ -366,7 +365,6 @@ fn token_symbol(contract_address: &str) -> String {
         "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1" => "DAI".to_string(),
         "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063" => "DAI".to_string(),
         "0xd586e7f844cea2f87f50152665bcbc2c279d8d70" => "DAI.e".to_string(),
-        "0x50b7545627a5162f82a992c33b87adc75187b219" => "DAI".to_string(),
 
         // WETH — L2 deployments
         "0x82af49447d8a07e3bd95bd0d56f35241523fbab1" => "WETH".to_string(),

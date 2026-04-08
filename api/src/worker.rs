@@ -163,6 +163,18 @@ async fn execute_job(
     // to avoid conflicting with the worker that reclaimed the job.
     if lease_lost.is_cancelled() {
         warn!(job_id = %job_id, "Lease lost during ingestion — skipping terminal state update");
+        // Best-effort: mark the ingestion run as failed so it doesn't stay 'running' forever.
+        if run_created {
+            let _ = repo
+                .update_ingestion_run_status(
+                    run_id,
+                    "failed",
+                    Some(chrono::Utc::now()),
+                    0,
+                    Some("lease lost"),
+                )
+                .await;
+        }
         return;
     }
 
