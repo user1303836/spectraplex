@@ -15,6 +15,24 @@ ignore = [
     # keccak 0.1.5 (via solana-zk-sdk/merlin/sha3): unsound ARMv8 assembly.
     # Transitive dependency pinned by solana-zk-sdk; cannot upgrade independently.
     "RUSTSEC-2026-0012",
+
+    # rand 0.8.5 (via alloy-signer-local, governor, solana-*): unsound when a
+    # CUSTOM `log::Log` implementation calls `rand::rng()` / ThreadRng methods
+    # and triggers a reseed mid-log. Affects rand `>= 0.7, < 0.9.3`; fix is
+    # rand 0.9.3+, which is a major-version bump the transitive deps above
+    # have not yet taken.
+    #
+    # Not exploitable in this workspace:
+    # - We do not implement `log::Log`. We use `tracing_subscriber::fmt` (a
+    #   tracing Layer, not a `log::Log` impl).
+    # - No code in this repo calls `rand::rng()` or `rand::thread_rng()` from
+    #   inside a logger. Transitive crates that use `rand` do so outside of
+    #   logging paths (key generation, jitter, QUIC connection IDs, etc.).
+    # Revisit when alloy / governor / solana-* bump past rand 0.9.3.
+    #
+    # We also run `cargo update -p rand` to keep the rand 0.9.x line on the
+    # latest 0.9.x (currently 0.9.4, past the advisory cutoff of 0.9.3).
+    "RUSTSEC-2026-0097",
 ]
 
 [yanked]
