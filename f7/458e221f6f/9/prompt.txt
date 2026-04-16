@@ -1,0 +1,130 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 2: Target-Centric Ingestion
+- work packet: P2-W1: Connector interface redesign
+- objective: Introduce a filter-driven connector abstraction that accepts typed target specs (wallet, contract, program, etc.) instead of only wallet addresses, with backfill vs stream semantics and a wallet-focused compatibility wrapper so existing CLI/API calls still work.
+- branch: p2-w1-connector-interface
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- core/src/models.rs
+- core/src/v2.rs
+- adapters/src/solana.rs
+- adapters/src/solana_grpc.rs
+- adapters/src/evm.rs
+- adapters/src/hyperliquid.rs
+- cli/src/main.rs
+- api/src/main.rs
+
+Implementation steps:
+1. Design a filter-driven connector trait that accepts IndexTarget specs instead of bare wallet addresses
+2. Define target-specific request spec types (wallet filter, contract filter, program filter, topic filter)
+3. Define backfill vs stream mode semantics in the connector interface
+4. Implement a wallet-focused compatibility wrapper that maps legacy wallet_address+chain calls to the new target spec interface
+5. Add unit tests for target spec construction, validation, and compatibility mapping
+6. Verify existing wallet ingestion still works through the compatibility layer
+
+Verification expectations:
+1. cargo fmt --all --check
+2. cargo clippy --workspace --all-targets -- -D warnings
+3. cargo test --workspace
+4. Verify connectors can be invoked with typed target specs
+5. Verify legacy wallet ingest path still works through adapter layer
+
+Tracked review artifacts required in the PR:
+- docs/phase2/p2-w1-connector-interface-handoff.md
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p2-w1-connector-interface from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P2-W1: Connector interface redesign.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 2: Target-Centric Ingestion"
+- workPacket: "P2-W1: Connector interface redesign"
+- branchName: "p2-w1-connector-interface"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

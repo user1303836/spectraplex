@@ -1,0 +1,61 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "88c878cc7de6",
+  "strategy": "manual-commit",
+  "branch": "codex/p0-w3-network-model-spec",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "docs/phase0/p0-w3-network-model-handoff.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/88/c878cc7de6/0/metadata.json",
+      "transcript": "/88/c878cc7de6/0/full.jsonl",
+      "context": "/88/c878cc7de6/0/context.md",
+      "content_hash": "/88/c878cc7de6/0/content_hash.txt",
+      "prompt": "/88/c878cc7de6/0/prompt.txt"
+    },
+    {
+      "metadata": "/88/c878cc7de6/1/metadata.json",
+      "transcript": "/88/c878cc7de6/1/full.jsonl",
+      "context": "/88/c878cc7de6/1/context.md",
+      "content_hash": "/88/c878cc7de6/1/content_hash.txt",
+      "prompt": "/88/c878cc7de6/1/prompt.txt"
+    },
+    {
+      "metadata": "/88/c878cc7de6/2/metadata.json",
+      "transcript": "/88/c878cc7de6/2/full.jsonl",
+      "context": "/88/c878cc7de6/2/context.md",
+      "content_hash": "/88/c878cc7de6/2/content_hash.txt",
+      "prompt": "/88/c878cc7de6/2/prompt.txt"
+    },
+    {
+      "metadata": "/88/c878cc7de6/3/metadata.json",
+      "transcript": "/88/c878cc7de6/3/full.jsonl",
+      "context": "/88/c878cc7de6/3/context.md",
+      "content_hash": "/88/c878cc7de6/3/content_hash.txt",
+      "prompt": "/88/c878cc7de6/3/prompt.txt"
+    },
+    {
+      "metadata": "/88/c878cc7de6/4/metadata.json",
+      "transcript": "/88/c878cc7de6/4/full.jsonl",
+      "context": "/88/c878cc7de6/4/context.md",
+      "content_hash": "/88/c878cc7de6/4/content_hash.txt",
+      "prompt": "/88/c878cc7de6/4/prompt.txt"
+    },
+    {
+      "metadata": "/88/c878cc7de6/5/metadata.json",
+      "transcript": "/88/c878cc7de6/5/full.jsonl",
+      "context": "/88/c878cc7de6/5/context.md",
+      "content_hash": "/88/c878cc7de6/5/content_hash.txt",
+      "prompt": "/88/c878cc7de6/5/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 142,
+    "cache_creation_tokens": 708753,
+    "cache_read_tokens": 9653096,
+    "output_tokens": 92853,
+    "api_call_count": 120
+  }
+}

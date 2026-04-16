@@ -1,0 +1,31 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "69f823a8a6d8",
+  "session_id": "828a10bd-69aa-4f38-9e40-45155b7f37ec",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T16:13:17.399166Z",
+  "branch": "codex/p0-w1-v2-architecture-rfc",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "docs/phase0/p0-w1-v2-architecture-rfc-handoff.md"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "6253eb6f3196",
+  "token_usage": {
+    "input_tokens": 33,
+    "cache_creation_tokens": 135048,
+    "cache_read_tokens": 2966751,
+    "output_tokens": 19591,
+    "api_call_count": 29
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T16:13:17.150266Z",
+    "agent_lines": 0,
+    "human_added": 580,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 580,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/828a10bd-69aa-4f38-9e40-45155b7f37ec.jsonl"
+}

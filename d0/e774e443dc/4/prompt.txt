@@ -1,0 +1,128 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- mode: fix_validation
+- phase: Phase 0
+- work packet: P0-W3
+- objective: Freeze the V2 network taxonomy, finality model, and checkpoint cursor semantics so Phase 1 schema work has a stable network contract.
+- branch: codex/p0-w3-network-model-spec
+- existing PR: (none)
+
+Repo touchpoints:
+- design/NETWORK_MODEL.md
+- design/V2_ARCHITECTURE_RFC.md
+- design/TARGET_MODEL.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+- core/src/models.rs
+- adapters/src/repo.rs
+- adapters/src/evm.rs
+- adapters/src/solana_grpc.rs
+
+Implementation steps:
+1. Update `design/TARGET_MODEL.md` so the HyperCore examples use `hypercore-mainnet`/`hypercore-testnet` instead of `hyperliquid-mainnet`.
+2. Align `design/V2_ARCHITECTURE_RFC.md` Section 3.3 with P0-W3 by removing the deployment-specific `rpc_url` field from `networks`, adopting the four finality labels, and keeping `network` as the stable raw/checkpoint key.
+3. Re-run a Phase 0 consistency sweep across P0-W1, P0-W2, and P0-W3 so the frozen names, cursor fields, and migration guidance match both each other and the current codebase.
+
+Verification expectations:
+1. Confirm the required six examples remain explicit and unchanged in scope: Solana mainnet, Ethereum mainnet, Base, Arbitrum, HyperCore, and HyperEVM.
+2. Confirm the documented migration mapping still matches the current flat `Chain` enum, `chain_enum`, and `IndexerCheckpoint` usage in `core/src/models.rs`, `adapters/src/repo.rs`, and the existing migrations.
+3. Search Phase 0 docs for stale `hyperliquid-mainnet` references and stale `networks.rpc_url` assumptions; validation only passes when those are gone or explicitly resolved.
+4. Validate that wallet indexing remains first-class in the docs while the V2 raw/network abstractions stay target-agnostic.
+
+Outstanding validation or review feedback:
+Validation failures:
+- Phase 0 docs still do not freeze a single HyperCore network ID. [NETWORK_MODEL.md](REDACTED.md#L663) resolves the name to `hypercore-mainnet`, but [TARGET_MODEL.md](REDACTED.md#L780) and [TARGET_MODEL.md](REDACTED.md#L856) still publish `hyperliquid-mainnet`. That is a doc-sync and migration blocker because Phase 1 cannot use one canonical name directly across the Phase 0 spec set.
+- [NETWORK_MODEL.md](REDACTED.md#L107) changes the `networks` table contract from [V2_ARCHITECTURE_RFC.md](REDACTED.md#L230) by removing `rpc_url`, but the alignment section does not reconcile that difference. Phase 1 schema work is left with two incompatible `networks` table definitions in Phase 0 docs.
+
+Validation warnings:
+- The core checkpoint cursor shapes are grounded in current adapters, but some worked-example prose is target-state rather than current behavior: [NETWORK_MODEL.md](REDACTED.md#L446) describes startup reorg walk-back that is not wired into [evm.rs](/Users/user1303836/Development/spectraplex/adapters/src/evm.rs#L92), and [NETWORK_MODEL.md](REDACTED.md#L565) describes HyperCore WS gap-fill that does not exist in [hyperliquid_ws.rs](/Users/user1303836/Development/spectraplex/adapters/src/hyperliquid_ws.rs#L58).
+- Migration compatibility still depends on the documented override path for any legacy Base/Arbitrum data that was stored under the flat `Chain::Ethereum` value in [core/src/models.rs](/Users/user1303836/Development/spectraplex/core/src/models.rs#L6) and [repo.rs](/Users/user1303836/Development/spectraplex/adapters/src/repo.rs#L4); [NETWORK_MODEL.md](REDACTED.md#L177) and [NETWORK_MODEL.md](REDACTED.md#L697) document that residual migration risk.
+
+Requirements:
+1. If this is a new packet, create or reset the local branch codex/p0-w3-network-model-spec from the latest main branch state.
+2. If this is a fix iteration, stay on the existing branch and address the outstanding validation or review feedback first.
+3. Make only the changes needed for P0-W3.
+4. Run the relevant verification commands before finishing.
+5. Create a local commit if changes were made and verification is good.
+6. Do not push, do not open a PR, and do not merge a PR.
+
+Return JSON with:
+- phase: "Phase 0"
+- workPacket: "P0-W3"
+- branchName: "codex/p0-w3-network-model-spec"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

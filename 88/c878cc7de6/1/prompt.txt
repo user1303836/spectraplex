@@ -1,0 +1,120 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the approved Spectraplex work packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Resolved scope:
+- phase: Phase 0: Lock The V2 Architecture
+- work packet: P0-W1
+- objective: Write the missing V2 architecture RFC that locks Spectraplex’s target-centric canonical Bronze/Silver/Gold model and the compatibility path from the current wallet-centric implementation.
+- scope summary: Resolve the absent Phase 0 architecture gate by creating `design/V2_ARCHITECTURE_RFC.md`, grounded in the current codebase where `Transaction`, repository access, CLI/API inputs, and some adapter semantics are still wallet-shaped.
+
+Caller intent:
+- requested phase: (not provided)
+- requested work packet: (not provided)
+- goal: (not provided)
+- acceptance criteria:
+None provided.
+- constraints:
+None provided.
+
+Plan touchpoints:
+- design/V2_ARCHITECTURE_RFC.md (new)
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+- core/src/models.rs
+- adapters/src/repo.rs
+- api/src/main.rs
+- cli/src/main.rs
+- adapters/src/evm.rs
+- adapters/src/solana_grpc.rs
+- migrations/20251219000000_init.sql
+- migrations/20260217100000_add_unique_chain_tx_hash.sql
+- migrations/20260217010000_add_indexer_checkpoints.sql
+
+Implementation steps:
+1. Draft `design/V2_ARCHITECTURE_RFC.md` as the Phase 0 anchor document, using the strategy doc and phased plan as inputs and the current codebase as the source of truth.
+2. Define the V2 architecture layers explicitly: canonical Bronze storage, reusable Silver datasets, Gold/materialized views, and control-plane objects needed for target-centric indexing.
+3. Map the current wallet-centric model to the V2 model, covering `Transaction` and checkpoint shape in `core/src/models.rs`, raw transaction storage and uniqueness in `adapters/src/repo.rs` plus migrations, and wallet-scoped API/CLI surfaces in `api/src/main.rs` and `cli/src/main.rs`.
+4. Specify the transitional compatibility strategy in concrete terms: additive schema direction, dual-write or compatibility boundary, legacy wallet read support, and deprecation sequence for wallet-shaped Bronze assumptions.
+5. Call out the chain-specific semantic corrections the later packets must honor, especially EVM `eth_getLogs` address semantics and Solana gRPC program-filter versus tracked-target mismatch.
+6. Structure the RFC so P0-W2, P0-W3, and P0-W4 can reference named sections instead of reopening core decisions; update `design/PHASED_IMPLEMENTATION_PLAN.md` only if the RFC forces sequencing or packet changes.
+
+Verification expectations:
+1. Confirm `design/V2_ARCHITECTURE_RFC.md` exists and explicitly covers: canonical raw data model, target matching model, materialization model, and transitional dual-read or dual-write compatibility strategy.
+2. Run `rg -n "wallet_address|wallet|fetch_history|eth_getLogs|program_ids" core/src/models.rs adapters/src/repo.rs api/src/main.rs cli/src/main.rs adapters/src/evm.rs adapters/src/solana_grpc.rs` and verify every architectural mismatch described in the RFC is grounded in current code.
+3. Run `rg -n "canonical raw|target matching|materialization|dual-write|compatibility" design/V2_ARCHITECTURE_RFC.md` to ensure the required decision areas are present and searchable for follow-on packets.
+4. Verify the phased plan still reads coherently against the RFC and adjust `design/PHASED_IMPLEMENTATION_PLAN.md` only if the RFC changes dependencies or packet definitions.
+
+Prior implementation summary:
+No prior implementation output.
+
+Outstanding validation or review feedback:
+No prior validation or review feedback. This is the first implementation pass.
+
+Requirements:
+1. Make the code changes for this packet.
+2. Address any outstanding validation or review feedback before expanding scope.
+3. Preserve existing wallet behavior unless the plan explicitly calls for a compatibility-layer change.
+4. Do not commit, push, open a PR, or create a git worktree.
+5. Update tests for changed behavior.
+6. If user-facing behavior changes, update tracked docs; if planning notes need updates, keep them under design/.
+7. Run the relevant verification commands before finishing.
+
+Return JSON with:
+- summary: concise summary of code and doc changes
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated, if any
+- followUps: remaining items that should be watched or picked up later
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

@@ -1,0 +1,128 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 4: ETL-First Delivery
+- work packet: P4-W4: Metadata and observability
+- objective: Attach run IDs, dataset version, and completeness metadata to exports; add status introspection for export and materialization jobs so downstream consumers can determine provenance and completeness of exported data
+- branch: p4-w4-metadata-observability
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- api/src/main.rs — ExportJobStatus, ExportJobRequest, run_export_job, export job endpoints
+- core/src/materializer.rs — DeliveryMetadata, DeliveryReceipt, ExportSink trait
+- core/src/v2.rs — DatasetVersion, DatasetCompleteness, IngestionRun (read-only references)
+- adapters/src/repo.rs — repository queries for dataset versions and completeness
+- README.md — document enriched export metadata
+
+Implementation steps:
+1. 1. Add metadata fields to ExportJobStatus: dataset_version_id (Option<Uuid>), dataset_version (Option<i32>), completeness_status (Option<String>), completeness_coverage (Option<serde_json::Value>), started_at and completed_at wall-clock timestamps (Option<DateTime<Utc>>), last_ingestion_run_id (Option<Uuid>). Use skip_serializing_if for backward compatibility.
+2. 2. Enhance run_export_job to look up the active DatasetVersion for the requested dataset (query dataset_versions table for status=Active, matching dataset_name). Return version metadata alongside (body, record_count).
+3. 3. Enhance run_export_job to look up DatasetCompleteness for the requested dataset+target+network+time range. Return completeness_status and coverage bounds.
+4. 4. Update the spawned export task to populate the new ExportJobStatus metadata fields from the version and completeness lookups before and after the export runs.
+5. 5. Enrich DeliveryMetadata with dataset_version_id and completeness_status so sink consumers receive provenance context.
+6. 6. Add a materialization status introspection helper: expose which Materializer version produced a given dataset's current records. This can be a new /v1/datasets/{name}/status endpoint or an enrichment of the existing /v1/datasets/{name}/versions endpoint.
+7. 7. Add unit tests for enriched ExportJobStatus serde (new fields omitted when None, present when populated), metadata propagation from dataset_versions/completeness to export jobs, and materialization status response shape.
+8. 8. Update README.md to document the enriched export metadata fields and any new endpoints.
+
+Verification expectations:
+1. cargo fmt --all --check
+2. cargo clippy --workspace --all-targets -- -D warnings
+3. cargo test --workspace — all existing 772+ tests must continue to pass
+4. New tests verify: ExportJobStatus serialization with metadata fields, metadata lookup integration, DeliveryMetadata enrichment, backward compatibility when metadata is absent, materialization status endpoint shape
+
+Tracked review artifacts required in the PR:
+- No tracked review artifact required.
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p4-w4-metadata-observability from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P4-W4: Metadata and observability.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 4: ETL-First Delivery"
+- workPacket: "P4-W4: Metadata and observability"
+- branchName: "p4-w4-metadata-observability"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

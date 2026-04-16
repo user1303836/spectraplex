@@ -1,0 +1,134 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 4: ETL-First Delivery
+- work packet: P4-W3: Sink abstraction
+- objective: Add a sink abstraction so export jobs can deliver dataset exports to local files, webhooks, or external databases, with object storage designed as the next extension point.
+- branch: p4-w3-sink-abstraction
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- core/src/materializer.rs — add SinkConfig enum, SinkType enum, ExportSink trait
+- api/src/main.rs — extend ExportJobRequest with optional sink config, integrate sink delivery into export job lifecycle, add sink-specific validation
+- adapters/src/v2_repo.rs — potential database-to-database sink support methods
+- README.md — update API docs for sink config on POST /v1/export/dataset
+- CLAUDE.md — update if any routes or CLI flags change
+
+Implementation steps:
+1. 1. Add SinkType enum to core/src/materializer.rs (LocalFile, Webhook, Database, with ObjectStorage reserved/documented)
+2. 2. Add SinkConfig struct to core/src/materializer.rs with per-type config (file_path for LocalFile, url + optional headers for Webhook, connection_string + table for Database)
+3. 3. Define an async ExportSink trait in core/src/materializer.rs with deliver(data, metadata) -> Result<DeliveryReceipt>
+4. 4. Implement LocalFileSink in api/src/main.rs — writes serialized export data to a specified file path with proper error handling
+5. 5. Implement WebhookSink in api/src/main.rs — POSTs export data to a validated URL, reusing validate_callback_url() and fire_callback() patterns with proper Content-Type
+6. 6. Implement DatabaseSink as a stub/documented design — database-to-database delivery requires external connection management, so provide the interface and config parsing with a clear TODO for runtime implementation
+7. 7. Extend ExportJobRequest to accept an optional 'sink' field with SinkConfig
+8. 8. Modify create_export_job to validate sink config (e.g., webhook URL validation, file path validation)
+9. 9. Modify the export job spawned task to call sink.deliver() after serialization completes, alongside or instead of storing data in-memory
+10. 10. Add ExportJobStatus fields to reflect sink delivery state (delivered_to, delivery_status)
+11. 11. Add comprehensive tests: LocalFileSink write + read-back, WebhookSink URL validation, SinkConfig serde roundtrip, export job with sink config
+12. 12. Update README.md with sink config documentation on POST /v1/export/dataset
+
+Verification expectations:
+1. cargo fmt --all --check
+2. cargo clippy --workspace --all-targets -- -D warnings
+3. cargo test --workspace — all existing 737+ tests pass, new sink tests pass
+4. Verify LocalFileSink and WebhookSink are exercised by at least one test each (two sink types as required by P4-W3 verification criteria)
+5. Verify existing export download endpoint still works unchanged (backward compatibility)
+6. Verify README.md documents the new sink config
+
+Tracked review artifacts required in the PR:
+- No tracked review artifact required.
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p4-w3-sink-abstraction from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P4-W3: Sink abstraction.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 4: ETL-First Delivery"
+- workPacket: "P4-W3: Sink abstraction"
+- branchName: "p4-w3-sink-abstraction"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

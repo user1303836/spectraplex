@@ -1,0 +1,138 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 2: Target-Centric Ingestion
+- work packet: P2-W4: Fix Solana gRPC target semantics
+- objective: Implement V2 Connector trait for Solana adapters (gRPC and RPC) with correct target-driven subscription semantics. Wallet targets use account_include=[wallet_pubkey], program targets use account_include=[program_id], account targets use account_include=[account_pubkey]. Remove wallet-stamping from program-filtered results. Produce target-agnostic RawTransaction output. Preserve legacy ChainIngestor for backward compatibility.
+- branch: p2-w4-solana-grpc-target-semantics
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- adapters/src/solana_grpc.rs — V2 Connector implementation with wallet/program/account target paths and stream support
+- adapters/src/solana.rs — V2 Connector implementation for RPC backfill (wallet targets)
+- core/src/v2.rs — No changes expected, RawTransaction and types already in place
+- core/src/connector.rs — No changes expected, Connector trait already defined
+- adapters/src/lib.rs — Verify module exports if new modules added
+- design/ — P2-W4 handoff doc
+
+Implementation steps:
+1. 1. Create SolanaGrpcConnector wrapper (or extend SolanaGrpcAdapter) implementing the V2 Connector trait with capabilities: Wallet, Program, Account target kinds; Backfill and Stream modes; Solana chain family
+2. 2. Implement wallet_backfill: subscribe with account_include=[wallet_pubkey] to capture only transactions involving that wallet, emit target-agnostic RawTransaction records
+3. 3. Implement program_backfill: subscribe with account_include=[program_id] to capture all program interactions, no wallet identity stamped on results
+4. 4. Implement account_backfill: subscribe with account_include=[account_pubkey] for PDAs, token accounts, vaults — the natural Solana primitive
+5. 5. Implement stream() method: build target-kind-aware SubscribeRequest, spawn background task with reconnection logic, return mpsc::Receiver<RawTransaction>
+6. 6. Add convert_grpc_to_raw_transaction helper that produces RawTransaction (not V1 Transaction) with network field, no wallet_address or user_id
+7. 7. Implement Connector for SolanaAdapter (RPC): backfill-only, wallet targets use getSignaturesForAddress, emit RawTransaction
+8. 8. Preserve existing ChainIngestor implementations unchanged for V1 backward compatibility
+9. 9. Add cursor support: JSONB cursor with {last_slot, last_signature} for checkpoint resume
+10. 10. Add comprehensive unit tests: subscription request construction per target kind, raw transaction output structure, cursor parsing, capabilities validation, account_include correctness
+11. 11. Write P2-W4 handoff doc in design/ summarizing implementation decisions and known limitations
+
+Verification expectations:
+1. cargo fmt --all --check
+2. cargo clippy --workspace --all-targets -- -D warnings
+3. cargo test --workspace
+4. Verify wallet target subscription uses account_include=[wallet_pubkey] not hardcoded program IDs
+5. Verify program target subscription uses account_include=[program_id] and does not stamp wallet identity
+6. Verify account target subscription uses account_include=[account_pubkey]
+7. Verify stream() method spawns background task and returns Receiver<RawTransaction>
+8. Verify RawTransaction output has no wallet_address or user_id fields
+9. Verify legacy ChainIngestor implementations are unchanged
+10. Verify capabilities accurately declare Wallet, Program, Account for Solana chain family
+
+Tracked review artifacts required in the PR:
+- No tracked review artifact required.
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p2-w4-solana-grpc-target-semantics from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P2-W4: Fix Solana gRPC target semantics.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 2: Target-Centric Ingestion"
+- workPacket: "P2-W4: Fix Solana gRPC target semantics"
+- branchName: "p2-w4-solana-grpc-target-semantics"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

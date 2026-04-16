@@ -1,0 +1,119 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "c317c5c03437",
+  "strategy": "manual-commit",
+  "branch": "p3-w6-completeness-metadata",
+  "checkpoints_count": 7,
+  "files_touched": [
+    "adapters/src/v2_repo.rs",
+    "core/src/v2.rs",
+    "migrations/20260310100000_add_dataset_completeness.sql"
+  ],
+  "sessions": [
+    {
+      "metadata": "/c3/17c5c03437/0/metadata.json",
+      "transcript": "/c3/17c5c03437/0/full.jsonl",
+      "context": "/c3/17c5c03437/0/context.md",
+      "content_hash": "/c3/17c5c03437/0/content_hash.txt",
+      "prompt": "/c3/17c5c03437/0/prompt.txt"
+    },
+    {
+      "metadata": "/c3/17c5c03437/1/metadata.json",
+      "transcript": "/c3/17c5c03437/1/full.jsonl",
+      "context": "/c3/17c5c03437/1/context.md",
+      "content_hash": "/c3/17c5c03437/1/content_hash.txt",
+      "prompt": "/c3/17c5c03437/1/prompt.txt"
+    },
+    {
+      "metadata": "/c3/17c5c03437/2/metadata.json",
+      "transcript": "/c3/17c5c03437/2/full.jsonl",
+      "context": "/c3/17c5c03437/2/context.md",
+      "content_hash": "/c3/17c5c03437/2/content_hash.txt",
+      "prompt": "/c3/17c5c03437/2/prompt.txt"
+    },
+    {
+      "metadata": "/c3/17c5c03437/3/metadata.json",
+      "transcript": "/c3/17c5c03437/3/full.jsonl",
+      "context": "/c3/17c5c03437/3/context.md",
+      "content_hash": "/c3/17c5c03437/3/content_hash.txt",
+      "prompt": "/c3/17c5c03437/3/prompt.txt"
+    },
+    {
+      "metadata": "/c3/17c5c03437/4/metadata.json",
+      "transcript": "/c3/17c5c03437/4/full.jsonl",
+      "context": "/c3/17c5c03437/4/context.md",
+      "content_hash": "/c3/17c5c03437/4/content_hash.txt",
+      "prompt": "/c3/17c5c03437/4/prompt.txt"
+    },
+    {
+      "metadata": "/c3/17c5c03437/5/metadata.json",
+      "transcript": "/c3/17c5c03437/5/full.jsonl",
+      "context": "/c3/17c5c03437/5/context.md",
+      "content_hash": "/c3/17c5c03437/5/content_hash.txt",
+      "prompt": "/c3/17c5c03437/5/prompt.txt"
+    },
+    {
+      "metadata": "/c3/17c5c03437/6/metadata.json",
+      "transcript": "/c3/17c5c03437/6/full.jsonl",
+      "context": "/c3/17c5c03437/6/context.md",
+      "content_hash": "/c3/17c5c03437/6/content_hash.txt",
+      "prompt": "/c3/17c5c03437/6/prompt.txt"
+    },
+    {
+      "metadata": "/c3/17c5c03437/7/metadata.json",
+      "transcript": "/c3/17c5c03437/7/full.jsonl",
+      "context": "/c3/17c5c03437/7/context.md",
+      "content_hash": "/c3/17c5c03437/7/content_hash.txt",
+      "prompt": "/c3/17c5c03437/7/prompt.txt"
+    },
+    {
+      "metadata": "/c3/17c5c03437/8/metadata.json",
+      "transcript": "/c3/17c5c03437/8/full.jsonl",
+      "context": "/c3/17c5c03437/8/context.md",
+      "content_hash": "/c3/17c5c03437/8/content_hash.txt",
+      "prompt": "/c3/17c5c03437/8/prompt.txt"
+    },
+    {
+      "metadata": "/c3/17c5c03437/9/metadata.json",
+      "transcript": "/c3/17c5c03437/9/full.jsonl",
+      "context": "/c3/17c5c03437/9/context.md",
+      "content_hash": "/c3/17c5c03437/9/content_hash.txt",
+      "prompt": "/c3/17c5c03437/9/prompt.txt"
+    },
+    {
+      "metadata": "/c3/17c5c03437/10/metadata.json",
+      "transcript": "/c3/17c5c03437/10/full.jsonl",
+      "context": "/c3/17c5c03437/10/context.md",
+      "content_hash": "/c3/17c5c03437/10/content_hash.txt",
+      "prompt": "/c3/17c5c03437/10/prompt.txt"
+    },
+    {
+      "metadata": "/c3/17c5c03437/11/metadata.json",
+      "transcript": "/c3/17c5c03437/11/full.jsonl",
+      "context": "/c3/17c5c03437/11/context.md",
+      "content_hash": "/c3/17c5c03437/11/content_hash.txt",
+      "prompt": "/c3/17c5c03437/11/prompt.txt"
+    },
+    {
+      "metadata": "/c3/17c5c03437/12/metadata.json",
+      "transcript": "/c3/17c5c03437/12/full.jsonl",
+      "context": "/c3/17c5c03437/12/context.md",
+      "content_hash": "/c3/17c5c03437/12/content_hash.txt",
+      "prompt": "/c3/17c5c03437/12/prompt.txt"
+    },
+    {
+      "metadata": "/c3/17c5c03437/13/metadata.json",
+      "transcript": "/c3/17c5c03437/13/full.jsonl",
+      "context": "/c3/17c5c03437/13/context.md",
+      "content_hash": "/c3/17c5c03437/13/content_hash.txt",
+      "prompt": "/c3/17c5c03437/13/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 511,
+    "cache_creation_tokens": 1418882,
+    "cache_read_tokens": 31699125,
+    "output_tokens": 235213,
+    "api_call_count": 412
+  }
+}

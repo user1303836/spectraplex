@@ -1,0 +1,34 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "cd2456751b23",
+  "session_id": "5f8ba938-0894-4ace-a888-a7f9140faad3",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T22:25:26.515251Z",
+  "branch": "p3-w5-ledger-derived-materialization",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "adapters/src/ledger_derivation.rs",
+    "adapters/src/lib.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "8fc779032b64",
+  "checkpoint_transcript_start": 61,
+  "transcript_lines_at_start": 61,
+  "token_usage": {
+    "input_tokens": 16,
+    "cache_creation_tokens": 95758,
+    "cache_read_tokens": 1029773,
+    "output_tokens": 16708,
+    "api_call_count": 14
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T22:25:26.329672Z",
+    "agent_lines": 0,
+    "human_added": 1368,
+    "human_modified": 1,
+    "human_removed": 0,
+    "total_committed": 1368,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/5f8ba938-0894-4ace-a888-a7f9140faad3.jsonl"
+}

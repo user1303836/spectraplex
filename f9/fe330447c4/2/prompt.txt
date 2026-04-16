@@ -1,0 +1,135 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 2: Target-Centric Ingestion
+- work packet: P2-W5: Hyperliquid target model
+- objective: Implement V2 Connector trait for Hyperliquid adapters with wallet and market target kinds, align REST backfill with WS stream continuity, and document HyperEVM reuse of the EVM adapter path
+- branch: p2-w5-hyperliquid-target-model
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- adapters/src/hyperliquid.rs — V2 Connector impl, market-level REST fetch methods, wallet backfill producing RawTransaction
+- adapters/src/hyperliquid_ws.rs — market WS subscription support, stream integration for V2 Connector
+- core/src/connector.rs — read-only reference for Connector trait, MarketFilterSpec
+- core/src/v2.rs — read-only reference for IndexTarget, RawTransaction, ChainFamily, TargetKind
+
+Implementation steps:
+1. 1. Add market-level REST fetch methods to HyperliquidAdapter (fetch_recent_trades for a coin, potentially fetch_funding_history for a market)
+2. 2. Implement V2 Connector::capabilities() on HyperliquidAdapter: supported_target_kinds=[Wallet, Market], supported_modes=[Backfill, Stream], chain_family=Hyperliquid
+3. 3. Implement Connector::backfill() wallet path: use existing fetch_user_fills/funding/ledger_updates, produce target-agnostic RawTransaction records with network from target, no wallet_address/user_id, cursor from checkpoint JSON
+4. 4. Implement Connector::backfill() market path: use new market REST methods, produce RawTransaction records per market trade/event, cursor from checkpoint JSON
+5. 5. Implement Connector::stream() for wallet targets: spawn task using HyperliquidWsClient::subscribe_user(), convert WsMessage to RawTransaction, send via mpsc channel
+6. 6. Implement Connector::stream() for market targets: add trades subscription to HyperliquidWsClient (subscribe to trades channel for a coin), convert to RawTransaction
+7. 7. Add WS subscription variant for market trades to HyperliquidWsClient (WsSubType::Trades with coin field)
+8. 8. Preserve legacy ChainIngestor implementation byte-identical on HyperliquidAdapter
+9. 9. Add comprehensive unit tests: capabilities declaration, wallet backfill with mock server, market backfill with mock server, error handling for unsupported target kinds, cursor/checkpoint resume, RawTransaction output has no wallet_address/user_id
+10. 10. Run cargo fmt --all --check, cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace
+
+Verification expectations:
+1. cargo fmt --all --check passes
+2. cargo clippy --workspace --all-targets -- -D warnings passes
+3. cargo test --workspace passes (minus known pre-existing flaky semaphore test)
+4. V2 Connector capabilities correctly declare Wallet + Market target kinds, Backfill + Stream modes, Hyperliquid chain family
+5. Wallet backfill produces RawTransaction records with no wallet_address or user_id fields
+6. Market backfill produces RawTransaction records for market-level data
+7. Stream method returns mpsc::Receiver<RawTransaction> for wallet targets
+8. Stream method returns mpsc::Receiver<RawTransaction> for market targets (or documents the design if WS market channel is partially implemented)
+9. Legacy ChainIngestor implementation is byte-identical to main
+10. Unsupported target kinds (e.g. Contract, Program) return clear error
+
+Tracked review artifacts required in the PR:
+- No tracked review artifact required.
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p2-w5-hyperliquid-target-model from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P2-W5: Hyperliquid target model.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 2: Target-Centric Ingestion"
+- workPacket: "P2-W5: Hyperliquid target model"
+- branchName: "p2-w5-hyperliquid-target-model"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

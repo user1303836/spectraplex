@@ -1,0 +1,35 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "fcd1dd9930fe",
+  "session_id": "9e6de054-86ed-4d52-9ed8-0bd7f16dafb6",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T16:57:23.164978Z",
+  "branch": "codex/p1-w1-v2-core-types",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "core/src/lib.rs",
+    "core/src/v2.rs",
+    "docs/phase1/p1-w1-v2-core-types-handoff.md",
+    "Cargo.lock",
+    "core/Cargo.toml"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "6a4913a81c2d",
+  "token_usage": {
+    "input_tokens": 19,
+    "cache_creation_tokens": 85447,
+    "cache_read_tokens": 1251017,
+    "output_tokens": 20634,
+    "api_call_count": 17
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T16:57:23.021697Z",
+    "agent_lines": 0,
+    "human_added": 870,
+    "human_modified": 2,
+    "human_removed": 0,
+    "total_committed": 870,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/9e6de054-86ed-4d52-9ed8-0bd7f16dafb6.jsonl"
+}

@@ -1,0 +1,136 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 3: Expand Silver Into Reusable Datasets
+- work packet: P3-W3: Event and instruction datasets
+- objective: Add normalized decoded_events Silver table with extraction functions for EVM log events and Solana program instructions, enabling downstream consumers to query decoded protocol activity without going through ledger_entries.
+- branch: p3-w3-event-instruction-datasets
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- core/src/materializer.rs — add DecodedEvent struct
+- adapters/src/evm_parser.rs — add extract_evm_decoded_events() and EvmDecodedEventMaterializer
+- adapters/src/solana_parser.rs — add extract_solana_decoded_events() and SolanaDecodedEventMaterializer
+- adapters/src/v2_repo.rs — add row_to_decoded_event(), build_decoded_event_insert(), save/query methods
+- migrations/20260309200000_add_decoded_events.sql — new Silver table
+
+Implementation steps:
+1. 1. Add DecodedEvent struct to core/src/materializer.rs with fields: id, raw_transaction_id, network, program_or_contract, event_signature, event_name, log_index, decoded_fields (serde_json::Value), raw_fields (serde_json::Value), dataset_version_id, created_at
+2. 2. Add serde roundtrip and no-wallet-field tests for DecodedEvent in core/src/materializer.rs
+3. 3. Create migration 20260309200000_add_decoded_events.sql with IF NOT EXISTS guard, chain_family_enum column, nullable FK to raw_transactions, nullable FK to dataset_versions, JSONB columns for decoded_fields and raw_fields, dedup UNIQUE index on (raw_transaction_id, program_or_contract, log_index) WHERE raw_transaction_id IS NOT NULL, and indexes on program_or_contract and event_signature
+4. 4. Add extract_evm_decoded_events() to evm_parser.rs — extract ALL log events from raw_metadata (topics, data, address), decode event signature (topic0), indexed topics (topic1-3), and non-indexed data. For Transfer and Approval events, provide named decoded_fields
+5. 5. Add EvmDecodedEventMaterializer to evm_parser.rs with dataset_name=DecodedEvents, chain_family=Evm, unique parser_hash
+6. 6. Add extract_solana_decoded_events() to solana_parser.rs — extract program instructions from parsed transaction, including program_id, instruction data (hex), and account keys. Include inner instructions when available from OptionSerializer
+7. 7. Add SolanaDecodedEventMaterializer to solana_parser.rs with dataset_name=DecodedEvents, chain_family=Solana, unique parser_hash
+8. 8. Add row_to_decoded_event() and build_decoded_event_insert() to v2_repo.rs following the established patterns from token_transfers/native_balance_deltas
+9. 9. Add save_decoded_events() and get_decoded_events_by_contract() repository methods to v2_repo.rs
+10. 10. Add tests: extraction functions (EVM known events, unknown events, empty metadata; Solana instructions, inner instructions, failed tx skip), materializer contracts, global hash uniqueness across all 10 materializers, repository insert builder verification
+11. 11. Write handoff doc in design/P3_W3_HANDOFF.md
+
+Verification expectations:
+1. cargo fmt --all --check
+2. cargo clippy --workspace --all-targets -- -D warnings
+3. cargo test --workspace — all tests pass including new ones (expect ~600+ total)
+4. Verify all 10 materializer parser_hash values are globally distinct across all 3 chain families
+5. Verify DecodedEvent struct has no wallet_address or user_id fields
+6. Verify migration uses IF NOT EXISTS guards and nullable FKs
+7. Verify existing evm_logs and blocks tables remain untouched
+8. Verify EVM extraction handles arbitrary events beyond ERC-20 Transfer
+9. Verify Solana extraction handles parsed instructions and skips failed transactions
+
+Tracked review artifacts required in the PR:
+- No tracked review artifact required.
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p3-w3-event-instruction-datasets from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P3-W3: Event and instruction datasets.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 3: Expand Silver Into Reusable Datasets"
+- workPacket: "P3-W3: Event and instruction datasets"
+- branchName: "p3-w3-event-instruction-datasets"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

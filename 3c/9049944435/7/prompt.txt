@@ -1,0 +1,195 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Coordinate the next Spectraplex work packet lifecycle.
+
+Read before deciding:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+- the current repository state
+- relevant open pull requests and packet branches
+
+Preflight:
+All preflight checks pass. Worktree is clean, on main at 484a3f3 (up-to-date with origin), all required tools and GitHub auth are available with full repo permissions, and both design docs exist. Ready for autonomous packet work.
+
+Workflow input:
+- goal: (not provided)
+- startAtPacket: (not provided)
+- stopAfterPacket: (not provided)
+- maxMergedPackets: (not provided)
+
+Previous coordination:
+P1-W5 merged as PR #109 at 9068e5e. Both review blockers fixed: (1) added PostgreSQL 16 service container to CI test job with require_pg! skip guard — all 22 migration tests now run and pass in GHA, (2) added uq_index_targets_filter_spec uniqueness constraint test with NULL exemption and different-kind positive cases. All 5 CI checks green. 315 total tests on main (314 pass, 1 pre-existing flaky API race condition). All Phase 1 packets (P1-W1 through P1-W5) are now merged, completing the Canonical Bronze and Control Plane phase. Selecting P2-W1 — the first packet of Phase 2: Target-Centric Ingestion.
+
+Previous active packet runtime:
+- stage: merged
+- implementation: Introduced a filter-driven Connector trait accepting typed IndexTarget specs instead of bare wallet addresses, with typed filter spec structs for all 8 target kinds, target validation, and a LegacyConnectorAdapter wrapper that bridges existing ChainIngestor adapters to the new interface so wallet ingestion paths remain functional.
+- validation: P2-W1 passes validation. The Connector trait accepts typed IndexTarget specs with backfill/stream semantics, all 8 target kinds have typed filter specs with serde roundtrip and validation tests, and the LegacyConnectorAdapter correctly bridges V1 ChainIngestor to the new interface for wallet targets. 55 new tests (37 core + 18 adapters) all pass. fmt, clippy, and all packet-related tests are green. The single test failure is pre-existing on main and unrelated to this work. No compatibility, migration, or wallet-assumption regressions detected.
+- PR state: Created PR #110 against main with the filter-driven Connector trait, typed filter specs for all 8 target kinds, LegacyConnectorAdapter compatibility wrapper, 55 new tests, and the tracked handoff artifact. PR is open and ready for review.
+- local review: PR is clean, well-structured, and purely additive. The Connector trait is fully generic across all 8 target kinds with no wallet-only assumptions in shared abstractions. All 55 new tests pass, all CI checks pass (Formatting, Clippy, Tests, Build), and the single test failure (test_semaphore_limits_concurrent_jobs) is pre-existing on main. Backward compatibility is preserved through wrapping, not rewriting. Approved with non-blocking observations for downstream packets.
+- remote review: Remote review clear. Purely additive, well-tested (53 new tests), architecturally sound. Connector trait is target-agnostic with all 8 target kinds covered, backward compatibility preserved via LegacyConnectorAdapter wrapping, and backfill/stream semantics well-defined. CI green (fmt, clippy, tests, build). No blocking issues. Ready to merge from PR-comment review perspective.
+- merge: PR #110 merged to main via admin merge (branch protection policy blocked normal merge; all CI checks green, validation/review clear). Local verification confirmed: fmt, clippy clean; all 55 new tests pass; sole test failure (test_semaphore_limits_concurrent_jobs) is a pre-existing flaky race condition. Branch p2-w1-connector-interface deleted locally and remotely. Local main updated to merge commit 54a80c6.
+
+Previous merge result:
+PR #110 merged to main via admin merge (branch protection policy blocked normal merge; all CI checks green, validation/review clear). Local verification confirmed: fmt, clippy clean; all 55 new tests pass; sole test failure (test_semaphore_limits_concurrent_jobs) is a pre-existing flaky race condition. Branch p2-w1-connector-interface deleted locally and remotely. Local main updated to merge commit 54a80c6.
+
+Merged packets so far:
+1. Phase 0: Lock The V2 Architecture P0-W1: V2 Architecture RFC
+2. Phase 0: Lock The V2 Architecture P0-W3: Network Model Spec
+3. Phase 0: Lock The V2 Architecture P0-W4: Rollout And Compatibility Plan
+4. Phase 1: Canonical Bronze And Control Plane P1-W1: Introduce V2 Core Types
+5. Phase 1: Canonical Bronze And Control Plane P1-W2: Add New Bronze And Control-Plane Tables
+6. Phase 1: Canonical Bronze And Control Plane P1-W3: Repository Support For Canonical Raw Data
+7. Phase 2: Target-Centric Ingestion P2-W1: Connector interface redesign
+
+Rules:
+1. Continue exactly one in-flight packet until it is merged. In-flight means an unmerged packet already selected by this workflow, an open PR for a packet branch, or local branch work that clearly maps to a packet.
+2. Only select a new packet when there is no in-flight packet left to finish.
+3. If multiple conflicting in-flight packets exist, return state="blocked" and explain why.
+4. Select the earliest incomplete packet allowed by dependencies in design/PHASED_IMPLEMENTATION_PLAN.md and still incomplete in the current repository and tracked docs.
+5. Respect phase order. Do not skip prerequisites unless the phased plan explicitly allows it.
+6. Keep wallet indexing first-class, but do not reinforce wallet-only assumptions in shared abstractions.
+7. If a packet's primary deliverables live under gitignored paths such as design/, require at least one tracked review artifact under docs/ and list it in trackedReviewArtifacts.
+8. Remote review happens as a PR comment, not a formal GitHub approval. Do not block on missing formal approval.
+9. Admin or force merge is allowed only after validation, local review, and the remote review comment all say the remaining blockers are cleared.
+10. If stopAfterPacket is provided and that packet is already merged, return state="complete".
+11. If maxMergedPackets is provided and the limit has been reached, return state="complete".
+12. If a prior merge attempt failed for an external reason that the workflow cannot safely resolve, return state="blocked" instead of looping forever.
+
+Return JSON with:
+- workflowComplete: true only if the workflow should stop successfully
+- state: "active", "complete", or "blocked"
+- phase: string, or "" if complete or blocked
+- workPacket: string, or "" if complete or blocked
+- objective: string, or "" if complete or blocked
+- branchName: string, or "" if complete or blocked
+- prNumber: number, or 0 if none
+- prUrl: string
+- prTitle: string
+- prBody: string
+- summary: concise coordination summary
+- repoTouchpoints: array
+- implementationSteps: array
+- verificationSteps: array
+- reviewFocus: array
+- trackedReviewArtifacts: array
+- blockingIssues: array
+- warnings: array
+- nextAction: string
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "workflowComplete": {
+      "type": "boolean"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "active",
+        "complete",
+        "blocked"
+      ]
+    },
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "objective": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "prNumber": {
+      "type": "number"
+    },
+    "prUrl": {
+      "type": "string"
+    },
+    "prTitle": {
+      "type": "string"
+    },
+    "prBody": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "repoTouchpoints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "implementationSteps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "verificationSteps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reviewFocus": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "trackedReviewArtifacts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blockingIssues": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "nextAction": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workflowComplete",
+    "state",
+    "phase",
+    "workPacket",
+    "objective",
+    "branchName",
+    "prNumber",
+    "prUrl",
+    "prTitle",
+    "prBody",
+    "summary",
+    "repoTouchpoints",
+    "implementationSteps",
+    "verificationSteps",
+    "reviewFocus",
+    "trackedReviewArtifacts",
+    "blockingIssues",
+    "warnings",
+    "nextAction"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

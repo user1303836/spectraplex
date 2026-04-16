@@ -1,0 +1,33 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "c317c5c03437",
+  "session_id": "344eefd8-4fde-4e66-810f-369a45d150e0",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T22:45:38.1382Z",
+  "branch": "p3-w6-completeness-metadata",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "core/src/v2.rs",
+    "migrations/20260310100000_add_dataset_completeness.sql",
+    "adapters/src/v2_repo.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "aa464b03d2b3",
+  "token_usage": {
+    "input_tokens": 35,
+    "cache_creation_tokens": 96989,
+    "cache_read_tokens": 2867027,
+    "output_tokens": 14608,
+    "api_call_count": 33
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T22:45:37.645006Z",
+    "agent_lines": 686,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 686,
+    "agent_percentage": 100
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/344eefd8-4fde-4e66-810f-369a45d150e0.jsonl"
+}

@@ -1,0 +1,40 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "aa2edeae03f3",
+  "session_id": "cc7ba527-12e3-4378-9825-0d39c8af768d",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T20:50:54.624385Z",
+  "branch": "p3-w1-dataset-registry-versioning",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "core/src/materializer.rs",
+    "core/src/lib.rs",
+    "core/src/v2.rs",
+    "migrations/20260309000000_add_dataset_versioning.sql",
+    "adapters/src/v2_repo.rs",
+    "adapters/src/solana_parser.rs",
+    "adapters/src/evm_parser.rs",
+    "adapters/src/hyperliquid_parser.rs",
+    "adapters/src/lib.rs",
+    "docs/phase3/p3-w1-dataset-registry-handoff.md"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "1346435ce00e",
+  "token_usage": {
+    "input_tokens": 54,
+    "cache_creation_tokens": 111150,
+    "cache_read_tokens": 5098568,
+    "output_tokens": 22246,
+    "api_call_count": 52
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T20:50:54.366428Z",
+    "agent_lines": 941,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 941,
+    "agent_percentage": 100
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/cc7ba527-12e3-4378-9825-0d39c8af768d.jsonl"
+}

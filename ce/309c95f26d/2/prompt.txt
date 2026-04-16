@@ -1,0 +1,143 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 5: Reference Downstream Packs
+- work packet: P5-W3: Protocol / TVL Pack
+- objective: Add Gold-tier protocol_events and pool_snapshots datasets materialized from Silver decoded_events and token_transfers, plus /v1/analytics/protocol/activity and /v1/analytics/protocol/tvl endpoints, enabling a protocol analytics consumer to build TVL and activity dashboards entirely from Spectraplex outputs.
+- branch: p5-w3-protocol-tvl-pack
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- core/src/materializer.rs — Add ProtocolEvents and PoolSnapshots to DatasetName enum, add ProtocolEvent and PoolSnapshot record structs, update all() and as_sql_str()
+- adapters/src/protocol_analytics.rs — New module: compute_protocol_events() from decoded_events, compute_pool_snapshots() from decoded_events + token_transfers, build_protocol_activity() and build_tvl_analytics() aggregation functions
+- adapters/src/lib.rs — Re-export protocol_analytics module
+- adapters/src/repo.rs — Add query_protocol_events(), export_protocol_events(), query_pool_snapshots(), export_pool_snapshots() repository methods
+- api/src/main.rs — Add protocol_events and pool_snapshots to QUERYABLE_DATASETS and EXPORTABLE_DATASETS, add /v1/analytics/protocol/activity and /v1/analytics/protocol/tvl endpoints, add query/export handler branches
+- migrations/20260311000000_add_protocol_tvl_gold.sql — Create protocol_events and pool_snapshots Gold tables with appropriate indexes
+- README.md — Document new datasets, endpoints, and protocol analytics section
+
+Implementation steps:
+1. 1. Add ProtocolEvents and PoolSnapshots variants to DatasetName enum in core/src/materializer.rs, update as_sql_str(), all(), and add ProtocolEvent and PoolSnapshot record structs with fields: id, network, protocol_address, protocol_name, event_type, event_details, pool_address, timestamp, dataset_version_id, created_at (for ProtocolEvent) and id, network, pool_address, protocol_address, protocol_name, token0_address, token0_symbol, token1_address, token1_symbol, reserve0, reserve1, tvl_usd, snapshot_timestamp, block_number, dataset_version_id, created_at (for PoolSnapshot)
+2. 2. Add ProtocolActivity and TvlAnalytics response structs to core/src/materializer.rs following the TraderAnalytics/MarketAnalytics pattern — ProtocolActivity contains protocol_address, event_counts_by_type, unique_participants, total_events, time_range; TvlAnalytics contains pools with per-pool TVL, protocol-level aggregation, total_tvl
+3. 3. Create migration 20260311000000_add_protocol_tvl_gold.sql with protocol_events table (id UUID PK, network TEXT, protocol_address TEXT, protocol_name TEXT, event_type TEXT, event_details JSONB, pool_address TEXT, raw_event_id UUID FK to decoded_events, timestamp BIGINT, dataset_version_id UUID FK, created_at TIMESTAMPTZ) and pool_snapshots table (id UUID PK, network TEXT, pool_address TEXT, protocol_address TEXT, protocol_name TEXT, token0_address TEXT, token0_symbol TEXT, token1_address TEXT, token1_symbol TEXT, reserve0 NUMERIC, reserve1 NUMERIC, tvl_usd NUMERIC, snapshot_timestamp BIGINT, block_number BIGINT, dataset_version_id UUID FK, created_at TIMESTAMPTZ), with IF NOT EXISTS guards and appropriate indexes on protocol_address, pool_address, network, timestamp
+4. 4. Create adapters/src/protocol_analytics.rs with: compute_protocol_events() aggregating decoded_events by protocol_address into ProtocolEvent records, compute_pool_snapshots() deriving pool state from decoded_events (Swap, LiquidityAdded, LiquidityRemoved events) + token_transfers, build_protocol_activity() computing per-protocol aggregations (event counts by type, unique participants, time range), build_tvl_analytics() computing per-pool and aggregate TVL from pool_snapshots
+5. 5. Add query_protocol_events(), export_protocol_events(), query_pool_snapshots(), export_pool_snapshots() to adapters/src/repo.rs following the same build_dataset_filter_query pattern used by other datasets
+6. 6. Register protocol_analytics module in adapters/src/lib.rs
+7. 7. Add 'protocol_events' and 'pool_snapshots' to QUERYABLE_DATASETS and EXPORTABLE_DATASETS arrays in api/src/main.rs, add query/export handler match branches for both datasets, add ProtocolAnalyticsParams query struct, add /v1/analytics/protocol/activity and /v1/analytics/protocol/tvl route handlers behind auth
+8. 8. Add unit tests: protocol event aggregation from decoded_events, pool snapshot computation, TVL calculation correctness, analytics response format, CSV export header validation, endpoint routing and auth tests
+9. 9. Update QUERYABLE_DATASETS count test to 12 and EXPORTABLE_DATASETS count test to 12, update DatasetName::all() count test to 13
+10. 10. Update README.md: add protocol_events and pool_snapshots to dataset documentation, document /v1/analytics/protocol/activity and /v1/analytics/protocol/tvl endpoints with example requests/responses, update Gold datasets section to list 6 Gold datasets
+
+Verification expectations:
+1. cargo fmt --all --check passes
+2. cargo clippy --workspace --all-targets -- -D warnings passes
+3. cargo test --workspace passes with all tests passing (expected ~920+ tests)
+4. DatasetName::all() returns 13 datasets (7 Silver + 6 Gold)
+5. QUERYABLE_DATASETS contains 12 entries including protocol_events and pool_snapshots
+6. EXPORTABLE_DATASETS contains 12 entries including protocol_events and pool_snapshots
+7. ProtocolEvent correctly maps decoded_events by protocol_address with event_type classification
+8. PoolSnapshot captures pool state with reserve amounts and optional TVL valuation
+9. ProtocolActivity aggregation produces correct event counts, unique participant counts, and time ranges
+10. TvlAnalytics produces per-pool and aggregate TVL from pool_snapshots
+11. /v1/analytics/protocol/activity and /v1/analytics/protocol/tvl endpoints route correctly behind auth
+12. CSV export tests validate well-formed header+data output for both new datasets
+13. Migration uses IF NOT EXISTS guards with proper indexes
+14. README documents all new endpoints and datasets
+15. Full backward compatibility with P5-W2 and P5-W1 confirmed — all existing tests still pass
+
+Tracked review artifacts required in the PR:
+- No tracked review artifact required.
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p5-w3-protocol-tvl-pack from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P5-W3: Protocol / TVL Pack.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 5: Reference Downstream Packs"
+- workPacket: "P5-W3: Protocol / TVL Pack"
+- branchName: "p5-w3-protocol-tvl-pack"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

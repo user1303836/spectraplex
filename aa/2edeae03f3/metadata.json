@@ -1,0 +1,112 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "aa2edeae03f3",
+  "strategy": "manual-commit",
+  "branch": "p3-w1-dataset-registry-versioning",
+  "checkpoints_count": 6,
+  "files_touched": [
+    "adapters/src/evm_parser.rs",
+    "adapters/src/hyperliquid_parser.rs",
+    "adapters/src/lib.rs",
+    "adapters/src/solana_parser.rs",
+    "adapters/src/v2_repo.rs",
+    "core/src/lib.rs",
+    "core/src/materializer.rs",
+    "core/src/v2.rs",
+    "docs/phase3/p3-w1-dataset-registry-handoff.md",
+    "migrations/20260309000000_add_dataset_versioning.sql"
+  ],
+  "sessions": [
+    {
+      "metadata": "/aa/2edeae03f3/0/metadata.json",
+      "transcript": "/aa/2edeae03f3/0/full.jsonl",
+      "context": "/aa/2edeae03f3/0/context.md",
+      "content_hash": "/aa/2edeae03f3/0/content_hash.txt",
+      "prompt": "/aa/2edeae03f3/0/prompt.txt"
+    },
+    {
+      "metadata": "/aa/2edeae03f3/1/metadata.json",
+      "transcript": "/aa/2edeae03f3/1/full.jsonl",
+      "context": "/aa/2edeae03f3/1/context.md",
+      "content_hash": "/aa/2edeae03f3/1/content_hash.txt",
+      "prompt": "/aa/2edeae03f3/1/prompt.txt"
+    },
+    {
+      "metadata": "/aa/2edeae03f3/2/metadata.json",
+      "transcript": "/aa/2edeae03f3/2/full.jsonl",
+      "context": "/aa/2edeae03f3/2/context.md",
+      "content_hash": "/aa/2edeae03f3/2/content_hash.txt",
+      "prompt": "/aa/2edeae03f3/2/prompt.txt"
+    },
+    {
+      "metadata": "/aa/2edeae03f3/3/metadata.json",
+      "transcript": "/aa/2edeae03f3/3/full.jsonl",
+      "context": "/aa/2edeae03f3/3/context.md",
+      "content_hash": "/aa/2edeae03f3/3/content_hash.txt",
+      "prompt": "/aa/2edeae03f3/3/prompt.txt"
+    },
+    {
+      "metadata": "/aa/2edeae03f3/4/metadata.json",
+      "transcript": "/aa/2edeae03f3/4/full.jsonl",
+      "context": "/aa/2edeae03f3/4/context.md",
+      "content_hash": "/aa/2edeae03f3/4/content_hash.txt",
+      "prompt": "/aa/2edeae03f3/4/prompt.txt"
+    },
+    {
+      "metadata": "/aa/2edeae03f3/5/metadata.json",
+      "transcript": "/aa/2edeae03f3/5/full.jsonl",
+      "context": "/aa/2edeae03f3/5/context.md",
+      "content_hash": "/aa/2edeae03f3/5/content_hash.txt",
+      "prompt": "/aa/2edeae03f3/5/prompt.txt"
+    },
+    {
+      "metadata": "/aa/2edeae03f3/6/metadata.json",
+      "transcript": "/aa/2edeae03f3/6/full.jsonl",
+      "context": "/aa/2edeae03f3/6/context.md",
+      "content_hash": "/aa/2edeae03f3/6/content_hash.txt",
+      "prompt": "/aa/2edeae03f3/6/prompt.txt"
+    },
+    {
+      "metadata": "/aa/2edeae03f3/7/metadata.json",
+      "transcript": "/aa/2edeae03f3/7/full.jsonl",
+      "context": "/aa/2edeae03f3/7/context.md",
+      "content_hash": "/aa/2edeae03f3/7/content_hash.txt",
+      "prompt": "/aa/2edeae03f3/7/prompt.txt"
+    },
+    {
+      "metadata": "/aa/2edeae03f3/8/metadata.json",
+      "transcript": "/aa/2edeae03f3/8/full.jsonl",
+      "context": "/aa/2edeae03f3/8/context.md",
+      "content_hash": "/aa/2edeae03f3/8/content_hash.txt",
+      "prompt": "/aa/2edeae03f3/8/prompt.txt"
+    },
+    {
+      "metadata": "/aa/2edeae03f3/9/metadata.json",
+      "transcript": "/aa/2edeae03f3/9/full.jsonl",
+      "context": "/aa/2edeae03f3/9/context.md",
+      "content_hash": "/aa/2edeae03f3/9/content_hash.txt",
+      "prompt": "/aa/2edeae03f3/9/prompt.txt"
+    },
+    {
+      "metadata": "/aa/2edeae03f3/10/metadata.json",
+      "transcript": "/aa/2edeae03f3/10/full.jsonl",
+      "context": "/aa/2edeae03f3/10/context.md",
+      "content_hash": "/aa/2edeae03f3/10/content_hash.txt",
+      "prompt": "/aa/2edeae03f3/10/prompt.txt"
+    },
+    {
+      "metadata": "/aa/2edeae03f3/11/metadata.json",
+      "transcript": "/aa/2edeae03f3/11/full.jsonl",
+      "context": "/aa/2edeae03f3/11/context.md",
+      "content_hash": "/aa/2edeae03f3/11/content_hash.txt",
+      "prompt": "/aa/2edeae03f3/11/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 380,
+    "cache_creation_tokens": 1260044,
+    "cache_read_tokens": 27085035,
+    "output_tokens": 206639,
+    "api_call_count": 346
+  }
+}

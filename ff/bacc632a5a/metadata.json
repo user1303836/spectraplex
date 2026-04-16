@@ -1,0 +1,110 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "ffbacc632a5a",
+  "strategy": "manual-commit",
+  "branch": "p3-w3-event-instruction-datasets",
+  "checkpoints_count": 8,
+  "files_touched": [
+    "migrations/20260309200000_add_decoded_events.sql"
+  ],
+  "sessions": [
+    {
+      "metadata": "/ff/bacc632a5a/0/metadata.json",
+      "transcript": "/ff/bacc632a5a/0/full.jsonl",
+      "context": "/ff/bacc632a5a/0/context.md",
+      "content_hash": "/ff/bacc632a5a/0/content_hash.txt",
+      "prompt": "/ff/bacc632a5a/0/prompt.txt"
+    },
+    {
+      "metadata": "/ff/bacc632a5a/1/metadata.json",
+      "transcript": "/ff/bacc632a5a/1/full.jsonl",
+      "context": "/ff/bacc632a5a/1/context.md",
+      "content_hash": "/ff/bacc632a5a/1/content_hash.txt",
+      "prompt": "/ff/bacc632a5a/1/prompt.txt"
+    },
+    {
+      "metadata": "/ff/bacc632a5a/2/metadata.json",
+      "transcript": "/ff/bacc632a5a/2/full.jsonl",
+      "context": "/ff/bacc632a5a/2/context.md",
+      "content_hash": "/ff/bacc632a5a/2/content_hash.txt",
+      "prompt": "/ff/bacc632a5a/2/prompt.txt"
+    },
+    {
+      "metadata": "/ff/bacc632a5a/3/metadata.json",
+      "transcript": "/ff/bacc632a5a/3/full.jsonl",
+      "context": "/ff/bacc632a5a/3/context.md",
+      "content_hash": "/ff/bacc632a5a/3/content_hash.txt",
+      "prompt": "/ff/bacc632a5a/3/prompt.txt"
+    },
+    {
+      "metadata": "/ff/bacc632a5a/4/metadata.json",
+      "transcript": "/ff/bacc632a5a/4/full.jsonl",
+      "context": "/ff/bacc632a5a/4/context.md",
+      "content_hash": "/ff/bacc632a5a/4/content_hash.txt",
+      "prompt": "/ff/bacc632a5a/4/prompt.txt"
+    },
+    {
+      "metadata": "/ff/bacc632a5a/5/metadata.json",
+      "transcript": "/ff/bacc632a5a/5/full.jsonl",
+      "context": "/ff/bacc632a5a/5/context.md",
+      "content_hash": "/ff/bacc632a5a/5/content_hash.txt",
+      "prompt": "/ff/bacc632a5a/5/prompt.txt"
+    },
+    {
+      "metadata": "/ff/bacc632a5a/6/metadata.json",
+      "transcript": "/ff/bacc632a5a/6/full.jsonl",
+      "context": "/ff/bacc632a5a/6/context.md",
+      "content_hash": "/ff/bacc632a5a/6/content_hash.txt",
+      "prompt": "/ff/bacc632a5a/6/prompt.txt"
+    },
+    {
+      "metadata": "/ff/bacc632a5a/7/metadata.json",
+      "transcript": "/ff/bacc632a5a/7/full.jsonl",
+      "context": "/ff/bacc632a5a/7/context.md",
+      "content_hash": "/ff/bacc632a5a/7/content_hash.txt",
+      "prompt": "/ff/bacc632a5a/7/prompt.txt"
+    },
+    {
+      "metadata": "/ff/bacc632a5a/8/metadata.json",
+      "transcript": "/ff/bacc632a5a/8/full.jsonl",
+      "context": "/ff/bacc632a5a/8/context.md",
+      "content_hash": "/ff/bacc632a5a/8/content_hash.txt",
+      "prompt": "/ff/bacc632a5a/8/prompt.txt"
+    },
+    {
+      "metadata": "/ff/bacc632a5a/9/metadata.json",
+      "transcript": "/ff/bacc632a5a/9/full.jsonl",
+      "context": "/ff/bacc632a5a/9/context.md",
+      "content_hash": "/ff/bacc632a5a/9/content_hash.txt",
+      "prompt": "/ff/bacc632a5a/9/prompt.txt"
+    },
+    {
+      "metadata": "/ff/bacc632a5a/10/metadata.json",
+      "transcript": "/ff/bacc632a5a/10/full.jsonl",
+      "context": "/ff/bacc632a5a/10/context.md",
+      "content_hash": "/ff/bacc632a5a/10/content_hash.txt",
+      "prompt": "/ff/bacc632a5a/10/prompt.txt"
+    },
+    {
+      "metadata": "/ff/bacc632a5a/11/metadata.json",
+      "transcript": "/ff/bacc632a5a/11/full.jsonl",
+      "context": "/ff/bacc632a5a/11/context.md",
+      "content_hash": "/ff/bacc632a5a/11/content_hash.txt",
+      "prompt": "/ff/bacc632a5a/11/prompt.txt"
+    },
+    {
+      "metadata": "/ff/bacc632a5a/12/metadata.json",
+      "transcript": "/ff/bacc632a5a/12/full.jsonl",
+      "context": "/ff/bacc632a5a/12/context.md",
+      "content_hash": "/ff/bacc632a5a/12/content_hash.txt",
+      "prompt": "/ff/bacc632a5a/12/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 463,
+    "cache_creation_tokens": 1305671,
+    "cache_read_tokens": 28259736,
+    "output_tokens": 216202,
+    "api_call_count": 366
+  }
+}

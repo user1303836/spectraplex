@@ -1,0 +1,37 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "3c9049944435",
+  "session_id": "828a10bd-69aa-4f38-9e40-45155b7f37ec",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T19:05:49.030139Z",
+  "branch": "p2-w2-target-registration",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "api/src/main.rs",
+    "cli/Cargo.toml",
+    "cli/src/main.rs",
+    "docs/phase2/p2-w2-target-registration-handoff.md",
+    "Cargo.lock",
+    "adapters/src/v2_repo.rs",
+    "api/Cargo.toml"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "6253eb6f3196",
+  "token_usage": {
+    "input_tokens": 33,
+    "cache_creation_tokens": 135048,
+    "cache_read_tokens": 2966751,
+    "output_tokens": 19591,
+    "api_call_count": 29
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T19:05:48.783139Z",
+    "agent_lines": 0,
+    "human_added": 969,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 969,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/828a10bd-69aa-4f38-9e40-45155b7f37ec.jsonl"
+}

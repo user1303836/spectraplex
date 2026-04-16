@@ -1,0 +1,133 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 3: Expand Silver Into Reusable Datasets
+- work packet: P3-W5: Ledger as a derived materialization
+- objective: Introduce Silver-to-LedgerEntry derivation functions that produce wallet-scoped ledger entries from reusable Silver datasets, proving ledger generation can be decoupled from direct Bronze parsing while keeping current API output stable.
+- branch: p3-w5-ledger-derived-materialization
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- adapters/src/ledger_derivation.rs (new module: Silver→LedgerEntry derivation functions)
+- adapters/src/lib.rs (register ledger_derivation module)
+- adapters/src/solana_parser.rs (reference for direct Solana LedgerEntry generation pattern)
+- adapters/src/evm_parser.rs (reference for direct EVM LedgerEntry generation pattern)
+- adapters/src/hyperliquid_parser.rs (reference for direct Hyperliquid LedgerEntry generation pattern)
+- core/src/materializer.rs (potential DatasetName or descriptor updates for derived ledger concept)
+- core/src/models.rs (LedgerEntry, EntryType structs consumed by derivation)
+
+Implementation steps:
+1. 1. Create adapters/src/ledger_derivation.rs with wallet-scoped derivation functions: derive_ledger_from_token_transfers(wallet, user_id, tx_id, transfers) → Vec<LedgerEntry> that filters TokenTransfer records by from_address/to_address matching wallet and creates Transfer entries with signed amounts
+2. 2. Add derive_ledger_from_native_balance_deltas(wallet, user_id, tx_id, deltas) → Vec<LedgerEntry> that filters NativeBalanceDelta records by account_address matching wallet, creating Fee entries for fee-payer deltas and Transfer entries for other native balance changes
+3. 3. Add derive_ledger_from_hl_fills(user_id, tx_id, fills) → Vec<LedgerEntry> that converts HlFillRecord into Trade entries with coin as asset_symbol and notional value as amount
+4. 4. Add derive_ledger_from_hl_funding(user_id, tx_id, payments) → Vec<LedgerEntry> that converts HlFundingPayment into Fee entries (consistent with current V1 behavior)
+5. 5. Add derive_all_ledger_entries(chain, wallet, user_id, tx_id, silver_records) → Vec<LedgerEntry> orchestration function that dispatches to chain-appropriate derivation functions and merges results
+6. 6. Add DerivedLedgerMaterializer structs per chain family (SolanaDerivedLedgerMaterializer, EvmDerivedLedgerMaterializer, HyperliquidDerivedLedgerMaterializer) implementing the Materializer trait with dataset_name LedgerEntries, distinct parser_hash values, and parser_version 2 to distinguish from direct V1 materializers
+7. 7. Register ledger_derivation module in adapters/src/lib.rs
+8. 8. Add comprehensive unit tests: (a) derivation from token transfers produces correct Transfer entries, (b) derivation from native balance deltas produces correct Fee/Transfer entries, (c) derivation from HL fills produces correct Trade entries, (d) derivation from HL funding produces correct Fee entries, (e) wallet filtering works correctly (only entries involving the wallet appear), (f) deterministic IDs are stable across re-derivation, (g) DerivedLedgerMaterializer trait implementations have globally distinct parser hashes from the 13 existing materializers
+9. 9. Add equivalence tests that run both V1 direct parsing and V2 Silver derivation on the same synthetic transaction and compare the resulting LedgerEntry sets for semantic equivalence (same entry_types, same asset_symbols, same amounts up to ordering)
+
+Verification expectations:
+1. cargo fmt --all --check
+2. cargo clippy --workspace --all-targets -- -D warnings
+3. cargo test --workspace (must pass all existing 634+ tests plus new derivation tests)
+4. Verify no changes to existing normalize CLI or API flow (grep for trigger_normalize and Commands::Normalize to confirm untouched)
+5. Verify all DerivedLedgerMaterializer parser hashes are globally distinct from all 13 existing materializers
+6. Verify LedgerEntry output from derivation path matches V1 direct parsing semantics
+
+Tracked review artifacts required in the PR:
+- No tracked review artifact required.
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p3-w5-ledger-derived-materialization from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P3-W5: Ledger as a derived materialization.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 3: Expand Silver Into Reusable Datasets"
+- workPacket: "P3-W5: Ledger as a derived materialization"
+- branchName: "p3-w5-ledger-derived-materialization"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

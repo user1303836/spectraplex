@@ -1,0 +1,31 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "522419b0c85f",
+  "session_id": "ce925e92-1e73-49f2-a41f-251548dd83df",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T16:27:29.262312Z",
+  "branch": "codex/p0-w2-target-model-spec",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "docs/phase0/p0-w2-target-model-spec-handoff.md"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "d684221a45b4",
+  "token_usage": {
+    "input_tokens": 13,
+    "cache_creation_tokens": 75321,
+    "cache_read_tokens": 552349,
+    "output_tokens": 15018,
+    "api_call_count": 11
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T16:27:29.112335Z",
+    "agent_lines": 895,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 895,
+    "agent_percentage": 100
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/ce925e92-1e73-49f2-a41f-251548dd83df.jsonl"
+}

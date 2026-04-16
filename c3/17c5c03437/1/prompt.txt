@@ -1,0 +1,134 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 3: Expand Silver Into Reusable Datasets
+- work packet: P3-W6: Completeness metadata
+- objective: Track dataset completeness per target and time range, expose completeness markers for downstream consumers so they can determine whether a dataset is partial, complete, or backfilling for a given target and network.
+- branch: p3-w6-completeness-metadata
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- core/src/v2.rs — CompletenessStatus enum and DatasetCompleteness struct
+- adapters/src/v2_repo.rs — Repository CRUD methods for dataset_completeness
+- migrations/ — New migration for dataset_completeness table with indexes and unique constraints
+- core/src/materializer.rs — DatasetName enum (read-only reference, no changes expected)
+
+Implementation steps:
+1. 1. Add CompletenessStatus enum (Partial, Complete, Backfilling, Gap) with serde, strum, Default derives to core/src/v2.rs following existing enum patterns
+2. 2. Add DatasetCompleteness struct to core/src/v2.rs with fields: id (UUID), target_id (UUID), dataset_name (String), dataset_version_id (Option<Uuid>), network (String), status (CompletenessStatus), coverage_start (Option<i64>), coverage_end (Option<i64>), block_start (Option<i64>), block_end (Option<i64>), last_ingestion_run_id (Option<Uuid>), records_count (i64), gap_ranges (Option<serde_json::Value>), notes (Option<String>), created_at, updated_at
+3. 3. Add migration file (next timestamp after 20260310000000) creating dataset_completeness table with UNIQUE(target_id, dataset_name, network) constraint, FK references to index_targets, dataset_versions, networks, and ingestion_runs, and indexes on target_id, dataset_name, and status
+4. 4. Add row_to_dataset_completeness() helper in v2_repo.rs following existing row-mapping patterns
+5. 5. Add upsert_dataset_completeness() repository method with ON CONFLICT UPDATE on the unique constraint
+6. 6. Add get_dataset_completeness(target_id, dataset_name, network) query method
+7. 7. Add list_completeness_by_target(target_id) method returning all dataset completeness records for a target
+8. 8. Add list_completeness_by_dataset(dataset_name) method returning all target completeness records for a dataset
+9. 9. Add list_completeness_by_status(status) method for finding partial/backfilling/gap records
+10. 10. Add update_completeness_after_run() method that updates coverage window, status, records_count, and last_ingestion_run_id
+11. 11. Add comprehensive unit tests: CompletenessStatus serialization/deserialization round-trips, DatasetCompleteness struct construction and validation, upsert idempotency, status transition sequences (partial → backfilling → complete), coverage window expansion, query filtering by target/dataset/status
+
+Verification expectations:
+1. cargo fmt --all --check
+2. cargo clippy --workspace --all-targets -- -D warnings
+3. cargo test --workspace — all existing 665+ tests pass plus new completeness tests
+4. Verify migration applies cleanly (no syntax errors in SQL)
+5. Verify CompletenessStatus enum values serialize to lowercase strings matching SQL CHECK constraint
+6. Verify UNIQUE constraint on (target_id, dataset_name, network) is enforced
+7. Verify FK references to index_targets, networks, dataset_versions, and ingestion_runs are correct
+8. Verify no changes to existing CLI, API, or parser flows
+
+Tracked review artifacts required in the PR:
+- No tracked review artifact required.
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p3-w6-completeness-metadata from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P3-W6: Completeness metadata.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 3: Expand Silver Into Reusable Datasets"
+- workPacket: "P3-W6: Completeness metadata"
+- branchName: "p3-w6-completeness-metadata"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

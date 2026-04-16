@@ -1,0 +1,36 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "fac1a771d287",
+  "session_id": "ffbe3786-7f20-41b0-9810-ef362c1783d9",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T23:29:23.627724Z",
+  "branch": "p4-w2-export-jobs",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "README.md",
+    "adapters/src/v2_repo.rs",
+    "api/src/main.rs",
+    "core/src/materializer.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "278bcc3c1b7f",
+  "checkpoint_transcript_start": 70,
+  "transcript_lines_at_start": 70,
+  "token_usage": {
+    "input_tokens": 22,
+    "cache_creation_tokens": 67380,
+    "cache_read_tokens": 741140,
+    "output_tokens": 17076,
+    "api_call_count": 16
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T23:29:23.505031Z",
+    "agent_lines": 0,
+    "human_added": 1261,
+    "human_modified": 1,
+    "human_removed": 0,
+    "total_committed": 1261,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/ffbe3786-7f20-41b0-9810-ef362c1783d9.jsonl"
+}

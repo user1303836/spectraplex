@@ -1,0 +1,141 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 5: Reference Downstream Packs
+- work packet: P5-W1: Wallet / Tax / Forensics Pack
+- objective: Prove the platform powers wallet, tax, and forensics use cases by adding a wallet_ledger Gold dataset with counterparty tracking, a balance_history dataset, a tax-export-friendly format, and a forensics activity view — all derived from existing Silver datasets without raw chain parsing.
+- branch: p5-w1-wallet-tax-forensics-pack
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- core/src/materializer.rs — Add WalletLedger and BalanceHistory DatasetName variants and record types
+- core/src/models.rs — Add WalletLedgerRecord and BalanceSnapshot types if needed
+- adapters/src/ledger_derivation.rs — Enhance with counterparty extraction and network-aware wallet_ledger materialization
+- adapters/src/v2_repo.rs — Repository methods for wallet_ledger and balance_history datasets
+- api/src/main.rs — Register new datasets in dataset API, add tax export format, add forensics activity endpoint
+- migrations/ — New tables for wallet_ledger (Gold) and balance_history datasets
+- README.md — Document new datasets and tax export shape
+
+Implementation steps:
+1. 1. Add WalletLedger and BalanceHistory variants to DatasetName enum in core/src/materializer.rs with record types (WalletLedgerRecord: timestamp, network, tx_hash, entry_type, asset_symbol, amount, counterparty_address, fee_amount, cost_basis nullable, proceeds nullable; BalanceSnapshot: wallet_address, asset_symbol, network, timestamp, balance, tx_hash)
+2. 2. Add SQL migration for wallet_ledger table — Gold-tier materialized records with counterparty, network, fee, and nullable cost_basis/proceeds fields
+3. 3. Add SQL migration for balance_history table — per-wallet, per-asset running balance snapshots derived from Silver data
+4. 4. Implement wallet_ledger materializer that derives from token_transfers + native_balance_deltas + hl_fills + hl_funding, extracts counterparty addresses, and is network-aware using V2 model
+5. 5. Implement balance_history materializer that computes running balance per asset per wallet from wallet_ledger entries or directly from token_transfers + native_balance_deltas
+6. 6. Add repository methods in v2_repo.rs for inserting/querying wallet_ledger and balance_history records
+7. 7. Register wallet_ledger and balance_history in the dataset API so they appear in /v1/datasets and are queryable via /v1/datasets/:name/records and exportable via /v1/export/dataset
+8. 8. Add tax export CSV format option — columns: Date, Type, Sent_Asset, Sent_Amount, Received_Asset, Received_Amount, Fee_Asset, Fee_Amount, Cost_Basis, Proceeds, Gain_Loss, Tx_Hash, Network (cost_basis/proceeds/gain_loss nullable for now)
+9. 9. Add forensics activity endpoint or dataset view — top counterparties, cross-chain activity summary, transaction type breakdown, interaction stats per wallet
+10. 10. Add unit tests for wallet_ledger and balance_history materializers, export format tests, forensics tests, and integration tests proving consumers can build tax/forensic workflows from datasets alone
+11. 11. Verify all existing wallet endpoints remain functional — run P4-W5 compatibility tests
+12. 12. Update README.md with new datasets, tax export shape, and forensics capabilities
+
+Verification expectations:
+1. cargo fmt --all --check
+2. cargo clippy --workspace --all-targets -- -D warnings
+3. cargo test --workspace — must pass ≥810 tests (current baseline) plus new P5-W1 tests
+4. Verify wallet_ledger dataset appears in /v1/datasets listing
+5. Verify wallet_ledger records are queryable via /v1/datasets/wallet_ledger/records with target_id filter
+6. Verify balance_history records are queryable via /v1/datasets/balance_history/records
+7. Verify tax export format produces well-formed CSV with expected columns
+8. Verify wallet_ledger includes counterparty_address from token_transfers
+9. Verify existing wallet endpoints (/v1/ledger/:wallet, /v1/balances/:wallet, /v1/export/:wallet) remain functional
+10. Verify P4-W5 compatibility tests still pass (30 surface tests)
+11. Verify forensics view returns meaningful wallet interaction data
+
+Tracked review artifacts required in the PR:
+- No tracked review artifact required.
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p5-w1-wallet-tax-forensics-pack from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P5-W1: Wallet / Tax / Forensics Pack.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 5: Reference Downstream Packs"
+- workPacket: "P5-W1: Wallet / Tax / Forensics Pack"
+- branchName: "p5-w1-wallet-tax-forensics-pack"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

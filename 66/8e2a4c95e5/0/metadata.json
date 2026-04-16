@@ -1,0 +1,31 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "668e2a4c95e5",
+  "session_id": "2f443725-c9ab-4c4b-bc83-5e5fd859af37",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T01:06:10.707339Z",
+  "branch": "codex/p0-w3-network-model-spec",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "design/V2_ARCHITECTURE_RFC.md"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "5985739bb00f",
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 187541,
+    "cache_read_tokens": 1448786,
+    "output_tokens": 13742,
+    "api_call_count": 22
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T01:06:10.50729Z",
+    "agent_lines": 0,
+    "human_added": 8,
+    "human_modified": 36,
+    "human_removed": 0,
+    "total_committed": 8,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/2f443725-c9ab-4c4b-bc83-5e5fd859af37.jsonl"
+}

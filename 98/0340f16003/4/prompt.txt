@@ -1,0 +1,138 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- mode: fix_review_feedback
+- phase: Phase 0
+- work packet: P0-W3
+- objective: Make PR #101 reviewable by publishing a tracked handoff artifact for the locked network model contract, then re-request review so P0-W3 can reach merge-ready state.
+- branch: codex/p0-w3-network-model-spec
+- existing PR: https://github.com/user1303836/spectraplex/pull/101
+
+Repo touchpoints:
+- docs/phase0/p0-w3-network-model-handoff.md
+- design/NETWORK_MODEL.md
+- design/V2_ARCHITECTURE_RFC.md
+- design/TARGET_MODEL.md
+- core/src/models.rs
+- adapters/src/repo.rs
+- adapters/src/solana_grpc.rs
+- adapters/src/hyperliquid.rs
+- migrations/20260217010000_add_indexer_checkpoints.sql
+- migrations/20260218000000_add_last_block_to_checkpoints.sql
+
+Implementation steps:
+1. Add a tracked handoff artifact at `docs/phase0/p0-w3-network-model-handoff.md` that mirrors the locked P0-W3 contract from the local `design/` docs without introducing new scope.
+2. In that artifact, explicitly capture the frozen network registry, four finality labels, the six required worked examples, and the HyperCore versus HyperEVM routing split.
+3. Tighten the Phase 1 migration guidance so reviewers can see the legacy caveats in tracked form: Solana gRPC has no persisted legacy checkpoint to migrate, HyperCore legacy checkpoints only carry timestamp state, and EVM legacy rows default to `ethereum-mainnet` unless manually reclassified.
+4. Update PR #101 body to point reviewers at the tracked handoff artifact and re-request review once the diff is no longer empty.
+
+Verification expectations:
+1. Confirm `git diff --stat origin/main...HEAD` includes the new tracked handoff document so PR #101 is reviewable on GitHub.
+2. Run a manual consistency pass between the tracked handoff artifact and `design/NETWORK_MODEL.md`, `design/V2_ARCHITECTURE_RFC.md`, and `design/TARGET_MODEL.md` for network IDs, finality labels, checkpoint cursor shapes, and HyperCore naming.
+3. Verify the migration notes in the handoff artifact still match current code in `core/src/models.rs`, `adapters/src/repo.rs`, `adapters/src/solana_grpc.rs`, `adapters/src/hyperliquid.rs`, and the checkpoint migrations.
+4. Confirm the branch remains docs-only; no Rust test run is required under `CLAUDE.md` for this packet update.
+
+Outstanding validation or review feedback:
+Local review blockers:
+- PR #101 has no tracked diff; the P0-W3 network contract currently exists only in ignored design docs, so there is nothing mergeable freezing the Phase 1 contract.
+- The proposed checkpoint migration incorrectly defaults all legacy Solana checkpoints to source="rpc" even though the current CLI can persist gRPC-derived Solana checkpoints that resume by slot.
+- The proposed HyperCore checkpoint migration maps second-precision last_timestamp to exact millisecond last_timestamp_ms, which overstates the precision of existing data and needs explicit replay/dedupe semantics.
+
+Local review follow-ups:
+- The spec correctly documents that legacy Chain::Ethereum data may need manual network reclassification, but Phase 1 still needs to define the exact override mechanism before migration code ships.
+
+PR review blockers:
+- PR #101 is still an empty draft shell with zero tracked file changes, so there is no published packet artifact to review or approve on GitHub.
+- The packet content currently appears to live only in REDACTED.md while /Users/user1303836/Development/spectraplex/.gitignore:4 excludes design/, which blocks validation of the HyperCore vs HyperEVM routing, Phase 1 networks table contract, finality/cursor semantics, and compatibility guidance as submitted.
+
+PR review follow-ups:
+- GitHub would not allow a formal REQUEST_CHANGES review on your own PR, so I posted a blocking PR comment instead: https://github.com/user1303836/spectraplex/pull/101#issuecomment-4017837478
+
+Requirements:
+1. If this is a new packet, create or reset the local branch codex/p0-w3-network-model-spec from the latest main branch state.
+2. If this is a fix iteration, stay on the existing branch and address the outstanding validation or review feedback first.
+3. Make only the changes needed for P0-W3.
+4. Run the relevant verification commands before finishing.
+5. Create a local commit if changes were made and verification is good.
+6. Do not push, do not open a PR, and do not merge a PR.
+
+Return JSON with:
+- phase: "Phase 0"
+- workPacket: "P0-W3"
+- branchName: "codex/p0-w3-network-model-spec"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

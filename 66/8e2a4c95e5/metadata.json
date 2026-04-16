@@ -1,0 +1,57 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "668e2a4c95e5",
+  "strategy": "manual-commit",
+  "branch": "codex/p0-w3-network-model-spec",
+  "checkpoints_count": 5,
+  "files_touched": [
+    "design/NETWORK_MODEL.md",
+    "design/PHASED_IMPLEMENTATION_PLAN.md",
+    "design/TARGET_MODEL.md",
+    "design/V2_ARCHITECTURE_RFC.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/66/8e2a4c95e5/0/metadata.json",
+      "transcript": "/66/8e2a4c95e5/0/full.jsonl",
+      "context": "/66/8e2a4c95e5/0/context.md",
+      "content_hash": "/66/8e2a4c95e5/0/content_hash.txt",
+      "prompt": "/66/8e2a4c95e5/0/prompt.txt"
+    },
+    {
+      "metadata": "/66/8e2a4c95e5/1/metadata.json",
+      "transcript": "/66/8e2a4c95e5/1/full.jsonl",
+      "context": "/66/8e2a4c95e5/1/context.md",
+      "content_hash": "/66/8e2a4c95e5/1/content_hash.txt",
+      "prompt": "/66/8e2a4c95e5/1/prompt.txt"
+    },
+    {
+      "metadata": "/66/8e2a4c95e5/2/metadata.json",
+      "transcript": "/66/8e2a4c95e5/2/full.jsonl",
+      "context": "/66/8e2a4c95e5/2/context.md",
+      "content_hash": "/66/8e2a4c95e5/2/content_hash.txt",
+      "prompt": "/66/8e2a4c95e5/2/prompt.txt"
+    },
+    {
+      "metadata": "/66/8e2a4c95e5/3/metadata.json",
+      "transcript": "/66/8e2a4c95e5/3/full.jsonl",
+      "context": "/66/8e2a4c95e5/3/context.md",
+      "content_hash": "/66/8e2a4c95e5/3/content_hash.txt",
+      "prompt": "/66/8e2a4c95e5/3/prompt.txt"
+    },
+    {
+      "metadata": "/66/8e2a4c95e5/4/metadata.json",
+      "transcript": "/66/8e2a4c95e5/4/full.jsonl",
+      "context": "/66/8e2a4c95e5/4/context.md",
+      "content_hash": "/66/8e2a4c95e5/4/content_hash.txt",
+      "prompt": "/66/8e2a4c95e5/4/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 126,
+    "cache_creation_tokens": 581180,
+    "cache_read_tokens": 8279303,
+    "output_tokens": 77919,
+    "api_call_count": 106
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "e7b6f974cd94",
+  "session_id": "705f7f05-679e-46ca-9681-e8343a30bc27",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-09T01:51:45.44728Z",
+  "branch": "p5-w3-protocol-tvl-pack",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "adapters/src/lib.rs",
+    "adapters/src/protocol_analytics.rs",
+    "adapters/src/v2_repo.rs",
+    "api/src/main.rs",
+    "core/src/materializer.rs",
+    "migrations/20260311000000_add_protocol_tvl_gold.sql",
+    "README.md"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "20d0e27e9fd1",
+  "token_usage": {
+    "input_tokens": 3459,
+    "cache_creation_tokens": 60506,
+    "cache_read_tokens": 2606749,
+    "output_tokens": 16027,
+    "api_call_count": 46
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-09T01:51:45.204511Z",
+    "agent_lines": 0,
+    "human_added": 1587,
+    "human_modified": 12,
+    "human_removed": 0,
+    "total_committed": 1587,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/705f7f05-679e-46ca-9681-e8343a30bc27.jsonl"
+}

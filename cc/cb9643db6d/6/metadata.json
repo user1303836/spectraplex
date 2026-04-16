@@ -1,0 +1,36 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "cccb9643db6d",
+  "session_id": "879b3644-4c1e-4484-a191-5b811d707ade",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T18:23:38.496156Z",
+  "branch": "p1-w5-migration-verification",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "Cargo.lock",
+    "adapters/Cargo.toml",
+    "adapters/tests/migration_test.rs",
+    "docs/phase1/p1-w5-migration-verification-handoff.md"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "0519b19f8130",
+  "checkpoint_transcript_start": 58,
+  "transcript_lines_at_start": 58,
+  "token_usage": {
+    "input_tokens": 14,
+    "cache_creation_tokens": 21691,
+    "cache_read_tokens": 754068,
+    "output_tokens": 3895,
+    "api_call_count": 14
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T18:23:38.376415Z",
+    "agent_lines": 0,
+    "human_added": 1223,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 1223,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/879b3644-4c1e-4484-a191-5b811d707ade.jsonl"
+}

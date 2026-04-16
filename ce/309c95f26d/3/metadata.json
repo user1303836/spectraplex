@@ -1,0 +1,33 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "ce309c95f26d",
+  "session_id": "aa0f1db2-6af6-4a56-98ed-5ced7e6a2beb",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-13T17:38:05.148193Z",
+  "branch": "fix/medium-issues-149-150-153-160",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "migrations/20260313200000_add_ledger_entries_transaction_id_index.sql"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "b6658d210368",
+  "checkpoint_transcript_start": 294,
+  "transcript_lines_at_start": 294,
+  "token_usage": {
+    "input_tokens": 94,
+    "cache_creation_tokens": 136632,
+    "cache_read_tokens": 9425471,
+    "output_tokens": 32007,
+    "api_call_count": 92
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-13T17:38:02.785885Z",
+    "agent_lines": 0,
+    "human_added": 45,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 45,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/aa0f1db2-6af6-4a56-98ed-5ced7e6a2beb.jsonl"
+}

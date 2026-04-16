@@ -1,0 +1,190 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Coordinate the next Spectraplex work packet lifecycle.
+
+Read before deciding:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+- the current repository state
+- relevant open pull requests and packet branches
+
+Preflight:
+All preflight checks pass. Worktree is clean, on main at 484a3f3 (up-to-date with origin), all required tools and GitHub auth are available with full repo permissions, and both design docs exist. Ready for autonomous packet work.
+
+Workflow input:
+- goal: (not provided)
+- startAtPacket: (not provided)
+- stopAfterPacket: (not provided)
+- maxMergedPackets: (not provided)
+
+Previous coordination:
+PR #101 (P0-W3 Network Model Spec) is merged. No in-flight packets remain. Selecting P0-W1 (V2 Architecture RFC) as the next packet—it is the earliest incomplete packet and the prerequisite for P0-W2 and P0-W4. The 604-line design doc already exists; the packet needs a tracked handoff artifact, PR, validation, and merge to complete.
+
+Previous active packet runtime:
+- stage: merged
+- implementation: Created tracked P0-W1 handoff artifact (580 lines) capturing all 10 locked decisions, wallet-centric mismatches with verified line references, Bronze/Silver/Gold model summaries, target matching model, connector redesign, dual-write compatibility strategy, deprecation sequence, and downstream packet mapping from the 604-line V2 Architecture RFC.
+- validation: P0-W1 handoff artifact validated. All 3 cargo checks pass (211 tests, 0 failures). All 10 locked decisions faithfully represented. All wallet-centric mismatches present with line references verified against the codebase. Connector trait redesign, dual-write strategy, deprecation sequence, and downstream packet mapping are complete and accurate. P0-W3 cross-reference confirmed — P0-W3 handoff depends on RFC §3.3 and its Section 8.1 confirms alignment.
+- PR state: Created PR #102 with the 580-line P0-W1 handoff artifact (docs/phase0/p0-w1-v2-architecture-rfc-handoff.md). Branch pushed to origin, PR is open and ready for review against main. Contains all 10 locked decisions, wallet-centric mismatches, connector redesign, dual-write strategy, and downstream packet mapping.
+- local review: All 50+ file/line references verified accurate against the current codebase. 10 locked decisions are complete and internally consistent. Dual-write compatibility strategy correctly preserves all current wallet flows with additive-only migrations. Connector trait redesign correctly models EVM, Solana gRPC, and Hyperliquid semantic corrections. No new wallet-only assumptions introduced in shared abstractions. Downstream packet mapping is complete — P0-W2, P0-W4, and Phase 1+ can reference this handoff. P0-W3 cross-reference verified against the existing p0-w3-network-model-handoff.md. Approved with no blocking issues.
+- remote review: Remote review pass is clear. All 10 locked decisions present and consistent. All 100+ file/line references verified accurate against c1752ff. Dual-write strategy preserves all wallet flows. Connector redesign correctly models EVM, Solana gRPC, and Hyperliquid semantic corrections. No new wallet-only assumptions in shared abstractions. Downstream packet mapping complete. P0-W3 cross-reference confirmed. All CI checks pass. Ready to merge.
+- merge: PR #102 merged to main. All 4 CI checks passed (Formatting, Clippy, Tests, Build). 580-line handoff artifact at docs/phase0/p0-w1-v2-architecture-rfc-handoff.md contains all 10 locked decisions, wallet-centric mismatches, connector redesign, dual-write strategy, deprecation sequence, and downstream packet mapping. Admin merge used to bypass branch protection review requirement — packet was fully validated and review-cleared. Branch deleted, local main updated and clean.
+
+Previous merge result:
+PR #102 merged to main. All 4 CI checks passed (Formatting, Clippy, Tests, Build). 580-line handoff artifact at docs/phase0/p0-w1-v2-architecture-rfc-handoff.md contains all 10 locked decisions, wallet-centric mismatches, connector redesign, dual-write strategy, deprecation sequence, and downstream packet mapping. Admin merge used to bypass branch protection review requirement — packet was fully validated and review-cleared. Branch deleted, local main updated and clean.
+
+Merged packets so far:
+1. Phase 0: Lock The V2 Architecture P0-W1: V2 Architecture RFC
+2. Phase 0: Lock The V2 Architecture P0-W3: Network Model Spec
+
+Rules:
+1. Continue exactly one in-flight packet until it is merged. In-flight means an unmerged packet already selected by this workflow, an open PR for a packet branch, or local branch work that clearly maps to a packet.
+2. Only select a new packet when there is no in-flight packet left to finish.
+3. If multiple conflicting in-flight packets exist, return state="blocked" and explain why.
+4. Select the earliest incomplete packet allowed by dependencies in design/PHASED_IMPLEMENTATION_PLAN.md and still incomplete in the current repository and tracked docs.
+5. Respect phase order. Do not skip prerequisites unless the phased plan explicitly allows it.
+6. Keep wallet indexing first-class, but do not reinforce wallet-only assumptions in shared abstractions.
+7. If a packet's primary deliverables live under gitignored paths such as design/, require at least one tracked review artifact under docs/ and list it in trackedReviewArtifacts.
+8. Remote review happens as a PR comment, not a formal GitHub approval. Do not block on missing formal approval.
+9. Admin or force merge is allowed only after validation, local review, and the remote review comment all say the remaining blockers are cleared.
+10. If stopAfterPacket is provided and that packet is already merged, return state="complete".
+11. If maxMergedPackets is provided and the limit has been reached, return state="complete".
+12. If a prior merge attempt failed for an external reason that the workflow cannot safely resolve, return state="blocked" instead of looping forever.
+
+Return JSON with:
+- workflowComplete: true only if the workflow should stop successfully
+- state: "active", "complete", or "blocked"
+- phase: string, or "" if complete or blocked
+- workPacket: string, or "" if complete or blocked
+- objective: string, or "" if complete or blocked
+- branchName: string, or "" if complete or blocked
+- prNumber: number, or 0 if none
+- prUrl: string
+- prTitle: string
+- prBody: string
+- summary: concise coordination summary
+- repoTouchpoints: array
+- implementationSteps: array
+- verificationSteps: array
+- reviewFocus: array
+- trackedReviewArtifacts: array
+- blockingIssues: array
+- warnings: array
+- nextAction: string
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "workflowComplete": {
+      "type": "boolean"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "active",
+        "complete",
+        "blocked"
+      ]
+    },
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "objective": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "prNumber": {
+      "type": "number"
+    },
+    "prUrl": {
+      "type": "string"
+    },
+    "prTitle": {
+      "type": "string"
+    },
+    "prBody": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "repoTouchpoints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "implementationSteps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "verificationSteps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reviewFocus": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "trackedReviewArtifacts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blockingIssues": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "nextAction": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workflowComplete",
+    "state",
+    "phase",
+    "workPacket",
+    "objective",
+    "branchName",
+    "prNumber",
+    "prUrl",
+    "prTitle",
+    "prBody",
+    "summary",
+    "repoTouchpoints",
+    "implementationSteps",
+    "verificationSteps",
+    "reviewFocus",
+    "trackedReviewArtifacts",
+    "blockingIssues",
+    "warnings",
+    "nextAction"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

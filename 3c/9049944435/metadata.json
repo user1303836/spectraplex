@@ -1,0 +1,102 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "3c9049944435",
+  "strategy": "manual-commit",
+  "branch": "p2-w2-target-registration",
+  "checkpoints_count": 5,
+  "files_touched": [
+    "Cargo.lock",
+    "adapters/src/v2_repo.rs",
+    "api/Cargo.toml",
+    "api/src/main.rs",
+    "cli/Cargo.toml",
+    "cli/src/main.rs",
+    "docs/phase2/p2-w2-target-registration-handoff.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/3c/9049944435/0/metadata.json",
+      "transcript": "/3c/9049944435/0/full.jsonl",
+      "context": "/3c/9049944435/0/context.md",
+      "content_hash": "/3c/9049944435/0/content_hash.txt",
+      "prompt": "/3c/9049944435/0/prompt.txt"
+    },
+    {
+      "metadata": "/3c/9049944435/1/metadata.json",
+      "transcript": "/3c/9049944435/1/full.jsonl",
+      "context": "/3c/9049944435/1/context.md",
+      "content_hash": "/3c/9049944435/1/content_hash.txt",
+      "prompt": "/3c/9049944435/1/prompt.txt"
+    },
+    {
+      "metadata": "/3c/9049944435/2/metadata.json",
+      "transcript": "/3c/9049944435/2/full.jsonl",
+      "context": "/3c/9049944435/2/context.md",
+      "content_hash": "/3c/9049944435/2/content_hash.txt",
+      "prompt": "/3c/9049944435/2/prompt.txt"
+    },
+    {
+      "metadata": "/3c/9049944435/3/metadata.json",
+      "transcript": "/3c/9049944435/3/full.jsonl",
+      "context": "/3c/9049944435/3/context.md",
+      "content_hash": "/3c/9049944435/3/content_hash.txt",
+      "prompt": "/3c/9049944435/3/prompt.txt"
+    },
+    {
+      "metadata": "/3c/9049944435/4/metadata.json",
+      "transcript": "/3c/9049944435/4/full.jsonl",
+      "context": "/3c/9049944435/4/context.md",
+      "content_hash": "/3c/9049944435/4/content_hash.txt",
+      "prompt": "/3c/9049944435/4/prompt.txt"
+    },
+    {
+      "metadata": "/3c/9049944435/5/metadata.json",
+      "transcript": "/3c/9049944435/5/full.jsonl",
+      "context": "/3c/9049944435/5/context.md",
+      "content_hash": "/3c/9049944435/5/content_hash.txt",
+      "prompt": "/3c/9049944435/5/prompt.txt"
+    },
+    {
+      "metadata": "/3c/9049944435/6/metadata.json",
+      "transcript": "/3c/9049944435/6/full.jsonl",
+      "context": "/3c/9049944435/6/context.md",
+      "content_hash": "/3c/9049944435/6/content_hash.txt",
+      "prompt": "/3c/9049944435/6/prompt.txt"
+    },
+    {
+      "metadata": "/3c/9049944435/7/metadata.json",
+      "transcript": "/3c/9049944435/7/full.jsonl",
+      "context": "/3c/9049944435/7/context.md",
+      "content_hash": "/3c/9049944435/7/content_hash.txt",
+      "prompt": "/3c/9049944435/7/prompt.txt"
+    },
+    {
+      "metadata": "/3c/9049944435/8/metadata.json",
+      "transcript": "/3c/9049944435/8/full.jsonl",
+      "context": "/3c/9049944435/8/context.md",
+      "content_hash": "/3c/9049944435/8/content_hash.txt",
+      "prompt": "/3c/9049944435/8/prompt.txt"
+    },
+    {
+      "metadata": "/3c/9049944435/9/metadata.json",
+      "transcript": "/3c/9049944435/9/full.jsonl",
+      "context": "/3c/9049944435/9/context.md",
+      "content_hash": "/3c/9049944435/9/content_hash.txt",
+      "prompt": "/3c/9049944435/9/prompt.txt"
+    },
+    {
+      "metadata": "/3c/9049944435/10/metadata.json",
+      "transcript": "/3c/9049944435/10/full.jsonl",
+      "context": "/3c/9049944435/10/context.md",
+      "content_hash": "/3c/9049944435/10/content_hash.txt",
+      "prompt": "/3c/9049944435/10/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 317,
+    "cache_creation_tokens": 1131539,
+    "cache_read_tokens": 20465053,
+    "output_tokens": 170922,
+    "api_call_count": 285
+  }
+}

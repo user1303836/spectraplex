@@ -1,0 +1,37 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "5f5283dcdbfc",
+  "session_id": "ffbe3786-7f20-41b0-9810-ef362c1783d9",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T17:59:10.289905Z",
+  "branch": "p1-w4-dual-write-compat",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "api/src/main.rs",
+    "cli/src/main.rs",
+    "docs/phase1/p1-w4-dual-write-handoff.md",
+    "adapters/src/dual_write.rs",
+    "adapters/src/lib.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "278bcc3c1b7f",
+  "checkpoint_transcript_start": 70,
+  "transcript_lines_at_start": 70,
+  "token_usage": {
+    "input_tokens": 22,
+    "cache_creation_tokens": 67380,
+    "cache_read_tokens": 741140,
+    "output_tokens": 17076,
+    "api_call_count": 16
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T17:59:10.170181Z",
+    "agent_lines": 0,
+    "human_added": 942,
+    "human_modified": 5,
+    "human_removed": 0,
+    "total_committed": 942,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/ffbe3786-7f20-41b0-9810-ef362c1783d9.jsonl"
+}

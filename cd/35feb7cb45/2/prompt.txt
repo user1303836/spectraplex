@@ -1,0 +1,147 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 5: Reference Downstream Packs
+- work packet: P5-W2: Hyperliquid Analytics Pack
+- objective: Add Gold-tier Hyperliquid analytics datasets (hl_pnl_summary, hl_trade_history) materialized from Silver fills, funding, and positions, plus trader and market analytics endpoints, proving a Hyperliquid dashboard can consume Spectraplex outputs directly without raw chain parsing.
+- branch: p5-w2-hl-analytics-pack
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- core/src/materializer.rs — Add DatasetName::HlPnlSummary, DatasetName::HlTradeHistory variants, HlPnlSummary and HlTradeHistory Gold record structs, TraderAnalytics and MarketAnalytics response types
+- adapters/src/hl_analytics.rs — New module with Gold materialization: compute_pnl_summary() from hl_fills (closed_pnl) + hl_funding (amounts), build_trade_history() grouping fills into logical trades, build_trader_analytics() and build_market_analytics() aggregation functions
+- adapters/src/lib.rs — Register pub mod hl_analytics
+- adapters/src/v2_repo.rs — Add query_hl_pnl_summary(), query_hl_trade_history(), export_hl_pnl_summary(), export_hl_trade_history() repository methods
+- api/src/main.rs — Add /v1/analytics/hl/trader and /v1/analytics/hl/market endpoints, register hl_pnl_summary and hl_trade_history in QUERYABLE_DATASETS and EXPORTABLE_DATASETS, add CSV converters, wire routes
+- migrations/YYYYMMDDHHMMSS_add_hl_analytics_gold.sql — Create hl_pnl_summary and hl_trade_history Gold tables with appropriate indexes
+- README.md — Document new endpoints and Gold datasets
+
+Implementation steps:
+1. 1. Create branch p5-w2-hl-analytics-pack from main at 0279019
+2. 2. Add DatasetName::HlPnlSummary and DatasetName::HlTradeHistory to the enum in core/src/materializer.rs, update as_sql_str(), all(), and update test assertions for count (9→11)
+3. 3. Add HlPnlSummary struct (id, wallet_address, coin, network, period_start, period_end, total_closed_pnl, total_funding, total_fees, net_pnl, trade_count, fill_count, avg_trade_size, win_count, loss_count, dataset_version_id, created_at)
+4. 4. Add HlTradeHistory struct (id, wallet_address, coin, network, side, entry_price, exit_price, size, opened_at, closed_at, realized_pnl, fees, num_fills, dataset_version_id, created_at)
+5. 5. Add TraderAnalytics and MarketAnalytics response types in core/src/materializer.rs following the ForensicsActivity pattern
+6. 6. Create adapters/src/hl_analytics.rs with: compute_pnl_summary() aggregating fills and funding by coin, build_trade_history() grouping fills into open/close sequences, build_trader_analytics() for per-trader summary, build_market_analytics() for per-coin market aggregates
+7. 7. Add migration for hl_pnl_summary table (indexes on wallet_address+coin, network, period_start, period_end) and hl_trade_history table (indexes on wallet_address+coin, network, opened_at DESC, closed_at DESC)
+8. 8. Add repository query/export methods in adapters/src/v2_repo.rs following the existing pattern (build_dataset_filter_query with dynamic SQL)
+9. 9. Add /v1/analytics/hl/trader and /v1/analytics/hl/market route handlers in api/src/main.rs following the forensics_activity_handler pattern, register new datasets in QUERYABLE_DATASETS (10) and EXPORTABLE_DATASETS (10)
+10. 10. Add CSV converters for hl_pnl_summary and hl_trade_history exports
+11. 11. Add comprehensive tests: dataset registration (count=11, contains new names), endpoint routing, auth requirements, CSV format, materialization logic, analytics aggregation correctness
+12. 12. Update README.md with new endpoints and Gold dataset documentation
+13. 13. Run cargo fmt --all --check, cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace
+
+Verification expectations:
+1. cargo fmt --all --check passes
+2. cargo clippy --workspace --all-targets -- -D warnings passes
+3. cargo test --workspace passes with all tests green (expect ~870+ tests)
+4. DatasetName::all() returns 11 datasets
+5. QUERYABLE_DATASETS contains hl_pnl_summary and hl_trade_history (10 total)
+6. EXPORTABLE_DATASETS contains hl_pnl_summary and hl_trade_history (10 total)
+7. HlPnlSummary correctly aggregates closed_pnl from fills + funding amounts into net_pnl
+8. HlTradeHistory correctly groups fills into logical trades with entry/exit prices and realized PnL
+9. TraderAnalytics produces dashboard-ready per-coin PnL, win rate, volume, and position breakdown
+10. MarketAnalytics produces per-coin aggregate volume, unique traders, and PnL distribution
+11. GET /v1/analytics/hl/trader endpoint routes correctly and requires auth
+12. GET /v1/analytics/hl/market endpoint routes correctly and requires auth
+13. CSV export for hl_pnl_summary and hl_trade_history produces well-formed output
+14. Migration creates tables with correct indexes and IF NOT EXISTS guards
+15. All P5-W1 and P4-W5 compatibility surface tests still pass
+16. README documents new endpoints and datasets
+
+Tracked review artifacts required in the PR:
+- No tracked review artifact required.
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p5-w2-hl-analytics-pack from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P5-W2: Hyperliquid Analytics Pack.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 5: Reference Downstream Packs"
+- workPacket: "P5-W2: Hyperliquid Analytics Pack"
+- branchName: "p5-w2-hl-analytics-pack"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

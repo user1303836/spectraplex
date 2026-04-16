@@ -1,0 +1,136 @@
+IMPORTANT: After completing the task below, you MUST output a JSON object in a ```json code fence at the very end of your response. Do NOT forget this — the workflow fails without it.
+
+Implement the current Spectraplex packet.
+
+Follow:
+- CLAUDE.md
+- design/SPECTRAPLEX_STRATEGY_AND_EXECUTION_PLAN.md
+- design/PHASED_IMPLEMENTATION_PLAN.md
+
+Current coordination:
+- phase: Phase 1: Canonical Bronze And Control Plane
+- work packet: P1-W3: Repository Support For Canonical Raw Data
+- objective: Add repository methods for all V2 tables (networks, index_targets, raw_transactions, target_matches, ingestion_runs, checkpoints, dataset_versions) alongside the existing V1 wallet-scoped methods, with comprehensive unit tests for query building and type conversion.
+- branch: p1-w3-v2-repo-layer
+- stage: new packet implementation
+- existing PR: 
+
+Repo touchpoints:
+- adapters/src/v2_repo.rs (new file — V2 repository methods as impl Repository)
+- adapters/src/lib.rs (add pub mod v2_repo)
+- docs/phase1/p1-w3-v2-repo-layer-handoff.md (new handoff artifact)
+
+Implementation steps:
+1. 1. Create branch p1-w3-v2-repo-layer from main (aa7a051)
+2. 2. Create adapters/src/v2_repo.rs with an impl Repository block containing all V2 methods
+3. 3. Networks: get_network(id) -> Option<Network>, list_networks() -> Vec<Network>, list_networks_by_family(family) -> Vec<Network>
+4. 4. IndexTargets: create_index_target(target) -> Result<IndexTarget>, get_index_target(id) -> Option<IndexTarget>, get_index_target_by_address(kind, network, address) -> Option<IndexTarget>, list_index_targets_by_network(network) -> Vec<IndexTarget>, list_index_targets_by_kind(kind) -> Vec<IndexTarget>
+5. 5. RawTransactions: save_raw_transactions(txs) -> Result<()> with batch insert ON CONFLICT (network, tx_hash) DO NOTHING, get_raw_transaction_by_hash(network, tx_hash) -> Option<RawTransaction>, get_raw_transactions_by_run(run_id) -> Vec<RawTransaction>
+6. 6. TargetMatches: save_target_matches(matches) -> Result<()> with batch insert ON CONFLICT (target_id, raw_transaction_id) DO NOTHING, get_matches_by_target(target_id, limit, offset) -> Vec<(TargetMatch, RawTransaction)>, get_matches_by_raw_tx(raw_tx_id) -> Vec<TargetMatch>
+7. 7. IngestionRuns: create_ingestion_run(run) -> Result<()>, update_ingestion_run_status(id, status, finished_at, records_written, error_message) -> Result<()>, get_ingestion_run(id) -> Option<IngestionRun>, list_ingestion_runs_by_target(target_id) -> Vec<IngestionRun>
+8. 8. Checkpoints (V2): upsert_checkpoint(checkpoint) -> Result<()> with INSERT ON CONFLICT DO UPDATE, get_checkpoint_v2(target_id, network, source) -> Option<Checkpoint>
+9. 9. DatasetVersions: create_dataset_version(version) -> Result<()>, get_latest_dataset_version(dataset_name) -> Option<DatasetVersion>
+10. 10. Add helper functions for ChainFamily/TargetKind/TargetMode to/from string conversion matching SQL enum values
+11. 11. Export pub mod v2_repo from adapters/src/lib.rs
+12. 12. Write unit tests: query building for batch inserts (raw_transactions, target_matches), type conversion roundtrips, helper function coverage
+13. 13. Run cargo fmt --all --check, cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace
+14. 14. Write docs/phase1/p1-w3-v2-repo-layer-handoff.md with method inventory, design decisions, and verification results
+
+Verification expectations:
+1. cargo fmt --all --check passes
+2. cargo clippy --workspace --all-targets -- -D warnings passes
+3. cargo test --workspace passes with zero regressions (baseline: 244 tests)
+4. New unit tests cover: batch insert query building for raw_transactions and target_matches, all enum-to-string helper roundtrips, single-row insert query construction, upsert query construction for checkpoints and index_targets
+5. No existing method signature in repo.rs is changed
+6. V2 repo methods use correct SQL enum casts ($x::chain_family_enum, $x::target_kind_enum, $x::target_mode_enum)
+7. All V2 struct fields from core/src/v2.rs are properly mapped in query construction
+8. Handoff doc present and consistent with implementation
+
+Tracked review artifacts required in the PR:
+- docs/phase1/p1-w3-v2-repo-layer-handoff.md
+
+Outstanding validation or review feedback:
+No outstanding validation or review feedback.
+
+Requirements:
+1. If this is a new packet implementation, create or reset the local branch p1-w3-v2-repo-layer from the latest main branch state.
+2. If this is a validation or review fix iteration, stay on the existing branch and address the outstanding blockers first.
+3. Make only the changes needed for P1-W3: Repository Support For Canonical Raw Data.
+4. If the packet's authoritative outputs live in gitignored files, create or update the tracked review artifacts listed above so the PR is actually reviewable on GitHub.
+5. Run the relevant verification commands before finishing.
+6. Create a local commit if changes were made and the packet is in a good local state.
+7. Do not push, do not create or update the PR, and do not merge.
+
+Return JSON with:
+- phase: "Phase 1: Canonical Bronze And Control Plane"
+- workPacket: "P1-W3: Repository Support For Canonical Raw Data"
+- branchName: "p1-w3-v2-repo-layer"
+- commitSha: the local commit SHA, or "" if no commit was created
+- summary: concise summary of what changed
+- filesChanged: array of changed files
+- testsRun: array of commands or checks you ran
+- docsUpdated: array of docs updated
+- followUps: array of remaining follow-up items
+
+
+**REQUIRED OUTPUT** — You MUST end your response with a JSON object in a code fence matching this schema:
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "phase": {
+      "type": "string"
+    },
+    "workPacket": {
+      "type": "string"
+    },
+    "branchName": {
+      "type": "string"
+    },
+    "commitSha": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "testsRun": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "docsUpdated": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "phase",
+    "workPacket",
+    "branchName",
+    "commitSha",
+    "summary",
+    "filesChanged",
+    "testsRun",
+    "docsUpdated",
+    "followUps"
+  ],
+  "additionalProperties": false
+}
+```
+Output the JSON at the END of your response. The workflow will fail without it.

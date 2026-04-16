@@ -1,0 +1,68 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "522419b0c85f",
+  "strategy": "manual-commit",
+  "branch": "codex/p0-w2-target-model-spec",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "docs/phase0/p0-w2-target-model-spec-handoff.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/52/2419b0c85f/0/metadata.json",
+      "transcript": "/52/2419b0c85f/0/full.jsonl",
+      "context": "/52/2419b0c85f/0/context.md",
+      "content_hash": "/52/2419b0c85f/0/content_hash.txt",
+      "prompt": "/52/2419b0c85f/0/prompt.txt"
+    },
+    {
+      "metadata": "/52/2419b0c85f/1/metadata.json",
+      "transcript": "/52/2419b0c85f/1/full.jsonl",
+      "context": "/52/2419b0c85f/1/context.md",
+      "content_hash": "/52/2419b0c85f/1/content_hash.txt",
+      "prompt": "/52/2419b0c85f/1/prompt.txt"
+    },
+    {
+      "metadata": "/52/2419b0c85f/2/metadata.json",
+      "transcript": "/52/2419b0c85f/2/full.jsonl",
+      "context": "/52/2419b0c85f/2/context.md",
+      "content_hash": "/52/2419b0c85f/2/content_hash.txt",
+      "prompt": "/52/2419b0c85f/2/prompt.txt"
+    },
+    {
+      "metadata": "/52/2419b0c85f/3/metadata.json",
+      "transcript": "/52/2419b0c85f/3/full.jsonl",
+      "context": "/52/2419b0c85f/3/context.md",
+      "content_hash": "/52/2419b0c85f/3/content_hash.txt",
+      "prompt": "/52/2419b0c85f/3/prompt.txt"
+    },
+    {
+      "metadata": "/52/2419b0c85f/4/metadata.json",
+      "transcript": "/52/2419b0c85f/4/full.jsonl",
+      "context": "/52/2419b0c85f/4/context.md",
+      "content_hash": "/52/2419b0c85f/4/content_hash.txt",
+      "prompt": "/52/2419b0c85f/4/prompt.txt"
+    },
+    {
+      "metadata": "/52/2419b0c85f/5/metadata.json",
+      "transcript": "/52/2419b0c85f/5/full.jsonl",
+      "context": "/52/2419b0c85f/5/context.md",
+      "content_hash": "/52/2419b0c85f/5/content_hash.txt",
+      "prompt": "/52/2419b0c85f/5/prompt.txt"
+    },
+    {
+      "metadata": "/52/2419b0c85f/6/metadata.json",
+      "transcript": "/52/2419b0c85f/6/full.jsonl",
+      "context": "/52/2419b0c85f/6/context.md",
+      "content_hash": "/52/2419b0c85f/6/content_hash.txt",
+      "prompt": "/52/2419b0c85f/6/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 159,
+    "cache_creation_tokens": 772921,
+    "cache_read_tokens": 10506193,
+    "output_tokens": 109206,
+    "api_call_count": 135
+  }
+}
