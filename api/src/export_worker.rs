@@ -19,7 +19,8 @@ use uuid::Uuid;
 
 // These items are defined in main.rs and need to be pub(crate) for this
 // module to use them.  The parent task will adjust visibility.
-use crate::{build_sink, run_export_job, write_no_follow};
+use crate::build_sink;
+use crate::export_stream::write_export_to_file;
 
 /// How often the worker polls for new jobs when idle.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -164,8 +165,46 @@ async fn execute_export_job(
         }
     };
 
-    // Execute the actual export.
-    let result = run_export_job(
+    // Determine file extension from format, so we can build the artifact
+    // path before running the export. The path is needed up-front because
+    // `write_export_to_file` streams records directly to this path, page by
+    // page (fix for #208: the old code accumulated the whole export in
+    // memory first).
+    let ext = match format {
+        ExportFormat::Jsonl => "jsonl",
+        ExportFormat::Csv => "csv",
+    };
+
+    let exports_dir = format!("{}/exports", export_dir);
+    if let Err(e) = tokio::fs::create_dir_all(&exports_dir).await {
+        let err_msg = format!("Failed to create exports directory: {e}");
+        error!(job_id = %job_id, error = %err_msg, "Export job failed");
+        let _ = update_or_abort(
+            repo,
+            job_id,
+            "failed",
+            None,
+            None,
+            Some(&err_msg),
+            worker_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        heartbeat_cancel.cancel();
+        return;
+    }
+
+    let file_path = format!("{}/{}.{}", exports_dir, job_id, ext);
+
+    // Stream the export directly to disk. Peak per-job memory is bounded by
+    // `export_stream::PAGE_SIZE * per-record bytes`, not by total dataset
+    // size.
+    let result = write_export_to_file(
         repo,
         &job.dataset,
         format,
@@ -173,6 +212,7 @@ async fn execute_export_job(
         network.as_deref(),
         time_start,
         time_end,
+        &file_path,
     )
     .await;
 
@@ -182,7 +222,7 @@ async fn execute_export_job(
     // causing duplicate deliveries and conflicting final states.
 
     match result {
-        Ok((body, record_count, _export_meta)) => {
+        Ok((record_count, _export_meta)) => {
             let has_sink = job.sink_config.is_some();
 
             // Extract provenance fields from export metadata for persistence.
@@ -191,61 +231,6 @@ async fn execute_export_job(
             let prov_cs = _export_meta.completeness_status.as_deref();
             let prov_cc = _export_meta.completeness_coverage.as_ref();
             let prov_lri = _export_meta.last_ingestion_run_id;
-
-            // Determine file extension from format.
-            let ext = match format {
-                ExportFormat::Jsonl => "jsonl",
-                ExportFormat::Csv => "csv",
-            };
-
-            // Write export data to filesystem.
-            let exports_dir = format!("{}/exports", export_dir);
-            if let Err(e) = tokio::fs::create_dir_all(&exports_dir).await {
-                let err_msg = format!("Failed to create exports directory: {e}");
-                error!(job_id = %job_id, error = %err_msg, "Export job failed");
-                let _ = update_or_abort(
-                    repo,
-                    job_id,
-                    "failed",
-                    None,
-                    None,
-                    Some(&err_msg),
-                    worker_id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await;
-                heartbeat_cancel.cancel();
-                return;
-            }
-
-            let file_path = format!("{}/{}.{}", exports_dir, job_id, ext);
-            if let Err(e) = write_no_follow(&file_path, &body).await {
-                let err_msg = format!("Failed to write export file: {e}");
-                error!(job_id = %job_id, error = %err_msg, "Export job failed");
-                let _ = update_or_abort(
-                    repo,
-                    job_id,
-                    "failed",
-                    None,
-                    None,
-                    Some(&err_msg),
-                    worker_id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await;
-                heartbeat_cancel.cancel();
-                return;
-            }
 
             // Canonical on-disk artifact path — always preserved for download.
             let result_location = format!("exports/{}.{}", job_id, ext);
@@ -277,30 +262,54 @@ async fn execute_export_job(
                 }
 
                 // Attempt sink delivery.
+                //
+                // The streaming writer already produced the export artifact
+                // on disk. The current `ExportSink::deliver` contract takes
+                // `&[u8]`, so we read the artifact back into memory once for
+                // the sink call. Peak memory here is bounded by the disk
+                // artifact size (which is itself bounded by
+                // `export_stream::EXPORT_HARD_CAP * per-record bytes`) — much
+                // smaller than the pre-#208 behavior where the full export
+                // was also held in memory for the disk write. Converting the
+                // sink trait to take a file path / reader is a follow-up.
                 let sink_value = job.sink_config.as_ref().unwrap();
                 let delivery_result = match serde_json::from_value::<SinkConfig>(sink_value.clone())
                 {
                     Ok(sink_config) => match build_sink(&sink_config, export_dir) {
-                        Ok(sink) => {
-                            let delivery_meta = DeliveryMetadata {
-                                job_id,
-                                dataset: job.dataset.clone(),
-                                format: job.format.clone(),
-                                record_count,
-                                dataset_version_id: _export_meta.dataset_version_id,
-                                completeness_status: _export_meta.completeness_status.clone(),
-                            };
-                            match sink.deliver(&body, &delivery_meta).await {
-                                Ok(receipt) => Ok(receipt.destination),
-                                Err(e) => {
-                                    warn!(job_id = %job_id, error = %e, "Sink delivery failed");
-                                    Err(format!(
-                                        "Exported {} records, but sink delivery failed: {e}",
-                                        record_count
-                                    ))
+                        Ok(sink) => match tokio::fs::read(&file_path).await {
+                            Ok(body) => {
+                                let delivery_meta = DeliveryMetadata {
+                                    job_id,
+                                    dataset: job.dataset.clone(),
+                                    format: job.format.clone(),
+                                    record_count,
+                                    dataset_version_id: _export_meta.dataset_version_id,
+                                    completeness_status: _export_meta.completeness_status.clone(),
+                                };
+                                match sink.deliver(&body, &delivery_meta).await {
+                                    Ok(receipt) => Ok(receipt.destination),
+                                    Err(e) => {
+                                        warn!(job_id = %job_id, error = %e, "Sink delivery failed");
+                                        Err(format!(
+                                            "Exported {} records, but sink delivery failed: {e}",
+                                            record_count
+                                        ))
+                                    }
                                 }
                             }
-                        }
+                            Err(e) => {
+                                warn!(
+                                    job_id = %job_id,
+                                    error = %e,
+                                    file = %file_path,
+                                    "Failed to read export artifact for sink delivery",
+                                );
+                                Err(format!(
+                                    "Exported {} records to disk, but reading artifact for sink delivery failed: {e}",
+                                    record_count
+                                ))
+                            }
+                        },
                         Err(e) => {
                             warn!(job_id = %job_id, error = %e, "Failed to build sink");
                             Err(format!(
@@ -394,6 +403,20 @@ async fn execute_export_job(
         Err(e) => {
             let err_msg = format!("Export failed: {e}");
             error!(job_id = %job_id, error = %err_msg, "Export job failed");
+            // The streaming writer may have created a partial artifact before
+            // failing. Best-effort remove it so a retry does not append to a
+            // truncated file and so we do not hand out a partial artifact via
+            // `/download`.
+            if let Err(rm_err) = tokio::fs::remove_file(&file_path).await {
+                if rm_err.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        job_id = %job_id,
+                        error = %rm_err,
+                        file = %file_path,
+                        "Failed to clean up partial export artifact after failure",
+                    );
+                }
+            }
             let _ = update_or_abort(
                 repo,
                 job_id,
