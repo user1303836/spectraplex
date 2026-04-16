@@ -1050,6 +1050,66 @@ impl ExportSink for LocalFileSink {
             delivered_at: chrono::Utc::now(),
         })
     }
+
+    /// Copy the already-streamed export artifact from `path` to the
+    /// sink's target path without ever reading the full artifact into
+    /// memory (fixes the PR #238 [P2] concern that sink jobs still
+    /// hit the OOM class after #208).
+    async fn deliver_from_file(
+        &self,
+        path: &std::path::Path,
+        _metadata: &DeliveryMetadata,
+    ) -> Result<DeliveryReceipt, String> {
+        if let Some(parent) = std::path::Path::new(&self.path).parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("Failed to create directory for {}: {e}", self.path))?;
+        }
+
+        copy_no_follow(path, &self.path).await.map_err(|e| {
+            format!(
+                "Failed to copy export artifact {} -> {}: {e}",
+                path.display(),
+                self.path
+            )
+        })?;
+
+        let bytes_written = tokio::fs::metadata(&self.path)
+            .await
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+
+        Ok(DeliveryReceipt {
+            sink_type: SinkType::LocalFile,
+            destination: self.path.clone(),
+            bytes_written,
+            delivered_at: chrono::Utc::now(),
+        })
+    }
+}
+
+/// Copy `src` to `dst` with a streaming `io::copy`, opening `dst` with
+/// `O_NOFOLLOW` so symlink attacks on the sink destination still fail
+/// (shares the same defense as [`write_no_follow`] for #220).
+async fn copy_no_follow(src: &std::path::Path, dst: &str) -> std::io::Result<u64> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let src_owned = src.to_path_buf();
+    let dst_owned = dst.to_owned();
+    tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&src_owned)?;
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&dst_owned)?;
+        std::io::copy(&mut reader, &mut writer)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Opens a file for writing with `O_NOFOLLOW` to prevent symlink-following
@@ -1097,25 +1157,7 @@ impl ExportSink for WebhookSink {
         // Re-resolve and validate at delivery time to prevent DNS rebinding.
         let client = build_ssrf_safe_client(&self.url, Duration::from_secs(30)).await?;
 
-        let content_type = match metadata.format.as_str() {
-            "csv" => "text/csv; charset=utf-8",
-            _ => "application/x-ndjson",
-        };
-
-        let mut req = client
-            .post(&self.url)
-            .header("Content-Type", content_type)
-            .header("X-Export-Dataset", &metadata.dataset)
-            .header("X-Export-Format", &metadata.format)
-            .header("X-Export-Record-Count", metadata.record_count.to_string())
-            .header("X-Export-Job-Id", metadata.job_id.to_string());
-
-        if let Some(ref headers) = self.headers {
-            for (key, value) in headers {
-                req = req.header(key, value);
-            }
-        }
-
+        let req = self.build_request(&client, metadata);
         let response = req
             .body(data.to_vec())
             .send()
@@ -1135,6 +1177,88 @@ impl ExportSink for WebhookSink {
             bytes_written: data.len(),
             delivered_at: chrono::Utc::now(),
         })
+    }
+
+    /// Stream the export artifact as the request body without ever
+    /// reading the full file into memory (fixes the PR #238 [P2]
+    /// concern about sink jobs still hitting the OOM class after
+    /// #208). We preflight the file size so `Content-Length` is set
+    /// correctly for non-chunked HTTP and so the returned bytes_written
+    /// receipt is accurate, then hand reqwest a `Stream` built from a
+    /// `tokio::fs::File` via `tokio_util::io::ReaderStream`.
+    async fn deliver_from_file(
+        &self,
+        path: &std::path::Path,
+        metadata: &DeliveryMetadata,
+    ) -> Result<DeliveryReceipt, String> {
+        let client = build_ssrf_safe_client(&self.url, Duration::from_secs(30)).await?;
+
+        let size = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| format!("Failed to stat export artifact {}: {e}", path.display()))?
+            .len();
+
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|e| format!("Failed to open export artifact {}: {e}", path.display()))?;
+        let stream = tokio_util::io::ReaderStream::new(file);
+        let body = reqwest::Body::wrap_stream(stream);
+
+        let req = self
+            .build_request(&client, metadata)
+            .header(reqwest::header::CONTENT_LENGTH, size.to_string());
+
+        let response = req
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| format!("Webhook POST to {} failed: {e}", self.url))?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "Webhook returned non-success status: {}",
+                response.status()
+            ));
+        }
+
+        Ok(DeliveryReceipt {
+            sink_type: SinkType::Webhook,
+            destination: self.url.clone(),
+            bytes_written: size as usize,
+            delivered_at: chrono::Utc::now(),
+        })
+    }
+}
+
+impl WebhookSink {
+    /// Builder for the request shared by `deliver` and
+    /// `deliver_from_file`. Sets the Content-Type based on format, the
+    /// X-Export-* provenance headers, and any user-configured custom
+    /// headers.
+    fn build_request(
+        &self,
+        client: &reqwest::Client,
+        metadata: &DeliveryMetadata,
+    ) -> reqwest::RequestBuilder {
+        let content_type = match metadata.format.as_str() {
+            "csv" => "text/csv; charset=utf-8",
+            _ => "application/x-ndjson",
+        };
+
+        let mut req = client
+            .post(&self.url)
+            .header("Content-Type", content_type)
+            .header("X-Export-Dataset", &metadata.dataset)
+            .header("X-Export-Format", &metadata.format)
+            .header("X-Export-Record-Count", metadata.record_count.to_string())
+            .header("X-Export-Job-Id", metadata.job_id.to_string());
+
+        if let Some(ref headers) = self.headers {
+            for (key, value) in headers {
+                req = req.header(key, value);
+            }
+        }
+        req
     }
 }
 

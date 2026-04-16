@@ -627,8 +627,22 @@ pub struct DeliveryReceipt {
 /// Async trait for export sink implementations.
 ///
 /// Each sink type implements this trait to deliver serialized export data
-/// to its destination. Sinks receive the raw bytes (already serialized as
-/// JSONL or CSV) plus metadata about the export job.
+/// to its destination.
+///
+/// Sinks expose two entry points:
+///
+/// - [`ExportSink::deliver`] takes the raw in-memory bytes. Used by
+///   legacy callers and test scaffolding.
+/// - [`ExportSink::deliver_from_file`] takes a filesystem path to the
+///   already-streamed export artifact. This is the path the worker uses
+///   after the #208 streaming-exports fix; sinks implementing it can
+///   deliver without loading the whole artifact into memory (for
+///   example, `LocalFileSink` renames/copies the file, and `WebhookSink`
+///   streams the file body into the request).
+///
+/// A default `deliver_from_file` implementation is provided that reads
+/// the file into memory and calls `deliver`. Sinks that need true
+/// bounded-memory delivery MUST override it.
 #[async_trait::async_trait]
 pub trait ExportSink: Send + Sync {
     /// Deliver export data to the sink destination.
@@ -637,6 +651,21 @@ pub trait ExportSink: Send + Sync {
         data: &[u8],
         metadata: &DeliveryMetadata,
     ) -> Result<DeliveryReceipt, String>;
+
+    /// Deliver the export artifact stored at `path` to the sink
+    /// destination. Default implementation reads the entire file into
+    /// memory and delegates to [`ExportSink::deliver`]; override to
+    /// stream for bounded peak memory regardless of artifact size.
+    async fn deliver_from_file(
+        &self,
+        path: &std::path::Path,
+        metadata: &DeliveryMetadata,
+    ) -> Result<DeliveryReceipt, String> {
+        let data = tokio::fs::read(path)
+            .await
+            .map_err(|e| format!("Failed to read export artifact {}: {e}", path.display()))?;
+        self.deliver(&data, metadata).await
+    }
 }
 
 // ---------------------------------------------------------------------------

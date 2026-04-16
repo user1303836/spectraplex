@@ -1,18 +1,32 @@
 //! Streaming export writer (fixes #208 export OOM).
 //!
 //! Replaces the previous "load the entire dataset into a `Vec<u8>` buffer,
-//! then write it to disk" pattern with cursor-paginated streaming: records
-//! are fetched from Postgres in bounded pages, each page is serialized into
-//! a small per-page buffer, and each per-page buffer is streamed to disk
-//! before the next page is fetched.
+//! then write it to disk" pattern with cursor-paginated streaming inside
+//! a `REPEATABLE READ READ ONLY` Postgres transaction. Records are
+//! fetched in bounded pages, each page is serialized into a small
+//! per-page buffer, and each per-page buffer is streamed to disk before
+//! the next page is fetched.
 //!
-//! Peak per-job memory is bounded by `(PAGE_SIZE * per-record bytes)`
-//! regardless of total dataset size, so a single large export can no longer
-//! OOM-kill the worker process and take down co-located workers.
+//! Snapshot-stable: pagination runs inside a single snapshot
+//! transaction, and the dataset `ORDER BY` carries a `dt.id DESC`
+//! tiebreaker so concurrent ingestion cannot cause page boundaries to
+//! skip or duplicate rows (addresses PR #238 [P1] pagination concern).
 //!
-//! File opens use `O_NOFOLLOW` in the same way as [`crate::write_no_follow`]
-//! (defense-in-depth for #220 TOCTOU symlink attacks) but the file handle is
-//! kept open across the paged write loop rather than opened/closed per page.
+//! Cancellable: the caller supplies a [`CancellationToken`] that the
+//! worker drives from the heartbeat task — when the export job's lease
+//! is reclaimed by another worker, the token is cancelled, and this
+//! function aborts cleanly without emitting more bytes. The caller is
+//! responsible for cleaning up any attempt-scoped temp artifact before
+//! publishing to the final download path.
+//!
+//! Peak per-job memory is bounded by `PAGE_SIZE * per-record bytes`
+//! regardless of total dataset size, so a single large export can no
+//! longer OOM-kill the worker process and take down co-located workers.
+//!
+//! File opens use `O_NOFOLLOW` in the same way as
+//! [`crate::write_no_follow`] (defense-in-depth for #220 TOCTOU symlink
+//! attacks) but the file handle is kept open across the paged write
+//! loop rather than opened/closed per page.
 
 use crate::export_csv::{
     balance_history_csv_header, decoded_events_csv_header, hl_fills_csv_header,
@@ -28,9 +42,11 @@ use crate::export_csv::{
 use crate::ExportMetadata;
 use serde::Serialize;
 use spectraplex_adapters::repo::Repository;
+use spectraplex_adapters::v2_repo::ExportRecordBatch;
 use spectraplex_core::materializer::ExportFormat;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use uuid::Uuid;
 
@@ -42,13 +58,7 @@ use uuid::Uuid;
 /// a concurrent fleet of export workers cannot collectively OOM the host.
 pub(crate) const PAGE_SIZE: i64 = 10_000;
 
-/// Absolute safety cap on records per export job. The previous
-/// `EXPORT_MAX_RECORDS = 100_000` cap in `v2_repo` is effectively replaced
-/// by this cap (applied at the streaming layer, not the query layer).
-///
-/// Kept high enough that it does not become a surprise limit for real
-/// exports but low enough that a misconfigured filter cannot accidentally
-/// walk the entire dataset.
+/// Absolute safety cap on records per export job.
 const EXPORT_HARD_CAP: i64 = 1_000_000;
 
 /// BufWriter buffer capacity. Large enough that the writer does not flush
@@ -56,12 +66,14 @@ const EXPORT_HARD_CAP: i64 = 1_000_000;
 /// PAGE_SIZE-bounded peak.
 const WRITER_BUFFER_BYTES: usize = 256 * 1024;
 
+/// Channel depth for page handoff between the DB snapshot task and the
+/// disk writer. Kept small so DB streaming throttles to disk speed
+/// rather than buffering whole pages in RAM.
+const PAGE_CHANNEL_CAPACITY: usize = 2;
+
 /// Open the export target file with `O_NOFOLLOW` (mirrors
 /// [`crate::write_no_follow`]'s symlink-refusing open) and return it as an
 /// async [`tokio::fs::File`] suitable for streaming writes.
-///
-/// The underlying `std::fs::File::open` is performed on the blocking thread
-/// pool so the async runtime is not blocked on filesystem syscalls.
 async fn open_no_follow(path: &str) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     let path_owned = path.to_owned();
@@ -79,9 +91,6 @@ async fn open_no_follow(path: &str) -> std::io::Result<File> {
 }
 
 /// Look up dataset-version and completeness provenance for an export job.
-///
-/// Mirrors the metadata preamble that lived inside the old `run_export_job`
-/// so the streaming path produces the same ExportJob row fields.
 pub(crate) async fn fetch_export_metadata(
     repo: &Repository,
     dataset: &str,
@@ -159,6 +168,26 @@ pub(crate) async fn fetch_export_metadata(
     meta
 }
 
+/// Return the canonical CSV header line for a given dataset name, or
+/// `None` if the dataset is unknown.
+fn csv_header_for(dataset: &str) -> Option<&'static str> {
+    Some(match dataset {
+        "token_transfers" => token_transfers_csv_header(),
+        "native_balance_deltas" => native_balance_deltas_csv_header(),
+        "decoded_events" => decoded_events_csv_header(),
+        "hl_fills" => hl_fills_csv_header(),
+        "hl_funding" => hl_funding_csv_header(),
+        "positions" => hl_positions_csv_header(),
+        "wallet_ledger" => wallet_ledger_csv_header(),
+        "balance_history" => balance_history_csv_header(),
+        "hl_pnl_summary" => hl_pnl_summary_csv_header(),
+        "hl_trade_history" => hl_trade_history_csv_header(),
+        "protocol_events" => protocol_events_csv_header(),
+        "pool_snapshots" => pool_snapshots_csv_header(),
+        _ => return None,
+    })
+}
+
 /// Encode a page of records as JSONL into `buf`.
 fn encode_jsonl_page<T: Serialize>(records: &[T], buf: &mut Vec<u8>) -> anyhow::Result<()> {
     for r in records {
@@ -168,101 +197,82 @@ fn encode_jsonl_page<T: Serialize>(records: &[T], buf: &mut Vec<u8>) -> anyhow::
     Ok(())
 }
 
-/// Serialize a single page into an intermediate buffer, then stream it to
-/// the async writer. Returns the number of bytes written.
-async fn write_page<W, T, F>(
-    writer: &mut BufWriter<W>,
-    records: &[T],
+/// Serialize one batch (a page returned by the snapshot streamer) into
+/// the caller-provided byte buffer. CSV rows only — the CSV header is
+/// emitted once before the loop by [`write_export_to_file`].
+fn encode_batch(
+    batch: &ExportRecordBatch,
     format: ExportFormat,
-    csv_header: &str,
-    write_header: bool,
-    mut csv_row_writer: F,
-) -> anyhow::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-    T: Serialize,
-    F: FnMut(&[T], &mut Vec<u8>) -> std::io::Result<()>,
-{
-    // Buffer one page's bytes, then hand off to the async writer. The crucial
-    // property is that we never accumulate more than one page's worth at a
-    // time.
-    let mut buf: Vec<u8> = Vec::with_capacity(records.len().saturating_mul(512));
-
-    match format {
-        ExportFormat::Jsonl => {
-            encode_jsonl_page(records, &mut buf)?;
+    buf: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    match (format, batch) {
+        (ExportFormat::Jsonl, ExportRecordBatch::TokenTransfers(v)) => encode_jsonl_page(v, buf),
+        (ExportFormat::Jsonl, ExportRecordBatch::NativeBalanceDeltas(v)) => {
+            encode_jsonl_page(v, buf)
         }
-        ExportFormat::Csv => {
-            if write_header {
-                std::io::Write::write_all(&mut buf, csv_header.as_bytes())?;
-            }
-            csv_row_writer(records, &mut buf)?;
+        (ExportFormat::Jsonl, ExportRecordBatch::DecodedEvents(v)) => encode_jsonl_page(v, buf),
+        (ExportFormat::Jsonl, ExportRecordBatch::HlFills(v)) => encode_jsonl_page(v, buf),
+        (ExportFormat::Jsonl, ExportRecordBatch::HlFunding(v)) => encode_jsonl_page(v, buf),
+        (ExportFormat::Jsonl, ExportRecordBatch::Positions(v)) => encode_jsonl_page(v, buf),
+        (ExportFormat::Jsonl, ExportRecordBatch::WalletLedger(v)) => encode_jsonl_page(v, buf),
+        (ExportFormat::Jsonl, ExportRecordBatch::BalanceHistory(v)) => encode_jsonl_page(v, buf),
+        (ExportFormat::Jsonl, ExportRecordBatch::HlPnlSummary(v)) => encode_jsonl_page(v, buf),
+        (ExportFormat::Jsonl, ExportRecordBatch::HlTradeHistory(v)) => encode_jsonl_page(v, buf),
+        (ExportFormat::Jsonl, ExportRecordBatch::ProtocolEvents(v)) => encode_jsonl_page(v, buf),
+        (ExportFormat::Jsonl, ExportRecordBatch::PoolSnapshots(v)) => encode_jsonl_page(v, buf),
+
+        (ExportFormat::Csv, ExportRecordBatch::TokenTransfers(v)) => {
+            Ok(write_token_transfers_csv_rows(v, buf)?)
+        }
+        (ExportFormat::Csv, ExportRecordBatch::NativeBalanceDeltas(v)) => {
+            Ok(write_native_balance_deltas_csv_rows(v, buf)?)
+        }
+        (ExportFormat::Csv, ExportRecordBatch::DecodedEvents(v)) => {
+            Ok(write_decoded_events_csv_rows(v, buf)?)
+        }
+        (ExportFormat::Csv, ExportRecordBatch::HlFills(v)) => Ok(write_hl_fills_csv_rows(v, buf)?),
+        (ExportFormat::Csv, ExportRecordBatch::HlFunding(v)) => {
+            Ok(write_hl_funding_csv_rows(v, buf)?)
+        }
+        (ExportFormat::Csv, ExportRecordBatch::Positions(v)) => {
+            Ok(write_hl_positions_csv_rows(v, buf)?)
+        }
+        (ExportFormat::Csv, ExportRecordBatch::WalletLedger(v)) => {
+            Ok(write_wallet_ledger_csv_rows(v, buf)?)
+        }
+        (ExportFormat::Csv, ExportRecordBatch::BalanceHistory(v)) => {
+            Ok(write_balance_history_csv_rows(v, buf)?)
+        }
+        (ExportFormat::Csv, ExportRecordBatch::HlPnlSummary(v)) => {
+            Ok(write_hl_pnl_summary_csv_rows(v, buf)?)
+        }
+        (ExportFormat::Csv, ExportRecordBatch::HlTradeHistory(v)) => {
+            Ok(write_hl_trade_history_csv_rows(v, buf)?)
+        }
+        (ExportFormat::Csv, ExportRecordBatch::ProtocolEvents(v)) => {
+            Ok(write_protocol_events_csv_rows(v, buf)?)
+        }
+        (ExportFormat::Csv, ExportRecordBatch::PoolSnapshots(v)) => {
+            Ok(write_pool_snapshots_csv_rows(v, buf)?)
         }
     }
-
-    writer.write_all(&buf).await?;
-    Ok(())
 }
 
-/// Generate one streaming-dispatch arm for a dataset. Expanded inside
-/// [`write_export_to_file`] below.
-macro_rules! stream_dataset {
-    (
-        $repo:expr, $writer:expr, $format:expr, $target_id:expr, $network:expr,
-        $time_start:expr, $time_end:expr, $query_fn:ident,
-        $csv_header_fn:path, $csv_rows_fn:path $(,)?
-    ) => {{
-        let mut offset: i64 = 0;
-        let mut total: usize = 0;
-        let mut write_header = true;
-        loop {
-            let records = $repo
-                .$query_fn(
-                    $target_id,
-                    $network,
-                    $time_start,
-                    $time_end,
-                    PAGE_SIZE,
-                    offset,
-                )
-                .await?;
-            let n = records.len();
-            if n == 0 {
-                break;
-            }
-
-            write_page(
-                &mut $writer,
-                &records,
-                $format,
-                $csv_header_fn(),
-                write_header,
-                |recs, buf| $csv_rows_fn(recs, buf),
-            )
-            .await?;
-
-            write_header = false;
-            total += n;
-            offset += n as i64;
-
-            // Short page means the underlying query is exhausted.
-            if (n as i64) < PAGE_SIZE {
-                break;
-            }
-            if offset >= EXPORT_HARD_CAP {
-                break;
-            }
-        }
-        total
-    }};
-}
-
-/// Stream an export for `dataset` to `output_path`, fetching records in
-/// pages of [`PAGE_SIZE`] and writing each page directly to disk.
+/// Stream an export for `dataset` to `output_path`, fetching records
+/// in pages of [`PAGE_SIZE`] inside a `REPEATABLE READ READ ONLY`
+/// transaction and writing each page directly to disk.
 ///
-/// Returns the total number of records written and the provenance metadata
-/// gathered at the start of the export (matches the old `run_export_job`
-/// contract minus the giant `Vec<u8>`).
+/// Returns the total number of records written and the provenance
+/// metadata gathered at the start of the export.
+///
+/// # Cancellation
+///
+/// The `cancel` token is checked before the write loop pulls each
+/// page from the channel and before each async write. When cancelled,
+/// the snapshot task aborts the remaining pages, the transaction is
+/// rolled back implicitly on drop, and this function returns an error.
+/// The caller is responsible for deleting the (attempt-scoped) output
+/// file so a reclaiming worker never sees partial bytes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_export_to_file(
     repo: &Repository,
@@ -273,159 +283,91 @@ pub(crate) async fn write_export_to_file(
     time_start: Option<i64>,
     time_end: Option<i64>,
     output_path: &str,
+    cancel: CancellationToken,
 ) -> anyhow::Result<(usize, ExportMetadata)> {
     let meta = fetch_export_metadata(repo, dataset, target_id, network).await;
+
+    // Reject unknown datasets before opening the file so we don't leave
+    // an empty artifact behind.
+    let csv_header =
+        csv_header_for(dataset).ok_or_else(|| anyhow::anyhow!("Unknown dataset: {dataset}"))?;
 
     let file = open_no_follow(output_path).await?;
     let mut writer = BufWriter::with_capacity(WRITER_BUFFER_BYTES, file);
 
-    let total = match dataset {
-        "token_transfers" => stream_dataset!(
-            repo,
-            writer,
-            format,
-            target_id,
-            network,
-            time_start,
-            time_end,
-            query_token_transfers,
-            token_transfers_csv_header,
-            write_token_transfers_csv_rows,
-        ),
-        "native_balance_deltas" => stream_dataset!(
-            repo,
-            writer,
-            format,
-            target_id,
-            network,
-            time_start,
-            time_end,
-            query_native_balance_deltas,
-            native_balance_deltas_csv_header,
-            write_native_balance_deltas_csv_rows,
-        ),
-        "decoded_events" => stream_dataset!(
-            repo,
-            writer,
-            format,
-            target_id,
-            network,
-            time_start,
-            time_end,
-            query_decoded_events,
-            decoded_events_csv_header,
-            write_decoded_events_csv_rows,
-        ),
-        "hl_fills" => stream_dataset!(
-            repo,
-            writer,
-            format,
-            target_id,
-            network,
-            time_start,
-            time_end,
-            query_hl_fill_records,
-            hl_fills_csv_header,
-            write_hl_fills_csv_rows,
-        ),
-        "hl_funding" => stream_dataset!(
-            repo,
-            writer,
-            format,
-            target_id,
-            network,
-            time_start,
-            time_end,
-            query_hl_funding_payments,
-            hl_funding_csv_header,
-            write_hl_funding_csv_rows,
-        ),
-        "positions" => stream_dataset!(
-            repo,
-            writer,
-            format,
-            target_id,
-            network,
-            time_start,
-            time_end,
-            query_hl_position_changes,
-            hl_positions_csv_header,
-            write_hl_positions_csv_rows,
-        ),
-        "wallet_ledger" => stream_dataset!(
-            repo,
-            writer,
-            format,
-            target_id,
-            network,
-            time_start,
-            time_end,
-            query_wallet_ledger_records,
-            wallet_ledger_csv_header,
-            write_wallet_ledger_csv_rows,
-        ),
-        "balance_history" => stream_dataset!(
-            repo,
-            writer,
-            format,
-            target_id,
-            network,
-            time_start,
-            time_end,
-            query_balance_snapshots,
-            balance_history_csv_header,
-            write_balance_history_csv_rows,
-        ),
-        "hl_pnl_summary" => stream_dataset!(
-            repo,
-            writer,
-            format,
-            target_id,
-            network,
-            time_start,
-            time_end,
-            query_hl_pnl_summary,
-            hl_pnl_summary_csv_header,
-            write_hl_pnl_summary_csv_rows,
-        ),
-        "hl_trade_history" => stream_dataset!(
-            repo,
-            writer,
-            format,
-            target_id,
-            network,
-            time_start,
-            time_end,
-            query_hl_trade_history,
-            hl_trade_history_csv_header,
-            write_hl_trade_history_csv_rows,
-        ),
-        "protocol_events" => stream_dataset!(
-            repo,
-            writer,
-            format,
-            target_id,
-            network,
-            time_start,
-            time_end,
-            query_protocol_events,
-            protocol_events_csv_header,
-            write_protocol_events_csv_rows,
-        ),
-        "pool_snapshots" => stream_dataset!(
-            repo,
-            writer,
-            format,
-            target_id,
-            network,
-            time_start,
-            time_end,
-            query_pool_snapshots,
-            pool_snapshots_csv_header,
-            write_pool_snapshots_csv_rows,
-        ),
-        other => return Err(anyhow::anyhow!("Unknown dataset: {other}")),
-    };
+    // Always emit the CSV header before the page loop so an export with
+    // zero rows still produces a header-only file (fixes PR #238 [P2]
+    // empty-CSV regression). For JSONL, zero rows correctly produces an
+    // empty file.
+    if matches!(format, ExportFormat::Csv) {
+        writer.write_all(csv_header.as_bytes()).await?;
+    }
+
+    // Spawn the snapshot streamer on a separate task so the snapshot
+    // transaction and the write loop run concurrently, with backpressure
+    // provided by the small channel.
+    let (page_tx, mut page_rx) =
+        tokio::sync::mpsc::channel::<ExportRecordBatch>(PAGE_CHANNEL_CAPACITY);
+    let repo_clone = repo.clone();
+    let dataset_owned = dataset.to_string();
+    let network_owned = network.map(|s| s.to_string());
+    let cancel_for_stream = cancel.clone();
+
+    let stream_task = tokio::spawn(async move {
+        repo_clone
+            .stream_export_snapshot(
+                &dataset_owned,
+                target_id,
+                network_owned.as_deref(),
+                time_start,
+                time_end,
+                PAGE_SIZE,
+                EXPORT_HARD_CAP,
+                cancel_for_stream,
+                page_tx,
+            )
+            .await
+    });
+
+    let mut total: usize = 0;
+    let write_result: anyhow::Result<()> = async {
+        while let Some(batch) = page_rx.recv().await {
+            if cancel.is_cancelled() {
+                anyhow::bail!("export cancelled during write loop");
+            }
+
+            let n = batch.len();
+            let mut buf: Vec<u8> = Vec::with_capacity(n.saturating_mul(512));
+            encode_batch(&batch, format, &mut buf)?;
+            writer.write_all(&buf).await?;
+            total += n;
+        }
+        Ok(())
+    }
+    .await;
+
+    // Always drain the snapshot task so we propagate its errors (e.g.
+    // lease-lost cancellation, DB errors) and don't leak a pending
+    // transaction. If the write loop failed, cancel the token so the
+    // snapshot task short-circuits rather than continuing to push
+    // pages into a dropped channel.
+    if write_result.is_err() {
+        cancel.cancel();
+    }
+
+    let stream_result = stream_task
+        .await
+        .map_err(|e| anyhow::anyhow!("export snapshot task panicked: {e}"))?;
+
+    // Surface the first error we have. The write loop's error is
+    // generally the root cause (cancellation, disk failure); the
+    // snapshot task typically reports the secondary "channel dropped".
+    write_result?;
+    let streamed = stream_result?;
+
+    // Sanity check: the DB-reported total must match what we wrote.
+    // A mismatch would indicate dropped pages or a bookkeeping bug.
+    debug_assert_eq!(streamed, total);
 
     writer.flush().await?;
 

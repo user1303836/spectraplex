@@ -1158,6 +1158,140 @@ pub fn build_dataset_completeness_upsert(
 // Dataset filter query builder (P4-W1)
 // ---------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------
+// Snapshotted streaming export types (fixes PR #238 [P1] pagination)
+// -----------------------------------------------------------------------
+
+/// One page of records produced by [`Repository::stream_export_snapshot`].
+///
+/// Each variant carries the owned `Vec` for one page, keyed by dataset.
+/// The consumer (the API-side export writer) matches the variant, hands
+/// the slice to the matching CSV/JSONL row-writer, and writes the result
+/// directly to disk.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum ExportRecordBatch {
+    TokenTransfers(Vec<TokenTransfer>),
+    NativeBalanceDeltas(Vec<NativeBalanceDelta>),
+    DecodedEvents(Vec<DecodedEvent>),
+    HlFills(Vec<HlFillRecord>),
+    HlFunding(Vec<HlFundingPayment>),
+    Positions(Vec<HlPositionChange>),
+    WalletLedger(Vec<WalletLedgerRecord>),
+    BalanceHistory(Vec<BalanceSnapshot>),
+    HlPnlSummary(Vec<HlPnlSummary>),
+    HlTradeHistory(Vec<HlTradeHistory>),
+    ProtocolEvents(Vec<ProtocolEvent>),
+    PoolSnapshots(Vec<PoolSnapshot>),
+}
+
+impl ExportRecordBatch {
+    /// Number of records in this page. Used by the consumer to decide
+    /// whether a short page (`< page_size`) means the snapshot is
+    /// exhausted.
+    pub fn len(&self) -> usize {
+        match self {
+            ExportRecordBatch::TokenTransfers(v) => v.len(),
+            ExportRecordBatch::NativeBalanceDeltas(v) => v.len(),
+            ExportRecordBatch::DecodedEvents(v) => v.len(),
+            ExportRecordBatch::HlFills(v) => v.len(),
+            ExportRecordBatch::HlFunding(v) => v.len(),
+            ExportRecordBatch::Positions(v) => v.len(),
+            ExportRecordBatch::WalletLedger(v) => v.len(),
+            ExportRecordBatch::BalanceHistory(v) => v.len(),
+            ExportRecordBatch::HlPnlSummary(v) => v.len(),
+            ExportRecordBatch::HlTradeHistory(v) => v.len(),
+            ExportRecordBatch::ProtocolEvents(v) => v.len(),
+            ExportRecordBatch::PoolSnapshots(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Run a paged `SELECT ... LIMIT/OFFSET` inside the given transaction,
+/// mapping each page via `row_fn` and forwarding the resulting batch via
+/// `batch_fn` to `tx_out`. Honors the `cancel` token both before every
+/// query and before every send so lease-loss (heartbeat reporting the
+/// export job was reclaimed) aborts promptly.
+#[allow(clippy::too_many_arguments)]
+async fn stream_paged_in_tx<T, R, B>(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cols: &str,
+    table: &str,
+    order_col: &str,
+    target_id: Option<Uuid>,
+    network: Option<&str>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
+    page_size: i64,
+    hard_cap: i64,
+    cancel: &tokio_util::sync::CancellationToken,
+    tx_out: &tokio::sync::mpsc::Sender<ExportRecordBatch>,
+    row_fn: R,
+    batch_fn: B,
+) -> anyhow::Result<usize>
+where
+    R: Fn(&sqlx::postgres::PgRow) -> anyhow::Result<T>,
+    B: Fn(Vec<T>) -> ExportRecordBatch,
+{
+    let mut offset: i64 = 0;
+    let mut total: usize = 0;
+    loop {
+        if cancel.is_cancelled() {
+            anyhow::bail!("export snapshot cancelled (lease lost or worker shutdown)");
+        }
+
+        let (sql, args) = build_dataset_filter_query(
+            cols, table, order_col, target_id, network, time_start, time_end, page_size, offset,
+        )?;
+
+        let rows = sqlx::query_with(&sql, args).fetch_all(&mut **tx).await?;
+        let n = rows.len();
+        if n == 0 {
+            break;
+        }
+
+        let records: Vec<T> = rows
+            .iter()
+            .map(&row_fn)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        // A second cancel check immediately before the blocking send so
+        // a lost lease can't push one more page to the consumer.
+        if cancel.is_cancelled() {
+            anyhow::bail!("export snapshot cancelled (lease lost or worker shutdown)");
+        }
+
+        if tx_out.send(batch_fn(records)).await.is_err() {
+            // Consumer dropped the receiver — treat as cancellation so
+            // we short-circuit the remaining pages and roll back the
+            // snapshot transaction.
+            anyhow::bail!("export consumer dropped the record-batch channel");
+        }
+
+        total += n;
+        offset += n as i64;
+
+        // Short page means the snapshot is exhausted for this dataset.
+        if (n as i64) < page_size {
+            break;
+        }
+        if offset >= hard_cap {
+            tracing::warn!(
+                table,
+                offset,
+                hard_cap,
+                "Export hit EXPORT_HARD_CAP — truncating stream"
+            );
+            break;
+        }
+    }
+    Ok(total)
+}
+
 /// Build a filtered SELECT query for a Silver dataset table.
 ///
 /// Dynamically adds JOIN and WHERE clauses based on which filters are
@@ -1224,8 +1358,16 @@ pub fn build_dataset_filter_query(
     let lim_n = n;
     n += 1;
     let off_n = n;
+    // `order_col` alone is not a total order — on ties the physical row order
+    // is not stable, so OFFSET pagination can reshuffle rows across pages.
+    // Append `dt.id DESC` as a deterministic tiebreaker so pages are
+    // disjoint and cover the full result set exactly once, both for
+    // one-shot queries and for the snapshotted paged export in
+    // [`Repository::stream_export_snapshot`]. This fixes the PR #238
+    // [P1] correctness concern about LIMIT/OFFSET exports losing or
+    // duplicating rows across page boundaries (#208).
     sql.push_str(&format!(
-        " ORDER BY {order_col} DESC LIMIT ${lim_n} OFFSET ${off_n}"
+        " ORDER BY {order_col} DESC, dt.id DESC LIMIT ${lim_n} OFFSET ${off_n}"
     ));
     use sqlx::Arguments;
     args.add(limit).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -3172,6 +3314,336 @@ impl Repository {
             0,
         )
         .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshotted streaming export (fixes PR #238 [P1] correctness)
+    // -----------------------------------------------------------------------
+
+    /// Stream a snapshotted, paged export for one dataset into `tx_out`.
+    ///
+    /// Runs every page query inside a single `REPEATABLE READ READ ONLY`
+    /// transaction so pagination is stable even if ingestion writes rows
+    /// concurrently — the reader sees a single snapshot for the duration
+    /// of the export. Combined with the `(order_col, dt.id)` total ORDER
+    /// BY (see [`build_dataset_filter_query`]), this guarantees every
+    /// page is disjoint and together they cover the full result set
+    /// exactly once. This fixes the PR #238 [P1] comment that the
+    /// previous per-page queries could skip or duplicate rows on tied
+    /// `created_at`/`timestamp` values or under concurrent insert.
+    ///
+    /// Cancellation: checks `cancel` before every query and every send.
+    /// When the heartbeat task detects that the export job's lease was
+    /// reclaimed by another worker (the PR #238 [P1] lease-loss issue),
+    /// it cancels this token; the function aborts, the transaction is
+    /// rolled back on drop, and the caller can clean up its attempt-
+    /// scoped temp artifact without racing the new owner.
+    ///
+    /// Backpressure: the per-page channel is expected to be small
+    /// (`capacity=2` in the worker) so that DB streaming throttles to
+    /// the disk-write rate rather than buffering whole pages in RAM.
+    ///
+    /// Returns the total number of records sent.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_export_snapshot(
+        &self,
+        dataset: &str,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        page_size: i64,
+        hard_cap: i64,
+        cancel: tokio_util::sync::CancellationToken,
+        tx_out: tokio::sync::mpsc::Sender<ExportRecordBatch>,
+    ) -> anyhow::Result<usize> {
+        let mut tx = self.pool().begin().await?;
+        // Snapshot isolation: every page sees the same committed state
+        // that existed when this SET statement returned. READ ONLY lets
+        // Postgres skip some write-path bookkeeping.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+
+        let total = match dataset {
+            "token_transfers" => {
+                let cols = "dt.id, dt.raw_transaction_id, dt.network, dt.token_address, \
+                            dt.token_symbol, dt.from_address, dt.to_address, dt.amount, \
+                            dt.decimals, dt.transfer_index, dt.dataset_version_id, dt.created_at";
+                stream_paged_in_tx(
+                    &mut tx,
+                    cols,
+                    DatasetName::TokenTransfers.physical_table(),
+                    "dt.created_at",
+                    target_id,
+                    network,
+                    time_start,
+                    time_end,
+                    page_size,
+                    hard_cap,
+                    &cancel,
+                    &tx_out,
+                    row_to_token_transfer,
+                    ExportRecordBatch::TokenTransfers,
+                )
+                .await?
+            }
+            "native_balance_deltas" => {
+                let cols = "dt.id, dt.raw_transaction_id, dt.network, dt.account_address, \
+                            dt.native_token, dt.pre_balance, dt.post_balance, dt.delta, \
+                            dt.is_fee_payer, dt.dataset_version_id, dt.created_at";
+                stream_paged_in_tx(
+                    &mut tx,
+                    cols,
+                    DatasetName::NativeBalanceDeltas.physical_table(),
+                    "dt.created_at",
+                    target_id,
+                    network,
+                    time_start,
+                    time_end,
+                    page_size,
+                    hard_cap,
+                    &cancel,
+                    &tx_out,
+                    row_to_native_balance_delta,
+                    ExportRecordBatch::NativeBalanceDeltas,
+                )
+                .await?
+            }
+            "decoded_events" => {
+                let cols = "dt.id, dt.raw_transaction_id, dt.network, dt.program_or_contract, \
+                            dt.event_signature, dt.event_name, dt.log_index, dt.decoded_fields, \
+                            dt.raw_fields, dt.dataset_version_id, dt.created_at";
+                stream_paged_in_tx(
+                    &mut tx,
+                    cols,
+                    DatasetName::DecodedEvents.physical_table(),
+                    "dt.created_at",
+                    target_id,
+                    network,
+                    time_start,
+                    time_end,
+                    page_size,
+                    hard_cap,
+                    &cancel,
+                    &tx_out,
+                    row_to_decoded_event,
+                    ExportRecordBatch::DecodedEvents,
+                )
+                .await?
+            }
+            "hl_fills" => {
+                let cols = "dt.id, dt.raw_transaction_id, dt.network, dt.coin, dt.side, \
+                            dt.price, dt.size, dt.direction, dt.closed_pnl, dt.fee, \
+                            dt.fee_token, dt.fill_time, dt.order_id, dt.trade_id, \
+                            dt.dataset_version_id, dt.created_at";
+                stream_paged_in_tx(
+                    &mut tx,
+                    cols,
+                    DatasetName::HlFills.physical_table(),
+                    "dt.fill_time",
+                    target_id,
+                    network,
+                    time_start,
+                    time_end,
+                    page_size,
+                    hard_cap,
+                    &cancel,
+                    &tx_out,
+                    row_to_hl_fill_record,
+                    ExportRecordBatch::HlFills,
+                )
+                .await?
+            }
+            "hl_funding" => {
+                let cols = "dt.id, dt.raw_transaction_id, dt.network, dt.coin, dt.amount, \
+                            dt.funding_rate, dt.payment_time, dt.dataset_version_id, dt.created_at";
+                stream_paged_in_tx(
+                    &mut tx,
+                    cols,
+                    DatasetName::HlFunding.physical_table(),
+                    "dt.payment_time",
+                    target_id,
+                    network,
+                    time_start,
+                    time_end,
+                    page_size,
+                    hard_cap,
+                    &cancel,
+                    &tx_out,
+                    row_to_hl_funding_payment,
+                    ExportRecordBatch::HlFunding,
+                )
+                .await?
+            }
+            "positions" => {
+                let cols = "dt.id, dt.raw_transaction_id, dt.network, dt.coin, dt.side, \
+                            dt.size_delta, dt.price, dt.direction, dt.source_event, \
+                            dt.dataset_version_id, dt.created_at";
+                stream_paged_in_tx(
+                    &mut tx,
+                    cols,
+                    DatasetName::Positions.physical_table(),
+                    "dt.created_at",
+                    target_id,
+                    network,
+                    time_start,
+                    time_end,
+                    page_size,
+                    hard_cap,
+                    &cancel,
+                    &tx_out,
+                    row_to_hl_position_change,
+                    ExportRecordBatch::Positions,
+                )
+                .await?
+            }
+            "wallet_ledger" => {
+                let cols = "dt.id, dt.raw_transaction_id, dt.wallet_address, dt.network, \
+                            dt.tx_hash, dt.timestamp, dt.entry_type, dt.asset_symbol, \
+                            dt.amount, dt.counterparty_address, dt.fee_amount, dt.fee_asset, \
+                            dt.cost_basis, dt.proceeds, dt.dataset_version_id, dt.created_at";
+                stream_paged_in_tx(
+                    &mut tx,
+                    cols,
+                    DatasetName::WalletLedger.physical_table(),
+                    "dt.timestamp",
+                    target_id,
+                    network,
+                    time_start,
+                    time_end,
+                    page_size,
+                    hard_cap,
+                    &cancel,
+                    &tx_out,
+                    row_to_wallet_ledger_record,
+                    ExportRecordBatch::WalletLedger,
+                )
+                .await?
+            }
+            "balance_history" => {
+                let cols = "dt.id, dt.wallet_address, dt.asset_symbol, dt.network, \
+                            dt.timestamp, dt.balance, dt.tx_hash, dt.dataset_version_id, \
+                            dt.created_at";
+                stream_paged_in_tx(
+                    &mut tx,
+                    cols,
+                    DatasetName::BalanceHistory.physical_table(),
+                    "dt.timestamp",
+                    target_id,
+                    network,
+                    time_start,
+                    time_end,
+                    page_size,
+                    hard_cap,
+                    &cancel,
+                    &tx_out,
+                    row_to_balance_snapshot,
+                    ExportRecordBatch::BalanceHistory,
+                )
+                .await?
+            }
+            "hl_pnl_summary" => {
+                let cols = "dt.id, dt.wallet_address, dt.coin, dt.network, dt.period_start, \
+                            dt.period_end, dt.total_closed_pnl, dt.total_funding, dt.total_fees, \
+                            dt.net_pnl, dt.trade_count, dt.fill_count, dt.avg_trade_size, \
+                            dt.win_count, dt.loss_count, dt.dataset_version_id, dt.created_at";
+                stream_paged_in_tx(
+                    &mut tx,
+                    cols,
+                    DatasetName::HlPnlSummary.physical_table(),
+                    "dt.period_end",
+                    target_id,
+                    network,
+                    time_start,
+                    time_end,
+                    page_size,
+                    hard_cap,
+                    &cancel,
+                    &tx_out,
+                    row_to_hl_pnl_summary,
+                    ExportRecordBatch::HlPnlSummary,
+                )
+                .await?
+            }
+            "hl_trade_history" => {
+                let cols = "dt.id, dt.wallet_address, dt.coin, dt.network, dt.side, \
+                            dt.entry_price, dt.exit_price, dt.size, dt.opened_at, dt.closed_at, \
+                            dt.realized_pnl, dt.fees, dt.num_fills, dt.dataset_version_id, \
+                            dt.created_at";
+                stream_paged_in_tx(
+                    &mut tx,
+                    cols,
+                    DatasetName::HlTradeHistory.physical_table(),
+                    "dt.closed_at",
+                    target_id,
+                    network,
+                    time_start,
+                    time_end,
+                    page_size,
+                    hard_cap,
+                    &cancel,
+                    &tx_out,
+                    row_to_hl_trade_history,
+                    ExportRecordBatch::HlTradeHistory,
+                )
+                .await?
+            }
+            "protocol_events" => {
+                let cols = "dt.id, dt.network, dt.protocol_address, dt.protocol_name, \
+                            dt.event_type, dt.event_details, dt.pool_address, dt.raw_event_id, \
+                            dt.timestamp, dt.dataset_version_id, dt.created_at";
+                stream_paged_in_tx(
+                    &mut tx,
+                    cols,
+                    DatasetName::ProtocolEvents.physical_table(),
+                    "dt.timestamp",
+                    target_id,
+                    network,
+                    time_start,
+                    time_end,
+                    page_size,
+                    hard_cap,
+                    &cancel,
+                    &tx_out,
+                    row_to_protocol_event,
+                    ExportRecordBatch::ProtocolEvents,
+                )
+                .await?
+            }
+            "pool_snapshots" => {
+                let cols = "dt.id, dt.network, dt.pool_address, dt.protocol_address, \
+                            dt.protocol_name, dt.token0_address, dt.token0_symbol, \
+                            dt.token1_address, dt.token1_symbol, dt.reserve0, dt.reserve1, \
+                            dt.tvl_usd, dt.snapshot_timestamp, dt.block_number, \
+                            dt.dataset_version_id, dt.created_at";
+                stream_paged_in_tx(
+                    &mut tx,
+                    cols,
+                    DatasetName::PoolSnapshots.physical_table(),
+                    "dt.snapshot_timestamp",
+                    target_id,
+                    network,
+                    time_start,
+                    time_end,
+                    page_size,
+                    hard_cap,
+                    &cancel,
+                    &tx_out,
+                    row_to_pool_snapshot,
+                    ExportRecordBatch::PoolSnapshots,
+                )
+                .await?
+            }
+            other => {
+                // Rolling back the snapshot transaction on unknown dataset
+                // is implicit via drop.
+                return Err(anyhow::anyhow!("Unknown export dataset: {other}"));
+            }
+        };
+
+        tx.commit().await?;
+        Ok(total)
     }
 
     // -----------------------------------------------------------------------
