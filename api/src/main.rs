@@ -1,3 +1,5 @@
+mod export_csv;
+mod export_stream;
 mod export_worker;
 mod materialize_worker;
 mod stream_worker;
@@ -19,10 +21,18 @@ use spectraplex_adapters::v2_repo::EnqueueIngestionJobParams;
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::connector::validate_target;
 use spectraplex_core::materializer::{
-    BalanceSnapshot, DatasetName, DatasetRegistry, DeliveryMetadata, DeliveryReceipt, ExportFormat,
-    ExportSink, ForensicsActivity, HlPnlSummary, HlTradeHistory, MarketAnalytics, PoolSnapshot,
-    ProtocolActivity, ProtocolEvent, SinkConfig, SinkType, TraderAnalytics, TvlAnalytics,
-    WalletLedgerRecord,
+    DatasetName, DatasetRegistry, DeliveryMetadata, DeliveryReceipt, ExportFormat, ExportSink,
+    ForensicsActivity, MarketAnalytics, ProtocolActivity, SinkConfig, SinkType, TraderAnalytics,
+    TvlAnalytics, WalletLedgerRecord,
+};
+// Types used only by the test-only `*_to_csv` helpers below and the
+// `*_to_csv_format` / `*_summary_to_csv_format` tests. Kept behind
+// `#[cfg(test)]` so non-test builds don't warn about unused imports now
+// that the streaming export path (`export_stream`) uses the row-writer
+// helpers in `export_csv` directly, not the `*_to_csv` wrappers.
+#[cfg(test)]
+use spectraplex_core::materializer::{
+    BalanceSnapshot, HlPnlSummary, HlTradeHistory, PoolSnapshot, ProtocolEvent,
 };
 use spectraplex_core::models::{Chain, EntryType, LedgerEntry, Transaction};
 use spectraplex_core::provider::{
@@ -1040,6 +1050,66 @@ impl ExportSink for LocalFileSink {
             delivered_at: chrono::Utc::now(),
         })
     }
+
+    /// Copy the already-streamed export artifact from `path` to the
+    /// sink's target path without ever reading the full artifact into
+    /// memory (fixes the PR #238 [P2] concern that sink jobs still
+    /// hit the OOM class after #208).
+    async fn deliver_from_file(
+        &self,
+        path: &std::path::Path,
+        _metadata: &DeliveryMetadata,
+    ) -> Result<DeliveryReceipt, String> {
+        if let Some(parent) = std::path::Path::new(&self.path).parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("Failed to create directory for {}: {e}", self.path))?;
+        }
+
+        copy_no_follow(path, &self.path).await.map_err(|e| {
+            format!(
+                "Failed to copy export artifact {} -> {}: {e}",
+                path.display(),
+                self.path
+            )
+        })?;
+
+        let bytes_written = tokio::fs::metadata(&self.path)
+            .await
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+
+        Ok(DeliveryReceipt {
+            sink_type: SinkType::LocalFile,
+            destination: self.path.clone(),
+            bytes_written,
+            delivered_at: chrono::Utc::now(),
+        })
+    }
+}
+
+/// Copy `src` to `dst` with a streaming `io::copy`, opening `dst` with
+/// `O_NOFOLLOW` so symlink attacks on the sink destination still fail
+/// (shares the same defense as [`write_no_follow`] for #220).
+async fn copy_no_follow(src: &std::path::Path, dst: &str) -> std::io::Result<u64> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let src_owned = src.to_path_buf();
+    let dst_owned = dst.to_owned();
+    tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&src_owned)?;
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&dst_owned)?;
+        std::io::copy(&mut reader, &mut writer)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Opens a file for writing with `O_NOFOLLOW` to prevent symlink-following
@@ -1087,25 +1157,7 @@ impl ExportSink for WebhookSink {
         // Re-resolve and validate at delivery time to prevent DNS rebinding.
         let client = build_ssrf_safe_client(&self.url, Duration::from_secs(30)).await?;
 
-        let content_type = match metadata.format.as_str() {
-            "csv" => "text/csv; charset=utf-8",
-            _ => "application/x-ndjson",
-        };
-
-        let mut req = client
-            .post(&self.url)
-            .header("Content-Type", content_type)
-            .header("X-Export-Dataset", &metadata.dataset)
-            .header("X-Export-Format", &metadata.format)
-            .header("X-Export-Record-Count", metadata.record_count.to_string())
-            .header("X-Export-Job-Id", metadata.job_id.to_string());
-
-        if let Some(ref headers) = self.headers {
-            for (key, value) in headers {
-                req = req.header(key, value);
-            }
-        }
-
+        let req = self.build_request(&client, metadata);
         let response = req
             .body(data.to_vec())
             .send()
@@ -1125,6 +1177,88 @@ impl ExportSink for WebhookSink {
             bytes_written: data.len(),
             delivered_at: chrono::Utc::now(),
         })
+    }
+
+    /// Stream the export artifact as the request body without ever
+    /// reading the full file into memory (fixes the PR #238 [P2]
+    /// concern about sink jobs still hitting the OOM class after
+    /// #208). We preflight the file size so `Content-Length` is set
+    /// correctly for non-chunked HTTP and so the returned bytes_written
+    /// receipt is accurate, then hand reqwest a `Stream` built from a
+    /// `tokio::fs::File` via `tokio_util::io::ReaderStream`.
+    async fn deliver_from_file(
+        &self,
+        path: &std::path::Path,
+        metadata: &DeliveryMetadata,
+    ) -> Result<DeliveryReceipt, String> {
+        let client = build_ssrf_safe_client(&self.url, Duration::from_secs(30)).await?;
+
+        let size = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| format!("Failed to stat export artifact {}: {e}", path.display()))?
+            .len();
+
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|e| format!("Failed to open export artifact {}: {e}", path.display()))?;
+        let stream = tokio_util::io::ReaderStream::new(file);
+        let body = reqwest::Body::wrap_stream(stream);
+
+        let req = self
+            .build_request(&client, metadata)
+            .header(reqwest::header::CONTENT_LENGTH, size.to_string());
+
+        let response = req
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| format!("Webhook POST to {} failed: {e}", self.url))?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "Webhook returned non-success status: {}",
+                response.status()
+            ));
+        }
+
+        Ok(DeliveryReceipt {
+            sink_type: SinkType::Webhook,
+            destination: self.url.clone(),
+            bytes_written: size as usize,
+            delivered_at: chrono::Utc::now(),
+        })
+    }
+}
+
+impl WebhookSink {
+    /// Builder for the request shared by `deliver` and
+    /// `deliver_from_file`. Sets the Content-Type based on format, the
+    /// X-Export-* provenance headers, and any user-configured custom
+    /// headers.
+    fn build_request(
+        &self,
+        client: &reqwest::Client,
+        metadata: &DeliveryMetadata,
+    ) -> reqwest::RequestBuilder {
+        let content_type = match metadata.format.as_str() {
+            "csv" => "text/csv; charset=utf-8",
+            _ => "application/x-ndjson",
+        };
+
+        let mut req = client
+            .post(&self.url)
+            .header("Content-Type", content_type)
+            .header("X-Export-Dataset", &metadata.dataset)
+            .header("X-Export-Format", &metadata.format)
+            .header("X-Export-Record-Count", metadata.record_count.to_string())
+            .header("X-Export-Job-Id", metadata.job_id.to_string());
+
+        if let Some(ref headers) = self.headers {
+            for (key, value) in headers {
+                req = req.header(key, value);
+            }
+        }
+        req
     }
 }
 
@@ -2424,6 +2558,17 @@ fn content_type_for_format(format: ExportFormat) -> &'static str {
     }
 }
 
+// Test-only convenience wrappers.
+//
+// Before #208, these were the primary serialization entry points called
+// from `run_export_job` to produce a single `Vec<u8>`. The streaming export
+// path (`export_stream::write_export_to_file`) now writes pages directly
+// to disk via the row-emitters in `export_csv`, and production code no
+// longer needs a single `Vec<u8>`. The wrappers remain so the existing
+// `*_to_csv_format` / `test_serialize_to_jsonl` tests keep asserting the
+// exact output format.
+
+#[cfg(test)]
 fn serialize_to_jsonl<T: Serialize>(records: &[T]) -> Result<Vec<u8>, AppError> {
     let mut buf = Vec::new();
     for record in records {
@@ -2433,358 +2578,67 @@ fn serialize_to_jsonl<T: Serialize>(records: &[T]) -> Result<Vec<u8>, AppError> 
     Ok(buf)
 }
 
+#[cfg(test)]
 fn token_transfers_to_csv(records: &[spectraplex_core::materializer::TokenTransfer]) -> Vec<u8> {
-    let mut buf = String::from(
-        "id,raw_transaction_id,network,token_address,token_symbol,from_address,to_address,amount,decimals,transfer_index,dataset_version_id,created_at\n",
-    );
-    for r in records {
-        buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{}\n",
-            r.id,
-            r.raw_transaction_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            csv_escape(&r.network),
-            csv_escape(&r.token_address),
-            r.token_symbol.as_deref().unwrap_or(""),
-            csv_escape(&r.from_address),
-            csv_escape(&r.to_address),
-            r.amount,
-            r.decimals,
-            r.transfer_index,
-            r.dataset_version_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            r.created_at.to_rfc3339(),
-        ));
-    }
-    buf.into_bytes()
+    let mut buf = Vec::from(export_csv::token_transfers_csv_header().as_bytes());
+    export_csv::write_token_transfers_csv_rows(records, &mut buf)
+        .expect("writing to Vec<u8> cannot fail");
+    buf
 }
 
-fn native_balance_deltas_to_csv(
-    records: &[spectraplex_core::materializer::NativeBalanceDelta],
-) -> Vec<u8> {
-    let mut buf = String::from(
-        "id,raw_transaction_id,network,account_address,native_token,pre_balance,post_balance,delta,is_fee_payer,dataset_version_id,created_at\n",
-    );
-    for r in records {
-        buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{}\n",
-            r.id,
-            r.raw_transaction_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            csv_escape(&r.network),
-            csv_escape(&r.account_address),
-            csv_escape(&r.native_token),
-            r.pre_balance,
-            r.post_balance,
-            r.delta,
-            r.is_fee_payer,
-            r.dataset_version_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            r.created_at.to_rfc3339(),
-        ));
-    }
-    buf.into_bytes()
-}
+// The `*_to_csv` wrappers for `native_balance_deltas`, `decoded_events`,
+// `hl_fills`, `hl_funding`, and `hl_positions` were deleted in the #208
+// streaming-exports fix — they had no tests and were only called from the
+// old in-memory `run_export_job`. The row-emission logic for those datasets
+// now lives exclusively in `export_csv::write_*_csv_rows` and is exercised
+// by the streaming export path.
 
-fn decoded_events_to_csv(records: &[spectraplex_core::materializer::DecodedEvent]) -> Vec<u8> {
-    let mut buf = String::from(
-        "id,raw_transaction_id,network,program_or_contract,event_signature,event_name,log_index,dataset_version_id,created_at\n",
-    );
-    for r in records {
-        buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{}\n",
-            r.id,
-            r.raw_transaction_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            csv_escape(&r.network),
-            csv_escape(&r.program_or_contract),
-            csv_escape(r.event_signature.as_deref().unwrap_or("")),
-            csv_escape(r.event_name.as_deref().unwrap_or("")),
-            r.log_index,
-            r.dataset_version_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            r.created_at.to_rfc3339(),
-        ));
-    }
-    buf.into_bytes()
-}
-
-fn hl_fills_to_csv(records: &[spectraplex_core::materializer::HlFillRecord]) -> Vec<u8> {
-    let mut buf = String::from(
-        "id,raw_transaction_id,network,coin,side,price,size,direction,closed_pnl,fee,fee_token,fill_time,order_id,trade_id,dataset_version_id,created_at\n",
-    );
-    for r in records {
-        buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-            r.id,
-            r.raw_transaction_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            csv_escape(&r.network),
-            csv_escape(&r.coin),
-            csv_escape(&r.side),
-            r.price,
-            r.size,
-            r.direction.as_deref().unwrap_or(""),
-            r.closed_pnl
-                .as_ref()
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            r.fee.as_ref().map(|v| v.to_string()).unwrap_or_default(),
-            r.fee_token.as_deref().unwrap_or(""),
-            r.fill_time,
-            r.order_id.map(|v| v.to_string()).unwrap_or_default(),
-            r.trade_id.map(|v| v.to_string()).unwrap_or_default(),
-            r.dataset_version_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            r.created_at.to_rfc3339(),
-        ));
-    }
-    buf.into_bytes()
-}
-
-fn hl_funding_to_csv(records: &[spectraplex_core::materializer::HlFundingPayment]) -> Vec<u8> {
-    let mut buf = String::from(
-        "id,raw_transaction_id,network,coin,amount,funding_rate,payment_time,dataset_version_id,created_at\n",
-    );
-    for r in records {
-        buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{}\n",
-            r.id,
-            r.raw_transaction_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            csv_escape(&r.network),
-            csv_escape(&r.coin),
-            r.amount,
-            r.funding_rate
-                .as_ref()
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            r.payment_time,
-            r.dataset_version_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            r.created_at.to_rfc3339(),
-        ));
-    }
-    buf.into_bytes()
-}
-
-fn hl_positions_to_csv(records: &[spectraplex_core::materializer::HlPositionChange]) -> Vec<u8> {
-    let mut buf = String::from(
-        "id,raw_transaction_id,network,coin,side,size_delta,price,direction,source_event,dataset_version_id,created_at\n",
-    );
-    for r in records {
-        buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{}\n",
-            r.id,
-            r.raw_transaction_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            csv_escape(&r.network),
-            csv_escape(&r.coin),
-            csv_escape(&r.side),
-            r.size_delta,
-            r.price,
-            r.direction.as_deref().unwrap_or(""),
-            csv_escape(&r.source_event),
-            r.dataset_version_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            r.created_at.to_rfc3339(),
-        ));
-    }
-    buf.into_bytes()
-}
-
+#[cfg(test)]
 fn wallet_ledger_to_csv(records: &[WalletLedgerRecord]) -> Vec<u8> {
-    let mut buf = String::from(
-        "id,raw_transaction_id,wallet_address,network,tx_hash,timestamp,entry_type,asset_symbol,amount,counterparty_address,fee_amount,fee_asset,cost_basis,proceeds,dataset_version_id,created_at\n",
-    );
-    for r in records {
-        buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-            r.id,
-            r.raw_transaction_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            csv_escape(&r.wallet_address),
-            csv_escape(&r.network),
-            csv_escape(&r.tx_hash),
-            r.timestamp,
-            csv_escape(&r.entry_type),
-            csv_escape(&r.asset_symbol),
-            r.amount,
-            r.counterparty_address.as_deref().unwrap_or(""),
-            r.fee_amount
-                .as_ref()
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            r.fee_asset.as_deref().unwrap_or(""),
-            r.cost_basis
-                .as_ref()
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            r.proceeds
-                .as_ref()
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            r.dataset_version_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            r.created_at.to_rfc3339(),
-        ));
-    }
-    buf.into_bytes()
+    let mut buf = Vec::from(export_csv::wallet_ledger_csv_header().as_bytes());
+    export_csv::write_wallet_ledger_csv_rows(records, &mut buf)
+        .expect("writing to Vec<u8> cannot fail");
+    buf
 }
 
+#[cfg(test)]
 fn balance_history_to_csv(records: &[BalanceSnapshot]) -> Vec<u8> {
-    let mut buf = String::from(
-        "id,wallet_address,asset_symbol,network,timestamp,balance,tx_hash,dataset_version_id,created_at\n",
-    );
-    for r in records {
-        buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{}\n",
-            r.id,
-            csv_escape(&r.wallet_address),
-            csv_escape(&r.asset_symbol),
-            csv_escape(&r.network),
-            r.timestamp,
-            r.balance,
-            csv_escape(&r.tx_hash),
-            r.dataset_version_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            r.created_at.to_rfc3339(),
-        ));
-    }
-    buf.into_bytes()
+    let mut buf = Vec::from(export_csv::balance_history_csv_header().as_bytes());
+    export_csv::write_balance_history_csv_rows(records, &mut buf)
+        .expect("writing to Vec<u8> cannot fail");
+    buf
 }
 
+#[cfg(test)]
 fn hl_pnl_summary_to_csv(records: &[HlPnlSummary]) -> Vec<u8> {
-    let mut buf = String::from(
-        "id,wallet_address,coin,network,period_start,period_end,total_closed_pnl,total_funding,total_fees,net_pnl,trade_count,fill_count,avg_trade_size,win_count,loss_count,dataset_version_id,created_at\n",
-    );
-    for r in records {
-        buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-            r.id,
-            csv_escape(&r.wallet_address),
-            csv_escape(&r.coin),
-            csv_escape(&r.network),
-            r.period_start,
-            r.period_end,
-            r.total_closed_pnl,
-            r.total_funding,
-            r.total_fees,
-            r.net_pnl,
-            r.trade_count,
-            r.fill_count,
-            r.avg_trade_size,
-            r.win_count,
-            r.loss_count,
-            r.dataset_version_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            r.created_at.to_rfc3339(),
-        ));
-    }
-    buf.into_bytes()
+    let mut buf = Vec::from(export_csv::hl_pnl_summary_csv_header().as_bytes());
+    export_csv::write_hl_pnl_summary_csv_rows(records, &mut buf)
+        .expect("writing to Vec<u8> cannot fail");
+    buf
 }
 
+#[cfg(test)]
 fn hl_trade_history_to_csv(records: &[HlTradeHistory]) -> Vec<u8> {
-    let mut buf = String::from(
-        "id,wallet_address,coin,network,side,entry_price,exit_price,size,opened_at,closed_at,realized_pnl,fees,num_fills,dataset_version_id,created_at\n",
-    );
-    for r in records {
-        buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-            r.id,
-            csv_escape(&r.wallet_address),
-            csv_escape(&r.coin),
-            csv_escape(&r.network),
-            csv_escape(&r.side),
-            r.entry_price,
-            r.exit_price,
-            r.size,
-            r.opened_at,
-            r.closed_at,
-            r.realized_pnl,
-            r.fees,
-            r.num_fills,
-            r.dataset_version_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            r.created_at.to_rfc3339(),
-        ));
-    }
-    buf.into_bytes()
+    let mut buf = Vec::from(export_csv::hl_trade_history_csv_header().as_bytes());
+    export_csv::write_hl_trade_history_csv_rows(records, &mut buf)
+        .expect("writing to Vec<u8> cannot fail");
+    buf
 }
 
+#[cfg(test)]
 fn protocol_events_to_csv(records: &[ProtocolEvent]) -> Vec<u8> {
-    let mut buf = String::from(
-        "id,network,protocol_address,protocol_name,event_type,event_details,pool_address,raw_event_id,timestamp,dataset_version_id,created_at\n",
-    );
-    for r in records {
-        buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{}\n",
-            r.id,
-            csv_escape(&r.network),
-            csv_escape(&r.protocol_address),
-            r.protocol_name.as_deref().unwrap_or(""),
-            csv_escape(&r.event_type),
-            csv_escape(&r.event_details.to_string()),
-            r.pool_address.as_deref().unwrap_or(""),
-            r.raw_event_id.map(|u| u.to_string()).unwrap_or_default(),
-            r.timestamp,
-            r.dataset_version_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            r.created_at.to_rfc3339(),
-        ));
-    }
-    buf.into_bytes()
+    let mut buf = Vec::from(export_csv::protocol_events_csv_header().as_bytes());
+    export_csv::write_protocol_events_csv_rows(records, &mut buf)
+        .expect("writing to Vec<u8> cannot fail");
+    buf
 }
 
+#[cfg(test)]
 fn pool_snapshots_to_csv(records: &[PoolSnapshot]) -> Vec<u8> {
-    let mut buf = String::from(
-        "id,network,pool_address,protocol_address,protocol_name,token0_address,token0_symbol,token1_address,token1_symbol,reserve0,reserve1,tvl_usd,snapshot_timestamp,block_number,dataset_version_id,created_at\n",
-    );
-    for r in records {
-        buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-            r.id,
-            csv_escape(&r.network),
-            csv_escape(&r.pool_address),
-            csv_escape(&r.protocol_address),
-            r.protocol_name.as_deref().unwrap_or(""),
-            csv_escape(&r.token0_address),
-            r.token0_symbol.as_deref().unwrap_or(""),
-            csv_escape(&r.token1_address),
-            r.token1_symbol.as_deref().unwrap_or(""),
-            r.reserve0,
-            r.reserve1,
-            r.tvl_usd
-                .as_ref()
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            r.snapshot_timestamp,
-            r.block_number.map(|v| v.to_string()).unwrap_or_default(),
-            r.dataset_version_id
-                .map(|u| u.to_string())
-                .unwrap_or_default(),
-            r.created_at.to_rfc3339(),
-        ));
-    }
-    buf.into_bytes()
+    let mut buf = Vec::from(export_csv::pool_snapshots_csv_header().as_bytes());
+    export_csv::write_pool_snapshots_csv_rows(records, &mut buf)
+        .expect("writing to Vec<u8> cannot fail");
+    buf
 }
 
 /// Generate tax-export-friendly CSV from wallet_ledger records.
@@ -2792,71 +2646,10 @@ fn pool_snapshots_to_csv(records: &[PoolSnapshot]) -> Vec<u8> {
 /// Columns: Date,Type,Sent_Asset,Sent_Amount,Received_Asset,Received_Amount,
 ///          Fee_Asset,Fee_Amount,Cost_Basis,Proceeds,Gain_Loss,Tx_Hash,Network
 fn wallet_ledger_to_tax_csv(records: &[WalletLedgerRecord]) -> Vec<u8> {
-    let mut buf = String::from(
-        "Date,Type,Sent_Asset,Sent_Amount,Received_Asset,Received_Amount,Fee_Asset,Fee_Amount,Cost_Basis,Proceeds,Gain_Loss,Tx_Hash,Network\n",
-    );
-    for r in records {
-        let date = chrono::DateTime::from_timestamp(r.timestamp, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_else(|| r.timestamp.to_string());
-
-        let (sent_asset, sent_amount, recv_asset, recv_amount) = if r.amount < BigDecimal::from(0) {
-            (
-                r.asset_symbol.as_str(),
-                r.amount.abs().to_string(),
-                "",
-                String::new(),
-            )
-        } else {
-            (
-                "",
-                String::new(),
-                r.asset_symbol.as_str(),
-                r.amount.to_string(),
-            )
-        };
-
-        let fee_asset = r.fee_asset.as_deref().unwrap_or("");
-        let fee_amount = r
-            .fee_amount
-            .as_ref()
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        let cost_basis = r
-            .cost_basis
-            .as_ref()
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        let proceeds = r
-            .proceeds
-            .as_ref()
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-
-        // Gain/Loss computed from cost_basis and proceeds when both available
-        let gain_loss = match (&r.proceeds, &r.cost_basis) {
-            (Some(p), Some(c)) => (p - c).to_string(),
-            _ => String::new(),
-        };
-
-        buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-            csv_escape(&date),
-            csv_escape(&r.entry_type),
-            csv_escape(sent_asset),
-            sent_amount,
-            csv_escape(recv_asset),
-            recv_amount,
-            csv_escape(fee_asset),
-            fee_amount,
-            cost_basis,
-            proceeds,
-            gain_loss,
-            csv_escape(&r.tx_hash),
-            csv_escape(&r.network),
-        ));
-    }
-    buf.into_bytes()
+    let mut buf = Vec::from(export_csv::wallet_ledger_tax_csv_header().as_bytes());
+    export_csv::write_wallet_ledger_tax_csv_rows(records, &mut buf)
+        .expect("writing to Vec<u8> cannot fail");
+    buf
 }
 
 async fn create_export_job(
@@ -2978,248 +2771,15 @@ pub(crate) struct ExportMetadata {
     pub(crate) last_ingestion_run_id: Option<Uuid>,
 }
 
-pub(crate) async fn run_export_job(
-    repo: &Repository,
-    dataset: &str,
-    format: ExportFormat,
-    target_id: Option<Uuid>,
-    network: Option<&str>,
-    time_start: Option<i64>,
-    time_end: Option<i64>,
-) -> anyhow::Result<(Vec<u8>, usize, ExportMetadata)> {
-    // Look up active dataset version for provenance
-    let active_version = repo
-        .get_active_dataset_version(dataset)
-        .await
-        .ok()
-        .flatten();
-
-    // Look up completeness records for the dataset (optionally filtered by target and network)
-    let completeness_records = repo
-        .list_completeness_filtered(dataset, target_id, network)
-        .await
-        .unwrap_or_default();
-
-    let mut meta = ExportMetadata::default();
-    if let Some(ref dv) = active_version {
-        meta.dataset_version_id = Some(dv.id);
-        meta.dataset_version = Some(dv.version);
-    }
-
-    if !completeness_records.is_empty() {
-        // Aggregate completeness: use worst status across matching records
-        let statuses: Vec<&str> = completeness_records
-            .iter()
-            .map(|c| match c.status {
-                spectraplex_core::v2::CompletenessStatus::Complete => "complete",
-                spectraplex_core::v2::CompletenessStatus::Partial => "partial",
-                spectraplex_core::v2::CompletenessStatus::Backfilling => "backfilling",
-                spectraplex_core::v2::CompletenessStatus::Gap => "gap",
-            })
-            .collect();
-
-        // Pick the most conservative status
-        let status = if statuses.contains(&"gap") {
-            "gap"
-        } else if statuses.contains(&"backfilling") {
-            "backfilling"
-        } else if statuses.contains(&"partial") {
-            "partial"
-        } else {
-            "complete"
-        };
-        meta.completeness_status = Some(status.to_string());
-
-        // Aggregate coverage bounds
-        let coverage_start = completeness_records
-            .iter()
-            .filter_map(|c| c.coverage_start)
-            .min();
-        let coverage_end = completeness_records
-            .iter()
-            .filter_map(|c| c.coverage_end)
-            .max();
-        let block_start = completeness_records
-            .iter()
-            .filter_map(|c| c.block_start)
-            .min();
-        let block_end = completeness_records
-            .iter()
-            .filter_map(|c| c.block_end)
-            .max();
-        meta.completeness_coverage = Some(serde_json::json!({
-            "coverage_start": coverage_start,
-            "coverage_end": coverage_end,
-            "block_start": block_start,
-            "block_end": block_end,
-        }));
-
-        // Use the most recent ingestion run ID from completeness records
-        meta.last_ingestion_run_id = completeness_records
-            .iter()
-            .rev()
-            .find_map(|c| c.last_ingestion_run_id);
-    }
-    match dataset {
-        "token_transfers" => {
-            let records = repo
-                .export_token_transfers(target_id, network, time_start, time_end)
-                .await?;
-            let count = records.len();
-            let body = match format {
-                ExportFormat::Jsonl => {
-                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
-                }
-                ExportFormat::Csv => token_transfers_to_csv(&records),
-            };
-            Ok((body, count, meta))
-        }
-        "native_balance_deltas" => {
-            let records = repo
-                .export_native_balance_deltas(target_id, network, time_start, time_end)
-                .await?;
-            let count = records.len();
-            let body = match format {
-                ExportFormat::Jsonl => {
-                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
-                }
-                ExportFormat::Csv => native_balance_deltas_to_csv(&records),
-            };
-            Ok((body, count, meta))
-        }
-        "decoded_events" => {
-            let records = repo
-                .export_decoded_events(target_id, network, time_start, time_end)
-                .await?;
-            let count = records.len();
-            let body = match format {
-                ExportFormat::Jsonl => {
-                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
-                }
-                ExportFormat::Csv => decoded_events_to_csv(&records),
-            };
-            Ok((body, count, meta))
-        }
-        "hl_fills" => {
-            let records = repo
-                .export_hl_fill_records(target_id, network, time_start, time_end)
-                .await?;
-            let count = records.len();
-            let body = match format {
-                ExportFormat::Jsonl => {
-                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
-                }
-                ExportFormat::Csv => hl_fills_to_csv(&records),
-            };
-            Ok((body, count, meta))
-        }
-        "hl_funding" => {
-            let records = repo
-                .export_hl_funding_payments(target_id, network, time_start, time_end)
-                .await?;
-            let count = records.len();
-            let body = match format {
-                ExportFormat::Jsonl => {
-                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
-                }
-                ExportFormat::Csv => hl_funding_to_csv(&records),
-            };
-            Ok((body, count, meta))
-        }
-        "positions" => {
-            let records = repo
-                .export_hl_position_changes(target_id, network, time_start, time_end)
-                .await?;
-            let count = records.len();
-            let body = match format {
-                ExportFormat::Jsonl => {
-                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
-                }
-                ExportFormat::Csv => hl_positions_to_csv(&records),
-            };
-            Ok((body, count, meta))
-        }
-        "wallet_ledger" => {
-            let records = repo
-                .export_wallet_ledger_records(target_id, network, time_start, time_end)
-                .await?;
-            let count = records.len();
-            let body = match format {
-                ExportFormat::Jsonl => {
-                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
-                }
-                ExportFormat::Csv => wallet_ledger_to_csv(&records),
-            };
-            Ok((body, count, meta))
-        }
-        "balance_history" => {
-            let records = repo
-                .export_balance_snapshots(target_id, network, time_start, time_end)
-                .await?;
-            let count = records.len();
-            let body = match format {
-                ExportFormat::Jsonl => {
-                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
-                }
-                ExportFormat::Csv => balance_history_to_csv(&records),
-            };
-            Ok((body, count, meta))
-        }
-        "hl_pnl_summary" => {
-            let records = repo
-                .export_hl_pnl_summary(target_id, network, time_start, time_end)
-                .await?;
-            let count = records.len();
-            let body = match format {
-                ExportFormat::Jsonl => {
-                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
-                }
-                ExportFormat::Csv => hl_pnl_summary_to_csv(&records),
-            };
-            Ok((body, count, meta))
-        }
-        "hl_trade_history" => {
-            let records = repo
-                .export_hl_trade_history(target_id, network, time_start, time_end)
-                .await?;
-            let count = records.len();
-            let body = match format {
-                ExportFormat::Jsonl => {
-                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
-                }
-                ExportFormat::Csv => hl_trade_history_to_csv(&records),
-            };
-            Ok((body, count, meta))
-        }
-        "protocol_events" => {
-            let records = repo
-                .export_protocol_events(target_id, network, time_start, time_end)
-                .await?;
-            let count = records.len();
-            let body = match format {
-                ExportFormat::Jsonl => {
-                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
-                }
-                ExportFormat::Csv => protocol_events_to_csv(&records),
-            };
-            Ok((body, count, meta))
-        }
-        "pool_snapshots" => {
-            let records = repo
-                .export_pool_snapshots(target_id, network, time_start, time_end)
-                .await?;
-            let count = records.len();
-            let body = match format {
-                ExportFormat::Jsonl => {
-                    serialize_to_jsonl(&records).map_err(|e| anyhow::anyhow!("{}", e.message))?
-                }
-                ExportFormat::Csv => pool_snapshots_to_csv(&records),
-            };
-            Ok((body, count, meta))
-        }
-        _ => Err(anyhow::anyhow!("Unknown dataset: {dataset}")),
-    }
-}
+// `run_export_job` was deleted in the #208 streaming-exports fix. It used
+// to load the full dataset into memory, serialize it into a single
+// `Vec<u8>`, and return that buffer to the worker for disk + sink delivery
+// — which OOM-killed co-located workers on large exports.
+//
+// The replacement is [`export_stream::write_export_to_file`], which fetches
+// the dataset in bounded pages and writes each page directly to disk. The
+// export worker owns artifact path construction and sink fan-out; see
+// [`export_worker::execute_export_job`].
 
 async fn get_export_job_status(
     State(state): State<Arc<AppState>>,

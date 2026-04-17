@@ -1,9 +1,25 @@
 //! Durable export worker loop.
 //!
-//! Claims pending `export_jobs` rows from Postgres, executes the actual
-//! export via [`crate::run_export_job`], optionally delivers to a configured
-//! sink, and marks jobs complete/failed durably. Heartbeats while running so
-//! that dead workers are detected and their jobs reclaimed.
+//! Claims pending `export_jobs` rows from Postgres, streams the export
+//! to disk via [`crate::export_stream::write_export_to_file`], optionally
+//! delivers to a configured sink, and marks jobs complete/failed
+//! durably. Heartbeats while running so that dead workers are detected
+//! and their jobs reclaimed.
+//!
+//! Lease safety (PR #238 [P1] fix):
+//!
+//! The worker writes the export artifact to an *attempt-scoped* temp
+//! file named `{job_id}.{worker_hash}.{ext}.tmp`, and only atomically
+//! renames it to the canonical `{job_id}.{ext}` download path after a
+//! lease-holder-confirming `update_export_job_status(..., worker_id)`
+//! has returned `Ok(true)`. If the heartbeat loop reports the job's
+//! lease was reclaimed, a `lease_lost` [`CancellationToken`] is
+//! cancelled — that token is propagated into the page loop in
+//! `write_export_to_file`, so the stale worker short-circuits the DB
+//! snapshot, skips the rename, and removes its temp file. The new
+//! owner starts from a clean state and writes to a distinct temp path,
+//! so the two workers cannot truncate each other's artifacts or hand
+//! out partial bytes via `/download`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,9 +33,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-// These items are defined in main.rs and need to be pub(crate) for this
-// module to use them.  The parent task will adjust visibility.
-use crate::{build_sink, run_export_job, write_no_follow};
+use crate::build_sink;
+use crate::export_stream::write_export_to_file;
 
 /// How often the worker polls for new jobs when idle.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -57,13 +72,9 @@ async fn worker_tick(
     job_semaphore: &Arc<Semaphore>,
     worker_id: &str,
 ) {
-    // Try to acquire a semaphore permit before claiming a job.
-    // This prevents the worker from claiming more jobs than it can execute
-    // concurrently.
     let permit = match Arc::clone(job_semaphore).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            // All permits are in use — back off and retry.
             tokio::time::sleep(POLL_INTERVAL).await;
             return;
         }
@@ -81,7 +92,6 @@ async fn worker_tick(
             execute_export_job(repo, config, worker_id, &job, permit).await;
         }
         Ok(None) => {
-            // No jobs available — drop the permit and sleep before polling again.
             drop(permit);
             tokio::time::sleep(POLL_INTERVAL).await;
         }
@@ -89,6 +99,39 @@ async fn worker_tick(
             drop(permit);
             error!(error = %e, worker_id = %worker_id, "Failed to claim export job");
             tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+}
+
+/// Build an attempt-scoped temp path for this worker's export. Two
+/// workers that race on the same `job_id` get different temp paths, so
+/// a stale worker cannot truncate the new owner's artifact.
+fn attempt_temp_path(exports_dir: &str, job_id: Uuid, worker_id: &str, ext: &str) -> String {
+    // Short, filesystem-safe tag derived from the worker id. FNV-style
+    // hash is fine — collision risk is negligible at the (active worker
+    // count) scale this operates at.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    worker_id.hash(&mut h);
+    let tag = format!("{:016x}", h.finish());
+    format!("{exports_dir}/{job_id}.{tag}.{ext}.tmp")
+}
+
+/// Best-effort remove a file, swallowing NotFound and logging other
+/// errors. Used by the failure paths in `execute_export_job` to clean
+/// up attempt-scoped temp artifacts without masking the real error.
+async fn best_effort_unlink(path: &str, job_id: Uuid) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(
+                job_id = %job_id,
+                error = %e,
+                file = %path,
+                "Failed to clean up temp export artifact",
+            );
         }
     }
 }
@@ -103,38 +146,49 @@ async fn execute_export_job(
     let job_id = job.id;
     let export_dir = &config.export_dir;
 
-    // Spawn a heartbeat task that runs until we signal completion.
+    // `heartbeat_cancel` stops the heartbeat task when the export is
+    // done. `lease_lost` is a *distinct* token that the heartbeat task
+    // flips when `heartbeat_export_job` reports the job has been
+    // reclaimed. Downstream code (the streaming writer and the final
+    // rename) checks `lease_lost` to short-circuit its side effects
+    // so a stale worker cannot publish a partial/bogus artifact over
+    // the new owner's work.
     let heartbeat_cancel = CancellationToken::new();
-    let hb_repo = repo.clone();
-    let hb_worker = worker_id.to_string();
-    let hb_cancel = heartbeat_cancel.clone();
-    let hb_job_id = job_id;
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
-        interval.tick().await; // first tick is immediate
-        loop {
-            tokio::select! {
-                _ = hb_cancel.cancelled() => { return; }
-                _ = interval.tick() => {
-                    match hb_repo.heartbeat_export_job(hb_job_id, &hb_worker).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            warn!(job_id = %hb_job_id, "Heartbeat returned false — lease lost");
-                            return;
-                        }
-                        Err(e) => {
-                            warn!(job_id = %hb_job_id, error = %e, "Heartbeat failed");
+    let lease_lost = CancellationToken::new();
+    {
+        let hb_repo = repo.clone();
+        let hb_worker = worker_id.to_string();
+        let hb_cancel = heartbeat_cancel.clone();
+        let hb_lost = lease_lost.clone();
+        let hb_job_id = job_id;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+            interval.tick().await; // first tick is immediate
+            loop {
+                tokio::select! {
+                    _ = hb_cancel.cancelled() => { return; }
+                    _ = interval.tick() => {
+                        match hb_repo.heartbeat_export_job(hb_job_id, &hb_worker).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(job_id = %hb_job_id, "Heartbeat returned false — lease lost");
+                                // Propagate to the write loop so it stops
+                                // before any more side effects.
+                                hb_lost.cancel();
+                                return;
+                            }
+                            Err(e) => {
+                                warn!(job_id = %hb_job_id, error = %e, "Heartbeat failed");
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+        });
+    }
 
-    // Parse filters from the job to extract query parameters.
     let (target_id, network, time_start, time_end) = parse_filters(&job.filters);
 
-    // Parse the export format.
     let format: ExportFormat = match job.format.parse() {
         Ok(f) => f,
         Err(_) => {
@@ -164,8 +218,41 @@ async fn execute_export_job(
         }
     };
 
-    // Execute the actual export.
-    let result = run_export_job(
+    let ext = match format {
+        ExportFormat::Jsonl => "jsonl",
+        ExportFormat::Csv => "csv",
+    };
+
+    let exports_dir = format!("{}/exports", export_dir);
+    if let Err(e) = tokio::fs::create_dir_all(&exports_dir).await {
+        let err_msg = format!("Failed to create exports directory: {e}");
+        error!(job_id = %job_id, error = %err_msg, "Export job failed");
+        let _ = update_or_abort(
+            repo,
+            job_id,
+            "failed",
+            None,
+            None,
+            Some(&err_msg),
+            worker_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        heartbeat_cancel.cancel();
+        return;
+    }
+
+    let temp_path = attempt_temp_path(&exports_dir, job_id, worker_id, ext);
+    let final_path = format!("{}/{}.{}", exports_dir, job_id, ext);
+
+    // Stream the export into the attempt-scoped temp path. Lease-loss
+    // cancellation propagates into the snapshot+write loop.
+    let result = write_export_to_file(
         repo,
         &job.dataset,
         format,
@@ -173,85 +260,46 @@ async fn execute_export_job(
         network.as_deref(),
         time_start,
         time_end,
+        &temp_path,
+        lease_lost.clone(),
     )
     .await;
 
-    // NOTE: Heartbeat stays alive through file write, sink delivery, and
-    // final status update. Stopping it early would let claim_export_job()
-    // reclaim a "delivering" job that is still actively writing/delivering,
-    // causing duplicate deliveries and conflicting final states.
+    // Heartbeat deliberately stays alive through publish + sink
+    // delivery + final status update, so we don't release the lease
+    // until side effects are durable.
 
     match result {
-        Ok((body, record_count, _export_meta)) => {
+        Ok((record_count, _export_meta)) => {
+            // Before touching the canonical download path, confirm we
+            // still hold the lease. If we don't, the heartbeat task has
+            // already set `lease_lost`; clean up the temp and bail
+            // without racing the new owner.
+            if lease_lost.is_cancelled() {
+                warn!(
+                    job_id = %job_id,
+                    "Lease lost after write — discarding temp artifact without publishing"
+                );
+                best_effort_unlink(&temp_path, job_id).await;
+                heartbeat_cancel.cancel();
+                return;
+            }
+
             let has_sink = job.sink_config.is_some();
 
-            // Extract provenance fields from export metadata for persistence.
             let prov_dv_id = _export_meta.dataset_version_id;
             let prov_dv = _export_meta.dataset_version;
             let prov_cs = _export_meta.completeness_status.as_deref();
             let prov_cc = _export_meta.completeness_coverage.as_ref();
             let prov_lri = _export_meta.last_ingestion_run_id;
 
-            // Determine file extension from format.
-            let ext = match format {
-                ExportFormat::Jsonl => "jsonl",
-                ExportFormat::Csv => "csv",
-            };
-
-            // Write export data to filesystem.
-            let exports_dir = format!("{}/exports", export_dir);
-            if let Err(e) = tokio::fs::create_dir_all(&exports_dir).await {
-                let err_msg = format!("Failed to create exports directory: {e}");
-                error!(job_id = %job_id, error = %err_msg, "Export job failed");
-                let _ = update_or_abort(
-                    repo,
-                    job_id,
-                    "failed",
-                    None,
-                    None,
-                    Some(&err_msg),
-                    worker_id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await;
-                heartbeat_cancel.cancel();
-                return;
-            }
-
-            let file_path = format!("{}/{}.{}", exports_dir, job_id, ext);
-            if let Err(e) = write_no_follow(&file_path, &body).await {
-                let err_msg = format!("Failed to write export file: {e}");
-                error!(job_id = %job_id, error = %err_msg, "Export job failed");
-                let _ = update_or_abort(
-                    repo,
-                    job_id,
-                    "failed",
-                    None,
-                    None,
-                    Some(&err_msg),
-                    worker_id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await;
-                heartbeat_cancel.cancel();
-                return;
-            }
-
-            // Canonical on-disk artifact path — always preserved for download.
             let result_location = format!("exports/{}.{}", job_id, ext);
 
             if has_sink {
-                // Transition to 'delivering'. If Ok(false), lease was lost.
+                // Transition to 'delivering'. update_or_abort only
+                // writes the row if we still own the lease (Ok(true)).
+                // If Ok(false) ("someone else took over"), we clean up
+                // our temp and exit without publishing.
                 match update_or_abort(
                     repo,
                     job_id,
@@ -271,12 +319,47 @@ async fn execute_export_job(
                 {
                     Ok(()) => {}
                     Err(()) => {
+                        best_effort_unlink(&temp_path, job_id).await;
                         heartbeat_cancel.cancel();
                         return;
                     }
                 }
 
-                // Attempt sink delivery.
+                // Publish: atomic rename temp -> final. Only after the
+                // lease-confirming 'delivering' update above, so a
+                // stale worker never publishes over the new owner's
+                // artifact. rename is atomic within the same
+                // filesystem; the exports_dir is a single dir so this
+                // holds.
+                if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
+                    let err_msg = format!("Failed to publish export artifact: {e}");
+                    error!(job_id = %job_id, error = %err_msg, "Export job failed");
+                    best_effort_unlink(&temp_path, job_id).await;
+                    let _ = update_or_abort(
+                        repo,
+                        job_id,
+                        "failed",
+                        Some(record_count as i32),
+                        Some(&result_location),
+                        Some(&err_msg),
+                        worker_id,
+                        None,
+                        prov_dv_id,
+                        prov_dv,
+                        prov_cs,
+                        prov_cc,
+                        prov_lri,
+                    )
+                    .await;
+                    heartbeat_cancel.cancel();
+                    return;
+                }
+
+                // Deliver to the sink from the already-streamed file.
+                // `deliver_from_file` avoids loading the full artifact
+                // into memory (fixes PR #238 [P2] sink-OOM concern):
+                // LocalFileSink does a streaming `io::copy`; WebhookSink
+                // uses `ReaderStream` for a streaming request body.
                 let sink_value = job.sink_config.as_ref().unwrap();
                 let delivery_result = match serde_json::from_value::<SinkConfig>(sink_value.clone())
                 {
@@ -290,7 +373,13 @@ async fn execute_export_job(
                                 dataset_version_id: _export_meta.dataset_version_id,
                                 completeness_status: _export_meta.completeness_status.clone(),
                             };
-                            match sink.deliver(&body, &delivery_meta).await {
+                            match sink
+                                .deliver_from_file(
+                                    std::path::Path::new(&final_path),
+                                    &delivery_meta,
+                                )
+                                .await
+                            {
                                 Ok(receipt) => Ok(receipt.destination),
                                 Err(e) => {
                                     warn!(job_id = %job_id, error = %e, "Sink delivery failed");
@@ -326,8 +415,6 @@ async fn execute_export_job(
                             destination = %destination,
                             "Export job completed with sink delivery"
                         );
-                        // Keep result_location as the on-disk file path for download.
-                        // The sink destination is stored in delivery_destination.
                         let _ = update_or_abort(
                             repo,
                             job_id,
@@ -366,14 +453,73 @@ async fn execute_export_job(
                     }
                 }
             } else {
-                // No sink — mark completed directly with the filesystem location.
+                // No sink. Mirror the sink path's lease-guarded publish:
+                // transition the row to `delivering` BEFORE the rename so
+                // a stale worker that has been reclaimed cannot overwrite
+                // the new owner's artifact. `update_or_abort` fails
+                // closed (Err) when `worker_id = $7 AND status IN
+                // ('running','delivering')` matches zero rows, i.e. the
+                // lease is no longer ours.
+                match update_or_abort(
+                    repo,
+                    job_id,
+                    "delivering",
+                    Some(record_count as i32),
+                    Some(&result_location),
+                    None,
+                    worker_id,
+                    None,
+                    prov_dv_id,
+                    prov_dv,
+                    prov_cs,
+                    prov_cc,
+                    prov_lri,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(()) => {
+                        best_effort_unlink(&temp_path, job_id).await;
+                        heartbeat_cancel.cancel();
+                        return;
+                    }
+                }
+
+                // Publish: atomic rename temp -> final. Only runs after
+                // the lease-confirming `delivering` update above, so a
+                // stale worker never publishes over the new owner's
+                // artifact.
+                if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
+                    let err_msg = format!("Failed to publish export artifact: {e}");
+                    error!(job_id = %job_id, error = %err_msg, "Export job failed");
+                    best_effort_unlink(&temp_path, job_id).await;
+                    let _ = update_or_abort(
+                        repo,
+                        job_id,
+                        "failed",
+                        Some(record_count as i32),
+                        Some(&result_location),
+                        Some(&err_msg),
+                        worker_id,
+                        None,
+                        prov_dv_id,
+                        prov_dv,
+                        prov_cs,
+                        prov_cc,
+                        prov_lri,
+                    )
+                    .await;
+                    heartbeat_cancel.cancel();
+                    return;
+                }
+
                 info!(
                     job_id = %job_id,
                     record_count,
                     result_location = %result_location,
                     "Export job completed"
                 );
-                let _ = update_or_abort(
+                match update_or_abort(
                     repo,
                     job_id,
                     "completed",
@@ -388,12 +534,31 @@ async fn execute_export_job(
                     prov_cc,
                     prov_lri,
                 )
-                .await;
+                .await
+                {
+                    Ok(()) => {}
+                    Err(()) => {
+                        // Lease was taken between the `delivering`
+                        // transition and the `completed` transition
+                        // (narrow window — our lease-holding update to
+                        // `delivering` just succeeded). Pull the
+                        // published artifact back so the new owner does
+                        // not serve our output via `/download`.
+                        warn!(
+                            job_id = %job_id,
+                            "Lease lost at final update — unpublishing artifact"
+                        );
+                        best_effort_unlink(&final_path, job_id).await;
+                    }
+                }
             }
         }
         Err(e) => {
             let err_msg = format!("Export failed: {e}");
             error!(job_id = %job_id, error = %err_msg, "Export job failed");
+            // Attempt-scoped temp path: nothing was ever published at
+            // final_path, so we only need to remove our temp.
+            best_effort_unlink(&temp_path, job_id).await;
             let _ = update_or_abort(
                 repo,
                 job_id,
