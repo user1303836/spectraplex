@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "b6560ecc8d46",
+  "strategy": "manual-commit",
+  "branch": "fix/rustsec-2026-0097-rand",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "adapters/src/hl_analytics.rs",
+    "adapters/src/ledger_derivation.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/b6/560ecc8d46/0/metadata.json",
+      "transcript": "/b6/560ecc8d46/0/full.jsonl",
+      "context": "/b6/560ecc8d46/0/context.md",
+      "content_hash": "/b6/560ecc8d46/0/content_hash.txt",
+      "prompt": "/b6/560ecc8d46/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 3,
+    "cache_creation_tokens": 1536,
+    "cache_read_tokens": 457353,
+    "output_tokens": 667,
+    "api_call_count": 3
+  }
+}
