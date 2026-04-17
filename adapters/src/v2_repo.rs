@@ -1259,17 +1259,28 @@ where
             .map(&row_fn)
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        // A second cancel check immediately before the blocking send so
-        // a lost lease can't push one more page to the consumer.
-        if cancel.is_cancelled() {
-            anyhow::bail!("export snapshot cancelled (lease lost or worker shutdown)");
-        }
-
-        if tx_out.send(batch_fn(records)).await.is_err() {
-            // Consumer dropped the receiver — treat as cancellation so
-            // we short-circuit the remaining pages and roll back the
-            // snapshot transaction.
-            anyhow::bail!("export consumer dropped the record-batch channel");
+        // The send itself must be cancellation-aware: the channel has
+        // bounded capacity (PAGE_CHANNEL_CAPACITY), so if the disk
+        // writer errors or the lease is lost while the channel is
+        // full, a plain `.await` on `send` would block forever (the
+        // consumer is no longer polling `recv`, and only a receiver
+        // drop wakes a blocked send). Racing it against `cancelled()`
+        // lets the producer exit promptly and roll back the snapshot
+        // transaction.
+        let batch = batch_fn(records);
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                anyhow::bail!("export snapshot cancelled (lease lost or worker shutdown)");
+            }
+            res = tx_out.send(batch) => {
+                if res.is_err() {
+                    // Consumer dropped the receiver — treat as cancellation
+                    // so we short-circuit the remaining pages and roll back
+                    // the snapshot transaction.
+                    anyhow::bail!("export consumer dropped the record-batch channel");
+                }
+            }
         }
 
         total += n;

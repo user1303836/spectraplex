@@ -453,15 +453,42 @@ async fn execute_export_job(
                     }
                 }
             } else {
-                // No sink. Publish + mark completed.
-                //
-                // Order: we do the rename first (best-effort) and then
-                // update the job row. If the update fails because our
-                // lease was lost in this narrow window, the
-                // `update_or_abort(Err(()))` branch below unlinks the
-                // just-published final_path so a reclaiming worker
-                // does not hand out our artifact via `/download`. This
-                // mirrors the pre-publish lease check above.
+                // No sink. Mirror the sink path's lease-guarded publish:
+                // transition the row to `delivering` BEFORE the rename so
+                // a stale worker that has been reclaimed cannot overwrite
+                // the new owner's artifact. `update_or_abort` fails
+                // closed (Err) when `worker_id = $7 AND status IN
+                // ('running','delivering')` matches zero rows, i.e. the
+                // lease is no longer ours.
+                match update_or_abort(
+                    repo,
+                    job_id,
+                    "delivering",
+                    Some(record_count as i32),
+                    Some(&result_location),
+                    None,
+                    worker_id,
+                    None,
+                    prov_dv_id,
+                    prov_dv,
+                    prov_cs,
+                    prov_cc,
+                    prov_lri,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(()) => {
+                        best_effort_unlink(&temp_path, job_id).await;
+                        heartbeat_cancel.cancel();
+                        return;
+                    }
+                }
+
+                // Publish: atomic rename temp -> final. Only runs after
+                // the lease-confirming `delivering` update above, so a
+                // stale worker never publishes over the new owner's
+                // artifact.
                 if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
                     let err_msg = format!("Failed to publish export artifact: {e}");
                     error!(job_id = %job_id, error = %err_msg, "Export job failed");
@@ -470,16 +497,16 @@ async fn execute_export_job(
                         repo,
                         job_id,
                         "failed",
-                        None,
-                        None,
+                        Some(record_count as i32),
+                        Some(&result_location),
                         Some(&err_msg),
                         worker_id,
                         None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
+                        prov_dv_id,
+                        prov_dv,
+                        prov_cs,
+                        prov_cc,
+                        prov_lri,
                     )
                     .await;
                     heartbeat_cancel.cancel();
@@ -511,9 +538,12 @@ async fn execute_export_job(
                 {
                     Ok(()) => {}
                     Err(()) => {
-                        // Lease was taken between rename and update. Pull
-                        // the published artifact back so the new owner
-                        // does not see our output.
+                        // Lease was taken between the `delivering`
+                        // transition and the `completed` transition
+                        // (narrow window — our lease-holding update to
+                        // `delivering` just succeeded). Pull the
+                        // published artifact back so the new owner does
+                        // not serve our output via `/download`.
                         warn!(
                             job_id = %job_id,
                             "Lease lost at final update — unpublishing artifact"
