@@ -907,7 +907,7 @@ pub fn build_forensics_activity(
             networks: agg.networks.into_iter().collect(),
         })
         .collect();
-    top_counterparties.sort_by(|a, b| b.interaction_count.cmp(&a.interaction_count));
+    top_counterparties.sort_by_key(|c| std::cmp::Reverse(c.interaction_count));
     top_counterparties.truncate(20);
 
     // Network activity
