@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "18de172da459",
+  "session_id": "bb448316-8b58-4115-84db-f8459c9ac37a",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-17T16:35:41.709035Z",
+  "branch": "fix/208-streaming-exports",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "adapters/src/v2_repo.rs",
+    "api/src/export_worker.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "5703bf17753b",
+  "token_usage": {
+    "input_tokens": 84,
+    "cache_creation_tokens": 178264,
+    "cache_read_tokens": 7340869,
+    "output_tokens": 25165,
+    "api_call_count": 69
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-17T16:35:41.484448Z",
+    "agent_lines": 71,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 71,
+    "agent_percentage": 100
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/bb448316-8b58-4115-84db-f8459c9ac37a.jsonl"
+}

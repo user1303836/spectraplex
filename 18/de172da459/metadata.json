@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "18de172da459",
+  "strategy": "manual-commit",
+  "branch": "fix/208-streaming-exports",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "adapters/src/v2_repo.rs",
+    "api/src/export_worker.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/18/de172da459/0/metadata.json",
+      "transcript": "/18/de172da459/0/full.jsonl",
+      "context": "/18/de172da459/0/context.md",
+      "content_hash": "/18/de172da459/0/content_hash.txt",
+      "prompt": "/18/de172da459/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 84,
+    "cache_creation_tokens": 178264,
+    "cache_read_tokens": 7340869,
+    "output_tokens": 25165,
+    "api_call_count": 69
+  }
+}
