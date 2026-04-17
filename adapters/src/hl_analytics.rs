@@ -247,7 +247,7 @@ pub fn build_trade_history(
         }
     }
 
-    trades.sort_by(|a, b| a.closed_at.cmp(&b.closed_at));
+    trades.sort_by_key(|t| t.closed_at);
     trades
 }
 
