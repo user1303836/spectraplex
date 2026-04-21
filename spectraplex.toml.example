@@ -20,6 +20,15 @@ solana_rpc_url = "https://api.mainnet-beta.solana.com"
 # evm_trace_rpc_url = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
 
 # ---------------------------------------------------------------------------
+# Callback signing
+# ---------------------------------------------------------------------------
+# When set, callback URL payloads (e.g. ingestion and materialization
+# job callbacks) are signed with HMAC-SHA256 and delivered with an
+# X-Spectraplex-Signature header (sha256=<hex>).
+#
+# callback_hmac_secret = "your-secret-key"
+
+# ---------------------------------------------------------------------------
 # Structured network and provider configuration (V2, recommended)
 # ---------------------------------------------------------------------------
 # Enable the networks you want to index. Each network needs at least one
@@ -116,12 +125,3 @@ solana_rpc_url = "https://api.mainnet-beta.solana.com"
 # url = "wss://api.hyperliquid.xyz/ws"
 # priority = 1
 # capabilities = ["stream"]
-
-# ---------------------------------------------------------------------------
-# Callback signing
-# ---------------------------------------------------------------------------
-# When set, callback URL payloads (e.g. ingestion and materialization
-# job callbacks) are signed with HMAC-SHA256 and delivered with an
-# X-Spectraplex-Signature header (sha256=<hex>).
-#
-# callback_hmac_secret = "your-secret-key"
