@@ -331,7 +331,7 @@ pub(crate) async fn execute_normalize(
 
     if let Some(run_id) = ingestion_run_id {
         // Bronze-driven: fetch raw_transactions for this specific ingestion run
-        // and convert V2 RawTransaction -> V1 Transaction for existing parsers.
+        // and materialize Silver datasets directly via Bronze-native path.
         //
         // Safety: validate that the ingestion_run exists and its target address
         // matches the caller-supplied wallet. Fail-closed: if any lookup fails

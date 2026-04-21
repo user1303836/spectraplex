@@ -535,15 +535,14 @@ struct BatchIngestRequest {
 #[derive(Deserialize)]
 struct NormalizeRequest {
     wallet: String,
-    /// Optional V2 network identifier (e.g. `"base-mainnet"`).  When provided,
-    /// overrides the chain-derived default during Silver materialization.  When
-    /// omitted, the normalize path resolves the actual network from existing
-    /// Bronze `raw_transactions` rows.
+    /// Optional V2 network identifier (e.g. `"base-mainnet"`).
+    /// No longer used by the worker; network is resolved from the
+    /// Bronze `raw_transactions` rows associated with the ingestion run.
     network: Option<String>,
     callback_url: Option<String>,
-    /// Optional ingestion run ID. When provided, the materialize worker uses
+    /// Required ingestion run ID. The materialize worker uses
     /// Bronze-range-driven execution — fetching raw_transactions for that
-    /// specific run instead of the legacy wallet-scoped V1 scan.
+    /// specific run. Without this, normalize will fail.
     ingestion_run_id: Option<Uuid>,
 }
 
@@ -1521,6 +1520,9 @@ async fn trigger_normalize(
 ) -> Result<Json<JobStatus>, AppError> {
     validate_wallet(&payload.wallet)?;
     check_wallet_allowed(&payload.wallet, &state.allowed_wallets)?;
+    let ingestion_run_id = payload.ingestion_run_id.ok_or_else(|| {
+        AppError::bad_request("ingestion_run_id is required; enqueue a materialization run from an ingestion job or stream flush")
+    })?;
     if let Some(ref url) = payload.callback_url {
         validate_callback_url(url).await?;
     }
@@ -1531,7 +1533,7 @@ async fn trigger_normalize(
         "wallet": &payload.wallet,
         "network": payload.network,
         "callback_url": payload.callback_url,
-        "ingestion_run_id": payload.ingestion_run_id,
+        "ingestion_run_id": ingestion_run_id,
     });
 
     // Enqueue only — the background materialize_worker will claim and execute.
@@ -3806,7 +3808,8 @@ mod tests {
             .header("authorization", "Bearer secret")
             .body(Body::from(
                 serde_json::to_string(&serde_json::json!({
-                    "wallet": "abc123"
+                    "wallet": "abc123",
+                    "ingestion_run_id": "550e8400-e29b-41d4-a716-446655440000"
                 }))
                 .unwrap(),
             ))
@@ -4457,7 +4460,8 @@ mod tests {
             .body(Body::from(
                 serde_json::to_string(&serde_json::json!({
                     "wallet": "abc123",
-                    "callback_url": "https://example.com/webhook"
+                    "callback_url": "https://example.com/webhook",
+                    "ingestion_run_id": "550e8400-e29b-41d4-a716-446655440000"
                 }))
                 .unwrap(),
             ))
