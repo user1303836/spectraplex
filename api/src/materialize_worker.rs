@@ -9,8 +9,7 @@ use std::time::Duration;
 
 use crate::fire_callback;
 use spectraplex_adapters::dual_write::BronzeSilverResult;
-use spectraplex_adapters::{evm_parser, hyperliquid_parser, repo::Repository, solana_parser};
-use spectraplex_core::models::Chain;
+use spectraplex_adapters::repo::Repository;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -88,7 +87,7 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
         info!(run_id = %run.id, worker_id = %worker_id, "Claimed materialization run");
 
         // Extract wallet, network, callback_url, and optional ingestion_run_id from scope JSON.
-        let (wallet, network, callback_url, ingestion_run_id) = match &run.scope {
+        let (wallet, _network, callback_url, ingestion_run_id) = match &run.scope {
             Some(scope) => {
                 let w = scope
                     .get("wallet")
@@ -168,7 +167,6 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
             let result = execute_normalize(
                 &task_repo,
                 &wallet,
-                network.as_deref(),
                 ingestion_run_id,
                 &lease_lost,
             )
@@ -314,19 +312,17 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
 
 /// Core normalize logic used by the background worker.
 ///
-/// Accepts a `lease_lost` token that is checked before each side-effecting
-/// operation (`save_ledger_entries`, `materialize_silver_datasets`). If the
-/// lease has been reclaimed by another worker while we were parsing, we bail
-/// early instead of producing duplicate writes.
+/// Accepts a `lease_lost` token that is checked before the Bronze-native
+/// Silver materialization side effect. If the lease has been reclaimed by
+/// another worker, we bail early instead of producing duplicate writes.
 ///
 /// NOTE: There is a narrow window between the pre-save lease check and the
-/// actual `save_ledger_entries` call where the lease could be lost. Making
-/// `save_ledger_entries` cancellation-aware would be needed to fully close
-/// this gap; we accept this as a known limitation and check again after save.
+/// actual `materialize_silver_from_bronze` call where the lease could be lost.
+/// Making `materialize_silver_from_bronze` cancellation-aware would be needed
+/// to fully close this gap; we accept this as a known limitation.
 pub(crate) async fn execute_normalize(
     repo: &Repository,
     wallet: &str,
-    network: Option<&str>,
     ingestion_run_id: Option<Uuid>,
     lease_lost: &CancellationToken,
 ) -> anyhow::Result<BronzeSilverResult> {
@@ -418,48 +414,7 @@ pub(crate) async fn execute_normalize(
         return Ok(silver_result);
     }
 
-    // Legacy fallback: wallet-scoped V1 scan (no ingestion_run_id).
-    let txs = repo.get_transactions_by_wallet(wallet).await?;
-
-    let mut all_entries = Vec::new();
-    for tx in &txs {
-        let result = match tx.chain {
-            Chain::Solana => solana_parser::parse_solana_transaction(tx),
-            Chain::Hyperliquid => hyperliquid_parser::parse_hyperliquid_transaction(tx),
-            Chain::Ethereum => evm_parser::parse_evm_transaction(tx),
-        };
-        match result {
-            Ok(entries) => all_entries.extend(entries),
-            Err(e) => {
-                error!(tx_hash = %tx.tx_hash, error = %e, "Skipping unparseable transaction");
-            }
-        }
-    }
-
-    if lease_lost.is_cancelled() {
-        anyhow::bail!("lease lost before persisting side effects");
-    }
-
-    let count = all_entries.len();
-    repo.save_ledger_entries(&all_entries).await?;
-
-    if lease_lost.is_cancelled() {
-        anyhow::bail!("lease lost before Silver materialization");
-    }
-
-    let silver_result = repo.materialize_silver_datasets(&txs, network).await;
-    if !silver_result.all_succeeded() {
-        warn!(
-            written = silver_result.total_written(),
-            failed = silver_result.total_failed(),
-            skipped = silver_result.skipped_ambiguous,
-            "Silver materialization completed with partial failures"
-        );
-    }
-    Ok(BronzeSilverResult {
-        total_written: count,
-        ..Default::default()
-    })
+    anyhow::bail!("normalize requires an ingestion_run_id; enqueue a materialization run from an ingestion job or stream flush")
 }
 
 /// Chain-aware address comparison: case-insensitive for EVM (0x-prefixed),
