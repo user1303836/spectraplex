@@ -1992,7 +1992,8 @@ impl Repository {
 
         // --- balance_history: seed from DB, then apply incrementally ---
         {
-            let mut balance_events: Vec<(String, String, i64, String, BigDecimal)> = Vec::new();
+            let mut balance_events: Vec<(String, String, i64, String, BigDecimal, Uuid)> =
+                Vec::new();
 
             for transfer in token_transfers {
                 let from_match =
@@ -2018,7 +2019,14 @@ impl Repository {
                 } else {
                     transfer.amount.clone()
                 };
-                balance_events.push((transfer.network.clone(), asset, timestamp, tx_hash, delta));
+                balance_events.push((
+                    transfer.network.clone(),
+                    asset,
+                    timestamp,
+                    tx_hash,
+                    delta,
+                    transfer.id,
+                ));
             }
 
             for delta in native_deltas {
@@ -2035,17 +2043,19 @@ impl Repository {
                     timestamp,
                     tx_hash,
                     delta.delta.clone(),
+                    delta.id,
                 ));
             }
 
             if !balance_events.is_empty() {
                 // Collect unique networks to seed balances per network.
                 let mut networks: HashSet<String> = HashSet::new();
-                for (net, _, _, _, _) in &balance_events {
+                for (net, _, _, _, _, _) in &balance_events {
                     networks.insert(net.clone());
                 }
 
                 let mut running_balances: HashMap<(String, String), BigDecimal> = HashMap::new();
+                let mut latest_ts: HashMap<(String, String), i64> = HashMap::new();
                 for network in &networks {
                     match self
                         .get_latest_balance_snapshots(wallet_address, network)
@@ -2053,18 +2063,18 @@ impl Repository {
                     {
                         Ok(snapshots) => {
                             for snap in snapshots {
-                                running_balances.insert(
-                                    (snap.network.clone(), snap.asset_symbol.clone()),
-                                    snap.balance,
-                                );
+                                let key = (snap.network.clone(), snap.asset_symbol.clone());
+                                running_balances.insert(key.clone(), snap.balance);
+                                latest_ts.insert(key, snap.timestamp);
                             }
                         }
                         Err(e) => {
                             warn!(
                                 error = %e,
                                 network = %network,
-                                "Failed to query latest balance snapshots — seeding from zero"
+                                "Failed to query latest balance snapshots — skipping balance_history for this network"
                             );
+                            balance_events.retain(|(net, _, _, _, _, _)| net != network);
                         }
                     }
                 }
@@ -2077,15 +2087,24 @@ impl Repository {
                 });
 
                 let mut snapshots: Vec<BalanceSnapshot> = Vec::new();
-                for (network, asset, timestamp, tx_hash, delta) in balance_events {
+                for (network, asset, timestamp, tx_hash, delta, source_id) in balance_events {
+                    // Skip events already represented in the DB to avoid double-counting.
+                    if let Some(&ts) = latest_ts.get(&(network.clone(), asset.clone())) {
+                        if timestamp <= ts {
+                            continue;
+                        }
+                    }
+
                     let key = (network.clone(), asset.clone());
                     let balance = running_balances
                         .entry(key)
                         .or_insert_with(|| BigDecimal::from(0));
                     *balance += &delta;
 
-                    let id_key =
-                        format!("bh:{}:{}:{}:{}", wallet_address, asset, timestamp, tx_hash);
+                    let id_key = format!(
+                        "bh:{}:{}:{}:{}:{}",
+                        wallet_address, asset, timestamp, tx_hash, source_id
+                    );
                     snapshots.push(BalanceSnapshot {
                         id: Uuid::new_v5(&Uuid::NAMESPACE_URL, id_key.as_bytes()),
                         wallet_address: wallet_address.to_string(),

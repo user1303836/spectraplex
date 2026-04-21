@@ -3468,7 +3468,7 @@ impl Repository {
              dataset_version_id, created_at \
              FROM balance_history \
              WHERE wallet_address = $1 AND network = $2 \
-             ORDER BY wallet_address, asset_symbol, network, timestamp DESC",
+             ORDER BY wallet_address, asset_symbol, network, timestamp DESC, created_at DESC, id DESC",
         )
         .bind(wallet_address)
         .bind(network)
