@@ -9,8 +9,8 @@
 use bigdecimal::BigDecimal;
 use chrono::Utc;
 use spectraplex_core::materializer::{
-    DatasetName, DatasetRegistry, HlFillRecord, HlFundingPayment, NativeBalanceDelta,
-    TokenTransfer, WalletLedgerRecord,
+    BalanceSnapshot, DatasetName, DatasetRegistry, DecodedEvent, HlFillRecord, HlFundingPayment,
+    NativeBalanceDelta, PoolSnapshot, TokenTransfer, WalletLedgerRecord,
 };
 use spectraplex_core::models::{Chain, IndexerCheckpoint, Transaction};
 use spectraplex_core::v2::{
@@ -40,6 +40,14 @@ pub struct BronzeSilverResult {
     pub gold_wallet_ledger_written: usize,
     /// Gold balance_history records successfully written.
     pub gold_balance_history_written: usize,
+    /// Gold hl_pnl_summary records successfully written.
+    pub gold_hl_pnl_summary_written: usize,
+    /// Gold hl_trade_history records successfully written.
+    pub gold_hl_trade_history_written: usize,
+    /// Gold protocol_events records successfully written.
+    pub gold_protocol_events_written: usize,
+    /// Gold pool_snapshots records successfully written.
+    pub gold_pool_snapshots_written: usize,
 }
 
 impl BronzeSilverResult {
@@ -55,6 +63,14 @@ pub struct GoldMaterializationResult {
     pub wallet_ledger_failed: usize,
     pub balance_history_written: usize,
     pub balance_history_failed: usize,
+    pub hl_pnl_summary_written: usize,
+    pub hl_pnl_summary_failed: usize,
+    pub hl_trade_history_written: usize,
+    pub hl_trade_history_failed: usize,
+    pub protocol_events_written: usize,
+    pub protocol_events_failed: usize,
+    pub pool_snapshots_written: usize,
+    pub pool_snapshots_failed: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -1502,16 +1518,25 @@ impl Repository {
                         wallet,
                         &all_token_transfers,
                         &all_native_balance_deltas,
+                        &all_decoded_events,
                         &all_hl_fills,
                         &all_hl_funding,
                     )
                     .await;
                 result.gold_wallet_ledger_written = gold_result.wallet_ledger_written;
                 result.gold_balance_history_written = gold_result.balance_history_written;
+                result.gold_hl_pnl_summary_written = gold_result.hl_pnl_summary_written;
+                result.gold_hl_trade_history_written = gold_result.hl_trade_history_written;
+                result.gold_protocol_events_written = gold_result.protocol_events_written;
+                result.gold_pool_snapshots_written = gold_result.pool_snapshots_written;
 
                 info!(
                     wallet_ledger = gold_result.wallet_ledger_written,
                     balance_history = gold_result.balance_history_written,
+                    hl_pnl_summary = gold_result.hl_pnl_summary_written,
+                    hl_trade_history = gold_result.hl_trade_history_written,
+                    protocol_events = gold_result.protocol_events_written,
+                    pool_snapshots = gold_result.pool_snapshots_written,
                     "Gold materialization from Silver complete"
                 );
             }
@@ -1692,16 +1717,19 @@ impl Repository {
         versions
     }
 
-    /// Derive Gold records (wallet_ledger, balance_history) from Silver data.
+    /// Derive Gold records (wallet_ledger, balance_history, hl_pnl_summary,
+    /// hl_trade_history, protocol_events, pool_snapshots) from Silver data.
     ///
     /// Called after Silver records have been written. Produces wallet-scoped
     /// Gold records using deterministic UUIDs for idempotency.
+    #[allow(clippy::too_many_arguments)]
     pub async fn materialize_gold_from_silver(
         &self,
         raw_txs: &[RawTransaction],
         wallet_address: &str,
         token_transfers: &[TokenTransfer],
         native_deltas: &[NativeBalanceDelta],
+        decoded_events: &[DecodedEvent],
         hl_fills: &[HlFillRecord],
         hl_funding: &[HlFundingPayment],
     ) -> GoldMaterializationResult {
@@ -1715,7 +1743,21 @@ impl Repository {
         let wl_version_id = gold_versions
             .get(DatasetName::WalletLedger.as_sql_str())
             .copied();
-        // NOTE: bh_version_id unused — balance_history skipped in this PR (see below).
+        let bh_version_id = gold_versions
+            .get(DatasetName::BalanceHistory.as_sql_str())
+            .copied();
+        let hl_pnl_version_id = gold_versions
+            .get(DatasetName::HlPnlSummary.as_sql_str())
+            .copied();
+        let hl_trade_version_id = gold_versions
+            .get(DatasetName::HlTradeHistory.as_sql_str())
+            .copied();
+        let protocol_events_version_id = gold_versions
+            .get(DatasetName::ProtocolEvents.as_sql_str())
+            .copied();
+        let pool_snapshots_version_id = gold_versions
+            .get(DatasetName::PoolSnapshots.as_sql_str())
+            .copied();
 
         // Build lookup map: raw_transaction_id -> &RawTransaction
         let raw_tx_map: HashMap<Uuid, &RawTransaction> =
@@ -1948,12 +1990,253 @@ impl Repository {
             }
         }
 
-        // TODO: balance_history requires seeding running_balances from the DB's
-        // last known balance per (wallet, asset, network) before computing
-        // incremental snapshots.  Without that seed the running totals restart
-        // from zero on every ingestion batch, producing incorrect data.
-        // Skipping balance_history generation in this PR — will be added in a
-        // follow-up PR that reads the latest snapshot from the DB first.
+        // --- balance_history: seed from DB, then apply incrementally ---
+        {
+            let mut balance_events: Vec<(String, String, i64, String, BigDecimal)> = Vec::new();
+
+            for transfer in token_transfers {
+                let from_match =
+                    normalize_address_for_comparison(&transfer.from_address) == wallet_norm;
+                let to_match =
+                    normalize_address_for_comparison(&transfer.to_address) == wallet_norm;
+                if !from_match && !to_match {
+                    continue;
+                }
+                let raw_tx_id = transfer.raw_transaction_id;
+                let raw_tx = raw_tx_id.and_then(|id| raw_tx_map.get(&id));
+                let tx_hash = raw_tx.map(|r| r.tx_hash.clone()).unwrap_or_default();
+                let timestamp = raw_tx.map(|r| r.timestamp).unwrap_or(0);
+                let asset = transfer
+                    .token_symbol
+                    .clone()
+                    .unwrap_or_else(|| transfer.token_address.clone());
+                let delta = if from_match && to_match {
+                    // Self-transfer: net zero for the wallet's own balance
+                    BigDecimal::from(0)
+                } else if from_match {
+                    -transfer.amount.clone()
+                } else {
+                    transfer.amount.clone()
+                };
+                balance_events.push((transfer.network.clone(), asset, timestamp, tx_hash, delta));
+            }
+
+            for delta in native_deltas {
+                if normalize_address_for_comparison(&delta.account_address) != wallet_norm {
+                    continue;
+                }
+                let raw_tx_id = delta.raw_transaction_id;
+                let raw_tx = raw_tx_id.and_then(|id| raw_tx_map.get(&id));
+                let tx_hash = raw_tx.map(|r| r.tx_hash.clone()).unwrap_or_default();
+                let timestamp = raw_tx.map(|r| r.timestamp).unwrap_or(0);
+                balance_events.push((
+                    delta.network.clone(),
+                    delta.native_token.clone(),
+                    timestamp,
+                    tx_hash,
+                    delta.delta.clone(),
+                ));
+            }
+
+            if !balance_events.is_empty() {
+                // Collect unique networks to seed balances per network.
+                let mut networks: HashSet<String> = HashSet::new();
+                for (net, _, _, _, _) in &balance_events {
+                    networks.insert(net.clone());
+                }
+
+                let mut running_balances: HashMap<(String, String), BigDecimal> = HashMap::new();
+                for network in &networks {
+                    match self
+                        .get_latest_balance_snapshots(wallet_address, network)
+                        .await
+                    {
+                        Ok(snapshots) => {
+                            for snap in snapshots {
+                                running_balances.insert(
+                                    (snap.network.clone(), snap.asset_symbol.clone()),
+                                    snap.balance,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                network = %network,
+                                "Failed to query latest balance snapshots — seeding from zero"
+                            );
+                        }
+                    }
+                }
+
+                // Sort by (network, asset, timestamp) for deterministic application.
+                balance_events.sort_by(|a, b| {
+                    a.0.cmp(&b.0)
+                        .then_with(|| a.1.cmp(&b.1))
+                        .then_with(|| a.2.cmp(&b.2))
+                });
+
+                let mut snapshots: Vec<BalanceSnapshot> = Vec::new();
+                for (network, asset, timestamp, tx_hash, delta) in balance_events {
+                    let key = (network.clone(), asset.clone());
+                    let balance = running_balances
+                        .entry(key)
+                        .or_insert_with(|| BigDecimal::from(0));
+                    *balance += &delta;
+
+                    let id_key =
+                        format!("bh:{}:{}:{}:{}", wallet_address, asset, timestamp, tx_hash);
+                    snapshots.push(BalanceSnapshot {
+                        id: Uuid::new_v5(&Uuid::NAMESPACE_URL, id_key.as_bytes()),
+                        wallet_address: wallet_address.to_string(),
+                        asset_symbol: asset,
+                        network,
+                        timestamp,
+                        balance: balance.clone(),
+                        tx_hash,
+                        dataset_version_id: bh_version_id,
+                        created_at: now,
+                    });
+                }
+
+                if !snapshots.is_empty() {
+                    let n = snapshots.len();
+                    match self.save_balance_snapshots(&snapshots).await {
+                        Ok(()) => {
+                            result.balance_history_written = n;
+                            info!(count = n, "Gold: balance_history records written");
+                        }
+                        Err(e) => {
+                            result.balance_history_failed = n;
+                            warn!(error = %e, count = n, "Gold: balance_history write failed");
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- HL PnL summary ---
+        if !hl_fills.is_empty() || !hl_funding.is_empty() {
+            let network = hl_fills
+                .first()
+                .map(|f| f.network.as_str())
+                .or_else(|| hl_funding.first().map(|f| f.network.as_str()))
+                .unwrap_or("hyperliquid");
+            let period_start = raw_txs.iter().map(|r| r.timestamp).min().unwrap_or(0);
+            let period_end = raw_txs.iter().map(|r| r.timestamp).max().unwrap_or(0);
+            let mut summaries = crate::hl_analytics::compute_pnl_summary(
+                wallet_address,
+                network,
+                hl_fills,
+                hl_funding,
+                period_start,
+                period_end,
+            );
+            for s in &mut summaries {
+                s.dataset_version_id = hl_pnl_version_id;
+            }
+            if !summaries.is_empty() {
+                let n = summaries.len();
+                match self.save_hl_pnl_summary(&summaries).await {
+                    Ok(()) => {
+                        result.hl_pnl_summary_written = n;
+                        info!(count = n, "Gold: hl_pnl_summary records written");
+                    }
+                    Err(e) => {
+                        result.hl_pnl_summary_failed = n;
+                        warn!(error = %e, count = n, "Gold: hl_pnl_summary write failed");
+                    }
+                }
+            }
+        }
+
+        // --- HL trade history ---
+        if !hl_fills.is_empty() {
+            let network = hl_fills
+                .first()
+                .map(|f| f.network.as_str())
+                .unwrap_or("hyperliquid");
+            let mut trades =
+                crate::hl_analytics::build_trade_history(wallet_address, network, hl_fills);
+            for t in &mut trades {
+                t.dataset_version_id = hl_trade_version_id;
+            }
+            if !trades.is_empty() {
+                let n = trades.len();
+                match self.save_hl_trade_history(&trades).await {
+                    Ok(()) => {
+                        result.hl_trade_history_written = n;
+                        info!(count = n, "Gold: hl_trade_history records written");
+                    }
+                    Err(e) => {
+                        result.hl_trade_history_failed = n;
+                        warn!(error = %e, count = n, "Gold: hl_trade_history write failed");
+                    }
+                }
+            }
+        }
+
+        // --- Protocol events ---
+        if !decoded_events.is_empty() {
+            let mut events =
+                crate::protocol_analytics::compute_protocol_events(decoded_events, None);
+            for e in &mut events {
+                e.dataset_version_id = protocol_events_version_id;
+            }
+            if !events.is_empty() {
+                let n = events.len();
+                match self.save_protocol_events(&events).await {
+                    Ok(()) => {
+                        result.protocol_events_written = n;
+                        info!(count = n, "Gold: protocol_events records written");
+                    }
+                    Err(e) => {
+                        result.protocol_events_failed = n;
+                        warn!(error = %e, count = n, "Gold: protocol_events write failed");
+                    }
+                }
+            }
+        }
+
+        // --- Pool snapshots ---
+        if !decoded_events.is_empty() {
+            let mut unique_programs: HashSet<String> = HashSet::new();
+            for de in decoded_events {
+                unique_programs.insert(de.program_or_contract.clone());
+            }
+            let mut all_snapshots: Vec<PoolSnapshot> = Vec::new();
+            for pool_address in unique_programs {
+                let pool_events: Vec<DecodedEvent> = decoded_events
+                    .iter()
+                    .filter(|de| de.program_or_contract == pool_address)
+                    .cloned()
+                    .collect();
+                let mut snapshots = crate::protocol_analytics::compute_pool_snapshots(
+                    &pool_events,
+                    token_transfers,
+                    &pool_address,
+                    ("", None),
+                    ("", None),
+                );
+                for s in &mut snapshots {
+                    s.dataset_version_id = pool_snapshots_version_id;
+                }
+                all_snapshots.extend(snapshots);
+            }
+            if !all_snapshots.is_empty() {
+                let n = all_snapshots.len();
+                match self.save_pool_snapshots(&all_snapshots).await {
+                    Ok(()) => {
+                        result.pool_snapshots_written = n;
+                        info!(count = n, "Gold: pool_snapshots records written");
+                    }
+                    Err(e) => {
+                        result.pool_snapshots_failed = n;
+                        warn!(error = %e, count = n, "Gold: pool_snapshots write failed");
+                    }
+                }
+            }
+        }
 
         result
     }

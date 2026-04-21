@@ -3328,6 +3328,156 @@ impl Repository {
     }
 
     // -----------------------------------------------------------------------
+    // Gold-tier save methods (P5-W4)
+    // -----------------------------------------------------------------------
+
+    /// Bulk insert HL PnL summary records.
+    pub async fn save_hl_pnl_summary(&self, records: &[HlPnlSummary]) -> anyhow::Result<()> {
+        for chunk in records.chunks(500) {
+            let mut query_builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+                "INSERT INTO hl_pnl_summary (id, wallet_address, coin, network, period_start, \
+                 period_end, total_closed_pnl, total_funding, total_fees, net_pnl, trade_count, \
+                 fill_count, avg_trade_size, win_count, loss_count, dataset_version_id, created_at) ",
+            );
+            query_builder.push_values(chunk, |mut b, r| {
+                b.push_bind(r.id)
+                    .push_bind(&r.wallet_address)
+                    .push_bind(&r.coin)
+                    .push_bind(&r.network)
+                    .push_bind(r.period_start)
+                    .push_bind(r.period_end)
+                    .push_bind(&r.total_closed_pnl)
+                    .push_bind(&r.total_funding)
+                    .push_bind(&r.total_fees)
+                    .push_bind(&r.net_pnl)
+                    .push_bind(r.trade_count)
+                    .push_bind(r.fill_count)
+                    .push_bind(&r.avg_trade_size)
+                    .push_bind(r.win_count)
+                    .push_bind(r.loss_count)
+                    .push_bind(r.dataset_version_id)
+                    .push_bind(r.created_at);
+            });
+            query_builder.push(" ON CONFLICT (id) DO NOTHING");
+            query_builder.build().execute(self.pool()).await?;
+        }
+        Ok(())
+    }
+
+    /// Bulk insert HL trade history records.
+    pub async fn save_hl_trade_history(&self, records: &[HlTradeHistory]) -> anyhow::Result<()> {
+        for chunk in records.chunks(500) {
+            let mut query_builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+                "INSERT INTO hl_trade_history (id, wallet_address, coin, network, side, \
+                 entry_price, exit_price, size, opened_at, closed_at, realized_pnl, fees, \
+                 num_fills, dataset_version_id, created_at) ",
+            );
+            query_builder.push_values(chunk, |mut b, r| {
+                b.push_bind(r.id)
+                    .push_bind(&r.wallet_address)
+                    .push_bind(&r.coin)
+                    .push_bind(&r.network)
+                    .push_bind(&r.side)
+                    .push_bind(&r.entry_price)
+                    .push_bind(&r.exit_price)
+                    .push_bind(&r.size)
+                    .push_bind(r.opened_at)
+                    .push_bind(r.closed_at)
+                    .push_bind(&r.realized_pnl)
+                    .push_bind(&r.fees)
+                    .push_bind(r.num_fills)
+                    .push_bind(r.dataset_version_id)
+                    .push_bind(r.created_at);
+            });
+            query_builder.push(" ON CONFLICT (id) DO NOTHING");
+            query_builder.build().execute(self.pool()).await?;
+        }
+        Ok(())
+    }
+
+    /// Bulk insert protocol event records.
+    pub async fn save_protocol_events(&self, records: &[ProtocolEvent]) -> anyhow::Result<()> {
+        for chunk in records.chunks(500) {
+            let mut query_builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+                "INSERT INTO protocol_events (id, network, protocol_address, protocol_name, \
+                 event_type, event_details, pool_address, raw_event_id, timestamp, \
+                 dataset_version_id, created_at) ",
+            );
+            query_builder.push_values(chunk, |mut b, r| {
+                b.push_bind(r.id)
+                    .push_bind(&r.network)
+                    .push_bind(&r.protocol_address)
+                    .push_bind(&r.protocol_name)
+                    .push_bind(&r.event_type)
+                    .push_bind(&r.event_details)
+                    .push_bind(&r.pool_address)
+                    .push_bind(r.raw_event_id)
+                    .push_bind(r.timestamp)
+                    .push_bind(r.dataset_version_id)
+                    .push_bind(r.created_at);
+            });
+            query_builder.push(" ON CONFLICT (id) DO NOTHING");
+            query_builder.build().execute(self.pool()).await?;
+        }
+        Ok(())
+    }
+
+    /// Bulk insert pool snapshot records.
+    pub async fn save_pool_snapshots(&self, records: &[PoolSnapshot]) -> anyhow::Result<()> {
+        for chunk in records.chunks(500) {
+            let mut query_builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+                "INSERT INTO pool_snapshots (id, network, pool_address, protocol_address, \
+                 protocol_name, token0_address, token0_symbol, token1_address, token1_symbol, \
+                 reserve0, reserve1, tvl_usd, snapshot_timestamp, block_number, \
+                 dataset_version_id, created_at) ",
+            );
+            query_builder.push_values(chunk, |mut b, r| {
+                b.push_bind(r.id)
+                    .push_bind(&r.network)
+                    .push_bind(&r.pool_address)
+                    .push_bind(&r.protocol_address)
+                    .push_bind(&r.protocol_name)
+                    .push_bind(&r.token0_address)
+                    .push_bind(&r.token0_symbol)
+                    .push_bind(&r.token1_address)
+                    .push_bind(&r.token1_symbol)
+                    .push_bind(&r.reserve0)
+                    .push_bind(&r.reserve1)
+                    .push_bind(&r.tvl_usd)
+                    .push_bind(r.snapshot_timestamp)
+                    .push_bind(r.block_number)
+                    .push_bind(r.dataset_version_id)
+                    .push_bind(r.created_at);
+            });
+            query_builder.push(" ON CONFLICT (id) DO NOTHING");
+            query_builder.build().execute(self.pool()).await?;
+        }
+        Ok(())
+    }
+
+    /// Query the latest balance snapshot per (wallet, asset, network).
+    /// Used to seed running balances before incremental balance_history computation.
+    pub async fn get_latest_balance_snapshots(
+        &self,
+        wallet_address: &str,
+        network: &str,
+    ) -> anyhow::Result<Vec<BalanceSnapshot>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT ON (wallet_address, asset_symbol, network) \
+             id, wallet_address, asset_symbol, network, timestamp, balance, tx_hash, \
+             dataset_version_id, created_at \
+             FROM balance_history \
+             WHERE wallet_address = $1 AND network = $2 \
+             ORDER BY wallet_address, asset_symbol, network, timestamp DESC",
+        )
+        .bind(wallet_address)
+        .bind(network)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_balance_snapshot).collect()
+    }
+
+    // -----------------------------------------------------------------------
     // Snapshotted streaming export (fixes PR #238 [P1] correctness)
     // -----------------------------------------------------------------------
 
