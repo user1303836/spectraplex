@@ -733,7 +733,9 @@ pub(crate) async fn fire_callback(url: &str, payload: &serde_json::Value, secret
     });
 
     for attempt in 0..MAX_RETRIES {
-        let mut req = client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json");
+        let mut req = client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
         if let Some(ref h) = signature_header {
             req = req.header("X-Spectraplex-Signature", h);
         }

@@ -47,7 +47,12 @@ pub fn spawn_materialize_worker(
     });
 }
 
-async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Semaphore>, callback_hmac_secret: Option<String>) {
+async fn worker_tick(
+    repo: &Repository,
+    worker_id: &str,
+    job_semaphore: &Arc<Semaphore>,
+    callback_hmac_secret: Option<String>,
+) {
     let runs = match repo.list_claimable_materialization_runs(5).await {
         Ok(runs) => runs,
         Err(e) => {

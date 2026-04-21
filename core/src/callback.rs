@@ -15,8 +15,8 @@ use sha2::Sha256;
 /// `hmac` crate (it accepts keys of any length).
 pub fn sign_callback_payload(secret: &str, body: &[u8]) -> String {
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(body);
     let result = mac.finalize();
     hex::encode(result.into_bytes())

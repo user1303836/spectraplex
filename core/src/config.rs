@@ -78,20 +78,6 @@ fn default_true() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Callbacks config
-// ---------------------------------------------------------------------------
-
-/// Callback-specific configuration.
-///
-/// Used inside the `[callbacks]` TOML table.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CallbacksConfig {
-    /// HMAC-SHA256 secret for signing callback payloads.
-    #[serde(default)]
-    pub hmac_secret: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
 // AppConfig
 // ---------------------------------------------------------------------------
 

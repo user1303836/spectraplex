@@ -241,7 +241,8 @@ async fn execute_job(
                     "network": &job.network,
                     "message": format!("Ingested {} transactions", count),
                 });
-                fire_callback_best_effort(url, &payload, config.callback_hmac_secret.as_deref()).await;
+                fire_callback_best_effort(url, &payload, config.callback_hmac_secret.as_deref())
+                    .await;
             }
         }
         Err(e) => {
@@ -269,7 +270,8 @@ async fn execute_job(
                     "network": &job.network,
                     "message": err_msg,
                 });
-                fire_callback_best_effort(url, &payload, config.callback_hmac_secret.as_deref()).await;
+                fire_callback_best_effort(url, &payload, config.callback_hmac_secret.as_deref())
+                    .await;
             }
         }
     }
@@ -500,7 +502,9 @@ async fn fire_callback_best_effort(url: &str, payload: &serde_json::Value, secre
         }
     };
 
-    let mut req = client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json");
+    let mut req = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
     if let Some(secret) = secret {
         let signature = spectraplex_core::callback::sign_callback_payload(secret, &body);
         req = req.header("X-Spectraplex-Signature", format!("sha256={signature}"));
