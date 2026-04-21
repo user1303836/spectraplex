@@ -237,6 +237,13 @@ impl AppConfig {
                 "export_dir must not be empty".to_string(),
             ));
         }
+        if let Some(ref secret) = self.callback_hmac_secret {
+            if secret.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "callback_hmac_secret must not be empty or whitespace-only".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 

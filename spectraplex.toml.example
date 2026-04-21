@@ -120,7 +120,8 @@ solana_rpc_url = "https://api.mainnet-beta.solana.com"
 # ---------------------------------------------------------------------------
 # Callback signing
 # ---------------------------------------------------------------------------
-# When set, all callback/webhook payloads are signed with HMAC-SHA256 and
-# delivered with an X-Spectraplex-Signature header (sha256=<hex>).
+# When set, callback URL payloads (e.g. ingestion and materialization
+# job callbacks) are signed with HMAC-SHA256 and delivered with an
+# X-Spectraplex-Signature header (sha256=<hex>).
 #
 # callback_hmac_secret = "your-secret-key"
