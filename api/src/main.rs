@@ -4481,7 +4481,8 @@ mod tests {
             .body(Body::from(
                 serde_json::to_string(&serde_json::json!({
                     "wallet": "abc123",
-                    "callback_url": "ftp://bad"
+                    "callback_url": "ftp://bad",
+                    "ingestion_run_id": "550e8400-e29b-41d4-a716-446655440000"
                 }))
                 .unwrap(),
             ))

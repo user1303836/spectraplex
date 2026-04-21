@@ -164,13 +164,8 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
 
             // Execute normalize work — pass lease_lost so side effects are
             // skipped if the lease is reclaimed mid-execution.
-            let result = execute_normalize(
-                &task_repo,
-                &wallet,
-                ingestion_run_id,
-                &lease_lost,
-            )
-            .await;
+            let result =
+                execute_normalize(&task_repo, &wallet, ingestion_run_id, &lease_lost).await;
 
             // Check lease_lost BEFORE writing terminal state. If the lease was
             // lost (either detected by heartbeat or by execute_normalize's own
