@@ -241,7 +241,7 @@ async fn execute_job(
                     "network": &job.network,
                     "message": format!("Ingested {} transactions", count),
                 });
-                fire_callback_best_effort(url, &payload).await;
+                fire_callback_best_effort(url, &payload, config.callback_hmac_secret.as_deref()).await;
             }
         }
         Err(e) => {
@@ -269,7 +269,7 @@ async fn execute_job(
                     "network": &job.network,
                     "message": err_msg,
                 });
-                fire_callback_best_effort(url, &payload).await;
+                fire_callback_best_effort(url, &payload, config.callback_hmac_secret.as_deref()).await;
             }
         }
     }
@@ -483,7 +483,7 @@ fn network_to_source(network: &str) -> String {
 /// Best-effort callback delivery using the SSRF-safe client. Pins DNS at
 /// send time and disables redirects to prevent DNS rebinding and
 /// redirect-based SSRF, matching the protections in `fire_callback`.
-async fn fire_callback_best_effort(url: &str, payload: &serde_json::Value) {
+async fn fire_callback_best_effort(url: &str, payload: &serde_json::Value, secret: Option<&str>) {
     let client = match crate::build_ssrf_safe_client(url, Duration::from_secs(10)).await {
         Ok(c) => c,
         Err(e) => {
@@ -491,7 +491,22 @@ async fn fire_callback_best_effort(url: &str, payload: &serde_json::Value) {
             return;
         }
     };
-    match client.post(url).json(payload).send().await {
+
+    let body = match serde_json::to_vec(payload) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, url, "Failed to serialize callback payload");
+            return;
+        }
+    };
+
+    let mut req = client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json");
+    if let Some(secret) = secret {
+        let signature = spectraplex_core::callback::sign_callback_payload(secret, &body);
+        req = req.header("X-Spectraplex-Signature", format!("sha256={signature}"));
+    }
+
+    match req.body(body).send().await {
         Ok(resp) => {
             if !resp.status().is_success() {
                 warn!(status = %resp.status(), url, "Callback returned non-success status");

@@ -78,6 +78,20 @@ fn default_true() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Callbacks config
+// ---------------------------------------------------------------------------
+
+/// Callback-specific configuration.
+///
+/// Used inside the `[callbacks]` TOML table.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CallbacksConfig {
+    /// HMAC-SHA256 secret for signing callback payloads.
+    #[serde(default)]
+    pub hmac_secret: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // AppConfig
 // ---------------------------------------------------------------------------
 
@@ -124,6 +138,14 @@ pub struct AppConfig {
     /// Provider endpoint definitions.
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+
+    // -- Callback signing --
+    /// Optional HMAC-SHA256 secret for signing callback payloads.
+    ///
+    /// Set via `SPECTRAPLEX_CALLBACK_HMAC_SECRET` environment variable or
+    /// `callback_hmac_secret` in TOML.
+    #[serde(default)]
+    pub callback_hmac_secret: Option<String>,
 }
 
 impl std::fmt::Debug for AppConfig {
@@ -196,6 +218,7 @@ impl Default for AppConfig {
             evm_trace_rpc_url: None,
             networks: HashMap::new(),
             providers: Vec::new(),
+            callback_hmac_secret: None,
         }
     }
 }

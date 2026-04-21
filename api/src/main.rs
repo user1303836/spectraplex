@@ -352,6 +352,7 @@ async fn main() -> anyhow::Result<()> {
     // Start the durable materialization worker loop.
     materialize_worker::spawn_materialize_worker(
         repo.clone(),
+        config.clone(),
         Arc::clone(&shared_state.job_semaphore),
         worker_cancel.clone(),
     );
@@ -706,7 +707,7 @@ pub(crate) async fn build_ssrf_safe_client(
         .map_err(|e| format!("failed to build HTTP client: {e}"))
 }
 
-pub(crate) async fn fire_callback(url: &str, payload: &serde_json::Value) {
+pub(crate) async fn fire_callback(url: &str, payload: &serde_json::Value, secret: Option<&str>) {
     const MAX_RETRIES: u32 = 3;
     const BASE_DELAY_MS: u64 = 500;
 
@@ -718,8 +719,26 @@ pub(crate) async fn fire_callback(url: &str, payload: &serde_json::Value) {
         }
     };
 
+    let body = match serde_json::to_vec(payload) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, url, "Failed to serialize callback payload");
+            return;
+        }
+    };
+
+    let signature_header = secret.map(|s| {
+        let sig = spectraplex_core::callback::sign_callback_payload(s, &body);
+        format!("sha256={sig}")
+    });
+
     for attempt in 0..MAX_RETRIES {
-        match client.post(url).json(payload).send().await {
+        let mut req = client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json");
+        if let Some(ref h) = signature_header {
+            req = req.header("X-Spectraplex-Signature", h);
+        }
+
+        match req.body(body.clone()).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() || status.is_redirection() {
