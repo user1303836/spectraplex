@@ -561,6 +561,26 @@ pub struct ExportJob {
     pub completed_at: Option<DateTime<Utc>>,
     pub heartbeat_at: Option<DateTime<Utc>>,
 }
+// ---------------------------------------------------------------------------
+// API Key (Tenant Isolation)
+// ---------------------------------------------------------------------------
+
+/// A durable API key for tenant-scoped authentication.
+/// Matches Issue #216 / Workstream G.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKey {
+    pub id: Uuid,
+    pub key_hash: String,
+    pub name: Option<String>,
+    pub owner_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Authenticated owner context injected by the auth middleware.
+/// `None` means legacy/admin mode (config-level API key).
+#[derive(Debug, Clone, Copy)]
+pub struct AuthenticatedOwner(pub Option<Uuid>);
 
 // ---------------------------------------------------------------------------
 // Materialization Run (Durable Control Plane)

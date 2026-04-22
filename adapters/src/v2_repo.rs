@@ -20,7 +20,7 @@ use spectraplex_core::materializer::{
     ProtocolEvent, TokenTransfer, WalletLedgerRecord,
 };
 use spectraplex_core::v2::{
-    ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
+    ApiKey, ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
     DatasetVersionStatus, DatasetWatermark, EvmTraceType, ExportJob, ExportJobStatus, IndexTarget,
     IngestionJob, IngestionJobMode, IngestionJobStatus, IngestionRun, MaterializationRun,
     MaterializationRunStatus, Network, RawEvmTrace, RawTransaction, StreamActualStatus,
@@ -1519,6 +1519,16 @@ fn row_to_export_job(row: &sqlx::postgres::PgRow) -> anyhow::Result<ExportJob> {
         started_at: row.try_get("started_at")?,
         completed_at: row.try_get("completed_at")?,
         heartbeat_at: row.try_get("heartbeat_at")?,
+    })
+}
+fn row_to_api_key(row: &sqlx::postgres::PgRow) -> anyhow::Result<ApiKey> {
+    Ok(ApiKey {
+        id: row.try_get("id")?,
+        key_hash: row.try_get("key_hash")?,
+        name: row.try_get("name")?,
+        owner_id: row.try_get("owner_id")?,
+        created_at: row.try_get("created_at")?,
+        revoked_at: row.try_get("revoked_at")?,
     })
 }
 
@@ -4696,6 +4706,70 @@ impl Repository {
     // -----------------------------------------------------------------------
     // Materialization Runs (Durable Control Plane)
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // API Keys (Tenant Isolation — Issue #216)
+    // -----------------------------------------------------------------------
+
+    /// Insert a new API key. The caller is responsible for hashing the key.
+    pub async fn create_api_key(
+        &self,
+        key_hash: &str,
+        name: Option<&str>,
+        owner_id: Uuid,
+    ) -> anyhow::Result<ApiKey> {
+        let row = sqlx::query(
+            "INSERT INTO api_keys (key_hash, name, owner_id) \
+             VALUES ($1, $2, $3) \
+             RETURNING id, key_hash, name, owner_id, created_at, revoked_at",
+        )
+        .bind(key_hash)
+        .bind(name)
+        .bind(owner_id)
+        .fetch_one(self.pool())
+        .await?;
+        row_to_api_key(&row)
+    }
+
+    /// Validate an API key by its raw hash. Returns `Ok(None)` if the key
+    /// does not exist or has been revoked.
+    pub async fn validate_api_key(&self, key_hash: &str) -> anyhow::Result<Option<ApiKey>> {
+        let row = sqlx::query(
+            "SELECT id, key_hash, name, owner_id, created_at, revoked_at \
+             FROM api_keys \
+             WHERE key_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(key_hash)
+        .fetch_optional(self.pool())
+        .await?;
+        match row {
+            Some(r) => Ok(Some(row_to_api_key(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Revoke an API key by id.
+    pub async fn revoke_api_key(&self, id: Uuid) -> anyhow::Result<()> {
+        sqlx::query("UPDATE api_keys SET revoked_at = NOW() WHERE id = $1")
+            .bind(id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// List API keys for a given owner (excluding revoked).
+    pub async fn list_api_keys_by_owner(&self, owner_id: Uuid) -> anyhow::Result<Vec<ApiKey>> {
+        let rows = sqlx::query(
+            "SELECT id, key_hash, name, owner_id, created_at, revoked_at \
+             FROM api_keys \
+             WHERE owner_id = $1 AND revoked_at IS NULL \
+             ORDER BY created_at",
+        )
+        .bind(owner_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_api_key).collect()
+    }
 
     /// Create a new materialization run with status=pending.
     pub async fn create_materialization_run(

@@ -6,7 +6,7 @@ mod stream_worker;
 mod worker;
 
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{Extension, Path, Query, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -39,9 +39,9 @@ use spectraplex_core::provider::{
     chain_to_network_id, NetworkContext, NetworkId, ProviderCapability, ProviderRegistry,
 };
 use spectraplex_core::v2::{
-    normalize_evm_address, normalize_solana_address, ChainFamily, DatasetCompleteness,
-    DatasetVersion, ExportJob, ExportJobStatus as DurableExportJobStatus, IndexTarget,
-    IngestionJobStatus, MaterializationRunStatus, Network, TargetKind, TargetMode,
+    normalize_evm_address, normalize_solana_address, AuthenticatedOwner, ChainFamily,
+    DatasetCompleteness, DatasetVersion, ExportJob, ExportJobStatus as DurableExportJobStatus,
+    IndexTarget, IngestionJobStatus, MaterializationRunStatus, Network, TargetKind, TargetMode,
 };
 use sqlx::postgres::PgPoolOptions;
 use std::collections::hash_map::DefaultHasher;
@@ -456,33 +456,54 @@ async fn health_check() -> &'static str {
 
 async fn require_auth(
     State(state): State<Arc<AppState>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    let expected = match &state.config.api_key {
-        Some(key) => key,
-        None => {
-            return Err(AppError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: "API key not configured".to_string(),
-            })
-        }
-    };
-
     let header = req
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
-    match header {
-        Some(token) if token.as_bytes().ct_eq(expected.as_bytes()).into() => {
-            Ok(next.run(req).await)
+    let token = match header {
+        Some(t) => t,
+        None => {
+            return Err(AppError {
+                status: StatusCode::UNAUTHORIZED,
+                message: "Missing or invalid API key".to_string(),
+            });
         }
-        _ => Err(AppError {
+    };
+
+    // 1. Try DB-backed API key first (tenant isolation).
+    let db_owner = match state.repo.validate_api_key(token).await {
+        Ok(Some(key)) => Some(key.owner_id),
+        Ok(None) => None,
+        Err(e) => {
+            error!(error = %e, "Failed to validate API key against database");
+            None
+        }
+    };
+
+    // 2. Fall back to legacy config-level key (admin/owner-less mode).
+    let legacy_ok = state
+        .config
+        .api_key
+        .as_ref()
+        .map(|k| token.as_bytes().ct_eq(k.as_bytes()).into())
+        .unwrap_or(false);
+
+    if db_owner.is_some() {
+        req.extensions_mut().insert(AuthenticatedOwner(db_owner));
+        Ok(next.run(req).await)
+    } else if legacy_ok {
+        req.extensions_mut().insert(AuthenticatedOwner(None));
+        Ok(next.run(req).await)
+    } else {
+        Err(AppError {
             status: StatusCode::UNAUTHORIZED,
             message: "Missing or invalid API key".to_string(),
-        }),
+        })
     }
 }
 
@@ -1342,6 +1363,33 @@ fn check_wallet_allowed(wallet: &str, allowed: &Option<HashSet<String>>) -> Resu
     Ok(())
 }
 
+/// Verify that the requested wallet belongs to the authenticated owner.
+/// In legacy mode (owner_id is None) this is a no-op.
+async fn check_wallet_owner(
+    repo: &Repository,
+    wallet: &str,
+    owner: &AuthenticatedOwner,
+) -> Result<(), AppError> {
+    if let Some(owner_id) = owner.0 {
+        // Look for a wallet target owned by this user.
+        let targets = repo
+            .list_index_targets_filtered(None, Some(TargetKind::Wallet), 1000, 0)
+            .await
+            .map_err(|e| AppError::internal(format!("Failed to lookup wallet ownership: {e}")))?;
+        let owned = targets.iter().any(|t| {
+            t.owner_id == Some(owner_id)
+                && t.address
+                    .as_deref()
+                    .map(|a| a.eq_ignore_ascii_case(wallet))
+                    .unwrap_or(false)
+        });
+        if !owned {
+            return Err(AppError::forbidden("Wallet not registered for this owner"));
+        }
+    }
+    Ok(())
+}
+
 /// Convert a V2 RawTransaction to a V1 Transaction for compatibility responses.
 fn raw_tx_to_compat_tx(raw: &spectraplex_core::v2::RawTransaction, wallet: &str) -> Transaction {
     let chain = if raw.network.starts_with("solana") {
@@ -1637,11 +1685,13 @@ fn ingestion_status_to_job_state(status: IngestionJobStatus) -> JobState {
 
 async fn get_transactions(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path(wallet): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<Transaction>>, AppError> {
     validate_wallet(&wallet)?;
     check_wallet_allowed(&wallet, &state.allowed_wallets)?;
+    check_wallet_owner(&state.repo, &wallet, &owner).await?;
     validate_date_range(params.from, params.to)?;
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
@@ -1659,11 +1709,13 @@ async fn get_transactions(
 
 async fn get_ledger(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path(wallet): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<LedgerEntry>>, AppError> {
     validate_wallet(&wallet)?;
     check_wallet_allowed(&wallet, &state.allowed_wallets)?;
+    check_wallet_owner(&state.repo, &wallet, &owner).await?;
     validate_date_range(params.from, params.to)?;
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
@@ -1713,11 +1765,13 @@ fn csv_escape(s: &str) -> String {
 
 async fn export_ledger(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path(wallet): Path<String>,
     Query(params): Query<ExportParams>,
 ) -> Result<Response, AppError> {
     validate_wallet(&wallet)?;
     check_wallet_allowed(&wallet, &state.allowed_wallets)?;
+    check_wallet_owner(&state.repo, &wallet, &owner).await?;
     validate_date_range(params.from, params.to)?;
 
     let format = params.format.as_deref().unwrap_or("json");
@@ -1793,11 +1847,13 @@ async fn export_ledger(
 
 async fn get_balances(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path(wallet): Path<String>,
     Query(params): Query<BalanceParams>,
 ) -> Result<Json<Vec<AssetBalance>>, AppError> {
     validate_wallet(&wallet)?;
     check_wallet_allowed(&wallet, &state.allowed_wallets)?;
+    check_wallet_owner(&state.repo, &wallet, &owner).await?;
     let rows = state
         .repo
         .get_wallet_balances_v2(&wallet, params.at)
@@ -1815,10 +1871,12 @@ async fn get_balances(
 
 async fn get_single_transaction(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path((wallet, tx_hash)): Path<(String, String)>,
 ) -> Result<Json<Transaction>, AppError> {
     validate_wallet(&wallet)?;
     check_wallet_allowed(&wallet, &state.allowed_wallets)?;
+    check_wallet_owner(&state.repo, &wallet, &owner).await?;
 
     let raw = state
         .repo
@@ -1834,10 +1892,12 @@ async fn get_single_transaction(
 
 async fn get_wallet_stats(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path(wallet): Path<String>,
 ) -> Result<Json<WalletStats>, AppError> {
     validate_wallet(&wallet)?;
     check_wallet_allowed(&wallet, &state.allowed_wallets)?;
+    check_wallet_owner(&state.repo, &wallet, &owner).await?;
 
     let stats = state
         .repo
@@ -2915,8 +2975,23 @@ struct TaxExportParams {
 /// GET /v1/export/tax — export wallet_ledger in tax-software-friendly CSV.
 async fn tax_export(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Query(params): Query<TaxExportParams>,
 ) -> Result<Response, AppError> {
+    if let Some(owner_id) = owner.0 {
+        let target_id = params.target_id.ok_or_else(|| {
+            AppError::bad_request("target_id is required for tenant-scoped requests")
+        })?;
+        let target = state
+            .repo
+            .get_index_target(target_id)
+            .await
+            .map_err(|e| AppError::internal(format!("Failed to fetch target: {e}")))?
+            .ok_or_else(|| AppError::not_found("Target not found"))?;
+        if target.owner_id != Some(owner_id) {
+            return Err(AppError::forbidden("Target does not belong to this owner"));
+        }
+    }
     validate_date_range(params.time_start, params.time_end)?;
 
     let records = state
@@ -3713,7 +3788,7 @@ mod tests {
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         // Unconfigured API key is a server misconfiguration, not a client auth failure
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
