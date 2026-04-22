@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::fire_callback;
 use spectraplex_adapters::dual_write::BronzeSilverResult;
 use spectraplex_adapters::repo::Repository;
+use spectraplex_core::config::AppConfig;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -25,11 +26,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// until `cancel` is triggered.
 pub fn spawn_materialize_worker(
     repo: Repository,
+    config: AppConfig,
     job_semaphore: Arc<Semaphore>,
     cancel: CancellationToken,
 ) {
     let worker_id = format!("mat-worker-{}", Uuid::new_v4());
     info!(worker_id = %worker_id, "Starting materialize worker");
+    let callback_hmac_secret = config.callback_hmac_secret.clone();
 
     tokio::spawn(async move {
         loop {
@@ -38,13 +41,18 @@ pub fn spawn_materialize_worker(
                     info!(worker_id = %worker_id, "Materialize worker shutting down");
                     return;
                 }
-                _ = worker_tick(&repo, &worker_id, &job_semaphore) => {}
+                _ = worker_tick(&repo, &worker_id, &job_semaphore, callback_hmac_secret.clone()) => {}
             }
         }
     });
 }
 
-async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Semaphore>) {
+async fn worker_tick(
+    repo: &Repository,
+    worker_id: &str,
+    job_semaphore: &Arc<Semaphore>,
+    callback_hmac_secret: Option<String>,
+) {
     let runs = match repo.list_claimable_materialization_runs(5).await {
         Ok(runs) => runs,
         Err(e) => {
@@ -128,6 +136,7 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
         let task_repo = repo.clone();
         let task_worker_id = worker_id.to_string();
         let run_id = run.id;
+        let task_hmac_secret = callback_hmac_secret.clone();
 
         tokio::spawn(async move {
             // Hold the semaphore permit for the duration of this task.
@@ -299,7 +308,7 @@ async fn worker_tick(repo: &Repository, worker_id: &str, job_semaphore: &Arc<Sem
                     "wallet": wallet,
                     "message": message,
                 });
-                fire_callback(url, &payload).await;
+                fire_callback(url, &payload, task_hmac_secret.as_deref()).await;
             }
         });
     }

@@ -124,6 +124,14 @@ pub struct AppConfig {
     /// Provider endpoint definitions.
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+
+    // -- Callback signing --
+    /// Optional HMAC-SHA256 secret for signing callback payloads.
+    ///
+    /// Set via `SPECTRAPLEX_CALLBACK_HMAC_SECRET` environment variable or
+    /// `callback_hmac_secret` in TOML.
+    #[serde(default)]
+    pub callback_hmac_secret: Option<String>,
 }
 
 impl std::fmt::Debug for AppConfig {
@@ -196,6 +204,7 @@ impl Default for AppConfig {
             evm_trace_rpc_url: None,
             networks: HashMap::new(),
             providers: Vec::new(),
+            callback_hmac_secret: None,
         }
     }
 }
@@ -227,6 +236,13 @@ impl AppConfig {
             return Err(ConfigError::Validation(
                 "export_dir must not be empty".to_string(),
             ));
+        }
+        if let Some(ref secret) = self.callback_hmac_secret {
+            if secret.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "callback_hmac_secret must not be empty or whitespace-only".to_string(),
+                ));
+            }
         }
         Ok(())
     }
