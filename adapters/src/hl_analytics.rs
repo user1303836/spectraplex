@@ -90,8 +90,12 @@ pub fn compute_pnl_summary(
                 total_size / BigDecimal::from(agg.trade_sizes.len() as i64)
             };
             let net_pnl = &agg.total_closed_pnl + &agg.total_funding - &agg.total_fees;
+            let id_key = format!(
+                "pnl:{}:{}:{}:{}:{}",
+                wallet, coin, network, period_start, period_end
+            );
             HlPnlSummary {
-                id: Uuid::new_v4(),
+                id: Uuid::new_v5(&Uuid::NAMESPACE_URL, id_key.as_bytes()),
                 wallet_address: wallet.to_string(),
                 coin,
                 network: network.to_string(),
@@ -113,6 +117,14 @@ pub fn compute_pnl_summary(
         .collect();
     results.sort_by(|a, b| a.coin.cmp(&b.coin));
     results
+}
+
+/// Deterministic trade ID from sorted constituent fill IDs.
+fn trade_deterministic_id(wallet: &str, coin: &str, fill_ids: &[Uuid]) -> Uuid {
+    let mut ids: Vec<String> = fill_ids.iter().map(|u| u.to_string()).collect();
+    ids.sort();
+    let id_key = format!("th:{}:{}:{}", wallet, coin, ids.join(":"));
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, id_key.as_bytes())
 }
 
 /// Build trade history from fills by grouping into logical open/close sequences.
@@ -172,9 +184,14 @@ pub fn build_trade_history(
                         .unwrap_or_default();
                     let opened_at = open_fills.first().map(|f| f.fill_time).unwrap_or(0);
                     let num_fills = (open_fills.len() + 1) as i64;
+                    let fill_ids: Vec<Uuid> = open_fills
+                        .iter()
+                        .map(|f| f.id)
+                        .chain(std::iter::once(fill.id))
+                        .collect();
 
                     trades.push(HlTradeHistory {
-                        id: Uuid::new_v4(),
+                        id: trade_deterministic_id(wallet, &coin, &fill_ids),
                         wallet_address: wallet.to_string(),
                         coin: coin.clone(),
                         network: network.to_string(),
@@ -197,7 +214,7 @@ pub fn build_trade_history(
                 } else if dir.contains("Close") {
                     // Close without a preceding open — standalone trade
                     trades.push(HlTradeHistory {
-                        id: Uuid::new_v4(),
+                        id: trade_deterministic_id(wallet, &coin, &[fill.id]),
                         wallet_address: wallet.to_string(),
                         coin: coin.clone(),
                         network: network.to_string(),
@@ -223,7 +240,7 @@ pub fn build_trade_history(
             for fill in &coin_fills {
                 if fill.closed_pnl.is_some() {
                     trades.push(HlTradeHistory {
-                        id: Uuid::new_v4(),
+                        id: trade_deterministic_id(wallet, &coin, &[fill.id]),
                         wallet_address: wallet.to_string(),
                         coin: coin.clone(),
                         network: network.to_string(),

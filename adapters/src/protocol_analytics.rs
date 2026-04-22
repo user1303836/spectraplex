@@ -59,7 +59,7 @@ pub fn compute_protocol_events(
         .map(|de| {
             let event_type = classify_event(de.event_name.as_deref());
             ProtocolEvent {
-                id: Uuid::new_v4(),
+                id: Uuid::new_v5(&Uuid::NAMESPACE_URL, format!("pe:{}", de.id).as_bytes()),
                 network: de.network.clone(),
                 protocol_address: de.program_or_contract.clone(),
                 protocol_name: None,
@@ -116,7 +116,10 @@ pub fn compute_pool_snapshots(
         .unwrap_or_else(|| BigDecimal::from(0));
 
     vec![PoolSnapshot {
-        id: Uuid::new_v4(),
+        id: Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("ps:{}:{}:{}", latest.network, pool_address, latest.id).as_bytes(),
+        ),
         network: latest.network.clone(),
         pool_address: pool_address.to_string(),
         protocol_address,

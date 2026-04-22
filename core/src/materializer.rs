@@ -383,7 +383,14 @@ impl DatasetRegistry {
     /// Returns the Gold datasets that need version tracking during
     /// Gold materialization from Silver.
     pub fn gold_materializable() -> &'static [DatasetName] {
-        &[DatasetName::WalletLedger, DatasetName::BalanceHistory]
+        &[
+            DatasetName::WalletLedger,
+            DatasetName::BalanceHistory,
+            DatasetName::HlPnlSummary,
+            DatasetName::HlTradeHistory,
+            DatasetName::ProtocolEvents,
+            DatasetName::PoolSnapshots,
+        ]
     }
 
     /// Check whether a canonical name string is a known queryable dataset.
