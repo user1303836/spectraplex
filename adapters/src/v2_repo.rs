@@ -4852,6 +4852,15 @@ impl Repository {
         Ok(())
     }
 
+    /// Revoke an API key by id (admin mode, no owner scoping).
+    pub async fn revoke_api_key_admin(&self, id: Uuid) -> anyhow::Result<()> {
+        sqlx::query("UPDATE api_keys SET revoked_at = NOW() WHERE id = $1")
+            .bind(id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
     /// List API keys for a given owner (excluding revoked).
     pub async fn list_api_keys_by_owner(&self, owner_id: Uuid) -> anyhow::Result<Vec<ApiKey>> {
         let rows = sqlx::query(
@@ -4861,6 +4870,19 @@ impl Repository {
              ORDER BY created_at",
         )
         .bind(owner_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_api_key).collect()
+    }
+
+    /// List all active API keys (admin mode).
+    pub async fn list_all_api_keys(&self) -> anyhow::Result<Vec<ApiKey>> {
+        let rows = sqlx::query(
+            "SELECT id, key_hash, name, owner_id, created_at, revoked_at \
+             FROM api_keys \
+             WHERE revoked_at IS NULL \
+             ORDER BY created_at",
+        )
         .fetch_all(self.pool())
         .await?;
         rows.iter().map(row_to_api_key).collect()
