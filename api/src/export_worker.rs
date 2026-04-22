@@ -344,6 +344,7 @@ async fn execute_export_job(
                     prov_cs,
                     prov_cc,
                     prov_lri,
+                    &lease_lost,
                 )
                 .await
                 {
@@ -556,6 +557,7 @@ async fn execute_export_job(
                     prov_cs,
                     prov_cc,
                     prov_lri,
+                    &lease_lost,
                 )
                 .await
                 {
@@ -719,6 +721,7 @@ async fn write_provenance_file(
     completeness_status: Option<&str>,
     completeness_coverage: Option<&serde_json::Value>,
     last_ingestion_run_id: Option<Uuid>,
+    lease_lost: &CancellationToken,
 ) -> std::io::Result<()> {
     let prov = serde_json::json!({
         "export_job_id": job_id,
@@ -746,6 +749,15 @@ async fn write_provenance_file(
     file.write_all(prov.to_string().as_bytes()).await?;
     file.flush().await?;
     drop(file);
+
+    if lease_lost.is_cancelled() {
+        tokio::fs::remove_file(&temp_path).await.ok();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "lease lost before provenance publish",
+        ));
+    }
+
     tokio::fs::rename(&temp_path, path).await?;
     Ok(())
 }
