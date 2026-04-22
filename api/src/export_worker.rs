@@ -305,6 +305,15 @@ async fn execute_export_job(
                 // artifact. rename is atomic within the same
                 // filesystem; the exports_dir is a single dir so this
                 // holds.
+                if lease_lost.is_cancelled() {
+                    warn!(
+                        job_id = %job_id,
+                        "Lease lost before artifact rename — discarding temp"
+                    );
+                    best_effort_unlink(&temp_path, job_id).await;
+                    heartbeat_cancel.cancel();
+                    return;
+                }
                 if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
                     let err_msg = format!("Failed to publish export artifact: {e}");
                     error!(job_id = %job_id, error = %err_msg, "Export job failed");
@@ -350,9 +359,6 @@ async fn execute_export_job(
                 {
                     let err_msg = format!("Failed to write provenance sidecar: {e}");
                     error!(job_id = %job_id, error = %err_msg, "Export job failed");
-                    if !lease_lost.is_cancelled() {
-                        best_effort_unlink(&final_path, job_id).await;
-                    }
                     let _ = update_or_abort(
                         repo,
                         job_id,
@@ -518,6 +524,15 @@ async fn execute_export_job(
                 // the lease-confirming `delivering` update above, so a
                 // stale worker never publishes over the new owner's
                 // artifact.
+                if lease_lost.is_cancelled() {
+                    warn!(
+                        job_id = %job_id,
+                        "Lease lost before artifact rename — discarding temp"
+                    );
+                    best_effort_unlink(&temp_path, job_id).await;
+                    heartbeat_cancel.cancel();
+                    return;
+                }
                 if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
                     let err_msg = format!("Failed to publish export artifact: {e}");
                     error!(job_id = %job_id, error = %err_msg, "Export job failed");
@@ -563,9 +578,6 @@ async fn execute_export_job(
                 {
                     let err_msg = format!("Failed to write provenance sidecar: {e}");
                     error!(job_id = %job_id, error = %err_msg, "Export job failed");
-                    if !lease_lost.is_cancelled() {
-                        best_effort_unlink(&final_path, job_id).await;
-                    }
                     let _ = update_or_abort(
                         repo,
                         job_id,
