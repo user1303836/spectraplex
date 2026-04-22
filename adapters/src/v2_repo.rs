@@ -4685,7 +4685,7 @@ impl Repository {
              delivery_destination, error_message, \
              dataset_version_id, dataset_version, completeness_status, \
              completeness_coverage, last_ingestion_run_id, \
-             created_at, updated_at, started_at, completed_at, heartbeat_at \
+             created_at, updated_at, started_at, completed_at, heartbeat_at, owner_id \
              FROM export_jobs WHERE id = $1",
         )
         .bind(job_id)
@@ -4788,7 +4788,7 @@ impl Repository {
              delivery_destination, error_message, \
              dataset_version_id, dataset_version, completeness_status, \
              completeness_coverage, last_ingestion_run_id, \
-             created_at, updated_at, started_at, completed_at, heartbeat_at \
+             created_at, updated_at, started_at, completed_at, heartbeat_at, owner_id \
              FROM export_jobs WHERE id = $1",
         )
         .bind(id)
