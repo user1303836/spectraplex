@@ -349,7 +349,9 @@ async fn execute_export_job(
                 {
                     let err_msg = format!("Failed to write provenance sidecar: {e}");
                     error!(job_id = %job_id, error = %err_msg, "Export job failed");
-                    best_effort_unlink(&final_path, job_id).await;
+                    if !lease_lost.is_cancelled() {
+                        best_effort_unlink(&final_path, job_id).await;
+                    }
                     let _ = update_or_abort(
                         repo,
                         job_id,
@@ -366,6 +368,17 @@ async fn execute_export_job(
                         prov_lri,
                     )
                     .await;
+                    heartbeat_cancel.cancel();
+                    return;
+                }
+
+                // Guard sink delivery with a lease check: a reclaimed worker
+                // must not deliver stale output to the sink.
+                if lease_lost.is_cancelled() {
+                    warn!(
+                        job_id = %job_id,
+                        "Lease lost before sink delivery — skipping delivery"
+                    );
                     heartbeat_cancel.cancel();
                     return;
                 }
@@ -548,7 +561,9 @@ async fn execute_export_job(
                 {
                     let err_msg = format!("Failed to write provenance sidecar: {e}");
                     error!(job_id = %job_id, error = %err_msg, "Export job failed");
-                    best_effort_unlink(&final_path, job_id).await;
+                    if !lease_lost.is_cancelled() {
+                        best_effort_unlink(&final_path, job_id).await;
+                    }
                     let _ = update_or_abort(
                         repo,
                         job_id,
