@@ -681,7 +681,29 @@ async fn insert_target(pool: &PgPool, kind: &str, network: &str, address: &str) 
     id
 }
 
-/// Helper: insert a raw_transaction and return its id.
+/// Helper: insert an index_target with a specific owner and return its id.
+async fn insert_target_with_owner(
+    pool: &PgPool,
+    kind: &str,
+    network: &str,
+    address: &str,
+    owner: Uuid,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO index_targets (id, kind, network, chain_family, address, mode, owner_id, created_at, updated_at)
+         VALUES ($1, $2::target_kind_enum, $3, 'solana'::chain_family_enum, $4, 'both'::target_mode_enum, $5, NOW(), NOW())",
+    )
+    .bind(id)
+    .bind(kind)
+    .bind(network)
+    .bind(address)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
 async fn insert_raw_tx(pool: &PgPool, network: &str, tx_hash: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -719,32 +741,51 @@ async fn uniqueness_index_targets_address() {
     let (pool, db_name) = create_test_db("uqaddr").await;
     run_all_migrations(&pool).await;
 
-    insert_target(&pool, "wallet", "solana-mainnet", "WaLLetABC").await;
+    let owner = Uuid::new_v4();
 
-    // Duplicate (kind, network, address) must fail.
+    insert_target_with_owner(&pool, "wallet", "solana-mainnet", "WaLLetABC", owner).await;
+
+    // Duplicate (kind, network, address, owner_id) must fail.
     let dup = sqlx::query(
-        "INSERT INTO index_targets (id, kind, network, chain_family, address, mode, created_at, updated_at)
-         VALUES ($1, 'wallet'::target_kind_enum, 'solana-mainnet', 'solana'::chain_family_enum, 'WaLLetABC', 'both'::target_mode_enum, NOW(), NOW())",
+        "INSERT INTO index_targets (id, kind, network, chain_family, address, mode, owner_id, created_at, updated_at)
+         VALUES ($1, 'wallet'::target_kind_enum, 'solana-mainnet', 'solana'::chain_family_enum, 'WaLLetABC', 'both'::target_mode_enum, $2, NOW(), NOW())",
     )
     .bind(Uuid::new_v4())
+    .bind(owner)
     .execute(&pool)
     .await;
     assert!(
         dup.is_err(),
-        "uq_index_targets_address should reject duplicate"
+        "uq_index_targets_address_owner should reject duplicate for same owner"
     );
 
-    // Different kind for same network+address is allowed.
+    // Different owner for same kind/network/address is allowed (tenant isolation).
+    let other_owner = Uuid::new_v4();
     let ok = sqlx::query(
-        "INSERT INTO index_targets (id, kind, network, chain_family, address, mode, created_at, updated_at)
-         VALUES ($1, 'account'::target_kind_enum, 'solana-mainnet', 'solana'::chain_family_enum, 'WaLLetABC', 'both'::target_mode_enum, NOW(), NOW())",
+        "INSERT INTO index_targets (id, kind, network, chain_family, address, mode, owner_id, created_at, updated_at)
+         VALUES ($1, 'wallet'::target_kind_enum, 'solana-mainnet', 'solana'::chain_family_enum, 'WaLLetABC', 'both'::target_mode_enum, $2, NOW(), NOW())",
     )
     .bind(Uuid::new_v4())
+    .bind(other_owner)
     .execute(&pool)
     .await;
     assert!(
         ok.is_ok(),
-        "different kind should be allowed for same network+address"
+        "different owner should be allowed for same network+address"
+    );
+
+    // Different kind for same network+address+owner is allowed.
+    let ok2 = sqlx::query(
+        "INSERT INTO index_targets (id, kind, network, chain_family, address, mode, owner_id, created_at, updated_at)
+         VALUES ($1, 'account'::target_kind_enum, 'solana-mainnet', 'solana'::chain_family_enum, 'WaLLetABC', 'both'::target_mode_enum, $2, NOW(), NOW())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(owner)
+    .execute(&pool)
+    .await;
+    assert!(
+        ok2.is_ok(),
+        "different kind should be allowed for same network+address+owner"
     );
 
     pool.close().await;

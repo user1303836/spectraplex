@@ -26,3 +26,22 @@ CREATE INDEX idx_api_keys_owner ON api_keys(owner_id);
 
 CREATE INDEX idx_index_targets_owner ON index_targets(owner_id)
     WHERE owner_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- 3. Update index_targets unique constraint to include owner_id
+-- ---------------------------------------------------------------------------
+-- Drop the old global unique index so each tenant can register the same
+-- wallet address independently.
+DROP INDEX IF EXISTS uq_index_targets_address;
+
+-- Create a new unique index that includes owner_id. PostgreSQL treats NULLs
+-- as not equal, so multiple global targets (owner_id IS NULL) for the same
+-- address are still allowed; this is acceptable because global target creation
+-- is already idempotent via ON CONFLICT.
+CREATE UNIQUE INDEX uq_index_targets_address_owner ON index_targets(kind, network, address, owner_id) WHERE address IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- 4. export_jobs: add owner_id for tenant-scoped export isolation
+-- ---------------------------------------------------------------------------
+ALTER TABLE export_jobs ADD COLUMN IF NOT EXISTS owner_id UUID;
+CREATE INDEX idx_export_jobs_owner ON export_jobs(owner_id) WHERE owner_id IS NOT NULL;

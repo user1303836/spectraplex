@@ -398,7 +398,7 @@ pub fn build_index_target_insert(
         "INSERT INTO index_targets \
          (id, kind, network, chain_family, address, filter_spec, mode, label, owner_id, created_at, updated_at) \
          VALUES ($1, $2::target_kind_enum, $3, $4::chain_family_enum, $5, $6, $7::target_mode_enum, $8, $9, $10, $11) \
-         ON CONFLICT (kind, network, address) WHERE address IS NOT NULL DO UPDATE SET updated_at = NOW() \
+         ON CONFLICT (kind, network, address, owner_id) WHERE address IS NOT NULL DO UPDATE SET updated_at = NOW() \
          RETURNING id, kind::text, network, chain_family::text, address, filter_spec, mode::text, label, owner_id, created_at, updated_at",
     );
     let mut args = sqlx::postgres::PgArguments::default();
@@ -1519,6 +1519,7 @@ fn row_to_export_job(row: &sqlx::postgres::PgRow) -> anyhow::Result<ExportJob> {
         started_at: row.try_get("started_at")?,
         completed_at: row.try_get("completed_at")?,
         heartbeat_at: row.try_get("heartbeat_at")?,
+        owner_id: row.try_get("owner_id").unwrap_or(None),
     })
 }
 fn row_to_api_key(row: &sqlx::postgres::PgRow) -> anyhow::Result<ApiKey> {
@@ -1664,18 +1665,34 @@ impl Repository {
         kind: TargetKind,
         network: &str,
         address: &str,
+        owner_id: Option<Uuid>,
     ) -> anyhow::Result<Option<IndexTarget>> {
-        let row = sqlx::query(
-            "SELECT id, kind::text, network, chain_family::text, address, filter_spec, \
-             mode::text, label, owner_id, created_at, updated_at \
-             FROM index_targets \
-             WHERE kind = $1::target_kind_enum AND network = $2 AND address = $3",
-        )
-        .bind(target_kind_to_sql(&kind))
-        .bind(network)
-        .bind(address)
-        .fetch_optional(self.pool())
-        .await?;
+        let row = if let Some(oid) = owner_id {
+            sqlx::query(
+                "SELECT id, kind::text, network, chain_family::text, address, filter_spec, \
+                 mode::text, label, owner_id, created_at, updated_at \
+                 FROM index_targets \
+                 WHERE kind = $1::target_kind_enum AND network = $2 AND address = $3 AND owner_id = $4",
+            )
+            .bind(target_kind_to_sql(&kind))
+            .bind(network)
+            .bind(address)
+            .bind(oid)
+            .fetch_optional(self.pool())
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, kind::text, network, chain_family::text, address, filter_spec, \
+                 mode::text, label, owner_id, created_at, updated_at \
+                 FROM index_targets \
+                 WHERE kind = $1::target_kind_enum AND network = $2 AND address = $3 AND owner_id IS NULL",
+            )
+            .bind(target_kind_to_sql(&kind))
+            .bind(network)
+            .bind(address)
+            .fetch_optional(self.pool())
+            .await?
+        };
         row.as_ref().map(row_to_index_target).transpose()
     }
 
@@ -1770,6 +1787,41 @@ impl Repository {
             query = query.bind(target_kind_to_sql(k).to_string());
         }
 
+        let rows = query.fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_index_target).collect()
+    }
+
+    /// List all index targets for a given owner, ordered by created_at.
+    /// Used for tenant-scoped target listing where pagination must be applied
+    /// after filtering (not before).
+    pub async fn list_index_targets_by_owner(
+        &self,
+        owner_id: Uuid,
+        network: Option<&str>,
+        kind: Option<TargetKind>,
+    ) -> anyhow::Result<Vec<IndexTarget>> {
+        let mut sql = String::from(
+            "SELECT id, kind::text, network, chain_family::text, address, filter_spec, \
+             mode::text, label, owner_id, created_at, updated_at \
+             FROM index_targets WHERE owner_id = $1",
+        );
+        let mut param_idx = 2_usize;
+        if network.is_some() {
+            sql.push_str(&format!(" AND network = ${param_idx}"));
+            param_idx += 1;
+        }
+        if kind.is_some() {
+            sql.push_str(&format!(" AND kind = ${param_idx}::target_kind_enum"));
+        }
+        sql.push_str(" ORDER BY created_at");
+
+        let mut query = sqlx::query(&sql).bind(owner_id);
+        if let Some(nw) = network {
+            query = query.bind(nw.to_string());
+        }
+        if let Some(ref k) = kind {
+            query = query.bind(target_kind_to_sql(k).to_string());
+        }
         let rows = query.fetch_all(self.pool()).await?;
         rows.iter().map(row_to_index_target).collect()
     }
@@ -4476,36 +4528,76 @@ impl Repository {
     pub async fn list_stream_subscriptions(
         &self,
         desired_status: Option<&str>,
+        owner_id: Option<Uuid>,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<StreamSubscription>> {
-        let rows = match desired_status {
-            Some(s) => {
-                sqlx::query(
-                    "SELECT id, target_id, network, source, desired_status, actual_status, \
-                     lease_owner, heartbeat_at, cursor_state, config, error_message, \
-                     created_at, updated_at \
-                     FROM stream_subscriptions WHERE desired_status = $1 \
-                     ORDER BY created_at LIMIT $2 OFFSET $3",
-                )
-                .bind(s)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(self.pool())
-                .await?
+        let rows = if let Some(oid) = owner_id {
+            // Owner-scoped: join with index_targets to enforce ownership.
+            match desired_status {
+                Some(s) => {
+                    sqlx::query(
+                        "SELECT s.id, s.target_id, s.network, s.source, s.desired_status, s.actual_status, \
+                         s.lease_owner, s.heartbeat_at, s.cursor_state, s.config, s.error_message, \
+                         s.created_at, s.updated_at \
+                         FROM stream_subscriptions s \
+                         JOIN index_targets t ON t.id = s.target_id \
+                         WHERE s.desired_status = $1 AND t.owner_id = $2 \
+                         ORDER BY s.created_at LIMIT $3 OFFSET $4",
+                    )
+                    .bind(s)
+                    .bind(oid)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(self.pool())
+                    .await?
+                }
+                None => {
+                    sqlx::query(
+                        "SELECT s.id, s.target_id, s.network, s.source, s.desired_status, s.actual_status, \
+                         s.lease_owner, s.heartbeat_at, s.cursor_state, s.config, s.error_message, \
+                         s.created_at, s.updated_at \
+                         FROM stream_subscriptions s \
+                         JOIN index_targets t ON t.id = s.target_id \
+                         WHERE t.owner_id = $1 \
+                         ORDER BY s.created_at LIMIT $2 OFFSET $3",
+                    )
+                    .bind(oid)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(self.pool())
+                    .await?
+                }
             }
-            None => {
-                sqlx::query(
-                    "SELECT id, target_id, network, source, desired_status, actual_status, \
-                     lease_owner, heartbeat_at, cursor_state, config, error_message, \
-                     created_at, updated_at \
-                     FROM stream_subscriptions \
-                     ORDER BY created_at LIMIT $1 OFFSET $2",
-                )
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(self.pool())
-                .await?
+        } else {
+            match desired_status {
+                Some(s) => {
+                    sqlx::query(
+                        "SELECT id, target_id, network, source, desired_status, actual_status, \
+                         lease_owner, heartbeat_at, cursor_state, config, error_message, \
+                         created_at, updated_at \
+                         FROM stream_subscriptions WHERE desired_status = $1 \
+                         ORDER BY created_at LIMIT $2 OFFSET $3",
+                    )
+                    .bind(s)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(self.pool())
+                    .await?
+                }
+                None => {
+                    sqlx::query(
+                        "SELECT id, target_id, network, source, desired_status, actual_status, \
+                         lease_owner, heartbeat_at, cursor_state, config, error_message, \
+                         created_at, updated_at \
+                         FROM stream_subscriptions \
+                         ORDER BY created_at LIMIT $1 OFFSET $2",
+                    )
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(self.pool())
+                    .await?
+                }
             }
         };
         rows.iter().map(row_to_stream_subscription).collect()
@@ -4522,24 +4614,26 @@ impl Repository {
         format: ExportFormat,
         filters: Option<&serde_json::Value>,
         sink_config: Option<&serde_json::Value>,
+        owner_id: Option<Uuid>,
     ) -> anyhow::Result<ExportJob> {
         let id = Uuid::new_v4();
         let row = sqlx::query(
             "INSERT INTO export_jobs \
-             (id, dataset, format, filters, sink_config) \
-             VALUES ($1, $2, $3, $4, $5) \
+             (id, dataset, format, filters, sink_config, owner_id) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
              RETURNING id, dataset, format, filters, sink_config, status, \
                        worker_id, record_count, result_location, \
                        delivery_destination, error_message, \
                        dataset_version_id, dataset_version, completeness_status, \
                        completeness_coverage, last_ingestion_run_id, \
-                       created_at, updated_at, started_at, completed_at, heartbeat_at",
+                       created_at, updated_at, started_at, completed_at, heartbeat_at, owner_id",
         )
         .bind(id)
         .bind(dataset.to_string())
         .bind(format.to_string())
         .bind(filters)
         .bind(sink_config)
+        .bind(owner_id)
         .fetch_one(self.pool())
         .await?;
         row_to_export_job(&row)
@@ -4748,10 +4842,11 @@ impl Repository {
         }
     }
 
-    /// Revoke an API key by id.
-    pub async fn revoke_api_key(&self, id: Uuid) -> anyhow::Result<()> {
-        sqlx::query("UPDATE api_keys SET revoked_at = NOW() WHERE id = $1")
+    /// Revoke an API key by id, scoped to an owner.
+    pub async fn revoke_api_key(&self, id: Uuid, owner_id: Uuid) -> anyhow::Result<()> {
+        sqlx::query("UPDATE api_keys SET revoked_at = NOW() WHERE id = $1 AND owner_id = $2")
             .bind(id)
+            .bind(owner_id)
             .execute(self.pool())
             .await?;
         Ok(())
@@ -4769,6 +4864,23 @@ impl Repository {
         .fetch_all(self.pool())
         .await?;
         rows.iter().map(row_to_api_key).collect()
+    }
+
+    /// List wallet targets belonging to a specific owner (no pagination limit).
+    pub async fn list_wallet_targets_by_owner(
+        &self,
+        owner_id: Uuid,
+    ) -> anyhow::Result<Vec<IndexTarget>> {
+        let rows = sqlx::query(
+            "SELECT id, kind::text, network, chain_family::text, address, filter_spec, \
+             mode::text, label, owner_id, created_at, updated_at \
+             FROM index_targets \
+             WHERE kind = 'wallet'::target_kind_enum AND owner_id = $1",
+        )
+        .bind(owner_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_index_target).collect()
     }
 
     /// Create a new materialization run with status=pending.
@@ -6919,7 +7031,7 @@ mod tests {
     fn repo_list_stream_subscriptions_is_send() {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
-            _assert_send(repo.list_stream_subscriptions(Some("active"), 10, 0));
+            _assert_send(repo.list_stream_subscriptions(Some("active"), None, 10, 0));
         }
         let _ = _check;
     }
@@ -6931,6 +7043,7 @@ mod tests {
             _assert_send(repo.enqueue_export_job(
                 DatasetName::TokenTransfers,
                 ExportFormat::Csv,
+                None,
                 None,
                 None,
             ));
@@ -7092,6 +7205,7 @@ mod tests {
             completeness_status: None,
             completeness_coverage: None,
             last_ingestion_run_id: None,
+            owner_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             started_at: None,

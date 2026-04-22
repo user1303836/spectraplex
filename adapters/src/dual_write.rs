@@ -500,7 +500,7 @@ impl Repository {
     ) -> anyhow::Result<IndexTarget> {
         // Check if target already exists
         if let Some(existing) = self
-            .get_index_target_by_address(TargetKind::Wallet, network, wallet_address)
+            .get_index_target_by_address(TargetKind::Wallet, network, wallet_address, owner_id)
             .await?
         {
             return Ok(existing);
@@ -912,7 +912,7 @@ impl Repository {
             for ((network, wallet_address), group_txs) in &wallet_groups {
                 // Look up or create the IndexTarget for this wallet.
                 let target = match self
-                    .get_index_target_by_address(TargetKind::Wallet, network, wallet_address)
+                    .get_index_target_by_address(TargetKind::Wallet, network, wallet_address, None)
                     .await
                 {
                     Ok(Some(t)) => t,
@@ -1570,7 +1570,7 @@ impl Repository {
                 }
                 for (network, group) in &net_groups {
                     let target_id = match self
-                        .get_index_target_by_address(TargetKind::Wallet, network, wallet)
+                        .get_index_target_by_address(TargetKind::Wallet, network, wallet, None)
                         .await
                     {
                         Ok(Some(t)) => t.id,
@@ -2291,7 +2291,7 @@ impl Repository {
 
             // Look up the target for this wallet.
             let target_id = match self
-                .get_index_target_by_address(TargetKind::Wallet, network, wallet_address)
+                .get_index_target_by_address(TargetKind::Wallet, network, wallet_address, None)
                 .await
             {
                 Ok(Some(target)) => target.id,

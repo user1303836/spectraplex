@@ -30,6 +30,7 @@ use spectraplex_core::materializer::{
 // `#[cfg(test)]` so non-test builds don't warn about unused imports now
 // that the streaming export path (`export_stream`) uses the row-writer
 // helpers in `export_csv` directly, not the `*_to_csv` wrappers.
+use sha2::{Digest, Sha256};
 #[cfg(test)]
 use spectraplex_core::materializer::{
     BalanceSnapshot, HlPnlSummary, HlTradeHistory, PoolSnapshot, ProtocolEvent,
@@ -476,7 +477,8 @@ async fn require_auth(
     };
 
     // 1. Try DB-backed API key first (tenant isolation).
-    let db_owner = match state.repo.validate_api_key(token).await {
+    let token_hash = format!("{:x}", Sha256::digest(token));
+    let db_owner = match state.repo.validate_api_key(&token_hash).await {
         Ok(Some(key)) => Some(key.owner_id),
         Ok(None) => None,
         Err(e) => {
@@ -1371,20 +1373,46 @@ async fn check_wallet_owner(
     owner: &AuthenticatedOwner,
 ) -> Result<(), AppError> {
     if let Some(owner_id) = owner.0 {
-        // Look for a wallet target owned by this user.
         let targets = repo
-            .list_index_targets_filtered(None, Some(TargetKind::Wallet), 1000, 0)
+            .list_wallet_targets_by_owner(owner_id)
             .await
             .map_err(|e| AppError::internal(format!("Failed to lookup wallet ownership: {e}")))?;
         let owned = targets.iter().any(|t| {
-            t.owner_id == Some(owner_id)
-                && t.address
-                    .as_deref()
-                    .map(|a| a.eq_ignore_ascii_case(wallet))
-                    .unwrap_or(false)
+            t.address
+                .as_deref()
+                .map(|a| {
+                    // EVM addresses are case-insensitive; Solana addresses are case-sensitive.
+                    // Heuristic: 0x-prefixed addresses are EVM-style.
+                    if wallet.starts_with("0x") || a.starts_with("0x") {
+                        a.eq_ignore_ascii_case(wallet)
+                    } else {
+                        a == wallet
+                    }
+                })
+                .unwrap_or(false)
         });
         if !owned {
             return Err(AppError::forbidden("Wallet not registered for this owner"));
+        }
+    }
+    Ok(())
+}
+
+/// Verify that a target_id belongs to the authenticated owner.
+/// Returns Ok(()) for legacy/admin mode (owner == None).
+async fn check_target_owner(
+    repo: &Repository,
+    target_id: Uuid,
+    owner: &AuthenticatedOwner,
+) -> Result<(), AppError> {
+    if let Some(owner_id) = owner.0 {
+        let target = repo
+            .get_index_target(target_id)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::forbidden("Target not found"))?;
+        if target.owner_id != Some(owner_id) {
+            return Err(AppError::forbidden("Target not owned by this tenant"));
         }
     }
     Ok(())
@@ -1404,6 +1432,7 @@ fn raw_tx_to_compat_tx(raw: &spectraplex_core::v2::RawTransaction, wallet: &str)
 
 async fn trigger_ingest(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Json(payload): Json<IngestRequest>,
 ) -> Result<Json<JobStatus>, AppError> {
     validate_wallet(&payload.wallet)?;
@@ -1454,13 +1483,18 @@ async fn trigger_ingest(
         spectraplex_adapters::dual_write::chain_to_default_network(&chain_enum).to_string()
     });
 
-    let user_id = payload.user_id.unwrap_or_else(Uuid::new_v4);
+    let owner_id = owner.0.or(payload.user_id).unwrap_or_else(Uuid::new_v4);
 
     // Ensure a V2 IndexTarget exists for this wallet.
     let target_id = if payload.network.is_some() {
         match state
             .repo
-            .ensure_wallet_target_for_network(&network, &chain_enum, &payload.wallet, Some(user_id))
+            .ensure_wallet_target_for_network(
+                &network,
+                &chain_enum,
+                &payload.wallet,
+                Some(owner_id),
+            )
             .await
         {
             Ok(target) => Some(target.id),
@@ -1477,7 +1511,7 @@ async fn trigger_ingest(
     } else {
         match state
             .repo
-            .ensure_wallet_target(&chain_enum, &payload.wallet, Some(user_id))
+            .ensure_wallet_target(&chain_enum, &payload.wallet, Some(owner_id))
             .await
         {
             Ok(target) => Some(target.id),
@@ -1499,7 +1533,7 @@ async fn trigger_ingest(
         mode: "incremental",
         priority: 0,
         idempotency_key: None,
-        requested_by: Some(&user_id.to_string()),
+        requested_by: Some(&owner_id.to_string()),
         callback_url: payload.callback_url.as_deref(),
     };
 
@@ -1521,6 +1555,7 @@ const MAX_BATCH_SIZE: usize = 50;
 
 async fn trigger_batch_ingest(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Json(payload): Json<BatchIngestRequest>,
 ) -> Result<Json<Vec<JobStatus>>, AppError> {
     if payload.wallets.is_empty() {
@@ -1567,7 +1602,7 @@ async fn trigger_batch_ingest(
             user_id: item.user_id,
             callback_url: item.callback_url,
         });
-        match trigger_ingest(State(Arc::clone(&state)), single).await {
+        match trigger_ingest(State(Arc::clone(&state)), Extension(owner), single).await {
             Ok(Json(status)) => jobs.push(status),
             Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => {
                 return Err(AppError::service_unavailable(format!(
@@ -1585,6 +1620,7 @@ async fn trigger_batch_ingest(
 
 async fn trigger_normalize(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Json(payload): Json<NormalizeRequest>,
 ) -> Result<Json<JobStatus>, AppError> {
     validate_wallet(&payload.wallet)?;
@@ -1594,6 +1630,24 @@ async fn trigger_normalize(
     })?;
     if let Some(ref url) = payload.callback_url {
         validate_callback_url(url).await?;
+    }
+    // Tenant isolation: validate the ingestion run's target belongs to the owner.
+    if let Some(_owner_id) = owner.0 {
+        let run = state
+            .repo
+            .get_ingestion_run(ingestion_run_id)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| {
+                AppError::not_found(format!("Ingestion run {} not found", ingestion_run_id))
+            })?;
+        if let Some(target_id) = run.target_id {
+            check_target_owner(&state.repo, target_id, &owner).await?;
+        } else {
+            return Err(AppError::forbidden(
+                "Cannot normalize a run without a target",
+            ));
+        }
     }
 
     // Build scope with wallet, optional network, and optional callback_url
@@ -1622,19 +1676,44 @@ async fn trigger_normalize(
 
 async fn get_job_status(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path(job_id): Path<Uuid>,
 ) -> Result<Json<JobStatus>, AppError> {
     // Check durable ingestion jobs in Postgres first.
     match state.repo.get_ingestion_job(job_id).await {
-        Ok(Some(job)) => Ok(Json(JobStatus {
-            id: job.id,
-            state: ingestion_status_to_job_state(job.status),
-            message: job.error_message,
-        })),
+        Ok(Some(job)) => {
+            // Tenant isolation: validate target ownership.
+            if let Some(_owner_id) = owner.0 {
+                if let Some(target_id) = job.target_id {
+                    check_target_owner(&state.repo, target_id, &owner).await?;
+                } else {
+                    return Err(AppError::forbidden("Job has no associated target"));
+                }
+            }
+            Ok(Json(JobStatus {
+                id: job.id,
+                state: ingestion_status_to_job_state(job.status),
+                message: job.error_message,
+            }))
+        }
         Ok(None) => {
             // Not an ingestion job — check materialization runs.
             match state.repo.get_materialization_run(job_id).await {
                 Ok(Some(run)) => {
+                    // Tenant isolation: validate via wallet in scope JSON.
+                    if let Some(_owner_id) = owner.0 {
+                        if let Some(scope) = run.scope {
+                            if let Some(wallet) = scope.get("wallet").and_then(|w| w.as_str()) {
+                                check_wallet_owner(&state.repo, wallet, &owner).await?;
+                            } else {
+                                return Err(AppError::forbidden(
+                                    "Materialization run has no wallet in scope",
+                                ));
+                            }
+                        } else {
+                            return Err(AppError::forbidden("Materialization run has no scope"));
+                        }
+                    }
                     let state_val = match run.status {
                         MaterializationRunStatus::Pending => JobState::Pending,
                         MaterializationRunStatus::Running => JobState::Running,
@@ -1937,6 +2016,7 @@ struct StartStreamRequest {
 
 async fn start_stream(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Json(payload): Json<StartStreamRequest>,
 ) -> Result<Json<StreamInfo>, AppError> {
     // Resolve chain from network (preferred) or use chain directly (compat).
@@ -2033,19 +2113,25 @@ async fn start_stream(
             let chain_enum = Chain::Hyperliquid;
             let target = state
                 .repo
-                .ensure_wallet_target_for_network(&network, &chain_enum, wallet, None)
+                .ensure_wallet_target_for_network(&network, &chain_enum, wallet, owner.0)
                 .await
                 .map_err(AppError::internal)?;
             target.id
         }
         "solana" => {
+            // Tenant isolation: global Solana gRPC streams are admin-only.
+            if owner.0.is_some() {
+                return Err(AppError::forbidden(
+                    "Tenant-scoped Solana gRPC streams are not supported; use admin mode",
+                ));
+            }
             // For global Solana gRPC streams, create a program-type target
             // keyed on the network.  The address is a sentinel so the unique
             // index on (kind, network, address) prevents duplicates.
             let sentinel = "__global_grpc_stream__";
             let target = match state
                 .repo
-                .get_index_target_by_address(TargetKind::Program, &network, sentinel)
+                .get_index_target_by_address(TargetKind::Program, &network, sentinel, None)
                 .await
                 .map_err(AppError::internal)?
             {
@@ -2111,8 +2197,26 @@ async fn start_stream(
 
 async fn stop_stream(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path(stream_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // Tenant isolation: validate subscription ownership before stopping.
+    if let Some(_owner_id) = owner.0 {
+        let sub = state
+            .repo
+            .get_stream_subscription(stream_id)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::not_found(format!("Stream {} not found", stream_id)))?;
+        if let Some(target_id) = sub.target_id {
+            check_target_owner(&state.repo, target_id, &owner).await?;
+        } else {
+            return Err(AppError::forbidden(
+                "Cannot stop a subscription without a target",
+            ));
+        }
+    }
+
     let updated = state
         .repo
         .set_stream_desired_status(stream_id, "stopped")
@@ -2134,10 +2238,11 @@ async fn stop_stream(
 
 async fn list_streams(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
 ) -> Result<Json<Vec<StreamInfo>>, AppError> {
     let subs = state
         .repo
-        .list_stream_subscriptions(Some("active"), 100, 0)
+        .list_stream_subscriptions(Some("active"), owner.0, 100, 0)
         .await
         .map_err(AppError::internal)?;
 
@@ -2212,6 +2317,7 @@ fn conflict(msg: impl Into<String>) -> AppError {
 
 async fn register_target(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Json(req): Json<RegisterTargetRequest>,
 ) -> Result<(StatusCode, Json<IndexTarget>), AppError> {
     // Parse kind
@@ -2250,7 +2356,7 @@ async fn register_target(
         filter_spec: req.filter_spec,
         mode,
         label: req.label,
-        owner_id: None,
+        owner_id: owner.0,
         created_at: now,
         updated_at: now,
     };
@@ -2278,6 +2384,7 @@ async fn register_target(
 
 async fn list_targets(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Query(params): Query<TargetListParams>,
 ) -> Result<Json<Vec<IndexTarget>>, AppError> {
     let limit = clamp_limit(params.limit);
@@ -2293,17 +2400,36 @@ async fn list_targets(
         })
         .transpose()?;
 
-    let targets = state
-        .repo
-        .list_index_targets_filtered(params.network.as_deref(), kind, limit, offset)
-        .await
-        .map_err(AppError::internal)?;
+    let targets = match owner.0 {
+        Some(owner_id) => state
+            .repo
+            .list_index_targets_by_owner(owner_id, params.network.as_deref(), kind)
+            .await
+            .map_err(AppError::internal)?,
+        None => state
+            .repo
+            .list_index_targets_filtered(params.network.as_deref(), kind, limit, offset)
+            .await
+            .map_err(AppError::internal)?,
+    };
 
-    Ok(Json(targets))
+    // Apply pagination in Rust for tenant-scoped results (owner filtering is
+    // already done in SQL for tenant mode; for legacy mode it was applied via
+    // LIMIT/OFFSET in the repo query).
+    let offset_usize = offset as usize;
+    let limit_usize = limit as usize;
+    let paginated: Vec<IndexTarget> = targets
+        .into_iter()
+        .skip(offset_usize)
+        .take(limit_usize)
+        .collect();
+
+    Ok(Json(paginated))
 }
 
 async fn get_target(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path(target_id): Path<Uuid>,
 ) -> Result<Json<IndexTarget>, AppError> {
     let target = state
@@ -2312,6 +2438,13 @@ async fn get_target(
         .await
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::not_found(format!("Target {} not found", target_id)))?;
+
+    if let Some(owner_id) = owner.0 {
+        if target.owner_id != Some(owner_id) {
+            return Err(AppError::forbidden("Target does not belong to this owner"));
+        }
+    }
+
     Ok(Json(target))
 }
 
@@ -2375,7 +2508,10 @@ fn validate_dataset_name(name: &str) -> Result<(), AppError> {
 
 async fn list_all_datasets(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
 ) -> Result<Json<Vec<DatasetInfo>>, AppError> {
+    // Tenant isolation: dataset metadata is global; allowed for all authenticated callers.
+    let _ = owner;
     let mut datasets = Vec::new();
     for ds in DatasetName::all() {
         let sql_name = ds.as_sql_str();
@@ -2395,8 +2531,11 @@ async fn list_all_datasets(
 
 async fn list_dataset_versions_handler(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<DatasetVersion>>, AppError> {
+    // Tenant isolation: dataset version metadata is global; allowed for all authenticated callers.
+    let _ = owner;
     validate_dataset_name(&name)?;
     let versions = state
         .repo
@@ -2408,9 +2547,17 @@ async fn list_dataset_versions_handler(
 
 async fn query_dataset_records(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path(name): Path<String>,
     Query(params): Query<DatasetQueryParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // Tenant isolation: require target_id and validate ownership.
+    if let Some(_owner_id) = owner.0 {
+        let target_id = params.target_id.ok_or_else(|| {
+            AppError::bad_request("target_id is required for tenant-scoped dataset queries")
+        })?;
+        check_target_owner(&state.repo, target_id, &owner).await?;
+    }
     validate_dataset_name(&name)?;
     if !DatasetRegistry::is_queryable(&name) {
         return Err(AppError::bad_request(format!(
@@ -2737,6 +2884,7 @@ fn wallet_ledger_to_tax_csv(records: &[WalletLedgerRecord]) -> Vec<u8> {
 
 async fn create_export_job(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Json(req): Json<ExportJobRequest>,
 ) -> Result<(StatusCode, Json<ExportJobStatus>), AppError> {
     validate_dataset_name(&req.dataset)?;
@@ -2784,6 +2932,14 @@ async fn create_export_job(
             EXPORTABLE_DATASETS.join(", ")
         ))
     })?;
+    // Tenant isolation: require and validate target_id for tenant-scoped requests.
+    if let Some(_owner_id) = owner.0 {
+        let target_id = req.target_id.ok_or_else(|| {
+            AppError::bad_request("target_id is required for tenant-scoped export requests")
+        })?;
+        check_target_owner(&state.repo, target_id, &owner).await?;
+    }
+
     let job = state
         .repo
         .enqueue_export_job(
@@ -2791,6 +2947,7 @@ async fn create_export_job(
             _format,
             Some(&filters),
             sink_config_json.as_ref(),
+            owner.0,
         )
         .await
         .map_err(|e| AppError::internal(format!("Failed to enqueue export job: {e}")))?;
@@ -2873,6 +3030,7 @@ pub(crate) struct ExportMetadata {
 
 async fn get_export_job_status(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path(job_id): Path<Uuid>,
 ) -> Result<Json<ExportJobStatus>, AppError> {
     let job = state
@@ -2881,13 +3039,21 @@ async fn get_export_job_status(
         .await
         .map_err(|e| AppError::internal(format!("Failed to fetch export job: {e}")))?;
     match job {
-        Some(j) => Ok(Json(export_job_to_status(&j))),
+        Some(j) => {
+            if let Some(owner_id) = owner.0 {
+                if j.owner_id != Some(owner_id) {
+                    return Err(AppError::forbidden("Export job not owned by this tenant"));
+                }
+            }
+            Ok(Json(export_job_to_status(&j)))
+        }
         None => Err(AppError::not_found("Export job not found")),
     }
 }
 
 async fn download_export(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path(job_id): Path<Uuid>,
 ) -> Result<Response, AppError> {
     let job = state
@@ -2896,6 +3062,11 @@ async fn download_export(
         .await
         .map_err(|e| AppError::internal(format!("Failed to fetch export job: {e}")))?
         .ok_or_else(|| AppError::not_found("Export job not found"))?;
+    if let Some(owner_id) = owner.0 {
+        if job.owner_id != Some(owner_id) {
+            return Err(AppError::forbidden("Export job not owned by this tenant"));
+        }
+    }
 
     match job.status {
         DurableExportJobStatus::Completed => {
@@ -3033,8 +3204,16 @@ struct ForensicsParams {
 /// GET /v1/forensics/activity — wallet interaction analysis from wallet_ledger.
 async fn forensics_activity_handler(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Query(params): Query<ForensicsParams>,
 ) -> Result<Json<ForensicsActivity>, AppError> {
+    // Tenant isolation: require target_id and validate ownership.
+    if let Some(_owner_id) = owner.0 {
+        let target_id = params.target_id.ok_or_else(|| {
+            AppError::bad_request("target_id is required for tenant-scoped analytics")
+        })?;
+        check_target_owner(&state.repo, target_id, &owner).await?;
+    }
     validate_date_range(params.time_start, params.time_end)?;
 
     let records = state
@@ -3081,8 +3260,16 @@ struct HlAnalyticsParams {
 /// GET /v1/analytics/hl/trader — per-trader Hyperliquid PnL analytics.
 async fn hl_trader_analytics_handler(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Query(params): Query<HlAnalyticsParams>,
 ) -> Result<Json<TraderAnalytics>, AppError> {
+    // Tenant isolation: require target_id and validate ownership.
+    if let Some(_owner_id) = owner.0 {
+        let target_id = params.target_id.ok_or_else(|| {
+            AppError::bad_request("target_id is required for tenant-scoped analytics")
+        })?;
+        check_target_owner(&state.repo, target_id, &owner).await?;
+    }
     validate_date_range(params.time_start, params.time_end)?;
 
     let pnl_summaries = state
@@ -3125,8 +3312,16 @@ async fn hl_trader_analytics_handler(
 /// GET /v1/analytics/hl/market — per-coin Hyperliquid market analytics.
 async fn hl_market_analytics_handler(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Query(params): Query<HlAnalyticsParams>,
 ) -> Result<Json<MarketAnalytics>, AppError> {
+    // Tenant isolation: require target_id and validate ownership.
+    if let Some(_owner_id) = owner.0 {
+        let target_id = params.target_id.ok_or_else(|| {
+            AppError::bad_request("target_id is required for tenant-scoped analytics")
+        })?;
+        check_target_owner(&state.repo, target_id, &owner).await?;
+    }
     validate_date_range(params.time_start, params.time_end)?;
 
     let pnl_summaries = state
@@ -3176,8 +3371,16 @@ struct ProtocolAnalyticsParams {
 /// GET /v1/analytics/protocol/activity — per-protocol event activity analytics.
 async fn protocol_activity_handler(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Query(params): Query<ProtocolAnalyticsParams>,
 ) -> Result<Json<ProtocolActivity>, AppError> {
+    // Tenant isolation: require target_id and validate ownership.
+    if let Some(_owner_id) = owner.0 {
+        let target_id = params.target_id.ok_or_else(|| {
+            AppError::bad_request("target_id is required for tenant-scoped analytics")
+        })?;
+        check_target_owner(&state.repo, target_id, &owner).await?;
+    }
     validate_date_range(params.time_start, params.time_end)?;
 
     let events = state
@@ -3207,8 +3410,16 @@ async fn protocol_activity_handler(
 /// GET /v1/analytics/protocol/tvl — TVL analytics from pool snapshots.
 async fn protocol_tvl_handler(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Query(params): Query<ProtocolAnalyticsParams>,
 ) -> Result<Json<TvlAnalytics>, AppError> {
+    // Tenant isolation: require target_id and validate ownership.
+    if let Some(_owner_id) = owner.0 {
+        let target_id = params.target_id.ok_or_else(|| {
+            AppError::bad_request("target_id is required for tenant-scoped analytics")
+        })?;
+        check_target_owner(&state.repo, target_id, &owner).await?;
+    }
     validate_date_range(params.time_start, params.time_end)?;
 
     let snapshots = state
@@ -3229,8 +3440,15 @@ async fn protocol_tvl_handler(
 
 async fn get_dataset_completeness_handler(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<DatasetCompleteness>>, AppError> {
+    // Tenant isolation: dataset completeness is not yet scoped by owner.
+    if owner.0.is_some() {
+        return Err(AppError::forbidden(
+            "Dataset completeness is not available for tenant-scoped requests",
+        ));
+    }
     validate_dataset_name(&name)?;
     let records = state
         .repo
@@ -3279,8 +3497,15 @@ struct DatasetCompletenessInfo {
 
 async fn get_dataset_status_handler(
     State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
     Path(name): Path<String>,
 ) -> Result<Json<DatasetStatus>, AppError> {
+    // Tenant isolation: dataset status includes global completeness; not yet scoped by owner.
+    if owner.0.is_some() {
+        return Err(AppError::forbidden(
+            "Dataset status is not available for tenant-scoped requests",
+        ));
+    }
     validate_dataset_name(&name)?;
 
     let versions = state

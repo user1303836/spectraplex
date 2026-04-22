@@ -560,6 +560,8 @@ pub struct ExportJob {
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub heartbeat_at: Option<DateTime<Utc>>,
+    /// Tenant owner for export job isolation. `None` for legacy/admin jobs.
+    pub owner_id: Option<Uuid>,
 }
 // ---------------------------------------------------------------------------
 // API Key (Tenant Isolation)
@@ -1656,6 +1658,7 @@ mod tests {
             completeness_status: None,
             completeness_coverage: None,
             last_ingestion_run_id: None,
+            owner_id: None,
             created_at: now,
             updated_at: now,
             started_at: None,

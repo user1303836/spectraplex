@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+sha2 = "0.10"
 spectraplex-core = { path = "../core" }
 spectraplex-adapters = { path = "../adapters" }
 axum = "0.8"
