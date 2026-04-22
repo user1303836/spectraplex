@@ -23,7 +23,8 @@ use spectraplex_core::config::AppConfig;
 use spectraplex_core::models::{Chain, Transaction};
 use spectraplex_core::provider::{NetworkContext, NetworkId, ProviderCapability, ProviderRegistry};
 use spectraplex_core::v2::{
-    Checkpoint, IngestionRun, RawTransaction, StreamSource, StreamSubscription,
+    Checkpoint, IngestionJobMode, IngestionJobStatus, IngestionRun, RawTransaction, StreamSource,
+    StreamSubscription,
 };
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -573,8 +574,8 @@ async fn flush_stream_batch(
         target_id,
         network: network.to_string(),
         source: source.to_string(),
-        mode: "stream".to_string(),
-        status: "running".to_string(),
+        mode: IngestionJobMode::Stream,
+        status: IngestionJobStatus::Running,
         started_at: chrono::Utc::now(),
         finished_at: None,
         records_written: 0,

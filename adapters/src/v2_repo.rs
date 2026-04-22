@@ -15,9 +15,9 @@ pub struct WalletStatsV2 {
     pub per_network: Vec<(String, i64)>,
 }
 use spectraplex_core::materializer::{
-    BalanceSnapshot, DatasetName, DecodedEvent, HlFillRecord, HlFundingPayment, HlPnlSummary,
-    HlPositionChange, HlTradeHistory, NativeBalanceDelta, PoolSnapshot, ProtocolEvent,
-    TokenTransfer, WalletLedgerRecord,
+    BalanceSnapshot, DatasetName, DecodedEvent, ExportFormat, HlFillRecord, HlFundingPayment,
+    HlPnlSummary, HlPositionChange, HlTradeHistory, NativeBalanceDelta, PoolSnapshot,
+    ProtocolEvent, TokenTransfer, WalletLedgerRecord,
 };
 use spectraplex_core::v2::{
     ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
@@ -209,13 +209,18 @@ fn row_to_target_match(row: &sqlx::postgres::PgRow) -> anyhow::Result<TargetMatc
 }
 
 fn row_to_ingestion_run(row: &sqlx::postgres::PgRow) -> anyhow::Result<IngestionRun> {
+    use std::str::FromStr;
+    let mode_str: String = row.try_get("mode")?;
+    let status_str: String = row.try_get("status")?;
     Ok(IngestionRun {
         id: row.try_get("id")?,
         target_id: row.try_get("target_id")?,
         network: row.try_get("network")?,
         source: row.try_get("source")?,
-        mode: row.try_get("mode")?,
-        status: row.try_get("status")?,
+        mode: IngestionJobMode::from_str(&mode_str)
+            .map_err(|e| anyhow::anyhow!("invalid ingestion run mode '{mode_str}': {e}"))?,
+        status: IngestionJobStatus::from_str(&status_str)
+            .map_err(|e| anyhow::anyhow!("invalid ingestion run status '{status_str}': {e}"))?,
         started_at: row.try_get("started_at")?,
         finished_at: row.try_get("finished_at")?,
         records_written: row.try_get("records_written")?,
@@ -454,8 +459,10 @@ pub fn build_ingestion_run_insert(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     args.add(&run.network).map_err(|e| anyhow::anyhow!("{e}"))?;
     args.add(&run.source).map_err(|e| anyhow::anyhow!("{e}"))?;
-    args.add(&run.mode).map_err(|e| anyhow::anyhow!("{e}"))?;
-    args.add(&run.status).map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(run.mode.to_string())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(run.status.to_string())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     args.add(run.started_at)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     args.add(run.finished_at)
@@ -1485,10 +1492,14 @@ fn row_to_stream_subscription(row: &sqlx::postgres::PgRow) -> anyhow::Result<Str
 fn row_to_export_job(row: &sqlx::postgres::PgRow) -> anyhow::Result<ExportJob> {
     use std::str::FromStr;
     let status_str: String = row.try_get("status")?;
+    let dataset_str: String = row.try_get("dataset")?;
+    let format_str: String = row.try_get("format")?;
     Ok(ExportJob {
         id: row.try_get("id")?,
-        dataset: row.try_get("dataset")?,
-        format: row.try_get("format")?,
+        dataset: DatasetName::from_str(&dataset_str)
+            .map_err(|e| anyhow::anyhow!("invalid export_job dataset '{dataset_str}': {e}"))?,
+        format: ExportFormat::from_str(&format_str)
+            .map_err(|e| anyhow::anyhow!("invalid export_job format '{format_str}': {e}"))?,
         filters: row.try_get("filters")?,
         sink_config: row.try_get("sink_config")?,
         status: ExportJobStatus::from_str(&status_str)
@@ -4497,8 +4508,8 @@ impl Repository {
     /// Enqueue an export job with status=pending.
     pub async fn enqueue_export_job(
         &self,
-        dataset: &str,
-        format: &str,
+        dataset: DatasetName,
+        format: ExportFormat,
         filters: Option<&serde_json::Value>,
         sink_config: Option<&serde_json::Value>,
     ) -> anyhow::Result<ExportJob> {
@@ -4515,8 +4526,8 @@ impl Repository {
                        created_at, updated_at, started_at, completed_at, heartbeat_at",
         )
         .bind(id)
-        .bind(dataset)
-        .bind(format)
+        .bind(dataset.to_string())
+        .bind(format.to_string())
         .bind(filters)
         .bind(sink_config)
         .fetch_one(self.pool())
@@ -5275,8 +5286,8 @@ mod tests {
             target_id: Some(Uuid::new_v4()),
             network: "solana-mainnet".to_string(),
             source: "rpc".to_string(),
-            mode: "backfill".to_string(),
-            status: "running".to_string(),
+            mode: IngestionJobMode::Backfill,
+            status: IngestionJobStatus::Running,
             started_at: Utc::now(),
             finished_at: None,
             records_written: 0,
@@ -6843,7 +6854,12 @@ mod tests {
     fn repo_enqueue_export_job_is_send() {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
-            _assert_send(repo.enqueue_export_job("token_transfers", "csv", None, None));
+            _assert_send(repo.enqueue_export_job(
+                DatasetName::TokenTransfers,
+                ExportFormat::Csv,
+                None,
+                None,
+            ));
         }
         let _ = _check;
     }
@@ -6987,8 +7003,8 @@ mod tests {
         // accidental removal that would break dead-worker recovery.
         let job = ExportJob {
             id: Uuid::new_v4(),
-            dataset: "test".into(),
-            format: "json".into(),
+            dataset: DatasetName::TokenTransfers,
+            format: ExportFormat::Jsonl,
             filters: None,
             sink_config: None,
             status: ExportJobStatus::Pending,

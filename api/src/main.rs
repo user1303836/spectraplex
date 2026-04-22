@@ -2717,11 +2717,18 @@ async fn create_export_job(
         .map(|sc| serde_json::to_value(sc).unwrap_or_default());
 
     // Enqueue a durable export job in Postgres
+    let dataset_name: DatasetName = req.dataset.parse().map_err(|_| {
+        AppError::bad_request(format!(
+            "Unknown dataset: {}. Supported: {}",
+            req.dataset,
+            EXPORTABLE_DATASETS.join(", ")
+        ))
+    })?;
     let job = state
         .repo
         .enqueue_export_job(
-            &req.dataset,
-            format_str,
+            dataset_name,
+            _format,
             Some(&filters),
             sink_config_json.as_ref(),
         )
@@ -2760,8 +2767,8 @@ fn export_job_to_status(job: &ExportJob) -> ExportJobStatus {
     ExportJobStatus {
         id: job.id,
         state,
-        dataset: job.dataset.clone(),
-        format: job.format.clone(),
+        dataset: job.dataset.to_string(),
+        format: job.format.to_string(),
         record_count: job.record_count.map(|n| n as usize),
         message: job.error_message.clone(),
         delivered_to,
@@ -2842,7 +2849,7 @@ async fn download_export(
                 .await
                 .map_err(|e| AppError::internal(format!("Failed to read export file: {e}")))?;
 
-            let format: ExportFormat = job.format.parse().unwrap_or(ExportFormat::Jsonl);
+            let format = job.format;
             let ct = content_type_for_format(format);
 
             let sanitize = |s: &str| -> String {
@@ -2850,8 +2857,8 @@ async fn download_export(
                     .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
                     .collect()
             };
-            let safe_dataset = sanitize(&job.dataset);
-            let safe_format = sanitize(&job.format);
+            let safe_dataset = sanitize(job.dataset.as_sql_str());
+            let safe_format = sanitize(&job.format.to_string());
             let disposition = format!(
                 "attachment; filename=\"{}-{}.{}\"",
                 safe_dataset, job_id, safe_format,
@@ -6322,8 +6329,8 @@ mod tests {
         let data = b"{\"foo\":1}\n{\"bar\":2}\n";
         let meta = DeliveryMetadata {
             job_id: Uuid::new_v4(),
-            dataset: "token_transfers".to_string(),
-            format: "jsonl".to_string(),
+            dataset: DatasetName::TokenTransfers.to_string(),
+            format: ExportFormat::Jsonl.to_string(),
             record_count: 2,
             dataset_version_id: None,
             completeness_status: None,
@@ -6350,8 +6357,8 @@ mod tests {
         let data = b"test";
         let meta = DeliveryMetadata {
             job_id: Uuid::new_v4(),
-            dataset: "test".to_string(),
-            format: "jsonl".to_string(),
+            dataset: DatasetName::TokenTransfers.to_string(),
+            format: ExportFormat::Jsonl.to_string(),
             record_count: 1,
             dataset_version_id: None,
             completeness_status: None,

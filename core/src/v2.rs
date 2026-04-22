@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 use uuid::Uuid;
 
+use crate::materializer::{DatasetName, ExportFormat};
 use crate::models::Chain;
 
 // ---------------------------------------------------------------------------
@@ -247,8 +248,8 @@ pub struct IngestionRun {
     pub target_id: Option<Uuid>,
     pub network: String,
     pub source: String,
-    pub mode: String,
-    pub status: String,
+    pub mode: IngestionJobMode,
+    pub status: IngestionJobStatus,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub records_written: i64,
@@ -415,6 +416,7 @@ pub enum IngestionJobStatus {
 pub enum IngestionJobMode {
     Backfill,
     Incremental,
+    Stream,
 }
 
 /// A queued ingestion work item stored in Postgres.
@@ -530,8 +532,8 @@ pub enum ExportJobStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportJob {
     pub id: Uuid,
-    pub dataset: String,
-    pub format: String,
+    pub dataset: DatasetName,
+    pub format: ExportFormat,
     pub filters: Option<serde_json::Value>,
     pub sink_config: Option<serde_json::Value>,
     pub status: ExportJobStatus,
@@ -638,6 +640,7 @@ pub fn normalize_solana_address(addr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::materializer::{DatasetName, ExportFormat};
     use std::str::FromStr;
 
     // -- ChainFamily --
@@ -1048,8 +1051,8 @@ mod tests {
             target_id: Some(Uuid::new_v4()),
             network: "solana-mainnet".to_string(),
             source: "rpc".to_string(),
-            mode: "backfill".to_string(),
-            status: "completed".to_string(),
+            mode: IngestionJobMode::Backfill,
+            status: IngestionJobStatus::Completed,
             started_at: Utc::now(),
             finished_at: Some(Utc::now()),
             records_written: 42,
@@ -1059,7 +1062,7 @@ mod tests {
         let json = serde_json::to_string(&run).unwrap();
         let back: IngestionRun = serde_json::from_str(&json).unwrap();
         assert_eq!(back.records_written, 42);
-        assert_eq!(back.status, "completed");
+        assert_eq!(back.status, IngestionJobStatus::Completed);
     }
 
     #[test]
@@ -1618,8 +1621,8 @@ mod tests {
         let now = Utc::now();
         let job = ExportJob {
             id: Uuid::new_v4(),
-            dataset: "token_transfers".to_string(),
-            format: "csv".to_string(),
+            dataset: DatasetName::TokenTransfers,
+            format: ExportFormat::Csv,
             filters: Some(serde_json::json!({"network": "solana-mainnet"})),
             sink_config: None,
             status: ExportJobStatus::Pending,
@@ -1641,8 +1644,8 @@ mod tests {
         };
         let json = serde_json::to_string(&job).unwrap();
         let back: ExportJob = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.dataset, "token_transfers");
-        assert_eq!(back.format, "csv");
+        assert_eq!(back.dataset, DatasetName::TokenTransfers);
+        assert_eq!(back.format, ExportFormat::Csv);
         assert_eq!(back.status, ExportJobStatus::Pending);
         assert!(back.heartbeat_at.is_none());
     }
