@@ -5048,6 +5048,7 @@ impl Repository {
     pub async fn get_wallet_transactions_v2(
         &self,
         wallet: &str,
+        owner_id: Option<Uuid>,
         limit: i64,
         offset: i64,
         from: Option<i64>,
@@ -5068,6 +5069,11 @@ impl Repository {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut n: usize = 1;
 
+        if let Some(oid) = owner_id {
+            n += 1;
+            sql.push_str(&format!(" AND it.owner_id = ${n}"));
+            args.add(oid).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
         if let Some(start) = from {
             n += 1;
             sql.push_str(&format!(" AND rt.timestamp >= ${n}"));
@@ -5098,19 +5104,33 @@ impl Repository {
         &self,
         wallet: &str,
         tx_hash: &str,
+        owner_id: Option<Uuid>,
     ) -> anyhow::Result<Option<RawTransaction>> {
-        let row = sqlx::query(
+        let mut sql = String::from(
             "SELECT DISTINCT rt.id, rt.network, rt.tx_hash, rt.timestamp, rt.block_number, \
              rt.raw_metadata, rt.source, rt.ingestion_run_id, rt.ingested_at \
              FROM raw_transactions rt \
              JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
              JOIN index_targets it ON it.id = tm.target_id \
              WHERE it.address = $1 AND it.kind = 'wallet' AND rt.tx_hash = $2",
-        )
-        .bind(wallet)
-        .bind(tx_hash)
-        .fetch_optional(self.pool())
-        .await?;
+        );
+        let mut args = sqlx::postgres::PgArguments::default();
+        use sqlx::Arguments;
+        args.add(wallet.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(tx_hash.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut n: usize = 2;
+
+        if let Some(oid) = owner_id {
+            n += 1;
+            sql.push_str(&format!(" AND it.owner_id = ${n}"));
+            args.add(oid).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+
+        let row = sqlx::query_with(&sql, args)
+            .fetch_optional(self.pool())
+            .await?;
         row.as_ref().map(row_to_raw_transaction).transpose()
     }
 
@@ -5118,11 +5138,27 @@ impl Repository {
     pub async fn get_wallet_ledger_v2(
         &self,
         wallet: &str,
+        owner_id: Option<Uuid>,
         limit: i64,
         offset: i64,
         from: Option<i64>,
         to: Option<i64>,
     ) -> anyhow::Result<Vec<WalletLedgerRecord>> {
+        // Defense-in-depth: reject tenant requests for unowned wallets.
+        // TODO: add owner_id to wallet_ledger for true row-level isolation.
+        if let Some(oid) = owner_id {
+            let owned: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM index_targets WHERE kind = 'wallet' AND address = $1 AND owner_id = $2"
+            )
+            .bind(wallet)
+            .bind(oid)
+            .fetch_one(self.pool())
+            .await?;
+            if owned.0 == 0 {
+                return Ok(vec![]);
+            }
+        }
+
         let limit = limit.min(MAX_QUERY_LIMIT);
         let mut sql = String::from(
             "SELECT id, raw_transaction_id, wallet_address, network, tx_hash, \
@@ -5166,8 +5202,24 @@ impl Repository {
     pub async fn get_wallet_balances_v2(
         &self,
         wallet: &str,
+        owner_id: Option<Uuid>,
         at: Option<i64>,
     ) -> anyhow::Result<Vec<(String, bigdecimal::BigDecimal)>> {
+        // Defense-in-depth: reject tenant requests for unowned wallets.
+        // TODO: add owner_id to wallet_ledger for true row-level isolation.
+        if let Some(oid) = owner_id {
+            let owned: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM index_targets WHERE kind = 'wallet' AND address = $1 AND owner_id = $2"
+            )
+            .bind(wallet)
+            .bind(oid)
+            .fetch_one(self.pool())
+            .await?;
+            if owned.0 == 0 {
+                return Ok(vec![]);
+            }
+        }
+
         let rows = if let Some(at_ts) = at {
             sqlx::query(
                 "SELECT asset_symbol, SUM(amount) as balance \
@@ -5205,11 +5257,37 @@ impl Repository {
     }
 
     /// Get wallet stats from V2 tables (raw_transactions + target_matches + wallet_ledger).
-    pub async fn get_wallet_stats_v2(&self, wallet: &str) -> anyhow::Result<WalletStatsV2> {
+    pub async fn get_wallet_stats_v2(
+        &self,
+        wallet: &str,
+        owner_id: Option<Uuid>,
+    ) -> anyhow::Result<WalletStatsV2> {
         use sqlx::Row;
 
+        // Defense-in-depth: reject tenant requests for unowned wallets.
+        // TODO: add owner_id to wallet_ledger for true row-level isolation.
+        if let Some(oid) = owner_id {
+            let owned: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM index_targets WHERE kind = 'wallet' AND address = $1 AND owner_id = $2"
+            )
+            .bind(wallet)
+            .bind(oid)
+            .fetch_one(self.pool())
+            .await?;
+            if owned.0 == 0 {
+                return Ok(WalletStatsV2 {
+                    tx_count: 0,
+                    earliest_timestamp: None,
+                    latest_timestamp: None,
+                    network_count: 0,
+                    unique_assets: 0,
+                    per_network: vec![],
+                });
+            }
+        }
+
         // Transaction counts from raw_transactions via target_matches
-        let tx_row = sqlx::query(
+        let mut tx_sql = String::from(
             "SELECT COUNT(DISTINCT rt.id) AS tx_count, \
                     MIN(rt.timestamp) AS earliest_timestamp, \
                     MAX(rt.timestamp) AS latest_timestamp, \
@@ -5218,10 +5296,21 @@ impl Repository {
              JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
              JOIN index_targets it ON it.id = tm.target_id \
              WHERE it.address = $1 AND it.kind = 'wallet'",
-        )
-        .bind(wallet)
-        .fetch_one(self.pool())
-        .await?;
+        );
+        let mut tx_args = sqlx::postgres::PgArguments::default();
+        use sqlx::Arguments;
+        tx_args
+            .add(wallet.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut n: usize = 1;
+        if let Some(oid) = owner_id {
+            n += 1;
+            tx_sql.push_str(&format!(" AND it.owner_id = ${n}"));
+            tx_args.add(oid).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        let tx_row = sqlx::query_with(&tx_sql, tx_args)
+            .fetch_one(self.pool())
+            .await?;
 
         let tx_count: i64 = tx_row.try_get("tx_count")?;
         let earliest_timestamp: Option<i64> = tx_row.try_get("earliest_timestamp")?;
@@ -5239,17 +5328,27 @@ impl Repository {
         let unique_assets: i64 = asset_row.try_get("unique_assets")?;
 
         // Per-network counts
-        let net_rows = sqlx::query(
+        let mut net_sql = String::from(
             "SELECT rt.network, COUNT(DISTINCT rt.id) AS count \
              FROM raw_transactions rt \
              JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
              JOIN index_targets it ON it.id = tm.target_id \
-             WHERE it.address = $1 AND it.kind = 'wallet' \
-             GROUP BY rt.network ORDER BY rt.network",
-        )
-        .bind(wallet)
-        .fetch_all(self.pool())
-        .await?;
+             WHERE it.address = $1 AND it.kind = 'wallet'",
+        );
+        let mut net_args = sqlx::postgres::PgArguments::default();
+        net_args
+            .add(wallet.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut net_n: usize = 1;
+        if let Some(oid) = owner_id {
+            net_n += 1;
+            net_sql.push_str(&format!(" AND it.owner_id = ${net_n}"));
+            net_args.add(oid).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        net_sql.push_str(" GROUP BY rt.network ORDER BY rt.network");
+        let net_rows = sqlx::query_with(&net_sql, net_args)
+            .fetch_all(self.pool())
+            .await?;
 
         let per_network: Vec<(String, i64)> = net_rows
             .iter()

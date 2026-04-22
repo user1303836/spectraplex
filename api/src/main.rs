@@ -1776,7 +1776,7 @@ async fn get_transactions(
     let offset = clamp_offset(params.offset);
     let raw_txs = state
         .repo
-        .get_wallet_transactions_v2(&wallet, limit, offset, params.from, params.to)
+        .get_wallet_transactions_v2(&wallet, owner.0, limit, offset, params.from, params.to)
         .await
         .map_err(AppError::internal)?;
     let txs: Vec<Transaction> = raw_txs
@@ -1800,7 +1800,7 @@ async fn get_ledger(
     let offset = clamp_offset(params.offset);
     let records = state
         .repo
-        .get_wallet_ledger_v2(&wallet, limit, offset, params.from, params.to)
+        .get_wallet_ledger_v2(&wallet, owner.0, limit, offset, params.from, params.to)
         .await
         .map_err(AppError::internal)?;
     let entries: Vec<LedgerEntry> = records
@@ -1862,7 +1862,14 @@ async fn export_ledger(
 
     let records = state
         .repo
-        .get_wallet_ledger_v2(&wallet, MAX_EXPORT_LIMIT, 0, params.from, params.to)
+        .get_wallet_ledger_v2(
+            &wallet,
+            owner.0,
+            MAX_EXPORT_LIMIT,
+            0,
+            params.from,
+            params.to,
+        )
         .await
         .map_err(AppError::internal)?;
     let entries: Vec<LedgerEntry> = records
@@ -1935,7 +1942,7 @@ async fn get_balances(
     check_wallet_owner(&state.repo, &wallet, &owner).await?;
     let rows = state
         .repo
-        .get_wallet_balances_v2(&wallet, params.at)
+        .get_wallet_balances_v2(&wallet, owner.0, params.at)
         .await
         .map_err(AppError::internal)?;
     let balances: Vec<AssetBalance> = rows
@@ -1959,7 +1966,7 @@ async fn get_single_transaction(
 
     let raw = state
         .repo
-        .get_wallet_transaction_by_hash_v2(&wallet, &tx_hash)
+        .get_wallet_transaction_by_hash_v2(&wallet, &tx_hash, owner.0)
         .await
         .map_err(AppError::internal)?;
 
@@ -1980,7 +1987,7 @@ async fn get_wallet_stats(
 
     let stats = state
         .repo
-        .get_wallet_stats_v2(&wallet)
+        .get_wallet_stats_v2(&wallet, owner.0)
         .await
         .map_err(AppError::internal)?;
 
@@ -2413,16 +2420,20 @@ async fn list_targets(
             .map_err(AppError::internal)?,
     };
 
-    // Apply pagination in Rust for tenant-scoped results (owner filtering is
-    // already done in SQL for tenant mode; for legacy mode it was applied via
-    // LIMIT/OFFSET in the repo query).
-    let offset_usize = offset as usize;
-    let limit_usize = limit as usize;
-    let paginated: Vec<IndexTarget> = targets
-        .into_iter()
-        .skip(offset_usize)
-        .take(limit_usize)
-        .collect();
+    // Apply pagination in Rust only for tenant-scoped results (owner filtering
+    // is done in SQL without LIMIT/OFFSET). For legacy mode, the repo query
+    // already applied LIMIT/OFFSET.
+    let paginated: Vec<IndexTarget> = if owner.0.is_some() {
+        let offset_usize = offset as usize;
+        let limit_usize = limit as usize;
+        targets
+            .into_iter()
+            .skip(offset_usize)
+            .take(limit_usize)
+            .collect()
+    } else {
+        targets
+    };
 
     Ok(Json(paginated))
 }
