@@ -10,7 +10,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use bigdecimal::BigDecimal;
@@ -389,6 +389,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/targets", post(register_target))
         .route("/v1/targets", get(list_targets))
         .route("/v1/targets/{target_id}", get(get_target))
+        .route("/v1/api-keys", post(create_api_key_handler))
+        .route("/v1/api-keys", get(list_api_keys_handler))
+        .route("/v1/api-keys/{key_id}", delete(revoke_api_key_handler))
         .route("/v1/networks", get(list_networks))
         .route("/v1/networks/{network_id}", get(get_network))
         .route("/v1/datasets", get(list_all_datasets))
@@ -2459,6 +2462,114 @@ async fn get_target(
     Ok(Json(target))
 }
 
+// ---------------------------------------------------------------------------
+// API key management handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateApiKeyRequest {
+    name: Option<String>,
+    /// Optional owner ID. Only allowed when using legacy/admin authentication.
+    /// When using a tenant-scoped API key, the new key inherits the caller's owner.
+    owner_id: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+struct CreateApiKeyResponse {
+    id: Uuid,
+    key: String,
+    name: Option<String>,
+    owner_id: Uuid,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize)]
+struct ApiKeyItem {
+    id: Uuid,
+    name: Option<String>,
+    owner_id: Uuid,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn create_api_key_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
+    Json(req): Json<CreateApiKeyRequest>,
+) -> Result<(StatusCode, Json<CreateApiKeyResponse>), AppError> {
+    let owner_id = match owner.0 {
+        Some(id) => id,
+        None => {
+            // Legacy/admin mode: use provided owner_id or generate a new one
+            req.owner_id.unwrap_or_else(Uuid::new_v4)
+        }
+    };
+
+    let raw_key = format!("spx_{}", Uuid::new_v4().to_string().replace('-', ""));
+    let key_hash = format!("{:x}", Sha256::digest(&raw_key));
+
+    let key = state
+        .repo
+        .create_api_key(&key_hash, req.name.as_deref(), owner_id)
+        .await
+        .map_err(AppError::internal)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateApiKeyResponse {
+            id: key.id,
+            key: raw_key,
+            name: key.name,
+            owner_id: key.owner_id,
+            created_at: key.created_at,
+        }),
+    ))
+}
+
+async fn list_api_keys_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
+) -> Result<Json<Vec<ApiKeyItem>>, AppError> {
+    let owner_id = owner.0.ok_or_else(|| {
+        AppError::bad_request("Listing API keys requires a tenant-scoped API key")
+    })?;
+
+    let keys = state
+        .repo
+        .list_api_keys_by_owner(owner_id)
+        .await
+        .map_err(AppError::internal)?;
+
+    let items: Vec<ApiKeyItem> = keys
+        .into_iter()
+        .map(|k| ApiKeyItem {
+            id: k.id,
+            name: k.name,
+            owner_id: k.owner_id,
+            created_at: k.created_at,
+        })
+        .collect();
+
+    Ok(Json(items))
+}
+
+async fn revoke_api_key_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
+    Path(key_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let owner_id = owner.0.ok_or_else(|| {
+        AppError::bad_request("Revoking API keys requires a tenant-scoped API key")
+    })?;
+
+    state
+        .repo
+        .revoke_api_key(key_id, owner_id)
+        .await
+        .map_err(AppError::internal)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_networks(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Network>>, AppError> {
     let networks = state
         .repo
@@ -3645,6 +3756,9 @@ mod tests {
             .route("/v1/targets", post(register_target))
             .route("/v1/targets", get(list_targets))
             .route("/v1/targets/{target_id}", get(get_target))
+            .route("/v1/api-keys", post(create_api_key_handler))
+            .route("/v1/api-keys", get(list_api_keys_handler))
+            .route("/v1/api-keys/{key_id}", delete(revoke_api_key_handler))
             .route("/v1/networks", get(list_networks))
             .route("/v1/networks/{network_id}", get(get_network))
             .route("/v1/datasets", get(list_all_datasets))

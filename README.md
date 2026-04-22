@@ -14,15 +14,14 @@ cd spectraplex
 cargo build --workspace
 
 # Start PostgreSQL
-docker-compose up -d
+./scripts/local-dev.sh
 
 # Start the API server (auto-runs migrations on first start)
 cargo run --bin spectraplex-api
 # → http://127.0.0.1:3000/health
 
-# Ingest some Solana transactions
-cargo run --bin spectraplex-cli -- --db-url postgresql://localhost/spectraplex ingest \
-  --chain solana --wallet <WALLET_ADDRESS> --rpc https://api.mainnet-beta.solana.com --limit 10
+# Run the smoke test (in another terminal)
+./scripts/smoke-test.sh
 ```
 
 Requires Rust (stable) and PostgreSQL 15+. Docker handles Postgres if you don't have one running.
@@ -140,12 +139,35 @@ Stream subscriptions are durable and create `ingestion_runs` per flush batch wit
 ```bash
 # Register an indexing target
 curl -X POST http://127.0.0.1:3000/v1/targets \
-  -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
+  -H "Authorization: Bearer $SPECT...KEY" \
   -H "Content-Type: application/json" \
   -d '{"kind": "wallet", "network": "solana-mainnet", "address": "<ADDRESS>", "mode": "both"}'
 
 # List networks
-curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" http://127.0.0.1:3000/v1/networks
+curl -H "Authorization: Bearer $SPECT...KEY" http://127.0.0.1:3000/v1/networks
+```
+
+### API Keys
+
+Spectraplex supports two authentication modes:
+- **Legacy config key** — set via `SPECTRAPLEX_API_KEY` or `api_key` in config. Full admin access, no tenant isolation.
+- **Tenant-scoped keys** — created via the API, stored in Postgres, isolated by owner.
+
+```bash
+# Create a tenant-scoped API key (use legacy key for auth)
+curl -X POST http://127.0.0.1:3000/v1/api-keys \
+  -H "Authorization: Bearer $SPECT...CONFIG_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "production"}'
+# → returns {"id":"...","key":"spx_...","owner_id":"..."}
+
+# List your active keys
+curl -H "Authorization: Bearer $SPX...TENANT_KEY" \
+  http://127.0.0.1:3000/v1/api-keys
+
+# Revoke a key
+curl -X DELETE http://127.0.0.1:3000/v1/api-keys/<KEY_ID> \
+  -H "Authorization: Bearer $SPX...TENANT_KEY"
 ```
 
 ### Query Datasets
@@ -203,6 +225,9 @@ curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
 
 **Targets and networks:**
 `POST /v1/targets` | `GET /v1/targets` | `GET /v1/targets/:target_id` | `GET /v1/networks` | `GET /v1/networks/:network_id`
+
+**API keys:**
+`POST /v1/api-keys` | `GET /v1/api-keys` | `DELETE /v1/api-keys/:key_id`
 
 **Datasets:**
 `GET /v1/datasets` | `GET /v1/datasets/:name/versions` | `GET /v1/datasets/:name/records` | `GET /v1/datasets/:name/completeness` | `GET /v1/datasets/:name/status`
