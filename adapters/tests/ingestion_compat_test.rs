@@ -34,8 +34,8 @@ use spectraplex_adapters::solana_grpc::SolanaGrpcAdapter;
 use spectraplex_core::connector::{validate_target, Connector, ConnectorCapabilities};
 use spectraplex_core::models::Chain;
 use spectraplex_core::v2::{
-    ChainFamily, Checkpoint, IndexTarget, IngestionRun, RawTransaction, TargetKind, TargetMatch,
-    TargetMode,
+    ChainFamily, Checkpoint, IndexTarget, IngestionJobMode, IngestionJobStatus, IngestionRun,
+    RawTransaction, TargetKind, TargetMatch, TargetMode,
 };
 
 // ---------------------------------------------------------------------------
@@ -207,13 +207,14 @@ fn make_ingestion_run(
     mode: &str,
     status: &str,
 ) -> IngestionRun {
+    use std::str::FromStr;
     IngestionRun {
         id: Uuid::new_v4(),
         target_id: Some(target_id),
         network: network.to_string(),
         source: source.to_string(),
-        mode: mode.to_string(),
-        status: status.to_string(),
+        mode: IngestionJobMode::from_str(mode).expect("valid mode"),
+        status: IngestionJobStatus::from_str(status).expect("valid status"),
         started_at: Utc::now(),
         finished_at: None,
         records_written: 0,
@@ -929,7 +930,10 @@ async fn ingestion_run_lifecycle() {
     repo.create_ingestion_run(&run).await.unwrap();
 
     let fetched_running = repo.get_ingestion_run(run.id).await.unwrap().unwrap();
-    assert_eq!(fetched_running.status, "running");
+    assert_eq!(
+        fetched_running.status,
+        spectraplex_core::v2::IngestionJobStatus::Running
+    );
     assert!(fetched_running.finished_at.is_none());
     assert_eq!(fetched_running.records_written, 0);
 
@@ -940,7 +944,10 @@ async fn ingestion_run_lifecycle() {
         .unwrap();
 
     let fetched_completed = repo.get_ingestion_run(run.id).await.unwrap().unwrap();
-    assert_eq!(fetched_completed.status, "completed");
+    assert_eq!(
+        fetched_completed.status,
+        spectraplex_core::v2::IngestionJobStatus::Completed
+    );
     assert!(fetched_completed.finished_at.is_some());
     assert_eq!(fetched_completed.records_written, 42);
     assert!(fetched_completed.error_message.is_none());

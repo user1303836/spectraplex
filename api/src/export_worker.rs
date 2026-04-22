@@ -189,34 +189,7 @@ async fn execute_export_job(
 
     let (target_id, network, time_start, time_end) = parse_filters(&job.filters);
 
-    let format: ExportFormat = match job.format.parse() {
-        Ok(f) => f,
-        Err(_) => {
-            heartbeat_cancel.cancel();
-            let err_msg = format!("Invalid export format: {}", job.format);
-            error!(job_id = %job_id, error = %err_msg, "Export job failed");
-            if let Err(e) = repo
-                .update_export_job_status(
-                    job_id,
-                    "failed",
-                    None,
-                    None,
-                    Some(&err_msg),
-                    worker_id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await
-            {
-                error!(job_id = %job_id, error = %e, "Failed to mark job failed");
-            }
-            return;
-        }
-    };
+    let format = job.format;
 
     let ext = match format {
         ExportFormat::Jsonl => "jsonl",
@@ -254,7 +227,7 @@ async fn execute_export_job(
     // cancellation propagates into the snapshot+write loop.
     let result = write_export_to_file(
         repo,
-        &job.dataset,
+        job.dataset.as_sql_str(),
         format,
         target_id,
         network.as_deref(),
@@ -367,8 +340,8 @@ async fn execute_export_job(
                         Ok(sink) => {
                             let delivery_meta = DeliveryMetadata {
                                 job_id,
-                                dataset: job.dataset.clone(),
-                                format: job.format.clone(),
+                                dataset: job.dataset.to_string(),
+                                format: job.format.to_string(),
                                 record_count,
                                 dataset_version_id: _export_meta.dataset_version_id,
                                 completeness_status: _export_meta.completeness_status.clone(),
