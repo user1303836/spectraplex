@@ -28,6 +28,7 @@ use spectraplex_adapters::repo::Repository;
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::materializer::{DeliveryMetadata, ExportFormat, SinkConfig};
 use spectraplex_core::v2::ExportJob;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -328,6 +329,25 @@ async fn execute_export_job(
                     return;
                 }
 
+                // Write provenance sidecar file alongside the export artifact.
+                let prov_path = format!("{}/{}.provenance.json", exports_dir, job_id);
+                if let Err(e) = write_provenance_file(
+                    &prov_path,
+                    job_id,
+                    &job.dataset.to_string(),
+                    format,
+                    record_count,
+                    prov_dv_id,
+                    prov_dv,
+                    prov_cs,
+                    prov_cc,
+                    prov_lri,
+                )
+                .await
+                {
+                    warn!(job_id = %job_id, error = %e, "Failed to write provenance file (non-fatal)");
+                }
+
                 // Deliver to the sink from the already-streamed file.
                 // `deliver_from_file` avoids loading the full artifact
                 // into memory (fixes PR #238 [P2] sink-OOM concern):
@@ -486,6 +506,25 @@ async fn execute_export_job(
                     return;
                 }
 
+                // Write provenance sidecar file alongside the export artifact.
+                let prov_path = format!("{}/{}.provenance.json", exports_dir, job_id);
+                if let Err(e) = write_provenance_file(
+                    &prov_path,
+                    job_id,
+                    &job.dataset.to_string(),
+                    format,
+                    record_count,
+                    prov_dv_id,
+                    prov_dv,
+                    prov_cs,
+                    prov_cc,
+                    prov_lri,
+                )
+                .await
+                {
+                    warn!(job_id = %job_id, error = %e, "Failed to write provenance file (non-fatal)");
+                }
+
                 info!(
                     job_id = %job_id,
                     record_count,
@@ -606,6 +645,38 @@ async fn update_or_abort(
             Err(())
         }
     }
+}
+
+/// Write a provenance sidecar JSON file next to the export artifact.
+async fn write_provenance_file(
+    path: &str,
+    job_id: Uuid,
+    dataset: &str,
+    format: spectraplex_core::materializer::ExportFormat,
+    record_count: usize,
+    dataset_version_id: Option<Uuid>,
+    dataset_version: Option<i32>,
+    completeness_status: Option<&str>,
+    completeness_coverage: Option<&serde_json::Value>,
+    last_ingestion_run_id: Option<Uuid>,
+) -> std::io::Result<()> {
+    let prov = serde_json::json!({
+        "export_job_id": job_id,
+        "dataset": dataset,
+        "format": format.to_string(),
+        "record_count": record_count,
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "dataset_version_id": dataset_version_id,
+        "dataset_version": dataset_version,
+        "completeness_status": completeness_status,
+        "completeness_coverage": completeness_coverage,
+        "last_ingestion_run_id": last_ingestion_run_id,
+    });
+
+    let mut file = tokio::fs::File::create(path).await?;
+    file.write_all(prov.to_string().as_bytes()).await?;
+    file.flush().await?;
+    Ok(())
 }
 
 /// Parse the filters JSON value from an export job into individual query

@@ -11,6 +11,7 @@ use crate::fire_callback;
 use spectraplex_adapters::dual_write::BronzeSilverResult;
 use spectraplex_adapters::repo::Repository;
 use spectraplex_core::config::AppConfig;
+use spectraplex_core::v2::{CompletenessStatus, DatasetCompleteness};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -214,6 +215,36 @@ async fn worker_tick(
                                 // under non-authoritative scope values.
                                 let wm_resolved = match task_repo.get_ingestion_run(irun_id).await {
                                     Ok(Some(irun)) => {
+                                        // Upsert dataset completeness for each materialized dataset.
+                                        for (dataset_name, ds_count) in &silver_result.per_dataset {
+                                            let status = if silver_result.all_succeeded() {
+                                                CompletenessStatus::Complete
+                                            } else {
+                                                CompletenessStatus::Partial
+                                            };
+                                            let dc = DatasetCompleteness {
+                                                id: Uuid::new_v4(),
+                                                target_id: irun.target_id.unwrap_or_else(Uuid::new_v4),
+                                                dataset_name: dataset_name.clone(),
+                                                dataset_version_id: None,
+                                                network: irun.network.clone(),
+                                                status,
+                                                coverage_start: silver_result.coverage_start,
+                                                coverage_end: silver_result.coverage_end,
+                                                block_start: None,
+                                                block_end: None,
+                                                last_ingestion_run_id: Some(irun_id),
+                                                records_count: *ds_count as i64,
+                                                gap_ranges: None,
+                                                notes: None,
+                                                created_at: chrono::Utc::now(),
+                                                updated_at: chrono::Utc::now(),
+                                            };
+                                            if let Err(e) = task_repo.upsert_dataset_completeness(&dc).await {
+                                                warn!(run_id = %run_id, dataset = %dataset_name, error = %e, "Failed to upsert dataset completeness (non-fatal)");
+                                            }
+                                        }
+
                                         let w = if let Some(tid) = irun.target_id {
                                             task_repo
                                                 .get_index_target(tid)
