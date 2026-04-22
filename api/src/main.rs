@@ -2529,15 +2529,18 @@ async fn list_api_keys_handler(
     State(state): State<Arc<AppState>>,
     Extension(owner): Extension<AuthenticatedOwner>,
 ) -> Result<Json<Vec<ApiKeyItem>>, AppError> {
-    let owner_id = owner.0.ok_or_else(|| {
-        AppError::bad_request("Listing API keys requires a tenant-scoped API key")
-    })?;
-
-    let keys = state
-        .repo
-        .list_api_keys_by_owner(owner_id)
-        .await
-        .map_err(AppError::internal)?;
+    let keys = match owner.0 {
+        Some(owner_id) => state
+            .repo
+            .list_api_keys_by_owner(owner_id)
+            .await
+            .map_err(AppError::internal)?,
+        None => state
+            .repo
+            .list_all_api_keys()
+            .await
+            .map_err(AppError::internal)?,
+    };
 
     let items: Vec<ApiKeyItem> = keys
         .into_iter()
@@ -2557,15 +2560,18 @@ async fn revoke_api_key_handler(
     Extension(owner): Extension<AuthenticatedOwner>,
     Path(key_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    let owner_id = owner.0.ok_or_else(|| {
-        AppError::bad_request("Revoking API keys requires a tenant-scoped API key")
-    })?;
-
-    state
-        .repo
-        .revoke_api_key(key_id, owner_id)
-        .await
-        .map_err(AppError::internal)?;
+    match owner.0 {
+        Some(owner_id) => state
+            .repo
+            .revoke_api_key(key_id, owner_id)
+            .await
+            .map_err(AppError::internal)?,
+        None => state
+            .repo
+            .revoke_api_key_admin(key_id)
+            .await
+            .map_err(AppError::internal)?,
+    };
 
     Ok(StatusCode::NO_CONTENT)
 }
