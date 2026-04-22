@@ -330,11 +330,12 @@ async fn execute_export_job(
                 }
 
                 // Write provenance sidecar file alongside the export artifact.
+                // Provenance is required for a complete export; failure fails the job.
                 let prov_path = format!("{}/{}.provenance.json", exports_dir, job_id);
                 if let Err(e) = write_provenance_file(
                     &prov_path,
                     job_id,
-                    &job.dataset.to_string(),
+                    job.dataset.as_sql_str(),
                     format,
                     record_count,
                     prov_dv_id,
@@ -345,7 +346,27 @@ async fn execute_export_job(
                 )
                 .await
                 {
-                    warn!(job_id = %job_id, error = %e, "Failed to write provenance file (non-fatal)");
+                    let err_msg = format!("Failed to write provenance sidecar: {e}");
+                    error!(job_id = %job_id, error = %err_msg, "Export job failed");
+                    best_effort_unlink(&final_path, job_id).await;
+                    let _ = update_or_abort(
+                        repo,
+                        job_id,
+                        "failed",
+                        Some(record_count as i32),
+                        Some(&result_location),
+                        Some(&err_msg),
+                        worker_id,
+                        None,
+                        prov_dv_id,
+                        prov_dv,
+                        prov_cs,
+                        prov_cc,
+                        prov_lri,
+                    )
+                    .await;
+                    heartbeat_cancel.cancel();
+                    return;
                 }
 
                 // Deliver to the sink from the already-streamed file.
@@ -507,11 +528,12 @@ async fn execute_export_job(
                 }
 
                 // Write provenance sidecar file alongside the export artifact.
+                // Provenance is required for a complete export; failure fails the job.
                 let prov_path = format!("{}/{}.provenance.json", exports_dir, job_id);
                 if let Err(e) = write_provenance_file(
                     &prov_path,
                     job_id,
-                    &job.dataset.to_string(),
+                    job.dataset.as_sql_str(),
                     format,
                     record_count,
                     prov_dv_id,
@@ -522,7 +544,27 @@ async fn execute_export_job(
                 )
                 .await
                 {
-                    warn!(job_id = %job_id, error = %e, "Failed to write provenance file (non-fatal)");
+                    let err_msg = format!("Failed to write provenance sidecar: {e}");
+                    error!(job_id = %job_id, error = %err_msg, "Export job failed");
+                    best_effort_unlink(&final_path, job_id).await;
+                    let _ = update_or_abort(
+                        repo,
+                        job_id,
+                        "failed",
+                        Some(record_count as i32),
+                        Some(&result_location),
+                        Some(&err_msg),
+                        worker_id,
+                        None,
+                        prov_dv_id,
+                        prov_dv,
+                        prov_cs,
+                        prov_cc,
+                        prov_lri,
+                    )
+                    .await;
+                    heartbeat_cancel.cancel();
+                    return;
                 }
 
                 info!(
@@ -554,13 +596,14 @@ async fn execute_export_job(
                         // transition and the `completed` transition
                         // (narrow window — our lease-holding update to
                         // `delivering` just succeeded). Pull the
-                        // published artifact back so the new owner does
-                        // not serve our output via `/download`.
+                        // published artifact and provenance back so the
+                        // new owner does not serve our output via `/download`.
                         warn!(
                             job_id = %job_id,
-                            "Lease lost at final update — unpublishing artifact"
+                            "Lease lost at final update — unpublishing artifact and provenance"
                         );
                         best_effort_unlink(&final_path, job_id).await;
+                        best_effort_unlink(&prov_path, job_id).await;
                     }
                 }
             }
@@ -673,9 +716,14 @@ async fn write_provenance_file(
         "last_ingestion_run_id": last_ingestion_run_id,
     });
 
-    let mut file = tokio::fs::File::create(path).await?;
+    // Atomic write: temp file -> rename so crashes or partial writes never
+    // leave a truncated sidecar next to the artifact.
+    let temp_path = format!("{}.tmp", path);
+    let mut file = tokio::fs::File::create(&temp_path).await?;
     file.write_all(prov.to_string().as_bytes()).await?;
     file.flush().await?;
+    drop(file);
+    tokio::fs::rename(&temp_path, path).await?;
     Ok(())
 }
 
