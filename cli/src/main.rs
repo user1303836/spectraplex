@@ -250,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
                                     spectraplex_core::v2::TargetKind::Wallet,
                                     net,
                                     wallet,
+                                    None,
                                 )
                                 .await
                                 .ok()

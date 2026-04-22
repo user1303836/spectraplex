@@ -20,7 +20,7 @@ use spectraplex_core::materializer::{
     ProtocolEvent, TokenTransfer, WalletLedgerRecord,
 };
 use spectraplex_core::v2::{
-    ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
+    ApiKey, ChainFamily, Checkpoint, CompletenessStatus, DatasetCompleteness, DatasetVersion,
     DatasetVersionStatus, DatasetWatermark, EvmTraceType, ExportJob, ExportJobStatus, IndexTarget,
     IngestionJob, IngestionJobMode, IngestionJobStatus, IngestionRun, MaterializationRun,
     MaterializationRunStatus, Network, RawEvmTrace, RawTransaction, StreamActualStatus,
@@ -398,7 +398,7 @@ pub fn build_index_target_insert(
         "INSERT INTO index_targets \
          (id, kind, network, chain_family, address, filter_spec, mode, label, owner_id, created_at, updated_at) \
          VALUES ($1, $2::target_kind_enum, $3, $4::chain_family_enum, $5, $6, $7::target_mode_enum, $8, $9, $10, $11) \
-         ON CONFLICT (kind, network, address) WHERE address IS NOT NULL DO UPDATE SET updated_at = NOW() \
+         ON CONFLICT (kind, network, address, owner_id) WHERE address IS NOT NULL DO UPDATE SET updated_at = NOW() \
          RETURNING id, kind::text, network, chain_family::text, address, filter_spec, mode::text, label, owner_id, created_at, updated_at",
     );
     let mut args = sqlx::postgres::PgArguments::default();
@@ -1519,6 +1519,17 @@ fn row_to_export_job(row: &sqlx::postgres::PgRow) -> anyhow::Result<ExportJob> {
         started_at: row.try_get("started_at")?,
         completed_at: row.try_get("completed_at")?,
         heartbeat_at: row.try_get("heartbeat_at")?,
+        owner_id: row.try_get("owner_id").unwrap_or(None),
+    })
+}
+fn row_to_api_key(row: &sqlx::postgres::PgRow) -> anyhow::Result<ApiKey> {
+    Ok(ApiKey {
+        id: row.try_get("id")?,
+        key_hash: row.try_get("key_hash")?,
+        name: row.try_get("name")?,
+        owner_id: row.try_get("owner_id")?,
+        created_at: row.try_get("created_at")?,
+        revoked_at: row.try_get("revoked_at")?,
     })
 }
 
@@ -1654,18 +1665,34 @@ impl Repository {
         kind: TargetKind,
         network: &str,
         address: &str,
+        owner_id: Option<Uuid>,
     ) -> anyhow::Result<Option<IndexTarget>> {
-        let row = sqlx::query(
-            "SELECT id, kind::text, network, chain_family::text, address, filter_spec, \
-             mode::text, label, owner_id, created_at, updated_at \
-             FROM index_targets \
-             WHERE kind = $1::target_kind_enum AND network = $2 AND address = $3",
-        )
-        .bind(target_kind_to_sql(&kind))
-        .bind(network)
-        .bind(address)
-        .fetch_optional(self.pool())
-        .await?;
+        let row = if let Some(oid) = owner_id {
+            sqlx::query(
+                "SELECT id, kind::text, network, chain_family::text, address, filter_spec, \
+                 mode::text, label, owner_id, created_at, updated_at \
+                 FROM index_targets \
+                 WHERE kind = $1::target_kind_enum AND network = $2 AND address = $3 AND owner_id = $4",
+            )
+            .bind(target_kind_to_sql(&kind))
+            .bind(network)
+            .bind(address)
+            .bind(oid)
+            .fetch_optional(self.pool())
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, kind::text, network, chain_family::text, address, filter_spec, \
+                 mode::text, label, owner_id, created_at, updated_at \
+                 FROM index_targets \
+                 WHERE kind = $1::target_kind_enum AND network = $2 AND address = $3 AND owner_id IS NULL",
+            )
+            .bind(target_kind_to_sql(&kind))
+            .bind(network)
+            .bind(address)
+            .fetch_optional(self.pool())
+            .await?
+        };
         row.as_ref().map(row_to_index_target).transpose()
     }
 
@@ -1760,6 +1787,41 @@ impl Repository {
             query = query.bind(target_kind_to_sql(k).to_string());
         }
 
+        let rows = query.fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_index_target).collect()
+    }
+
+    /// List all index targets for a given owner, ordered by created_at.
+    /// Used for tenant-scoped target listing where pagination must be applied
+    /// after filtering (not before).
+    pub async fn list_index_targets_by_owner(
+        &self,
+        owner_id: Uuid,
+        network: Option<&str>,
+        kind: Option<TargetKind>,
+    ) -> anyhow::Result<Vec<IndexTarget>> {
+        let mut sql = String::from(
+            "SELECT id, kind::text, network, chain_family::text, address, filter_spec, \
+             mode::text, label, owner_id, created_at, updated_at \
+             FROM index_targets WHERE owner_id = $1",
+        );
+        let mut param_idx = 2_usize;
+        if network.is_some() {
+            sql.push_str(&format!(" AND network = ${param_idx}"));
+            param_idx += 1;
+        }
+        if kind.is_some() {
+            sql.push_str(&format!(" AND kind = ${param_idx}::target_kind_enum"));
+        }
+        sql.push_str(" ORDER BY created_at");
+
+        let mut query = sqlx::query(&sql).bind(owner_id);
+        if let Some(nw) = network {
+            query = query.bind(nw.to_string());
+        }
+        if let Some(ref k) = kind {
+            query = query.bind(target_kind_to_sql(k).to_string());
+        }
         let rows = query.fetch_all(self.pool()).await?;
         rows.iter().map(row_to_index_target).collect()
     }
@@ -4466,36 +4528,76 @@ impl Repository {
     pub async fn list_stream_subscriptions(
         &self,
         desired_status: Option<&str>,
+        owner_id: Option<Uuid>,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<StreamSubscription>> {
-        let rows = match desired_status {
-            Some(s) => {
-                sqlx::query(
-                    "SELECT id, target_id, network, source, desired_status, actual_status, \
-                     lease_owner, heartbeat_at, cursor_state, config, error_message, \
-                     created_at, updated_at \
-                     FROM stream_subscriptions WHERE desired_status = $1 \
-                     ORDER BY created_at LIMIT $2 OFFSET $3",
-                )
-                .bind(s)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(self.pool())
-                .await?
+        let rows = if let Some(oid) = owner_id {
+            // Owner-scoped: join with index_targets to enforce ownership.
+            match desired_status {
+                Some(s) => {
+                    sqlx::query(
+                        "SELECT s.id, s.target_id, s.network, s.source, s.desired_status, s.actual_status, \
+                         s.lease_owner, s.heartbeat_at, s.cursor_state, s.config, s.error_message, \
+                         s.created_at, s.updated_at \
+                         FROM stream_subscriptions s \
+                         JOIN index_targets t ON t.id = s.target_id \
+                         WHERE s.desired_status = $1 AND t.owner_id = $2 \
+                         ORDER BY s.created_at LIMIT $3 OFFSET $4",
+                    )
+                    .bind(s)
+                    .bind(oid)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(self.pool())
+                    .await?
+                }
+                None => {
+                    sqlx::query(
+                        "SELECT s.id, s.target_id, s.network, s.source, s.desired_status, s.actual_status, \
+                         s.lease_owner, s.heartbeat_at, s.cursor_state, s.config, s.error_message, \
+                         s.created_at, s.updated_at \
+                         FROM stream_subscriptions s \
+                         JOIN index_targets t ON t.id = s.target_id \
+                         WHERE t.owner_id = $1 \
+                         ORDER BY s.created_at LIMIT $2 OFFSET $3",
+                    )
+                    .bind(oid)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(self.pool())
+                    .await?
+                }
             }
-            None => {
-                sqlx::query(
-                    "SELECT id, target_id, network, source, desired_status, actual_status, \
-                     lease_owner, heartbeat_at, cursor_state, config, error_message, \
-                     created_at, updated_at \
-                     FROM stream_subscriptions \
-                     ORDER BY created_at LIMIT $1 OFFSET $2",
-                )
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(self.pool())
-                .await?
+        } else {
+            match desired_status {
+                Some(s) => {
+                    sqlx::query(
+                        "SELECT id, target_id, network, source, desired_status, actual_status, \
+                         lease_owner, heartbeat_at, cursor_state, config, error_message, \
+                         created_at, updated_at \
+                         FROM stream_subscriptions WHERE desired_status = $1 \
+                         ORDER BY created_at LIMIT $2 OFFSET $3",
+                    )
+                    .bind(s)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(self.pool())
+                    .await?
+                }
+                None => {
+                    sqlx::query(
+                        "SELECT id, target_id, network, source, desired_status, actual_status, \
+                         lease_owner, heartbeat_at, cursor_state, config, error_message, \
+                         created_at, updated_at \
+                         FROM stream_subscriptions \
+                         ORDER BY created_at LIMIT $1 OFFSET $2",
+                    )
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(self.pool())
+                    .await?
+                }
             }
         };
         rows.iter().map(row_to_stream_subscription).collect()
@@ -4512,24 +4614,26 @@ impl Repository {
         format: ExportFormat,
         filters: Option<&serde_json::Value>,
         sink_config: Option<&serde_json::Value>,
+        owner_id: Option<Uuid>,
     ) -> anyhow::Result<ExportJob> {
         let id = Uuid::new_v4();
         let row = sqlx::query(
             "INSERT INTO export_jobs \
-             (id, dataset, format, filters, sink_config) \
-             VALUES ($1, $2, $3, $4, $5) \
+             (id, dataset, format, filters, sink_config, owner_id) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
              RETURNING id, dataset, format, filters, sink_config, status, \
                        worker_id, record_count, result_location, \
                        delivery_destination, error_message, \
                        dataset_version_id, dataset_version, completeness_status, \
                        completeness_coverage, last_ingestion_run_id, \
-                       created_at, updated_at, started_at, completed_at, heartbeat_at",
+                       created_at, updated_at, started_at, completed_at, heartbeat_at, owner_id",
         )
         .bind(id)
         .bind(dataset.to_string())
         .bind(format.to_string())
         .bind(filters)
         .bind(sink_config)
+        .bind(owner_id)
         .fetch_one(self.pool())
         .await?;
         row_to_export_job(&row)
@@ -4581,7 +4685,7 @@ impl Repository {
              delivery_destination, error_message, \
              dataset_version_id, dataset_version, completeness_status, \
              completeness_coverage, last_ingestion_run_id, \
-             created_at, updated_at, started_at, completed_at, heartbeat_at \
+             created_at, updated_at, started_at, completed_at, heartbeat_at, owner_id \
              FROM export_jobs WHERE id = $1",
         )
         .bind(job_id)
@@ -4684,7 +4788,7 @@ impl Repository {
              delivery_destination, error_message, \
              dataset_version_id, dataset_version, completeness_status, \
              completeness_coverage, last_ingestion_run_id, \
-             created_at, updated_at, started_at, completed_at, heartbeat_at \
+             created_at, updated_at, started_at, completed_at, heartbeat_at, owner_id \
              FROM export_jobs WHERE id = $1",
         )
         .bind(id)
@@ -4696,6 +4800,88 @@ impl Repository {
     // -----------------------------------------------------------------------
     // Materialization Runs (Durable Control Plane)
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // API Keys (Tenant Isolation — Issue #216)
+    // -----------------------------------------------------------------------
+
+    /// Insert a new API key. The caller is responsible for hashing the key.
+    pub async fn create_api_key(
+        &self,
+        key_hash: &str,
+        name: Option<&str>,
+        owner_id: Uuid,
+    ) -> anyhow::Result<ApiKey> {
+        let row = sqlx::query(
+            "INSERT INTO api_keys (key_hash, name, owner_id) \
+             VALUES ($1, $2, $3) \
+             RETURNING id, key_hash, name, owner_id, created_at, revoked_at",
+        )
+        .bind(key_hash)
+        .bind(name)
+        .bind(owner_id)
+        .fetch_one(self.pool())
+        .await?;
+        row_to_api_key(&row)
+    }
+
+    /// Validate an API key by its raw hash. Returns `Ok(None)` if the key
+    /// does not exist or has been revoked.
+    pub async fn validate_api_key(&self, key_hash: &str) -> anyhow::Result<Option<ApiKey>> {
+        let row = sqlx::query(
+            "SELECT id, key_hash, name, owner_id, created_at, revoked_at \
+             FROM api_keys \
+             WHERE key_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(key_hash)
+        .fetch_optional(self.pool())
+        .await?;
+        match row {
+            Some(r) => Ok(Some(row_to_api_key(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Revoke an API key by id, scoped to an owner.
+    pub async fn revoke_api_key(&self, id: Uuid, owner_id: Uuid) -> anyhow::Result<()> {
+        sqlx::query("UPDATE api_keys SET revoked_at = NOW() WHERE id = $1 AND owner_id = $2")
+            .bind(id)
+            .bind(owner_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// List API keys for a given owner (excluding revoked).
+    pub async fn list_api_keys_by_owner(&self, owner_id: Uuid) -> anyhow::Result<Vec<ApiKey>> {
+        let rows = sqlx::query(
+            "SELECT id, key_hash, name, owner_id, created_at, revoked_at \
+             FROM api_keys \
+             WHERE owner_id = $1 AND revoked_at IS NULL \
+             ORDER BY created_at",
+        )
+        .bind(owner_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_api_key).collect()
+    }
+
+    /// List wallet targets belonging to a specific owner (no pagination limit).
+    pub async fn list_wallet_targets_by_owner(
+        &self,
+        owner_id: Uuid,
+    ) -> anyhow::Result<Vec<IndexTarget>> {
+        let rows = sqlx::query(
+            "SELECT id, kind::text, network, chain_family::text, address, filter_spec, \
+             mode::text, label, owner_id, created_at, updated_at \
+             FROM index_targets \
+             WHERE kind = 'wallet'::target_kind_enum AND owner_id = $1",
+        )
+        .bind(owner_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_index_target).collect()
+    }
 
     /// Create a new materialization run with status=pending.
     pub async fn create_materialization_run(
@@ -4862,6 +5048,7 @@ impl Repository {
     pub async fn get_wallet_transactions_v2(
         &self,
         wallet: &str,
+        owner_id: Option<Uuid>,
         limit: i64,
         offset: i64,
         from: Option<i64>,
@@ -4882,6 +5069,11 @@ impl Repository {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut n: usize = 1;
 
+        if let Some(oid) = owner_id {
+            n += 1;
+            sql.push_str(&format!(" AND it.owner_id = ${n}"));
+            args.add(oid).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
         if let Some(start) = from {
             n += 1;
             sql.push_str(&format!(" AND rt.timestamp >= ${n}"));
@@ -4912,19 +5104,33 @@ impl Repository {
         &self,
         wallet: &str,
         tx_hash: &str,
+        owner_id: Option<Uuid>,
     ) -> anyhow::Result<Option<RawTransaction>> {
-        let row = sqlx::query(
+        let mut sql = String::from(
             "SELECT DISTINCT rt.id, rt.network, rt.tx_hash, rt.timestamp, rt.block_number, \
              rt.raw_metadata, rt.source, rt.ingestion_run_id, rt.ingested_at \
              FROM raw_transactions rt \
              JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
              JOIN index_targets it ON it.id = tm.target_id \
              WHERE it.address = $1 AND it.kind = 'wallet' AND rt.tx_hash = $2",
-        )
-        .bind(wallet)
-        .bind(tx_hash)
-        .fetch_optional(self.pool())
-        .await?;
+        );
+        let mut args = sqlx::postgres::PgArguments::default();
+        use sqlx::Arguments;
+        args.add(wallet.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        args.add(tx_hash.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut n: usize = 2;
+
+        if let Some(oid) = owner_id {
+            n += 1;
+            sql.push_str(&format!(" AND it.owner_id = ${n}"));
+            args.add(oid).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+
+        let row = sqlx::query_with(&sql, args)
+            .fetch_optional(self.pool())
+            .await?;
         row.as_ref().map(row_to_raw_transaction).transpose()
     }
 
@@ -4932,11 +5138,27 @@ impl Repository {
     pub async fn get_wallet_ledger_v2(
         &self,
         wallet: &str,
+        owner_id: Option<Uuid>,
         limit: i64,
         offset: i64,
         from: Option<i64>,
         to: Option<i64>,
     ) -> anyhow::Result<Vec<WalletLedgerRecord>> {
+        // Defense-in-depth: reject tenant requests for unowned wallets.
+        // TODO: add owner_id to wallet_ledger for true row-level isolation.
+        if let Some(oid) = owner_id {
+            let owned: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM index_targets WHERE kind = 'wallet' AND address = $1 AND owner_id = $2"
+            )
+            .bind(wallet)
+            .bind(oid)
+            .fetch_one(self.pool())
+            .await?;
+            if owned.0 == 0 {
+                return Ok(vec![]);
+            }
+        }
+
         let limit = limit.min(MAX_QUERY_LIMIT);
         let mut sql = String::from(
             "SELECT id, raw_transaction_id, wallet_address, network, tx_hash, \
@@ -4980,8 +5202,24 @@ impl Repository {
     pub async fn get_wallet_balances_v2(
         &self,
         wallet: &str,
+        owner_id: Option<Uuid>,
         at: Option<i64>,
     ) -> anyhow::Result<Vec<(String, bigdecimal::BigDecimal)>> {
+        // Defense-in-depth: reject tenant requests for unowned wallets.
+        // TODO: add owner_id to wallet_ledger for true row-level isolation.
+        if let Some(oid) = owner_id {
+            let owned: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM index_targets WHERE kind = 'wallet' AND address = $1 AND owner_id = $2"
+            )
+            .bind(wallet)
+            .bind(oid)
+            .fetch_one(self.pool())
+            .await?;
+            if owned.0 == 0 {
+                return Ok(vec![]);
+            }
+        }
+
         let rows = if let Some(at_ts) = at {
             sqlx::query(
                 "SELECT asset_symbol, SUM(amount) as balance \
@@ -5019,11 +5257,37 @@ impl Repository {
     }
 
     /// Get wallet stats from V2 tables (raw_transactions + target_matches + wallet_ledger).
-    pub async fn get_wallet_stats_v2(&self, wallet: &str) -> anyhow::Result<WalletStatsV2> {
+    pub async fn get_wallet_stats_v2(
+        &self,
+        wallet: &str,
+        owner_id: Option<Uuid>,
+    ) -> anyhow::Result<WalletStatsV2> {
         use sqlx::Row;
 
+        // Defense-in-depth: reject tenant requests for unowned wallets.
+        // TODO: add owner_id to wallet_ledger for true row-level isolation.
+        if let Some(oid) = owner_id {
+            let owned: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM index_targets WHERE kind = 'wallet' AND address = $1 AND owner_id = $2"
+            )
+            .bind(wallet)
+            .bind(oid)
+            .fetch_one(self.pool())
+            .await?;
+            if owned.0 == 0 {
+                return Ok(WalletStatsV2 {
+                    tx_count: 0,
+                    earliest_timestamp: None,
+                    latest_timestamp: None,
+                    network_count: 0,
+                    unique_assets: 0,
+                    per_network: vec![],
+                });
+            }
+        }
+
         // Transaction counts from raw_transactions via target_matches
-        let tx_row = sqlx::query(
+        let mut tx_sql = String::from(
             "SELECT COUNT(DISTINCT rt.id) AS tx_count, \
                     MIN(rt.timestamp) AS earliest_timestamp, \
                     MAX(rt.timestamp) AS latest_timestamp, \
@@ -5032,10 +5296,21 @@ impl Repository {
              JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
              JOIN index_targets it ON it.id = tm.target_id \
              WHERE it.address = $1 AND it.kind = 'wallet'",
-        )
-        .bind(wallet)
-        .fetch_one(self.pool())
-        .await?;
+        );
+        let mut tx_args = sqlx::postgres::PgArguments::default();
+        use sqlx::Arguments;
+        tx_args
+            .add(wallet.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut n: usize = 1;
+        if let Some(oid) = owner_id {
+            n += 1;
+            tx_sql.push_str(&format!(" AND it.owner_id = ${n}"));
+            tx_args.add(oid).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        let tx_row = sqlx::query_with(&tx_sql, tx_args)
+            .fetch_one(self.pool())
+            .await?;
 
         let tx_count: i64 = tx_row.try_get("tx_count")?;
         let earliest_timestamp: Option<i64> = tx_row.try_get("earliest_timestamp")?;
@@ -5053,17 +5328,27 @@ impl Repository {
         let unique_assets: i64 = asset_row.try_get("unique_assets")?;
 
         // Per-network counts
-        let net_rows = sqlx::query(
+        let mut net_sql = String::from(
             "SELECT rt.network, COUNT(DISTINCT rt.id) AS count \
              FROM raw_transactions rt \
              JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
              JOIN index_targets it ON it.id = tm.target_id \
-             WHERE it.address = $1 AND it.kind = 'wallet' \
-             GROUP BY rt.network ORDER BY rt.network",
-        )
-        .bind(wallet)
-        .fetch_all(self.pool())
-        .await?;
+             WHERE it.address = $1 AND it.kind = 'wallet'",
+        );
+        let mut net_args = sqlx::postgres::PgArguments::default();
+        net_args
+            .add(wallet.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut net_n: usize = 1;
+        if let Some(oid) = owner_id {
+            net_n += 1;
+            net_sql.push_str(&format!(" AND it.owner_id = ${net_n}"));
+            net_args.add(oid).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        net_sql.push_str(" GROUP BY rt.network ORDER BY rt.network");
+        let net_rows = sqlx::query_with(&net_sql, net_args)
+            .fetch_all(self.pool())
+            .await?;
 
         let per_network: Vec<(String, i64)> = net_rows
             .iter()
@@ -6845,7 +7130,7 @@ mod tests {
     fn repo_list_stream_subscriptions_is_send() {
         fn _assert_send<F: std::future::Future + Send>(_: F) {}
         fn _check(repo: &Repository) {
-            _assert_send(repo.list_stream_subscriptions(Some("active"), 10, 0));
+            _assert_send(repo.list_stream_subscriptions(Some("active"), None, 10, 0));
         }
         let _ = _check;
     }
@@ -6857,6 +7142,7 @@ mod tests {
             _assert_send(repo.enqueue_export_job(
                 DatasetName::TokenTransfers,
                 ExportFormat::Csv,
+                None,
                 None,
                 None,
             ));
@@ -7018,6 +7304,7 @@ mod tests {
             completeness_status: None,
             completeness_coverage: None,
             last_ingestion_run_id: None,
+            owner_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             started_at: None,
