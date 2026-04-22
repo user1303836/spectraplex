@@ -224,7 +224,9 @@ async fn worker_tick(
                                             };
                                             let dc = DatasetCompleteness {
                                                 id: Uuid::new_v4(),
-                                                target_id: irun.target_id.unwrap_or_else(Uuid::new_v4),
+                                                target_id: irun
+                                                    .target_id
+                                                    .unwrap_or_else(Uuid::new_v4),
                                                 dataset_name: dataset_name.clone(),
                                                 dataset_version_id: None,
                                                 network: irun.network.clone(),
@@ -240,7 +242,9 @@ async fn worker_tick(
                                                 created_at: chrono::Utc::now(),
                                                 updated_at: chrono::Utc::now(),
                                             };
-                                            if let Err(e) = task_repo.upsert_dataset_completeness(&dc).await {
+                                            if let Err(e) =
+                                                task_repo.upsert_dataset_completeness(&dc).await
+                                            {
                                                 warn!(run_id = %run_id, dataset = %dataset_name, error = %e, "Failed to upsert dataset completeness (non-fatal)");
                                             }
                                         }

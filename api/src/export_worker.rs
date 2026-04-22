@@ -721,6 +721,7 @@ async fn update_or_abort(
 }
 
 /// Write a provenance sidecar JSON file next to the export artifact.
+#[allow(clippy::too_many_arguments)]
 async fn write_provenance_file(
     path: &str,
     job_id: Uuid,
@@ -764,8 +765,7 @@ async fn write_provenance_file(
 
     if lease_lost.is_cancelled() {
         tokio::fs::remove_file(&temp_path).await.ok();
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "lease lost before provenance publish",
         ));
     }
