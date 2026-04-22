@@ -335,6 +335,7 @@ async fn execute_export_job(
                 if let Err(e) = write_provenance_file(
                     &prov_path,
                     job_id,
+                    worker_id,
                     job.dataset.as_sql_str(),
                     format,
                     record_count,
@@ -533,6 +534,7 @@ async fn execute_export_job(
                 if let Err(e) = write_provenance_file(
                     &prov_path,
                     job_id,
+                    worker_id,
                     job.dataset.as_sql_str(),
                     format,
                     record_count,
@@ -595,15 +597,14 @@ async fn execute_export_job(
                         // Lease was taken between the `delivering`
                         // transition and the `completed` transition
                         // (narrow window — our lease-holding update to
-                        // `delivering` just succeeded). Pull the
-                        // published artifact and provenance back so the
-                        // new owner does not serve our output via `/download`.
+                        // `delivering` just succeeded). Do NOT unlink
+                        // canonical paths here: a reclaiming worker may
+                        // have already published new output, and deleting
+                        // final_path/prov_path would race against it.
                         warn!(
                             job_id = %job_id,
-                            "Lease lost at final update — unpublishing artifact and provenance"
+                            "Lease lost at final update — leaving artifact/provenance for new owner"
                         );
-                        best_effort_unlink(&final_path, job_id).await;
-                        best_effort_unlink(&prov_path, job_id).await;
                     }
                 }
             }
@@ -694,6 +695,7 @@ async fn update_or_abort(
 async fn write_provenance_file(
     path: &str,
     job_id: Uuid,
+    worker_id: &str,
     dataset: &str,
     format: spectraplex_core::materializer::ExportFormat,
     record_count: usize,
@@ -716,9 +718,15 @@ async fn write_provenance_file(
         "last_ingestion_run_id": last_ingestion_run_id,
     });
 
-    // Atomic write: temp file -> rename so crashes or partial writes never
-    // leave a truncated sidecar next to the artifact.
-    let temp_path = format!("{}.tmp", path);
+    // Atomic write with attempt-scoped temp path so concurrent/reclaimed
+    // workers cannot clobber each other's sidecar temp.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    worker_id.hash(&mut h);
+    let tag = format!("{:016x}", h.finish());
+    let temp_path = format!("{}.{}.tmp", path, tag);
+
     let mut file = tokio::fs::File::create(&temp_path).await?;
     file.write_all(prov.to_string().as_bytes()).await?;
     file.flush().await?;
