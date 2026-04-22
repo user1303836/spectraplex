@@ -28,6 +28,7 @@ use spectraplex_adapters::repo::Repository;
 use spectraplex_core::config::AppConfig;
 use spectraplex_core::materializer::{DeliveryMetadata, ExportFormat, SinkConfig};
 use spectraplex_core::v2::ExportJob;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -304,6 +305,15 @@ async fn execute_export_job(
                 // artifact. rename is atomic within the same
                 // filesystem; the exports_dir is a single dir so this
                 // holds.
+                if lease_lost.is_cancelled() {
+                    warn!(
+                        job_id = %job_id,
+                        "Lease lost before artifact rename — discarding temp"
+                    );
+                    best_effort_unlink(&temp_path, job_id).await;
+                    heartbeat_cancel.cancel();
+                    return;
+                }
                 if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
                     let err_msg = format!("Failed to publish export artifact: {e}");
                     error!(job_id = %job_id, error = %err_msg, "Export job failed");
@@ -324,6 +334,58 @@ async fn execute_export_job(
                         prov_lri,
                     )
                     .await;
+                    heartbeat_cancel.cancel();
+                    return;
+                }
+
+                // Write provenance sidecar file alongside the export artifact.
+                // Provenance is required for a complete export; failure fails the job.
+                let prov_path = format!("{}/{}.provenance.json", exports_dir, job_id);
+                if let Err(e) = write_provenance_file(
+                    &prov_path,
+                    job_id,
+                    worker_id,
+                    job.dataset.as_sql_str(),
+                    format,
+                    record_count,
+                    prov_dv_id,
+                    prov_dv,
+                    prov_cs,
+                    prov_cc,
+                    prov_lri,
+                    &lease_lost,
+                )
+                .await
+                {
+                    let err_msg = format!("Failed to write provenance sidecar: {e}");
+                    error!(job_id = %job_id, error = %err_msg, "Export job failed");
+                    let _ = update_or_abort(
+                        repo,
+                        job_id,
+                        "failed",
+                        Some(record_count as i32),
+                        Some(&result_location),
+                        Some(&err_msg),
+                        worker_id,
+                        None,
+                        prov_dv_id,
+                        prov_dv,
+                        prov_cs,
+                        prov_cc,
+                        prov_lri,
+                    )
+                    .await;
+                    heartbeat_cancel.cancel();
+                    return;
+                }
+
+                // Guard sink delivery with a lease check: a reclaimed worker
+                // must not deliver stale output to the sink.
+                if lease_lost.is_cancelled() {
+                    warn!(
+                        job_id = %job_id,
+                        "Lease lost before sink delivery — skipping delivery"
+                    );
                     heartbeat_cancel.cancel();
                     return;
                 }
@@ -462,10 +524,60 @@ async fn execute_export_job(
                 // the lease-confirming `delivering` update above, so a
                 // stale worker never publishes over the new owner's
                 // artifact.
+                if lease_lost.is_cancelled() {
+                    warn!(
+                        job_id = %job_id,
+                        "Lease lost before artifact rename — discarding temp"
+                    );
+                    best_effort_unlink(&temp_path, job_id).await;
+                    heartbeat_cancel.cancel();
+                    return;
+                }
                 if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
                     let err_msg = format!("Failed to publish export artifact: {e}");
                     error!(job_id = %job_id, error = %err_msg, "Export job failed");
                     best_effort_unlink(&temp_path, job_id).await;
+                    let _ = update_or_abort(
+                        repo,
+                        job_id,
+                        "failed",
+                        Some(record_count as i32),
+                        Some(&result_location),
+                        Some(&err_msg),
+                        worker_id,
+                        None,
+                        prov_dv_id,
+                        prov_dv,
+                        prov_cs,
+                        prov_cc,
+                        prov_lri,
+                    )
+                    .await;
+                    heartbeat_cancel.cancel();
+                    return;
+                }
+
+                // Write provenance sidecar file alongside the export artifact.
+                // Provenance is required for a complete export; failure fails the job.
+                let prov_path = format!("{}/{}.provenance.json", exports_dir, job_id);
+                if let Err(e) = write_provenance_file(
+                    &prov_path,
+                    job_id,
+                    worker_id,
+                    job.dataset.as_sql_str(),
+                    format,
+                    record_count,
+                    prov_dv_id,
+                    prov_dv,
+                    prov_cs,
+                    prov_cc,
+                    prov_lri,
+                    &lease_lost,
+                )
+                .await
+                {
+                    let err_msg = format!("Failed to write provenance sidecar: {e}");
+                    error!(job_id = %job_id, error = %err_msg, "Export job failed");
                     let _ = update_or_abort(
                         repo,
                         job_id,
@@ -514,14 +626,14 @@ async fn execute_export_job(
                         // Lease was taken between the `delivering`
                         // transition and the `completed` transition
                         // (narrow window — our lease-holding update to
-                        // `delivering` just succeeded). Pull the
-                        // published artifact back so the new owner does
-                        // not serve our output via `/download`.
+                        // `delivering` just succeeded). Do NOT unlink
+                        // canonical paths here: a reclaiming worker may
+                        // have already published new output, and deleting
+                        // final_path/prov_path would race against it.
                         warn!(
                             job_id = %job_id,
-                            "Lease lost at final update — unpublishing artifact"
+                            "Lease lost at final update — leaving artifact/provenance for new owner"
                         );
-                        best_effort_unlink(&final_path, job_id).await;
                     }
                 }
             }
@@ -606,6 +718,60 @@ async fn update_or_abort(
             Err(())
         }
     }
+}
+
+/// Write a provenance sidecar JSON file next to the export artifact.
+#[allow(clippy::too_many_arguments)]
+async fn write_provenance_file(
+    path: &str,
+    job_id: Uuid,
+    worker_id: &str,
+    dataset: &str,
+    format: spectraplex_core::materializer::ExportFormat,
+    record_count: usize,
+    dataset_version_id: Option<Uuid>,
+    dataset_version: Option<i32>,
+    completeness_status: Option<&str>,
+    completeness_coverage: Option<&serde_json::Value>,
+    last_ingestion_run_id: Option<Uuid>,
+    lease_lost: &CancellationToken,
+) -> std::io::Result<()> {
+    let prov = serde_json::json!({
+        "export_job_id": job_id,
+        "dataset": dataset,
+        "format": format.to_string(),
+        "record_count": record_count,
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "dataset_version_id": dataset_version_id,
+        "dataset_version": dataset_version,
+        "completeness_status": completeness_status,
+        "completeness_coverage": completeness_coverage,
+        "last_ingestion_run_id": last_ingestion_run_id,
+    });
+
+    // Atomic write with attempt-scoped temp path so concurrent/reclaimed
+    // workers cannot clobber each other's sidecar temp.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    worker_id.hash(&mut h);
+    let tag = format!("{:016x}", h.finish());
+    let temp_path = format!("{}.{}.tmp", path, tag);
+
+    let mut file = tokio::fs::File::create(&temp_path).await?;
+    file.write_all(prov.to_string().as_bytes()).await?;
+    file.flush().await?;
+    drop(file);
+
+    if lease_lost.is_cancelled() {
+        tokio::fs::remove_file(&temp_path).await.ok();
+        return Err(std::io::Error::other(
+            "lease lost before provenance publish",
+        ));
+    }
+
+    tokio::fs::rename(&temp_path, path).await?;
+    Ok(())
 }
 
 /// Parse the filters JSON value from an export job into individual query

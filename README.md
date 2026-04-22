@@ -174,27 +174,39 @@ curl -X DELETE http://127.0.0.1:3000/v1/api-keys/<KEY_ID> \
 
 ```bash
 # Query any dataset with filters
-curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
+curl -H "Authorization: Bearer $SPECT...KEY" \
   "http://127.0.0.1:3000/v1/datasets/token_transfers/records?network=solana-mainnet&limit=50"
 
 # Check dataset completeness
-curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
+curl -H "Authorization: Bearer $SPECT...KEY" \
   http://127.0.0.1:3000/v1/datasets/token_transfers/completeness
+
+# Check dataset status (aggregated across targets)
+curl -H "Authorization: Bearer $SPECT...KEY" \
+  http://127.0.0.1:3000/v1/datasets/token_transfers/status
 ```
+
+Dataset completeness is tracked per target and network. After each materialization run, the system upserts a completeness record with coverage bounds (timestamp or block range), record count, and status (`complete`, `partial`, `backfilling`, or `gap`).
 
 ### Export
 
 ```bash
 # Create an export job (CSV or JSONL)
 curl -X POST http://127.0.0.1:3000/v1/export/dataset \
-  -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
+  -H "Authorization: Bearer $SPECT...KEY" \
   -H "Content-Type: application/json" \
   -d '{"dataset": "wallet_ledger", "format": "csv", "network": "solana-mainnet"}'
 
 # Download when ready
-curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
+curl -H "Authorization: Bearer $SPECT...KEY" \
   http://127.0.0.1:3000/v1/export/jobs/<JOB_ID>/download
 ```
+
+Export jobs write two files to the configured export directory:
+- `{job_id}.csv` or `{job_id}.jsonl` — the data artifact
+- `{job_id}.provenance.json` — sidecar with dataset version, completeness status, coverage bounds, and record count
+
+The provenance file is useful for downstream pipelines that need to know whether the export is complete or partial before processing.
 
 Export jobs are durable with heartbeat-based worker execution. Supported sinks: `local_file` and `webhook`.
 

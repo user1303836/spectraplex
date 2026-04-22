@@ -36,6 +36,10 @@ pub struct BronzeSilverResult {
     pub last_raw_transaction_id: Option<uuid::Uuid>,
     /// The latest raw_transaction timestamp in the input batch.
     pub last_timestamp: Option<i64>,
+    /// Coverage start (min timestamp) across all raw transactions.
+    pub coverage_start: Option<i64>,
+    /// Coverage end (max timestamp) across all raw transactions.
+    pub coverage_end: Option<i64>,
     /// Gold wallet_ledger records successfully written.
     pub gold_wallet_ledger_written: usize,
     /// Gold balance_history records successfully written.
@@ -1281,6 +1285,8 @@ impl Repository {
         let mut result = BronzeSilverResult {
             last_raw_transaction_id: raw_txs.iter().max_by_key(|r| r.timestamp).map(|r| r.id),
             last_timestamp: raw_txs.iter().map(|r| r.timestamp).max(),
+            coverage_start: raw_txs.iter().map(|r| r.timestamp).min(),
+            coverage_end: raw_txs.iter().map(|r| r.timestamp).max(),
             ..Default::default()
         };
 
