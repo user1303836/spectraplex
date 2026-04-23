@@ -2503,6 +2503,23 @@ async fn trigger_target_ingest(
         }
     }
 
+    // Validate target is suitable for ingestion (must have an address).
+    let target_address = target
+        .address
+        .ok_or_else(|| AppError::bad_request("Target has no address and cannot be ingested"))?;
+
+    // For wallet targets, enforce the allowed_wallets operator guard.
+    if target.kind == TargetKind::Wallet {
+        check_wallet_allowed(&target_address, &state.allowed_wallets)?;
+    }
+
+    // Validate ingestion mode.
+    if !matches!(payload.mode.as_str(), "incremental" | "backfill") {
+        return Err(AppError::bad_request(
+            "mode must be 'incremental' or 'backfill'",
+        ));
+    }
+
     // Validate callback URL if provided.
     if let Some(ref url) = payload.callback_url {
         validate_callback_url(url).await?;

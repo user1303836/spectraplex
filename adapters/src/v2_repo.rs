@@ -3254,7 +3254,13 @@ impl Repository {
         offset: i64,
     ) -> anyhow::Result<Vec<BalanceSnapshot>> {
         let target_address = if let Some(tid) = target_id {
-            self.get_index_target(tid).await?.and_then(|t| t.address)
+            match self.get_index_target(tid).await? {
+                Some(t) => match t.address {
+                    Some(addr) if !addr.is_empty() => Some(addr),
+                    _ => return Ok(Vec::new()),
+                },
+                None => return Ok(Vec::new()),
+            }
         } else {
             None
         };
@@ -3308,7 +3314,13 @@ impl Repository {
         offset: i64,
     ) -> anyhow::Result<Vec<HlPnlSummary>> {
         let target_address = if let Some(tid) = target_id {
-            self.get_index_target(tid).await?.and_then(|t| t.address)
+            match self.get_index_target(tid).await? {
+                Some(t) => match t.address {
+                    Some(addr) if !addr.is_empty() => Some(addr),
+                    _ => return Ok(Vec::new()),
+                },
+                None => return Ok(Vec::new()),
+            }
         } else {
             None
         };
@@ -3325,7 +3337,7 @@ impl Repository {
             network,
             time_start,
             time_end,
-            "period_start",
+            "period_end",
             limit,
             offset,
         )?;
@@ -3361,7 +3373,13 @@ impl Repository {
         offset: i64,
     ) -> anyhow::Result<Vec<HlTradeHistory>> {
         let target_address = if let Some(tid) = target_id {
-            self.get_index_target(tid).await?.and_then(|t| t.address)
+            match self.get_index_target(tid).await? {
+                Some(t) => match t.address {
+                    Some(addr) if !addr.is_empty() => Some(addr),
+                    _ => return Ok(Vec::new()),
+                },
+                None => return Ok(Vec::new()),
+            }
         } else {
             None
         };
@@ -3377,7 +3395,7 @@ impl Repository {
             network,
             time_start,
             time_end,
-            "opened_at",
+            "closed_at",
             limit,
             offset,
         )?;
@@ -3415,7 +3433,13 @@ impl Repository {
         offset: i64,
     ) -> anyhow::Result<Vec<ProtocolEvent>> {
         let target_address = if let Some(tid) = target_id {
-            self.get_index_target(tid).await?.and_then(|t| t.address)
+            match self.get_index_target(tid).await? {
+                Some(t) => match t.address {
+                    Some(addr) if !addr.is_empty() => Some(addr),
+                    _ => return Ok(Vec::new()),
+                },
+                None => return Ok(Vec::new()),
+            }
         } else {
             None
         };
@@ -3467,7 +3491,13 @@ impl Repository {
         offset: i64,
     ) -> anyhow::Result<Vec<PoolSnapshot>> {
         let target_address = if let Some(tid) = target_id {
-            self.get_index_target(tid).await?.and_then(|t| t.address)
+            match self.get_index_target(tid).await? {
+                Some(t) => match t.address {
+                    Some(addr) if !addr.is_empty() => Some(addr),
+                    _ => return Ok(Vec::new()),
+                },
+                None => return Ok(Vec::new()),
+            }
         } else {
             None
         };
