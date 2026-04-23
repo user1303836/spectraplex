@@ -93,6 +93,54 @@ extract_json() {
   echo "$json" | python3 -c "import sys, json; print(json.load(sys.stdin)['$key'])" 2>/dev/null || true
 }
 
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+require_command() {
+  local cmd="$1"
+  local hint="$2"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    fail "Required command '$cmd' is not available. $hint"
+  fi
+}
+
+start_postgres() {
+  if command -v docker-compose >/dev/null 2>&1 && docker-compose version >/dev/null 2>&1; then
+    if docker-compose up -d postgres >/dev/null 2>&1; then
+      echo "docker-compose"
+      return 0
+    fi
+  fi
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    if docker compose up -d postgres >/dev/null 2>&1; then
+      echo "docker compose"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+wait_for_postgres() {
+  local compose_cmd="$1"
+  for i in {1..30}; do
+    if command -v pg_isready >/dev/null 2>&1; then
+      if pg_isready -h localhost -p 5432 -U spectraplex >/dev/null 2>&1; then
+        return 0
+      fi
+    elif $compose_cmd exec -T postgres pg_isready -U spectraplex >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+require_command curl "Install curl to call the local API."
+require_command cargo "Install Rust/Cargo to build spectraplex-api."
+require_command python3 "Install python3 for JSON response parsing in the smoke script."
+
 echo "=== Spectraplex Smoke Test ==="
 echo ""
 
@@ -101,15 +149,12 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "[1/10] Starting Postgres..."
 cd "$PROJECT_DIR"
-docker-compose up -d postgres >/dev/null 2>&1 || docker compose up -d postgres >/dev/null 2>&1
-echo "       Postgres started"
+COMPOSE_CMD="$(start_postgres)" || fail "Could not start Postgres with either 'docker-compose up -d postgres' or 'docker compose up -d postgres'. Check Docker/Compose availability and local container logs."
+echo "       Postgres started via $COMPOSE_CMD"
 
-for i in {1..30}; do
-  if pg_isready -h localhost -p 5432 -U spectraplex >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
+if ! wait_for_postgres "$COMPOSE_CMD"; then
+  fail "Postgres did not become ready on localhost:5432 within 30 seconds. Check docker compose logs and local port usage."
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Build and start the API server
