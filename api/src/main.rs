@@ -389,6 +389,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/targets", post(register_target))
         .route("/v1/targets", get(list_targets))
         .route("/v1/targets/{target_id}", get(get_target))
+        .route(
+            "/v1/targets/{target_id}/ingest",
+            post(trigger_target_ingest),
+        )
         .route("/v1/api-keys", post(create_api_key_handler))
         .route("/v1/api-keys", get(list_api_keys_handler))
         .route("/v1/api-keys/{key_id}", delete(revoke_api_key_handler))
@@ -552,6 +556,22 @@ struct IngestRequest {
     wallet: String,
     user_id: Option<Uuid>,
     callback_url: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct TargetIngestRequest {
+    /// Ingestion mode: "incremental" (default) or "backfill".
+    #[serde(default = "default_ingest_mode")]
+    mode: String,
+    /// Job priority (higher = sooner). Defaults to 0.
+    #[serde(default)]
+    priority: i32,
+    /// Optional callback URL for job completion/failure notifications.
+    callback_url: Option<String>,
+}
+
+fn default_ingest_mode() -> String {
+    "incremental".to_string()
 }
 
 #[derive(Deserialize)]
@@ -2462,6 +2482,65 @@ async fn get_target(
     Ok(Json(target))
 }
 
+async fn trigger_target_ingest(
+    State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedOwner>,
+    Path(target_id): Path<Uuid>,
+    Json(payload): Json<TargetIngestRequest>,
+) -> Result<Json<JobStatus>, AppError> {
+    // Look up the target.
+    let target = state
+        .repo
+        .get_index_target(target_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found(format!("Target {target_id} not found")))?;
+
+    // Ownership check.
+    if let Some(owner_id) = owner.0 {
+        if target.owner_id != Some(owner_id) {
+            return Err(AppError::forbidden("Target does not belong to this owner"));
+        }
+    }
+
+    // Validate callback URL if provided.
+    if let Some(ref url) = payload.callback_url {
+        validate_callback_url(url).await?;
+    }
+
+    let owner_id = owner.0.unwrap_or_else(Uuid::new_v4);
+
+    // Enqueue the ingestion job scoped to this target.
+    let params = EnqueueIngestionJobParams {
+        target_id: Some(target_id),
+        network: &target.network,
+        mode: &payload.mode,
+        priority: payload.priority,
+        idempotency_key: None,
+        requested_by: Some(&owner_id.to_string()),
+        callback_url: payload.callback_url.as_deref(),
+    };
+
+    let job = state
+        .repo
+        .enqueue_ingestion_job(&params)
+        .await
+        .map_err(AppError::internal)?;
+
+    info!(
+        job_id = %job.id,
+        target_id = %target_id,
+        network = %target.network,
+        "Target-centric ingestion job enqueued"
+    );
+
+    Ok(Json(JobStatus {
+        id: job.id,
+        state: JobState::Pending,
+        message: Some("Job queued".to_string()),
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // API key management handlers
 // ---------------------------------------------------------------------------
@@ -3762,6 +3841,10 @@ mod tests {
             .route("/v1/targets", post(register_target))
             .route("/v1/targets", get(list_targets))
             .route("/v1/targets/{target_id}", get(get_target))
+            .route(
+                "/v1/targets/{target_id}/ingest",
+                post(trigger_target_ingest),
+            )
             .route("/v1/api-keys", post(create_api_key_handler))
             .route("/v1/api-keys", get(list_api_keys_handler))
             .route("/v1/api-keys/{key_id}", delete(revoke_api_key_handler))
@@ -5887,6 +5970,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_target_ingest_requires_auth() {
+        let app = test_router();
+        let target_id = Uuid::new_v4();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/targets/{}/ingest", target_id))
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn test_list_networks_requires_auth() {
         let app = test_router();
         let req = axum::http::Request::builder()
@@ -7388,6 +7485,17 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn compat_target_ingest_routed() {
+        let id = Uuid::new_v4();
+        assert_post_routed(
+            test_router(),
+            &format!("/v1/targets/{}/ingest", id),
+            r#"{}"#,
+        )
+        .await;
     }
 
     #[tokio::test]
