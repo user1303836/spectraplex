@@ -3,7 +3,7 @@ host = "127.0.0.1"
 database_url = "postgres://spectraplex:spectraplex@localhost:5432/spectraplex"
 pool_size = 10
 log_level = "info"
-ingest_limit = 50
+ingest_limit = 10
 export_dir = "./exports"
 
 # Legacy admin API key used to bootstrap the first tenant key.

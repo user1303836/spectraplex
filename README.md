@@ -22,6 +22,9 @@ cargo run --bin spectraplex-api
 
 # Run the smoke test (in another terminal)
 ./scripts/smoke-test.sh
+
+# Or skip provider-dependent ingestion if you don't have live RPC access:
+# ./scripts/smoke-test.sh --skip-ingest
 ```
 
 Requires Rust (stable) and PostgreSQL 15+. Docker handles Postgres if you don't have one running.
@@ -109,19 +112,21 @@ Operators who no longer need V1 tables can set `enable_v1_compat_writes = false`
 
 ## API
 
-All `/v1/*` routes require `Authorization: Bearer <SPECT...Y>`.
+All `/v1/*` routes require `Authorization: Bearer <API_KEY>`.
+
+Tenant-scoped API keys (created via `POST /v1/api-keys`) are required for tenant isolation on dataset queries and exports. The legacy config key (`SPECTRAPLEX_API_KEY`) can also call these endpoints (without tenant isolation) and is used to bootstrap the first tenant key.
 
 ### Ingestion and Jobs
 
 ```bash
-# Trigger ingestion
+# Trigger ingestion (wallet + network; API auto-creates the target)
 curl -X POST http://127.0.0.1:3000/v1/ingest \
-  -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"chain": "solana", "wallet": "<ADDRESS>", "rpc_url": "https://api.mainnet-beta.solana.com"}'
+  -d '{"wallet": "<ADDRESS>", "network": "solana-mainnet"}'
 
 # Check job status
-curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
+curl -H "Authorization: Bearer $API_KEY" \
   http://127.0.0.1:3000/v1/jobs/<JOB_ID>
 ```
 
@@ -130,25 +135,25 @@ Ingestion jobs are durable — they persist across restarts and are claimed by b
 ### Real-Time Streaming
 
 ```bash
-# Start a Solana gRPC stream (requires SOLANA_GRPC_URL)
+# Start a Solana gRPC stream (requires SOLANA_GRPC_URL and legacy/admin key)
 curl -X POST http://127.0.0.1:3000/v1/stream/start \
-  -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
+  -H "Authorization: Bearer $LEGACY_KEY" \
   -H "Content-Type: application/json" \
   -d '{"chain": "solana"}'
 
 # Start a Hyperliquid WebSocket stream for a wallet
 curl -X POST http://127.0.0.1:3000/v1/stream/start \
-  -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"chain": "hyperliquid", "wallet": "0x..."}'
 
 # List active streams
-curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
+curl -H "Authorization: Bearer $API_KEY" \
   http://127.0.0.1:3000/v1/streams
 
 # Stop a stream
 curl -X POST http://127.0.0.1:3000/v1/stream/<STREAM_ID>/stop \
-  -H "Authorization: Bearer $SPECTRAPLEX_API_KEY"
+  -H "Authorization: Bearer $API_KEY"
 ```
 
 Stream subscriptions are durable and create `ingestion_runs` per flush batch with full Bronze lineage. Hyperliquid streams subscribe to user fills, funding, and ledger updates via WebSocket with automatic reconnection.
@@ -191,17 +196,19 @@ curl -X DELETE http://127.0.0.1:3000/v1/api-keys/<KEY_ID> \
 
 ### Query Datasets
 
-```bash
-# Query any dataset with filters
-curl -H "Authorization: Bearer $SPECT...KEY" \
-  "http://127.0.0.1:3000/v1/datasets/token_transfers/records?network=solana-mainnet&limit=50"
+Tenant-scoped dataset queries require `target_id`:
 
-# Check dataset completeness
-curl -H "Authorization: Bearer $SPECT...KEY" \
+```bash
+# Query a dataset (tenant-scoped)
+curl -H "Authorization: Bearer $API_KEY" \
+  "http://127.0.0.1:3000/v1/datasets/token_transfers/records?target_id=<TARGET_ID>&network=solana-mainnet&limit=50"
+
+# Check dataset completeness (requires legacy/admin key — not tenant-scoped)
+curl -H "Authorization: Bearer $LEGACY_KEY" \
   http://127.0.0.1:3000/v1/datasets/token_transfers/completeness
 
-# Check dataset status (aggregated across targets)
-curl -H "Authorization: Bearer $SPECT...KEY" \
+# Check dataset status (requires legacy/admin key — not tenant-scoped)
+curl -H "Authorization: Bearer $LEGACY_KEY" \
   http://127.0.0.1:3000/v1/datasets/token_transfers/status
 ```
 
@@ -209,15 +216,17 @@ Dataset completeness is tracked per target and network. After each materializati
 
 ### Export
 
+Tenant-scoped exports require `target_id`:
+
 ```bash
 # Create an export job (CSV or JSONL)
 curl -X POST http://127.0.0.1:3000/v1/export/dataset \
-  -H "Authorization: Bearer $SPECT...KEY" \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"dataset": "wallet_ledger", "format": "csv", "network": "solana-mainnet"}'
+  -d '{"dataset": "wallet_ledger", "format": "csv", "target_id": "<TARGET_ID>", "network": "solana-mainnet"}'
 
 # Download when ready
-curl -H "Authorization: Bearer $SPECT...KEY" \
+curl -H "Authorization: Bearer $API_KEY" \
   http://127.0.0.1:3000/v1/export/jobs/<JOB_ID>/download
 ```
 
@@ -235,9 +244,9 @@ When `callback_hmac_secret` is configured, callback payloads include an `X-Spect
 
 ```bash
 curl -X POST http://127.0.0.1:3000/v1/ingest \
-  -H "Authorization: Bearer $SPECT...KEY" \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"chain": "solana", "wallet": "<ADDRESS>", "callback_url": "https://your-app.example.com/webhook"}'
+  -d '{"wallet": "<ADDRESS>", "network": "solana-mainnet", "callback_url": "https://your-app.example.com/webhook"}'
 ```
 
 The webhook receiver can verify the signature:
