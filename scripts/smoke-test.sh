@@ -190,7 +190,7 @@ fi
 # ---------------------------------------------------------------------------
 echo "[6/10] Polling job status..."
 if [[ -n "$JOB_ID" ]]; then
-  for i in {1..10}; do
+  for i in {1..30}; do
     JOB_STATUS=$(curl_json GET "$API_URL/v1/jobs/$JOB_ID" "$TENANT_KEY")
     STATUS=$(echo "$JOB_STATUS" | python3 -c "import sys, json; print(json.load(sys.stdin).get('state','unknown'))" 2>/dev/null || echo "unknown")
     echo "       Job status: $STATUS"
@@ -245,7 +245,7 @@ echo "       Listed $KEY_COUNT active key(s)"
 # ---------------------------------------------------------------------------
 echo "[10/10] Verifying target listing..."
 TARGETS_RESP=$(curl_json GET "$API_URL/v1/targets?limit=10" "$TENANT_KEY")
-TARGET_COUNT=$(echo "$TARGETS_RESP" | python3 -c "import sys, json; d=json.load(sys.stdin); print(len(d.get('targets', d if isinstance(d, list) else [])))" 2>/dev/null || echo "0")
+TARGET_COUNT=$(echo "$TARGETS_RESP" | python3 -c "import sys, json; d=json.load(sys.stdin); print(len(d) if isinstance(d, list) else len(d.get('targets',[])))" 2>/dev/null || echo "0")
 echo "       Listed $TARGET_COUNT target(s)"
 
 echo ""

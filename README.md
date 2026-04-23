@@ -135,9 +135,9 @@ Ingestion jobs are durable — they persist across restarts and are claimed by b
 ### Real-Time Streaming
 
 ```bash
-# Start a Solana gRPC stream (requires SOLANA_GRPC_URL)
+# Start a Solana gRPC stream (requires SOLANA_GRPC_URL and legacy/admin key)
 curl -X POST http://127.0.0.1:3000/v1/stream/start \
-  -H "Authorization: Bearer $API_KEY" \
+  -H "Authorization: Bearer $LEGACY_KEY" \
   -H "Content-Type: application/json" \
   -d '{"chain": "solana"}'
 
