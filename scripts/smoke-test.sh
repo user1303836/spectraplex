@@ -6,15 +6,29 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Proves the supported API path end-to-end on a fresh local environment.
 #
+# What this verifies:
+#   - API server boots and responds to health checks
+#   - Tenant API key creation and authentication work
+#   - Target registration works
+#   - Ingestion can be enqueued and its job status polled
+#   - Tenant-scoped dataset queries accept target_id and return data (if materialized)
+#   - Tenant-scoped export jobs can be created with a sink config
+#   - API key and target listing work
+#
+# What this does NOT verify (these run in background workers):
+#   - Actual RPC ingestion completion against live providers
+#   - Silver/Gold materialization (async, may take minutes)
+#   - Export job completion and file delivery (async worker process)
+#
 # Steps:
 #   1. Start Postgres
 #   2. Start the API server
 #   3. Create a tenant-scoped API key (using legacy admin key)
 #   4. Register a wallet target
 #   5. Trigger ingestion (wallet + network)
-#   6. Poll job status
+#   6. Poll job status (terminal state check)
 #   7. Query dataset records (tenant-scoped via target_id)
-#   8. Create and poll an export job (tenant-scoped via target_id)
+#   8. Create an export job (tenant-scoped via target_id)
 #   9. Verify tenant-scoped API key lifecycle
 #   10. Clean up
 #
@@ -48,7 +62,7 @@ curl_json() {
   local auth="${3:-}"
   local body="${4:-}"
 
-  local cmd=(curl -s -w "\n%{http_code}" -X "$method" "$url")
+  local cmd=(curl -sS -w "\n%{http_code}" -X "$method" "$url")
   if [[ -n "$auth" ]]; then
     cmd+=(-H "Authorization: Bearer $auth")
   fi

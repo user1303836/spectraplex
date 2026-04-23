@@ -114,7 +114,7 @@ Operators who no longer need V1 tables can set `enable_v1_compat_writes = false`
 
 All `/v1/*` routes require `Authorization: Bearer <API_KEY>`.
 
-Tenant-scoped API keys (created via `POST /v1/api-keys`) are required for dataset queries and exports. The legacy config key (`SPECTRAPLEX_API_KEY`) can create tenant keys but does not itself support tenant-scoped endpoints.
+Tenant-scoped API keys (created via `POST /v1/api-keys`) are required for tenant isolation on dataset queries and exports. The legacy config key (`SPECTRAPLEX_API_KEY`) can also call these endpoints (without tenant isolation) and is used to bootstrap the first tenant key.
 
 ### Ingestion and Jobs
 
