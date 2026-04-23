@@ -28,6 +28,12 @@ solana_rpc_url = "https://api.mainnet-beta.solana.com"
 #
 # callback_hmac_secret = "your-secret-key"
 
+# Optional: disable best-effort V1 compatibility writes.
+# When `false`, API ingestion and streaming workers skip writing to V1 tables
+# (`transactions`, `indexer_checkpoints`). Default is `true` for backward
+# compatibility. Set to `false` once all consumers are on V2 Bronze/Silver/Gold.
+# enable_v1_compat_writes = true
+
 # ---------------------------------------------------------------------------
 # Structured network and provider configuration (V2, recommended)
 # ---------------------------------------------------------------------------

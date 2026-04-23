@@ -45,9 +45,9 @@ path is:
 | C. Durable control plane | **Done for MVP** | Ingestion jobs, export jobs, stream subscriptions, materialization runs, leases, heartbeat, reclaim, and restart-oriented worker loops are DB-backed. |
 | D. V2-authoritative ingestion and streaming | **Done for API MVP** | API backfill and stream flows write V2 Bronze/checkpoints/runs first and auto-enqueue materialization. Internal connectors still emit V1-shaped `Transaction` values before conversion. |
 | E. Bronze -> Silver -> Gold pipeline | **Done for planned dataset coverage; hardening remains** | Bronze-native normalize writes Silver and all planned Gold datasets: `wallet_ledger`, `balance_history`, `hl_pnl_summary`, `hl_trade_history`, `protocol_events`, `pool_snapshots`. Gold completeness/provenance still needs MVP-level cleanup. |
-| F. Compatibility cutover and V1 de-emphasis | **Partial, active** | `/v1/normalize` now requires `ingestion_run_id` and the worker fails closed without it. Wallet API reads are V2-backed. Remaining V1 surfaces: best-effort API compatibility writes, V1-shaped connector/parser plumbing, and CLI ingest/normalize paths. |
-| G. Integrator UX improvements | **Partial** | Per-tenant API keys and owner-scoped query checks landed. OpenAPI, SDKs, presets, and user-facing workflow docs are still pending. For MVP, prioritize a short quickstart over SDK generation. |
-| H. Verification and operational hardening | **Active** | Need one end-to-end smoke path, restart/reclaim checks for the MVP flow, and clear operational notes. Full reorg/finality work can follow MVP. |
+| F. Compatibility cutover and V1 de-emphasis | **Done for MVP** | `/v1/normalize` requires `ingestion_run_id` and the worker fails closed without it. Wallet API reads are V2-backed. V1 compat writes are gated by `enable_v1_compat_writes` config (default true). CLI normalize is labeled as legacy compatibility. |
+| G. Integrator UX improvements | **Done for MVP** | Per-tenant API keys and owner-scoped query checks landed. Quickstart, curl examples, HMAC verification example, and supported-path docs are in README. SDKs and dashboards are still pending. |
+| H. Verification and operational hardening | **Done for MVP** | Smoke path proven (P0). Status/provenance usable (P1). Restart/reclaim, idempotency, tenant isolation, and export lifecycle tests added (P3). CLI/V1 compatibility story frozen with config gating (P2). |
 
 ## 3. Milestone Status
 

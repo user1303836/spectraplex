@@ -132,6 +132,14 @@ pub struct AppConfig {
     /// `callback_hmac_secret` in TOML.
     #[serde(default)]
     pub callback_hmac_secret: Option<String>,
+
+    // -- Compatibility --
+    /// Enable best-effort V1 compatibility writes during API ingestion and
+    /// streaming. When `true` (default), workers write to V1 tables
+    /// (`transactions`, `indexer_checkpoints`) in addition to the V2 Bronze
+    /// path. Operators who no longer need V1 tables can set this to `false`.
+    #[serde(default = "default_true")]
+    pub enable_v1_compat_writes: bool,
 }
 
 impl std::fmt::Debug for AppConfig {
@@ -205,6 +213,7 @@ impl Default for AppConfig {
             networks: HashMap::new(),
             providers: Vec::new(),
             callback_hmac_secret: None,
+            enable_v1_compat_writes: true,
         }
     }
 }
