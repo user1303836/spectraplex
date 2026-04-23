@@ -185,6 +185,14 @@ if [[ -n "$JOB_ID" ]]; then
     fi
     sleep 2
   done
+  if [[ "$STATUS" == "failed" ]]; then
+    echo "ERROR: Ingest job $JOB_ID failed"
+    exit 1
+  fi
+  if [[ "$STATUS" != "completed" ]]; then
+    echo "ERROR: Ingest job $JOB_ID did not complete within poll window (last status: $STATUS)"
+    exit 1
+  fi
 else
   echo "       Skipped (no job ID)"
 fi
@@ -223,7 +231,7 @@ echo "       Listed $KEY_COUNT active key(s)"
 # ---------------------------------------------------------------------------
 echo "[10/10] Verifying target listing..."
 TARGETS_RESP=$(curl_json GET "$API_URL/v1/targets?limit=10" "$TENANT_KEY")
-TARGET_COUNT=$(echo "$TARGETS_RESP" | python3 -c "import sys, json; d=json.load(sys.stdin); print(len(d.get('targets', d if isinstance(d, list) else []))))" 2>/dev/null || echo "0")
+TARGET_COUNT=$(echo "$TARGETS_RESP" | python3 -c "import sys, json; d=json.load(sys.stdin); print(len(d.get('targets', d if isinstance(d, list) else [])))" 2>/dev/null || echo "0")
 echo "       Listed $TARGET_COUNT target(s)"
 
 echo ""
