@@ -132,15 +132,28 @@ fn make_target(
     }
 }
 
-fn make_v1_tx(chain: Chain, tx_hash: &str, wallet: &str) -> Transaction {
+fn make_evm_tx_with_transfer(tx_hash: &str, wallet: &str) -> Transaction {
+    let from_padded = format!("0x000000000000000000000000{}", &wallet[2..]);
+    let to_padded = "0x0000000000000000000000002222222222222222222222222222222222222222";
     Transaction {
         id: Uuid::new_v4(),
         user_id: Uuid::new_v4(),
         wallet_address: wallet.to_string(),
         timestamp: 1700000000,
         tx_hash: tx_hash.to_string(),
-        chain,
-        raw_metadata: serde_json::json!({"slot": 100}),
+        chain: Chain::Ethereum,
+        raw_metadata: serde_json::json!({
+            "topics": [
+                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+                from_padded,
+                to_padded,
+            ],
+            "data": "0x0000000000000000000000000000000000000000000000000000000005f5e100",
+            "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "block_number": 42,
+            "gas_used": "0x5208",
+            "effective_gas_price": "0x3b9aca00",
+        }),
     }
 }
 
@@ -156,38 +169,35 @@ async fn silver_materialization_is_idempotent() {
     // Create a target
     let target = make_target(
         TargetKind::Wallet,
-        ChainFamily::Solana,
-        "solana-mainnet",
-        Some("DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy"),
+        ChainFamily::Evm,
+        "ethereum-mainnet",
+        Some("0x1111111111111111111111111111111111111111"),
         None,
     );
     repo.create_index_target(&target).await.unwrap();
 
-    // Ingest V1 transactions
+    // Ingest V1 transactions with ERC20 transfer metadata
+    let wallet = "0x1111111111111111111111111111111111111111";
     let txs = vec![
-        make_v1_tx(
-            Chain::Solana,
-            "tx1",
-            "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy",
-        ),
-        make_v1_tx(
-            Chain::Solana,
-            "tx2",
-            "DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy",
-        ),
+        make_evm_tx_with_transfer("tx1", wallet),
+        make_evm_tx_with_transfer("tx2", wallet),
     ];
     repo.save_transactions(&txs).await.unwrap();
 
     // First materialization
     let r1 = repo
-        .materialize_silver_datasets(&txs, Some("solana-mainnet"))
+        .materialize_silver_datasets(&txs, Some("ethereum-mainnet"))
         .await;
     assert!(r1.all_succeeded(), "first materialization should succeed");
     let count1 = row_count(&_pool, "token_transfers").await;
+    assert!(
+        count1 > 0,
+        "materialization should produce at least one token_transfer row"
+    );
 
     // Second materialization with same transactions
     let r2 = repo
-        .materialize_silver_datasets(&txs, Some("solana-mainnet"))
+        .materialize_silver_datasets(&txs, Some("ethereum-mainnet"))
         .await;
     assert!(r2.all_succeeded(), "second materialization should succeed");
     let count2 = row_count(&_pool, "token_transfers").await;
