@@ -1597,7 +1597,7 @@ impl Repository {
 
     /// Threshold after which a claimed/running job with no heartbeat is
     /// considered abandoned by a dead worker and eligible for reclaim.
-    const STALE_JOB_THRESHOLD_MINUTES: i64 = 5;
+    const STALE_JOB_THRESHOLD_MINUTES: i32 = 5;
 
     // -----------------------------------------------------------------------
     // Networks

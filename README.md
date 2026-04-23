@@ -88,9 +88,28 @@ All operational state — jobs, streams, exports, materialization runs — is du
 | `protocol_events` | Gold | Protocol events derived from decoded logs |
 | `pool_snapshots` | Gold | Pool state snapshots from events and transfers |
 
+## Supported Path vs Legacy Compatibility
+
+Spectraplex has two operational paths:
+
+**Supported MVP path (recommended):**
+1. Register a target via API (`POST /v1/targets`)
+2. Trigger ingestion via API (`POST /v1/ingest`)
+3. Workers write V2 Bronze (`raw_transactions`) and auto-materialize Silver/Gold
+4. Query or export from durable V2 tables
+
+This path is fully tenant-scoped, survives restarts, and produces completeness/provenance metadata for every export.
+
+**Legacy compatibility path (CLI `normalize`):**
+- `spectraplex-cli normalize` parses V1 transactions and writes `ledger_entries` directly
+- API workers optionally write V1 tables (`transactions`, `indexer_checkpoints`) for backward compatibility
+- Controlled by `enable_v1_compat_writes` config (default: `true`)
+
+Operators who no longer need V1 tables can set `enable_v1_compat_writes = false` in `spectraplex.toml`. The CLI `normalize` command remains available for offline/file-based workflows but is not the recommended pipeline.
+
 ## API
 
-All `/v1/*` routes require `Authorization: Bearer <SPECTRAPLEX_API_KEY>`.
+All `/v1/*` routes require `Authorization: Bearer <SPECT...Y>`.
 
 ### Ingestion and Jobs
 
@@ -210,6 +229,30 @@ The provenance file is useful for downstream pipelines that need to know whether
 
 Export jobs are durable with heartbeat-based worker execution. Supported sinks: `local_file` and `webhook`.
 
+### Callback HMAC Verification
+
+When `callback_hmac_secret` is configured, callback payloads include an `X-Spectraplex-Signature` header:
+
+```bash
+curl -X POST http://127.0.0.1:3000/v1/ingest \
+  -H "Authorization: Bearer $SPECT...KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"chain": "solana", "wallet": "<ADDRESS>", "callback_url": "https://your-app.example.com/webhook"}'
+```
+
+The webhook receiver can verify the signature:
+
+```python
+import hmac
+import hashlib
+
+def verify_signature(payload: bytes, signature_header: str, secret: str) -> bool:
+    expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(f"sha256={expected}", signature_header)
+```
+
+Signature format: `X-Spectraplex-Signature: sha256=<hex>`.
+
 ### Analytics
 
 ```bash
@@ -292,12 +335,14 @@ Key environment variables:
 
 ```bash
 DATABASE_URL=postgresql://localhost/spectraplex
-SPECTRAPLEX_API_KEY=your-api-key
+SPECTRAPLEX_API_KEY=***
 SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 EVM_RPC_URL=https://eth.llamarpc.com
 # Optional
 SOLANA_GRPC_URL=https://your-yellowstone-endpoint
-SOLANA_GRPC_TOKEN=your-grpc-token
+SOLANA_GRPC_TOKEN=***
+# Optional: disable V1 compatibility writes
+# SPECTRAPLEX_ENABLE_V1_COMPAT_WRITES=false
 ```
 
 ## Project Layout

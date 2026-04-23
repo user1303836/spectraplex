@@ -211,8 +211,15 @@ fn spawn_stream_task(
                 .await
             }
             StreamSource::Ws => {
-                run_hyperliquid_ws_stream(&repo, &provider_registry, &sub, &cancel, &worker_id)
-                    .await
+                run_hyperliquid_ws_stream(
+                    &repo,
+                    &config,
+                    &provider_registry,
+                    &sub,
+                    &cancel,
+                    &worker_id,
+                )
+                .await
             }
             StreamSource::Rpc => {
                 // RPC streaming not yet implemented
@@ -309,7 +316,7 @@ async fn run_solana_grpc_stream(
                                 "tx_count": tx_count,
                                 "last_slot": last_slot,
                             });
-                            if flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id, Some(&cursor)).await {
+                            if flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id, Some(&cursor), config.enable_v1_compat_writes).await {
                                 batch.clear();
                                 last_flush = tokio::time::Instant::now();
                                 if let Err(e) = repo.update_stream_cursor(sub_id, &cursor).await {
@@ -331,7 +338,7 @@ async fn run_solana_grpc_stream(
                                 "tx_count": tx_count,
                                 "last_slot": last_slot,
                             });
-                            if flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id, Some(&cursor)).await {
+                            if flush_stream_batch(repo, &batch, &sub.network, "grpc", sub.target_id, sub_id, Some(&cursor), config.enable_v1_compat_writes).await {
                                 let _ = repo.update_stream_cursor(sub_id, &cursor).await;
                             }
                         }
@@ -357,6 +364,7 @@ async fn run_solana_grpc_stream(
             sub.target_id,
             sub_id,
             Some(&cursor),
+            config.enable_v1_compat_writes,
         )
         .await
         {
@@ -371,6 +379,7 @@ async fn run_solana_grpc_stream(
 /// Run a Hyperliquid WebSocket stream for a subscription.
 async fn run_hyperliquid_ws_stream(
     repo: &Repository,
+    config: &Arc<AppConfig>,
     provider_registry: &Arc<ProviderRegistry>,
     sub: &StreamSubscription,
     cancel: &CancellationToken,
@@ -488,7 +497,7 @@ async fn run_hyperliquid_ws_stream(
                             let cursor = serde_json::json!({
                                 "tx_count": tx_count,
                             });
-                            if flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id, Some(&cursor)).await {
+                            if flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id, Some(&cursor), config.enable_v1_compat_writes).await {
                                 batch.clear();
                                 last_flush = tokio::time::Instant::now();
                                 if let Err(e) = repo.update_stream_cursor(sub_id, &cursor).await {
@@ -506,7 +515,7 @@ async fn run_hyperliquid_ws_stream(
                         // Flush remaining batch before failing
                         if !batch.is_empty() {
                             let cursor = serde_json::json!({ "tx_count": tx_count });
-                            if flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id, Some(&cursor)).await {
+                            if flush_stream_batch(repo, &batch, &sub.network, "ws", sub.target_id, sub_id, Some(&cursor), config.enable_v1_compat_writes).await {
                                 let _ = repo.update_stream_cursor(sub_id, &cursor).await;
                             }
                         }
@@ -529,6 +538,7 @@ async fn run_hyperliquid_ws_stream(
             sub.target_id,
             sub_id,
             Some(&cursor),
+            config.enable_v1_compat_writes,
         )
         .await
         {
@@ -554,6 +564,7 @@ async fn run_hyperliquid_ws_stream(
 ///
 /// Returns `true` if the V2 upsert succeeded (callers should clear the batch),
 /// `false` if it failed (callers should retain the batch for retry).
+#[allow(clippy::too_many_arguments)]
 async fn flush_stream_batch(
     repo: &Repository,
     batch: &[Transaction],
@@ -562,6 +573,7 @@ async fn flush_stream_batch(
     target_id: Option<Uuid>,
     sub_id: Uuid,
     cursor_state: Option<&serde_json::Value>,
+    enable_v1_compat: bool,
 ) -> bool {
     if batch.is_empty() {
         return true;
@@ -727,12 +739,14 @@ async fn flush_stream_batch(
             }
 
             // V1 compat (best-effort) — still attempt even on V2 failure
-            if let Err(e) = repo.save_transactions(batch).await {
-                warn!(
-                    subscription_id = %sub_id,
-                    error = %e,
-                    "V1 compat: save_transactions failed (non-fatal)"
-                );
+            if enable_v1_compat {
+                if let Err(e) = repo.save_transactions(batch).await {
+                    warn!(
+                        subscription_id = %sub_id,
+                        error = %e,
+                        "V1 compat: save_transactions failed (non-fatal)"
+                    );
+                }
             }
 
             return false;
@@ -740,12 +754,14 @@ async fn flush_stream_batch(
     }
 
     // V1 compat (best-effort)
-    if let Err(e) = repo.save_transactions(batch).await {
-        warn!(
-            subscription_id = %sub_id,
-            error = %e,
-            "V1 compat: save_transactions failed (non-fatal)"
-        );
+    if enable_v1_compat {
+        if let Err(e) = repo.save_transactions(batch).await {
+            warn!(
+                subscription_id = %sub_id,
+                error = %e,
+                "V1 compat: save_transactions failed (non-fatal)"
+            );
+        }
     }
 
     true

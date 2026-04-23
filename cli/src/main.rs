@@ -74,7 +74,13 @@ enum Commands {
         #[arg(long)]
         user_id: Option<Uuid>,
     },
-    /// Normalize Bronze data to Silver layer (Ledger Entries)
+    /// Normalize Bronze data to Silver layer (Ledger Entries).
+    ///
+    /// LEGACY COMPATIBILITY: this command parses V1 transactions and writes
+    /// `ledger_entries` directly. The supported MVP path is API ingestion
+    /// (`POST /v1/ingest`) which triggers Bronze-native materialization
+    /// automatically. Use this command only for offline/file-based workflows
+    /// or when you explicitly need V1-shaped output.
     Normalize {
         #[arg(short, long, default_value = "bronze_transactions.jsonl")]
         input: PathBuf,

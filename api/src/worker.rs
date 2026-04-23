@@ -443,15 +443,20 @@ async fn run_ingestion(
     // V1 transaction write fails (even partially), advancing the checkpoint
     // would cause legacy readers to skip those transactions permanently on
     // the next incremental run.
+    //
+    // Controlled by `enable_v1_compat_writes` config. Disabling this is safe
+    // for operators who no longer need V1 tables.
 
-    let v1_txs_ok = repo.save_transactions(&events).await.is_ok();
-    if !v1_txs_ok {
-        warn!(job_id = %job.id, "V1 compat: save_transactions failed, skipping V1 checkpoint (non-fatal)");
-    }
-    if v1_txs_ok {
-        if let Some(ref v1_cp) = build_checkpoint(chain_str, &wallet, &events) {
-            if let Err(e) = repo.save_checkpoint(v1_cp).await {
-                warn!(job_id = %job.id, error = %e, "V1 compat: save_checkpoint failed (non-fatal)");
+    if config.enable_v1_compat_writes {
+        let v1_txs_ok = repo.save_transactions(&events).await.is_ok();
+        if !v1_txs_ok {
+            warn!(job_id = %job.id, "V1 compat: save_transactions failed, skipping V1 checkpoint (non-fatal)");
+        }
+        if v1_txs_ok {
+            if let Some(ref v1_cp) = build_checkpoint(chain_str, &wallet, &events) {
+                if let Err(e) = repo.save_checkpoint(v1_cp).await {
+                    warn!(job_id = %job.id, error = %e, "V1 compat: save_checkpoint failed (non-fatal)");
+                }
             }
         }
     }
