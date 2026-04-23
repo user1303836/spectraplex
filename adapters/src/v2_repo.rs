@@ -3432,16 +3432,22 @@ impl Repository {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<ProtocolEvent>> {
-        let target_address = if let Some(tid) = target_id {
+        let (target_address, target_address_col) = if let Some(tid) = target_id {
             match self.get_index_target(tid).await? {
                 Some(t) => match t.address {
-                    Some(addr) if !addr.is_empty() => Some(addr),
+                    Some(addr) if !addr.is_empty() => {
+                        let col = match t.kind {
+                            TargetKind::Pool => "pool_address",
+                            _ => "protocol_address",
+                        };
+                        (Some(addr), col)
+                    }
                     _ => return Ok(Vec::new()),
                 },
                 None => return Ok(Vec::new()),
             }
         } else {
-            None
+            (None, "protocol_address")
         };
         let cols = "dt.id, dt.network, dt.protocol_address, dt.protocol_name, dt.event_type, \
                     dt.event_details, dt.pool_address, dt.raw_event_id, dt.timestamp, \
@@ -3451,7 +3457,7 @@ impl Repository {
             DatasetName::ProtocolEvents.physical_table(),
             "dt.timestamp",
             target_address.as_deref(),
-            "protocol_address",
+            target_address_col,
             network,
             time_start,
             time_end,

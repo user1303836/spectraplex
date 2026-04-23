@@ -2503,13 +2503,39 @@ async fn trigger_target_ingest(
         }
     }
 
+    // The current ingestion worker only supports wallet-style backfill
+    // (fetch_history(wallet, ...)). Reject non-wallet targets until
+    // connector-specific ingestion paths are implemented.
+    if target.kind != TargetKind::Wallet {
+        return Err(AppError::bad_request(format!(
+            "Ingestion for target kind {:?} is not yet supported",
+            target.kind
+        )));
+    }
+
+    // Preflight: ensure the target's network is actually configured in the
+    // provider registry (same gate as /v1/ingest).
+    if NetworkContext::from_registry(
+        &state.provider_registry,
+        &NetworkId::new(target.network.clone()),
+    )
+    .is_none()
+    {
+        return Err(AppError::bad_request(format!(
+            "network '{}' is not configured",
+            target.network
+        )));
+    }
+
     // Validate target is suitable for ingestion (must have an address).
     let target_address = target
         .address
         .ok_or_else(|| AppError::bad_request("Target has no address and cannot be ingested"))?;
 
-    // For wallet targets, enforce the allowed_wallets operator guard.
+    // For wallet targets, enforce the allowed_wallets operator guard and
+    // validate wallet address format (same gate as /v1/ingest).
     if target.kind == TargetKind::Wallet {
+        validate_wallet(&target_address)?;
         check_wallet_allowed(&target_address, &state.allowed_wallets)?;
     }
 
