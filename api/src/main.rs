@@ -3693,18 +3693,19 @@ async fn get_dataset_completeness_handler(
     Extension(owner): Extension<AuthenticatedOwner>,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<DatasetCompleteness>>, AppError> {
-    // Tenant isolation: dataset completeness is not yet scoped by owner.
-    if owner.0.is_some() {
-        return Err(AppError::forbidden(
-            "Dataset completeness is not available for tenant-scoped requests",
-        ));
-    }
     validate_dataset_name(&name)?;
-    let records = state
-        .repo
-        .list_completeness_by_dataset(&name)
-        .await
-        .map_err(AppError::internal)?;
+    let records = match owner.0 {
+        Some(owner_id) => state
+            .repo
+            .list_completeness_by_dataset_and_owner(&name, owner_id)
+            .await
+            .map_err(AppError::internal)?,
+        None => state
+            .repo
+            .list_completeness_by_dataset(&name)
+            .await
+            .map_err(AppError::internal)?,
+    };
     Ok(Json(records))
 }
 
@@ -3750,12 +3751,6 @@ async fn get_dataset_status_handler(
     Extension(owner): Extension<AuthenticatedOwner>,
     Path(name): Path<String>,
 ) -> Result<Json<DatasetStatus>, AppError> {
-    // Tenant isolation: dataset status includes global completeness; not yet scoped by owner.
-    if owner.0.is_some() {
-        return Err(AppError::forbidden(
-            "Dataset status is not available for tenant-scoped requests",
-        ));
-    }
     validate_dataset_name(&name)?;
 
     let versions = state
@@ -3764,11 +3759,18 @@ async fn get_dataset_status_handler(
         .await
         .map_err(AppError::internal)?;
 
-    let completeness_records = state
-        .repo
-        .list_completeness_by_dataset(&name)
-        .await
-        .map_err(AppError::internal)?;
+    let completeness_records = match owner.0 {
+        Some(owner_id) => state
+            .repo
+            .list_completeness_by_dataset_and_owner(&name, owner_id)
+            .await
+            .map_err(AppError::internal)?,
+        None => state
+            .repo
+            .list_completeness_by_dataset(&name)
+            .await
+            .map_err(AppError::internal)?,
+    };
 
     let version_infos: Vec<DatasetVersionInfo> = versions
         .iter()
@@ -6269,6 +6271,38 @@ mod tests {
         // Route exists (not 404); may fail with 500 due to fake DB pool
         assert_ne!(response.status(), StatusCode::NOT_FOUND);
         assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_dataset_completeness_allows_tenant_scoped_requests() {
+        let state = test_state();
+        let owner_id = Uuid::new_v4();
+
+        let err = get_dataset_completeness_handler(
+            State(state),
+            Extension(AuthenticatedOwner(Some(owner_id))),
+            Path("token_transfers".to_string()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_dataset_status_allows_tenant_scoped_requests() {
+        let state = test_state();
+        let owner_id = Uuid::new_v4();
+
+        let err = get_dataset_status_handler(
+            State(state),
+            Extension(AuthenticatedOwner(Some(owner_id))),
+            Path("token_transfers".to_string()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

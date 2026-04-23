@@ -1,12 +1,12 @@
 # V2 Authority And ETL Implementation Plan
 
-Status: **Active, updated after merged PRs through #244; narrowed to MVP readiness**
-Date: 2026-04-22
-Codebase: `c52625d` (`c52625dbebc38eb03358cd0d74d7481175d3c1cf`)
-Previous snapshot: 2026-04-21 / `4df29a8`
+Status: **Active, updated after merged PRs through #247; re-scoped to honest MVP readiness**
+Date: 2026-04-23
+Codebase: `bd56127` (`bd56127f5e6b7e34a643d28420bf1f38e7db8b7a`)
+Previous snapshot: 2026-04-22 / `c52625d`
 Audience: follow-on implementation agent(s)
 
-This document supersedes the 2026-04-21 version at
+This document supersedes the 2026-04-22 version at
 `design/V2_AUTHORITY_AND_ETL_IMPLEMENTATION_PLAN.md`. Since that snapshot, the
 following PRs landed:
 
@@ -15,26 +15,49 @@ following PRs landed:
 - #242: add HMAC signing to callbacks
 - #243: replace String fields with typed enums on `IngestionRun` and `ExportJob`
 - #244: per-user/tenant isolation at the query layer
+- #245: prove the API happy path
+- #246: make status and provenance usable
+- #247: freeze compatibility story, operational hardening, and integrator UX
 
-The result is that most of the original authority/ETL architecture work is no
-longer planning work. The active plan should now focus on proving a usable MVP
-path, closing the remaining compatibility edges, and documenting the workflow.
+Most of the original authority/ETL architecture work is now merged. The active
+plan is no longer "design V2"; it is to make the claimed supported path true,
+limit the MVP to what is actually supportable, and close the gaps that still
+prevent Spectraplex from being an honest general-purpose indexer MVP.
 
 ## 1. Current Conclusion
 
-V2 is now the authoritative API/runtime path for ingestion, streaming,
-normalization, dataset query, and export. Bronze-driven materialization writes
-Silver and all planned Gold datasets from V2 records. The old no-run API
-normalize fallback is gone.
+The repo is now close to a wallet-first API MVP with general-purpose V2
+building blocks, but it is not yet an honest "general-purpose blockchain
+indexer MVP" in the sense the README and recent plan snapshots imply.
 
-The remaining work is not another broad architecture pass. The minimum viable
-path is:
+What is already true:
 
-1. prove one reliable operator workflow end to end,
-2. make the remaining V1 compatibility surfaces explicit and non-blocking,
-3. make tenant-scoped status/completeness and export provenance usable enough,
-4. add the smallest possible docs/smoke tests so a team member can run it
-   without reading internal Rust code.
+- V2 Bronze, target registry, network/provider registry, durable jobs,
+  streaming subscriptions, materialization runs, and export jobs exist.
+- Bronze-driven Silver and Gold materialization exists for the planned dataset
+  set.
+- Tenant-scoped auth and owner checks exist at the API layer.
+
+What is not yet true enough to call the general-purpose MVP ready:
+
+- The public ingest/runtime path is still wallet-shaped. The API and worker
+  runtime still rely on the legacy wallet-oriented `ChainIngestor` flow and
+  only convert to V2 records after fetch. The general `Connector` abstraction
+  exists but is not yet the supported runtime contract.
+- Generic target-scoped dataset query/export is structurally fragile for some
+  Gold datasets. The shared dataset filter builder assumes the queried table
+  has `raw_transaction_id`, but several Gold tables do not, so target-scoped
+  Gold query/export must be treated as suspect until fixed.
+- The checked-in smoke test does not currently prove the supported path. It
+  uses stale request/response shapes, omits required tenant `target_id` on
+  dataset/export calls, and tolerates failures while still printing success.
+- Tenant users still cannot inspect dataset completeness/status for their own
+  targets.
+- The docs currently overstate readiness relative to the code's actual
+  supported path.
+
+The next phase should therefore focus on making the advertised path true, not
+on another broad architecture rewrite.
 
 ## 2. Workstream Status
 
@@ -43,11 +66,11 @@ path is:
 | A. Canonical registries and type cleanup | **Done for MVP** | `DatasetRegistry` is the canonical dataset registry. `DatasetName` covers Silver and Gold public names and physical table mapping. Future work is maintenance only. |
 | B. First-class network and provider configuration | **Done for MVP** | Structured provider config, `ProviderRegistry`, `NetworkContext`, and explicit `network` handling are in place. Legacy singleton config remains as compatibility. |
 | C. Durable control plane | **Done for MVP** | Ingestion jobs, export jobs, stream subscriptions, materialization runs, leases, heartbeat, reclaim, and restart-oriented worker loops are DB-backed. |
-| D. V2-authoritative ingestion and streaming | **Done for API MVP** | API backfill and stream flows write V2 Bronze/checkpoints/runs first and auto-enqueue materialization. Internal connectors still emit V1-shaped `Transaction` values before conversion. |
-| E. Bronze -> Silver -> Gold pipeline | **Done for planned dataset coverage; hardening remains** | Bronze-native normalize writes Silver and all planned Gold datasets: `wallet_ledger`, `balance_history`, `hl_pnl_summary`, `hl_trade_history`, `protocol_events`, `pool_snapshots`. Gold completeness/provenance still needs MVP-level cleanup. |
-| F. Compatibility cutover and V1 de-emphasis | **Done for MVP** | `/v1/normalize` requires `ingestion_run_id` and the worker fails closed without it. Wallet API reads are V2-backed. V1 compat writes are gated by `enable_v1_compat_writes` config (default true). CLI normalize is labeled as legacy compatibility. |
-| G. Integrator UX improvements | **Done for MVP** | Per-tenant API keys and owner-scoped query checks landed. Quickstart, curl examples, HMAC verification example, and supported-path docs are in README. SDKs and dashboards are still pending. |
-| H. Verification and operational hardening | **Done for MVP** | Smoke path proven (P0). Status/provenance usable (P1). Restart/reclaim, idempotency, tenant isolation, and export lifecycle tests added (P3). CLI/V1 compatibility story frozen with config gating (P2). |
+| D. V2-authoritative ingestion and streaming | **Partial** | Runtime writes V2 Bronze/checkpoints/runs first, but the supported ingest path is still wallet-shaped and still executes through the legacy wallet-oriented adapter flow rather than the general `Connector` contract. |
+| E. Bronze -> Silver -> Gold pipeline | **Partial for MVP** | Dataset coverage exists, but target-scoped query/export lineage for some Gold tables is not yet trustworthy because the shared query path assumes `raw_transaction_id` exists on the queried table. |
+| F. Compatibility cutover and V1 de-emphasis | **Partial** | `/v1/normalize` requires `ingestion_run_id`, wallet reads are V2-backed, and compat writes are gated. But V1-shaped adapter flow and compat projection are still part of the supported runtime path. |
+| G. Integrator UX improvements | **Partial** | Per-tenant API keys and owner-scoped handlers landed, but tenant-scoped dataset completeness/status is still unavailable and the README/smoke path currently overstate readiness. |
+| H. Verification and operational hardening | **Partial** | Restart/reclaim and lease hardening improved materially, but the checked-in smoke path is not yet an honest supported-path proof and target-scoped Gold query/export still needs direct verification. |
 
 ## 3. Milestone Status
 
@@ -55,11 +78,11 @@ path is:
 |---|---|---|
 | 1. Canonical naming and provider model | **Done** | No longer a planning blocker. |
 | 2. Durable control plane runtime | **Done** | Durable ingestion/export/stream/materialization state is in Postgres. |
-| 3. V2-authoritative backfill ingest | **Done for API** | Backfill worker writes V2 Bronze first, then compatibility projection. |
-| 4. V2-authoritative streams | **Done for API** | Stream flushes create `ingestion_runs`, write V2 Bronze/checkpoints, and enqueue materialization. |
-| 5. Bronze-driven materialization pipeline | **Done for planned coverage** | PR #241 completed all listed Gold datasets. Remaining work is correctness/provenance hardening, not missing coverage. |
+| 3. V2-authoritative backfill ingest | **Partial** | V2 writes are authoritative, but the supported public ingest path is still wallet-centric and not yet target-centric across the intended target model. |
+| 4. V2-authoritative streams | **Partial** | Durable streams exist, but the stable supported stream story is still narrow and not yet a broad target-driven runtime surface. |
+| 5. Bronze-driven materialization pipeline | **Partial for MVP** | Coverage is present, but correctness, target lineage, and export/query trustworthiness still need cleanup before Gold can be treated as broadly usable. |
 | 6. V2-backed reads and compatibility cutover | **Partial** | V2-backed reads and no-run normalize removal are done. V1 compatibility writes and CLI V1 paths remain. |
-| 7. Integrator polish and operational hardening | **MVP subset active** | Do quickstart/smoke/provenance first. SDKs and broader project UX can wait. |
+| 7. Integrator polish and operational hardening | **Partial** | Recent PRs moved this forward materially, but the documented happy path still needs to become a real, trustworthy, end-to-end operator workflow. |
 
 ## 4. Previously Open Medium-Severity Issues
 
@@ -113,12 +136,16 @@ Caveats that should stay visible:
 
 - The legacy config-level API key is still admin/ownerless and bypasses tenant
   scoping by design.
-- `/v1/datasets/:name/completeness` and `/v1/datasets/:name/status` are not yet
-  tenant-scoped; tenant requests are rejected instead of returning global
-  completeness.
+- `/v1/datasets/:name/completeness` and `/v1/datasets/:name/status` now return
+  owner-filtered completeness rows for tenant-scoped requests, but dataset
+  version metadata remains global by design.
 - Some Gold tables do not carry `owner_id` directly. Isolation is enforced via
   target ownership checks and target-scoped queries, not database row-level
   ownership on every Gold row.
+- The shared Gold dataset query/export path still needs explicit validation and
+  likely schema/query cleanup. The current generic filter builder assumes the
+  queried table exposes `raw_transaction_id`, which is not universally true
+  across Gold tables.
 
 ## 5. Gold Materialization Coverage
 
@@ -146,6 +173,11 @@ Registry/query/export status:
 
 Remaining Gold work for MVP:
 
+- Fix target-scoped Gold query/export lineage. The current generic dataset
+  query builder assumes `dt.raw_transaction_id` exists on the queried table,
+  but that is not true for every Gold dataset. Either add durable target/raw
+  lineage to those tables or replace the shared query path with
+  dataset-specific joins that are actually valid.
 - Add or fix Gold `dataset_completeness` updates. Current Bronze-native
   completeness upserts are still Silver-oriented.
 - Confirm export provenance for Gold datasets reports useful version and
@@ -170,8 +202,9 @@ Remaining Gold work for MVP:
 
 ### Still Present
 
-- API ingestion and stream workers still convert V1-shaped adapter output with
-  `v1_tx_to_v2_raw()` before V2 persistence.
+- API ingestion and stream workers still depend on the legacy wallet-oriented
+  adapter flow and convert V1-shaped adapter output with `v1_tx_to_v2_raw()`
+  before V2 persistence.
 - API workers still perform best-effort V1 compatibility writes using
   `save_transactions()` and V1 checkpoints.
 - `adapters/src/dual_write.rs::materialize_silver_datasets()` still exists for
@@ -181,159 +214,185 @@ Remaining Gold work for MVP:
   calls `materialize_silver_datasets()`.
 - V1 tables and parser-version names remain for compatibility and tests.
 
-MVP decision: do not block shipping on deleting all V1 code. For the first
-usable release, make the API workflow the supported path and label CLI
-normalize/legacy V1 projection as compatibility. Then remove or gate the
-remaining compatibility writes once the API smoke path is proven.
+MVP decision: do not block shipping on deleting all V1 code. But also do not
+pretend the runtime is fully target-centric yet. For the first usable release,
+make the API workflow the supported path, label CLI normalize/legacy V1
+projection as compatibility, and only de-emphasize the remaining V1 path after
+the supported API workflow is actually proven and documented.
 
 ## 7. Active MVP Plan
 
 ### MVP Target
 
-A team member should be able to:
+For this next phase, "general-purpose MVP" should mean:
 
-1. configure Postgres and providers,
+1. a team member can configure Postgres and providers,
 2. create or use a tenant-scoped API key,
-3. register a wallet target,
-4. enqueue ingestion,
-5. observe job/materialization status,
-6. query `wallet_ledger`, `balance_history`, and at least one chain-specific
-   Silver dataset,
-7. export a dataset to CSV or JSONL,
-8. repeat the flow after an API restart without losing jobs.
+3. register and ingest at least one supported target from a published support
+   matrix,
+4. observe job and materialization status,
+5. query and export at least one Silver dataset and one Gold dataset scoped to
+   that target,
+6. repeat the flow after an API restart without losing jobs or operational
+   truth.
 
-This is enough to be "actually usable" before SDKs, dashboards, or broader
-project/org management.
+This should not require every target kind to be production-grade. The MVP only
+needs a small stable matrix, for example:
 
-### P0: Prove The API Happy Path
+- Solana wallet
+- Hyperliquid wallet or market
+- EVM contract or topic_filter
 
-Deliver one checked-in or temporary smoke workflow:
+Wallet-derived Gold datasets remain first-class for the first usable release.
+For non-wallet targets, the MVP bar is successful Bronze/Silver ingestion plus
+scoped query/export on the supported path.
 
-- seed/create a tenant API key,
-- register a wallet target,
-- enqueue ingest for one supported network,
-- wait for ingestion and auto-materialization,
-- query `wallet_ledger` and `balance_history`,
-- create and download a dataset export,
-- show callback signing headers when `callback_hmac_secret` is configured.
+### P0: Make The Supported Path Honest And Provable
 
-Prefer a short shell script plus README quickstart over a large new framework.
-The script can be local-only and can assume `docker-compose up -d`.
+Fix the checked-in smoke path and README so they reflect the real API:
+
+- update the smoke script to use current request/response shapes,
+- require it to fail on unexpected HTTP responses instead of swallowing them,
+- include tenant `target_id` where the current tenant-scoped API requires it,
+- prove ingest -> status -> materialize -> query -> export -> download using a
+  deterministic path.
+
+If a live provider-backed smoke test is too flaky, prefer a deterministic
+fixture-backed path over a best-effort mainnet script that can print success on
+broken requests.
 
 Acceptance criteria:
 
-- a fresh local DB can run the flow,
+- a fresh local environment can run the documented path successfully,
 - failures are visible and actionable,
-- no one needs to read `api/src/main.rs` to operate the MVP.
+- the README no longer overclaims what the smoke path proves.
 
-### P1: Make Status And Provenance Usable
+### P1: Fix Target-Scoped Gold Query And Export Lineage
 
-Fix the status surfaces that a user will naturally inspect:
+Make target-scoped Gold reads actually trustworthy:
 
-- add tenant-scoped dataset status/completeness or document an explicit
-  admin-only status endpoint for MVP,
-- upsert Gold `dataset_completeness` when Gold records are written,
-- make export job provenance useful for Gold datasets,
-- ensure dataset version IDs are present for Gold rows written by the pipeline.
+- audit every Gold dataset exposed through generic query/export,
+- fix the shared filter path or replace it with dataset-specific query builders
+  where the generic `raw_transaction_id` join assumption is invalid,
+- add tests that prove tenant-scoped target queries and exports return only the
+  requested target's rows for supported Gold datasets.
 
 Acceptance criteria:
 
-- dataset export status does not imply unknown/stale completeness for newly
-  materialized Gold data,
+- target-scoped Gold query/export works correctly for all datasets labeled
+  supported in the MVP matrix,
+- no supported Gold endpoint depends on an invalid `raw_transaction_id` join.
+
+### P2: Make Ingest Target-Centric, Not Just Wallet-Centric
+
+Move the supported ingest/runtime path toward the actual target model:
+
+- add a supported target-centric ingest entry point, such as
+  `POST /v1/targets/:id/ingest` or an equivalent `target_id`-driven ingest
+  request,
+- route supported target kinds through the V2 `Connector` abstraction rather
+  than only the legacy wallet-oriented `ChainIngestor` path,
+- keep the wallet path first-class, but stop treating it as the only real
+  supported ingestion surface.
+
+Acceptance criteria:
+
+- at least one non-wallet target type is supported end-to-end through the
+  public API path,
+- the supported path is described in terms of targets, not just wallets.
+
+### P3: Make Tenant Status And Provenance Usable
+
+Fix the status surfaces that real users will inspect:
+
+- add tenant-scoped dataset completeness/status or add a target-specific status
+  endpoint that tenants can safely use,
+- ensure Gold `dataset_completeness` is updated when Gold records are written,
+- ensure export provenance for supported Gold datasets reflects useful version
+  and completeness information.
+
+Acceptance criteria:
+
 - tenant users can inspect their own target's materialization state without
-  seeing global state.
+  seeing global state,
+- completed exports carry provenance a downstream integrator can actually use.
 
-### P2: Freeze The Supported Compatibility Story
+### P4: Publish A Real Support Matrix And Correctness Fixtures
 
-Make the supported path unambiguous:
+Make the MVP boundaries explicit:
 
-- document API ingestion + auto-materialization as the supported MVP path,
-- mark CLI `normalize` as legacy compatibility unless it is moved to the
-  Bronze-native `ingestion_run_id` flow,
-- add a config flag or documented operational switch for best-effort V1
-  compatibility writes if operators need to disable them,
-- keep V1 reads/writes only where they support rollback or compatibility.
-
-Acceptance criteria:
-
-- a user cannot accidentally choose the stale V1 normalize path thinking it is
-  the recommended V2 pipeline,
-- disabling optional V1 projection is either proven safe for the MVP path or
-  clearly documented as not yet supported.
-
-### P3: Add Minimal Operational Hardening
-
-Focus on the exact MVP path:
-
-- restart/reclaim test for ingestion -> materialization -> export,
-- idempotency check for re-running materialization on the same ingestion run,
-- one export test covering a Gold dataset,
-- one tenant isolation test covering a forbidden target query/export.
+- publish a support matrix that labels target kinds and dataset flows as
+  `stable`, `beta`, or `experimental`,
+- add representative correctness fixtures for the supported matrix,
+- validate Gold semantics that downstream consumers are likely to rely on
+  (`balance_history`, HL PnL/trade grouping, `pool_snapshots`).
 
 Acceptance criteria:
 
-- duplicate worker claims do not duplicate visible Gold/export side effects,
-- tenant-scoped API keys cannot query or export another target.
+- operators can tell which paths are actually supported,
+- tests cover the supported target matrix instead of only internal helpers.
 
-### P4: Minimal Integrator UX
+### P5: Keep The Compatibility Story Explicit
 
-Do the smallest useful documentation work:
+Keep V1 compatibility bounded and understandable:
 
-- quickstart for local Postgres + API,
-- curl examples for target registration, ingest, job polling, dataset query,
-  and export,
-- callback HMAC verification example,
-- a short "supported MVP path vs legacy compatibility path" note.
+- document API ingestion + auto-materialization as the supported path,
+- keep CLI `normalize` labeled as legacy compatibility unless it is moved onto
+  the Bronze-native flow,
+- retain the V1 compat-write flag and document when disabling it is safe.
 
-Do not prioritize SDK generation, dashboard work, enterprise project/org
-management, or broad target presets before the MVP flow is proven.
+Acceptance criteria:
+
+- a user cannot accidentally choose a legacy path believing it is the
+  recommended V2 flow,
+- optional V1 projection is clearly described as compatibility, not authority.
 
 ## 8. Updated First PRs
 
-The old suggested first PRs are no longer correct. The following are the best
-next slices:
+The old suggested first PRs are no longer correct. The best next slices are:
 
-1. **MVP smoke workflow and docs**
-   - Add a local quickstart and smoke script for the API path.
-   - Include tenant API key setup, target registration, ingest, query, export,
-     and optional callback signing.
+1. **Honest supported-path smoke and README alignment**
+   - Fix the smoke script so it uses the real API contract and fails loudly.
+   - Align README curl examples with the current tenant-scoped API.
 
-2. **Gold status/provenance cleanup**
-   - Upsert Gold completeness for all six Gold datasets.
-   - Ensure export provenance is populated for Gold exports.
-   - Make tenant-scoped dataset status/completeness available or explicitly
-     admin-only with a documented replacement.
+2. **Target-scoped Gold query/export lineage**
+   - Fix or replace the generic Gold query/export path where `raw_transaction_id`
+     is assumed but not actually present.
+   - Add focused tests for supported Gold datasets.
 
-3. **CLI/V1 compatibility clarification**
-   - Either route CLI normalize through Bronze-native `ingestion_run_id`
-     materialization or label it as legacy.
-   - Add a compatibility-write flag if operators need to run API ingestion
-     without V1 projection.
+3. **Target-centric ingest API/runtime**
+   - Add a supported `target_id`-driven ingest path.
+   - Move supported non-wallet target kinds onto the `Connector` path.
 
-4. **Focused hardening tests**
-   - Add restart/reclaim and idempotency coverage for the MVP path.
-   - Add one cross-tenant forbidden query/export test.
+4. **Tenant status/completeness**
+   - Add safe tenant-visible status surfaces for owned targets.
+   - Wire Gold completeness/provenance through those surfaces.
 
-5. **Gold semantic validation**
-   - Validate `balance_history` seeding, HL PnL/trade grouping, and
-     `pool_snapshots` semantics against representative fixtures.
-   - Treat protocol TVL as limited until pool token/reserve derivation is
-     validated.
+5. **Support matrix and correctness fixtures**
+   - Publish the MVP support matrix.
+   - Add representative fixtures for Solana wallet, Hyperliquid wallet/market,
+     and EVM contract/topic flows.
 
 ## 9. Definition Of Done For MVP
 
 The MVP is ready when:
 
-- the documented API path runs successfully on a fresh local environment,
+- the documented API path runs successfully on a fresh local environment
+  without ignored failures,
 - ingestion, materialization, query, and export survive an API restart,
-- all six Gold datasets are materialized from Silver during the API path,
+- at least one non-wallet target type is supported end to end through the
+  public API path,
+- supported target-scoped Gold query/export paths are correct for the datasets
+  labeled stable in the support matrix,
 - wallet and dataset reads are tenant-scoped for DB-backed API keys,
 - users can see enough status/provenance to trust a completed job/export,
+- the support matrix is explicit and matches what the code actually proves,
 - V1 compatibility behavior is documented and does not surprise operators.
 
 Out of scope for MVP:
 
 - deleting all V1 tables/code,
+- production-grade support for every target kind on every chain,
 - full SDK generation,
 - dashboard/frontend work,
 - enterprise org/billing management,

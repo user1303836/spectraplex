@@ -114,7 +114,7 @@ Operators who no longer need V1 tables can set `enable_v1_compat_writes = false`
 
 All `/v1/*` routes require `Authorization: Bearer <API_KEY>`.
 
-Tenant-scoped API keys (created via `POST /v1/api-keys`) are required for tenant isolation on dataset queries and exports. The legacy config key (`SPECTRAPLEX_API_KEY`) can also call these endpoints (without tenant isolation) and is used to bootstrap the first tenant key.
+Tenant-scoped API keys (created via `POST /v1/api-keys`) are required for tenant isolation on dataset queries, dataset status/completeness, and exports. The legacy config key (`SPECTRAPLEX_API_KEY`) can also call these endpoints (without tenant isolation) and is used to bootstrap the first tenant key.
 
 ### Ingestion and Jobs
 
@@ -200,15 +200,15 @@ Tenant-scoped dataset queries require `target_id`:
 
 ```bash
 # Query a dataset (tenant-scoped)
-curl -H "Authorization: Bearer $API_KEY" \
+curl -H "Authorization: Bearer ***" \
   "http://127.0.0.1:3000/v1/datasets/token_transfers/records?target_id=<TARGET_ID>&network=solana-mainnet&limit=50"
 
-# Check dataset completeness (requires legacy/admin key — not tenant-scoped)
-curl -H "Authorization: Bearer $LEGACY_KEY" \
+# Check dataset completeness for your tenant's targets
+curl -H "Authorization: Bearer ***" \
   http://127.0.0.1:3000/v1/datasets/token_transfers/completeness
 
-# Check dataset status (requires legacy/admin key — not tenant-scoped)
-curl -H "Authorization: Bearer $LEGACY_KEY" \
+# Check dataset status for your tenant's targets
+curl -H "Authorization: Bearer ***" \
   http://127.0.0.1:3000/v1/datasets/token_transfers/status
 ```
 

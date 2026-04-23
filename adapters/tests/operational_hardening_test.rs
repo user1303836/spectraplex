@@ -14,7 +14,10 @@ use spectraplex_adapters::repo::Repository;
 
 use spectraplex_core::materializer::{DatasetName, ExportFormat};
 use spectraplex_core::models::{Chain, Transaction};
-use spectraplex_core::v2::{ChainFamily, IndexTarget, TargetKind, TargetMode};
+use spectraplex_core::v2::{
+    ChainFamily, CompletenessStatus, DatasetCompleteness, DatasetVersion, DatasetVersionStatus,
+    IndexTarget, TargetKind, TargetMode,
+};
 
 // ---------------------------------------------------------------------------
 // Helper: ephemeral database per test (reused from ingestion_compat_test.rs)
@@ -263,6 +266,92 @@ async fn tenant_isolation_prevents_cross_target_access() {
     // Admin (no owner filter) sees both
     let admin_targets = repo.list_index_targets(100, 0).await.unwrap();
     assert_eq!(admin_targets.len(), 2);
+
+    _pool.close().await;
+    drop_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn tenant_scoped_dataset_completeness_is_filtered_by_owner() {
+    require_pg!();
+    let (repo, _pool, db_name) = setup_test_repo("tenant_complete").await;
+
+    let tenant_a = Uuid::new_v4();
+    let tenant_b = Uuid::new_v4();
+    let now = Utc::now();
+
+    let target_a = make_target(
+        TargetKind::Wallet,
+        ChainFamily::Solana,
+        "solana-mainnet",
+        Some("tenant_a_wallet"),
+        Some(tenant_a),
+    );
+    repo.create_index_target(&target_a).await.unwrap();
+
+    let target_b = make_target(
+        TargetKind::Wallet,
+        ChainFamily::Solana,
+        "solana-mainnet",
+        Some("tenant_b_wallet"),
+        Some(tenant_b),
+    );
+    repo.create_index_target(&target_b).await.unwrap();
+
+    let version = DatasetVersion {
+        id: Uuid::new_v4(),
+        dataset_name: "token_transfers".to_string(),
+        version: 1,
+        parser_hash: Some("parser-v1".to_string()),
+        created_at: now,
+        notes: Some("tenant completeness test".to_string()),
+        status: DatasetVersionStatus::Active,
+    };
+    repo.create_dataset_version(&version).await.unwrap();
+
+    for (target_id, records_count) in [(target_a.id, 11_i64), (target_b.id, 22_i64)] {
+        let dc = DatasetCompleteness {
+            id: Uuid::new_v4(),
+            target_id,
+            dataset_name: "token_transfers".to_string(),
+            dataset_version_id: Some(version.id),
+            network: "solana-mainnet".to_string(),
+            status: CompletenessStatus::Complete,
+            coverage_start: Some(1_700_000_000),
+            coverage_end: Some(1_700_000_123),
+            block_start: None,
+            block_end: None,
+            last_ingestion_run_id: None,
+            records_count,
+            gap_ranges: None,
+            notes: None,
+            created_at: now,
+            updated_at: now,
+        };
+        repo.upsert_dataset_completeness(&dc).await.unwrap();
+    }
+
+    let tenant_a_records = repo
+        .list_completeness_by_dataset_and_owner("token_transfers", tenant_a)
+        .await
+        .unwrap();
+    assert_eq!(tenant_a_records.len(), 1);
+    assert_eq!(tenant_a_records[0].target_id, target_a.id);
+    assert_eq!(tenant_a_records[0].records_count, 11);
+
+    let tenant_b_records = repo
+        .list_completeness_by_dataset_and_owner("token_transfers", tenant_b)
+        .await
+        .unwrap();
+    assert_eq!(tenant_b_records.len(), 1);
+    assert_eq!(tenant_b_records[0].target_id, target_b.id);
+    assert_eq!(tenant_b_records[0].records_count, 22);
+
+    let admin_records = repo
+        .list_completeness_by_dataset("token_transfers")
+        .await
+        .unwrap();
+    assert_eq!(admin_records.len(), 2);
 
     _pool.close().await;
     drop_test_db(&db_name).await;

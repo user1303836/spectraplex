@@ -108,8 +108,41 @@ pub(crate) async fn fetch_export_metadata(
         .await
         .unwrap_or_default();
 
+    let has_unknown_version = completeness_records
+        .iter()
+        .any(|record| record.dataset_version_id.is_none());
+    let mut version_ids = completeness_records
+        .iter()
+        .filter_map(|c| c.dataset_version_id)
+        .collect::<Vec<_>>();
+    version_ids.sort_unstable();
+    version_ids.dedup();
+
+    let completeness_version = if completeness_records.is_empty() || has_unknown_version {
+        None
+    } else {
+        match version_ids.as_slice() {
+            [version_id] => repo
+                .get_dataset_version_by_id(*version_id)
+                .await
+                .ok()
+                .flatten(),
+            _ => None,
+        }
+    };
+
+    let preferred_version = if completeness_records.is_empty() {
+        active_version
+    } else if completeness_version.is_some() {
+        completeness_version
+    } else if version_ids.is_empty() {
+        active_version
+    } else {
+        None
+    };
+
     let mut meta = ExportMetadata::default();
-    if let Some(ref dv) = active_version {
+    if let Some(ref dv) = preferred_version {
         meta.dataset_version_id = Some(dv.id);
         meta.dataset_version = Some(dv.version);
     }
@@ -379,4 +412,317 @@ pub(crate) async fn write_export_to_file(
     );
 
     Ok((total, meta))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use spectraplex_core::v2::{
+        ChainFamily, CompletenessStatus, DatasetCompleteness, DatasetVersion, DatasetVersionStatus,
+        IndexTarget, TargetKind, TargetMode,
+    };
+    use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+    use sqlx::{Connection, PgConnection};
+    use std::str::FromStr;
+
+    fn base_url() -> String {
+        std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost/postgres".to_string())
+    }
+
+    async fn pg_is_available() -> bool {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            PgConnection::connect(&base_url()),
+        )
+        .await;
+        match result {
+            Ok(Ok(conn)) => {
+                drop(conn);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    macro_rules! require_pg {
+        () => {
+            if !pg_is_available().await {
+                eprintln!(
+                    "SKIPPED: PostgreSQL not available at {} — set TEST_DATABASE_URL or start PostgreSQL",
+                    base_url()
+                );
+                return;
+            }
+        };
+    }
+
+    async fn create_test_db(prefix: &str) -> (PgPool, String) {
+        let db_name = format!("spx_export_{}_{}", prefix, Uuid::new_v4().simple());
+
+        let mut conn = PgConnection::connect(&base_url())
+            .await
+            .expect("Cannot connect to base Postgres URL — is PostgreSQL running?");
+
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create test database {db_name}: {e}"));
+
+        conn.close().await.ok();
+
+        let opts = PgConnectOptions::from_str(&base_url())
+            .expect("bad base url")
+            .database(&db_name);
+
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(opts)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to connect to test database {db_name}: {e}"));
+
+        (pool, db_name)
+    }
+
+    async fn drop_test_db(db_name: &str) {
+        let mut conn = PgConnection::connect(&base_url()).await.ok();
+        if let Some(ref mut c) = conn {
+            let _ = sqlx::query(&format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"
+            ))
+            .execute(&mut *c)
+            .await;
+
+            let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+                .execute(&mut *c)
+                .await;
+        }
+    }
+
+    async fn setup_test_repo(prefix: &str) -> (Repository, PgPool, String) {
+        let (pool, db_name) = create_test_db(prefix).await;
+        sqlx::migrate!("../migrations")
+            .run(&pool)
+            .await
+            .expect("Migrations failed");
+        let repo = Repository::new(pool.clone());
+        (repo, pool, db_name)
+    }
+
+    fn make_target(owner_id: Option<Uuid>) -> IndexTarget {
+        let now = Utc::now();
+        IndexTarget {
+            id: Uuid::new_v4(),
+            kind: TargetKind::Wallet,
+            network: "solana-mainnet".to_string(),
+            chain_family: ChainFamily::Solana,
+            address: Some(format!("wallet_{}", Uuid::new_v4().simple())),
+            filter_spec: None,
+            mode: TargetMode::Backfill,
+            label: None,
+            owner_id,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_export_metadata_prefers_target_completeness_dataset_version() {
+        require_pg!();
+        let (repo, pool, db_name) = setup_test_repo("provenance").await;
+        let now = Utc::now();
+        let target = make_target(None);
+        repo.create_index_target(&target).await.unwrap();
+
+        let old_version = DatasetVersion {
+            id: Uuid::new_v4(),
+            dataset_name: "wallet_ledger".to_string(),
+            version: 1,
+            parser_hash: Some("wallet-ledger-v1".to_string()),
+            created_at: now,
+            notes: Some("older target data".to_string()),
+            status: DatasetVersionStatus::Superseded,
+        };
+        repo.create_dataset_version(&old_version).await.unwrap();
+
+        let active_version = DatasetVersion {
+            id: Uuid::new_v4(),
+            dataset_name: "wallet_ledger".to_string(),
+            version: 2,
+            parser_hash: Some("wallet-ledger-v2".to_string()),
+            created_at: now,
+            notes: Some("active registry version".to_string()),
+            status: DatasetVersionStatus::Active,
+        };
+        repo.create_dataset_version(&active_version).await.unwrap();
+
+        let completeness = DatasetCompleteness {
+            id: Uuid::new_v4(),
+            target_id: target.id,
+            dataset_name: "wallet_ledger".to_string(),
+            dataset_version_id: Some(old_version.id),
+            network: "solana-mainnet".to_string(),
+            status: CompletenessStatus::Complete,
+            coverage_start: Some(1_700_000_000),
+            coverage_end: Some(1_700_000_123),
+            block_start: None,
+            block_end: None,
+            last_ingestion_run_id: None,
+            records_count: 42,
+            gap_ranges: None,
+            notes: None,
+            created_at: now,
+            updated_at: now,
+        };
+        repo.upsert_dataset_completeness(&completeness)
+            .await
+            .unwrap();
+
+        let meta = fetch_export_metadata(
+            &repo,
+            "wallet_ledger",
+            Some(target.id),
+            Some("solana-mainnet"),
+        )
+        .await;
+
+        assert_eq!(meta.dataset_version_id, Some(old_version.id));
+        assert_eq!(meta.dataset_version, Some(1));
+        assert_eq!(meta.completeness_status.as_deref(), Some("complete"));
+        assert_eq!(meta.last_ingestion_run_id, None);
+
+        pool.close().await;
+        drop_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_export_metadata_omits_dataset_version_when_completeness_versions_conflict() {
+        require_pg!();
+        let (repo, pool, db_name) = setup_test_repo("provenance_conflict").await;
+        let now = Utc::now();
+        let target_a = make_target(None);
+        let target_b = make_target(None);
+        repo.create_index_target(&target_a).await.unwrap();
+        repo.create_index_target(&target_b).await.unwrap();
+
+        let version_one = DatasetVersion {
+            id: Uuid::new_v4(),
+            dataset_name: "wallet_ledger".to_string(),
+            version: 1,
+            parser_hash: Some("wallet-ledger-v1".to_string()),
+            created_at: now,
+            notes: Some("older target data".to_string()),
+            status: DatasetVersionStatus::Superseded,
+        };
+        repo.create_dataset_version(&version_one).await.unwrap();
+
+        let version_two = DatasetVersion {
+            id: Uuid::new_v4(),
+            dataset_name: "wallet_ledger".to_string(),
+            version: 2,
+            parser_hash: Some("wallet-ledger-v2".to_string()),
+            created_at: now,
+            notes: Some("active registry version".to_string()),
+            status: DatasetVersionStatus::Active,
+        };
+        repo.create_dataset_version(&version_two).await.unwrap();
+
+        for (target_id, dataset_version_id, records_count) in [
+            (target_a.id, Some(version_one.id), 10_i64),
+            (target_b.id, Some(version_two.id), 20_i64),
+        ] {
+            let completeness = DatasetCompleteness {
+                id: Uuid::new_v4(),
+                target_id,
+                dataset_name: "wallet_ledger".to_string(),
+                dataset_version_id,
+                network: "solana-mainnet".to_string(),
+                status: CompletenessStatus::Complete,
+                coverage_start: Some(1_700_000_000),
+                coverage_end: Some(1_700_000_123),
+                block_start: None,
+                block_end: None,
+                last_ingestion_run_id: None,
+                records_count,
+                gap_ranges: None,
+                notes: None,
+                created_at: now,
+                updated_at: now,
+            };
+            repo.upsert_dataset_completeness(&completeness)
+                .await
+                .unwrap();
+        }
+
+        let meta =
+            fetch_export_metadata(&repo, "wallet_ledger", None, Some("solana-mainnet")).await;
+
+        assert_eq!(meta.dataset_version_id, None);
+        assert_eq!(meta.dataset_version, None);
+        assert_eq!(meta.completeness_status.as_deref(), Some("complete"));
+
+        pool.close().await;
+        drop_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_export_metadata_omits_dataset_version_when_completeness_is_mixed_known_and_unknown(
+    ) {
+        require_pg!();
+        let (repo, pool, db_name) = setup_test_repo("provenance_mixed_null").await;
+        let now = Utc::now();
+        let target_a = make_target(None);
+        let target_b = make_target(None);
+        repo.create_index_target(&target_a).await.unwrap();
+        repo.create_index_target(&target_b).await.unwrap();
+
+        let version_one = DatasetVersion {
+            id: Uuid::new_v4(),
+            dataset_name: "wallet_ledger".to_string(),
+            version: 1,
+            parser_hash: Some("wallet-ledger-v1".to_string()),
+            created_at: now,
+            notes: Some("older target data".to_string()),
+            status: DatasetVersionStatus::Active,
+        };
+        repo.create_dataset_version(&version_one).await.unwrap();
+
+        for (target_id, dataset_version_id, records_count) in [
+            (target_a.id, Some(version_one.id), 10_i64),
+            (target_b.id, None, 20_i64),
+        ] {
+            let completeness = DatasetCompleteness {
+                id: Uuid::new_v4(),
+                target_id,
+                dataset_name: "wallet_ledger".to_string(),
+                dataset_version_id,
+                network: "solana-mainnet".to_string(),
+                status: CompletenessStatus::Complete,
+                coverage_start: Some(1_700_000_000),
+                coverage_end: Some(1_700_000_123),
+                block_start: None,
+                block_end: None,
+                last_ingestion_run_id: None,
+                records_count,
+                gap_ranges: None,
+                notes: None,
+                created_at: now,
+                updated_at: now,
+            };
+            repo.upsert_dataset_completeness(&completeness)
+                .await
+                .unwrap();
+        }
+
+        let meta =
+            fetch_export_metadata(&repo, "wallet_ledger", None, Some("solana-mainnet")).await;
+
+        assert_eq!(meta.dataset_version_id, None);
+        assert_eq!(meta.dataset_version, None);
+        assert_eq!(meta.completeness_status.as_deref(), Some("complete"));
+
+        pool.close().await;
+        drop_test_db(&db_name).await;
+    }
 }

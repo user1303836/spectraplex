@@ -2703,6 +2703,28 @@ impl Repository {
         rows.iter().map(row_to_dataset_completeness).collect()
     }
 
+    /// List completeness records for a dataset restricted to a specific owner.
+    pub async fn list_completeness_by_dataset_and_owner(
+        &self,
+        dataset_name: &str,
+        owner_id: Uuid,
+    ) -> anyhow::Result<Vec<DatasetCompleteness>> {
+        let rows = sqlx::query(
+            "SELECT dc.id, dc.target_id, dc.dataset_name, dc.dataset_version_id, dc.network, dc.status, \
+             dc.coverage_start, dc.coverage_end, dc.block_start, dc.block_end, \
+             dc.last_ingestion_run_id, dc.records_count, dc.gap_ranges, dc.notes, dc.created_at, dc.updated_at \
+             FROM dataset_completeness dc \
+             JOIN index_targets it ON it.id = dc.target_id \
+             WHERE dc.dataset_name = $1 AND it.owner_id = $2 \
+             ORDER BY dc.target_id, dc.network",
+        )
+        .bind(dataset_name)
+        .bind(owner_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_dataset_completeness).collect()
+    }
+
     /// List completeness records for a dataset with optional target and network filters.
     pub async fn list_completeness_filtered(
         &self,
