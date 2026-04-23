@@ -1394,6 +1394,81 @@ pub fn build_dataset_filter_query(
     Ok((sql, args))
 }
 
+/// Build a filter query for dataset tables that do NOT have `raw_transaction_id`.
+///
+/// Target scoping is done by filtering on a direct address column (e.g.
+/// `wallet_address`, `protocol_address`). Time filtering is applied directly
+/// to the dataset table's own time column instead of joining `raw_transactions`.
+///
+/// This fixes the generic filter builder for Gold tables like `balance_history`,
+/// `hl_pnl_summary`, `hl_trade_history`, `protocol_events`, and `pool_snapshots`
+/// that lack a `raw_transaction_id` column (P1).
+#[allow(clippy::too_many_arguments)]
+pub fn build_dataset_filter_query_direct(
+    select_cols: &str,
+    table_name: &str,
+    order_col: &str,
+    target_address: Option<&str>,
+    target_address_col: &str,
+    network: Option<&str>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
+    time_col: &str,
+    limit: i64,
+    offset: i64,
+) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+    let limit = limit.min(MAX_QUERY_LIMIT);
+    let mut sql = format!("SELECT {select_cols} FROM {table_name} dt");
+    let mut args = sqlx::postgres::PgArguments::default();
+    let mut n: usize = 0;
+    let mut wheres: Vec<String> = Vec::new();
+
+    if let Some(addr) = target_address {
+        n += 1;
+        wheres.push(format!("dt.{target_address_col} = ${n}"));
+        use sqlx::Arguments;
+        args.add(addr.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    if let Some(net) = network {
+        n += 1;
+        wheres.push(format!("dt.network = ${n}"));
+        use sqlx::Arguments;
+        args.add(net.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    if let Some(start) = time_start {
+        n += 1;
+        wheres.push(format!("dt.{time_col} >= ${n}"));
+        use sqlx::Arguments;
+        args.add(start).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    if let Some(end) = time_end {
+        n += 1;
+        wheres.push(format!("dt.{time_col} <= ${n}"));
+        use sqlx::Arguments;
+        args.add(end).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    if !wheres.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&wheres.join(" AND "));
+    }
+
+    n += 1;
+    let lim_n = n;
+    n += 1;
+    let off_n = n;
+    sql.push_str(&format!(
+        " ORDER BY {order_col} DESC, dt.id DESC LIMIT ${lim_n} OFFSET ${off_n}"
+    ));
+    use sqlx::Arguments;
+    args.add(limit).map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(offset).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    Ok((sql, args))
+}
+
 /// Build a batch INSERT for `raw_evm_traces` with ON CONFLICT DO NOTHING.
 pub fn build_raw_evm_trace_insert(
     traces: &[RawEvmTrace],
@@ -3178,16 +3253,23 @@ impl Repository {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<BalanceSnapshot>> {
+        let target_address = if let Some(tid) = target_id {
+            self.get_index_target(tid).await?.and_then(|t| t.address)
+        } else {
+            None
+        };
         let cols = "dt.id, dt.wallet_address, dt.asset_symbol, dt.network, dt.timestamp, \
                     dt.balance, dt.tx_hash, dt.dataset_version_id, dt.created_at";
-        let (sql, args) = build_dataset_filter_query(
+        let (sql, args) = build_dataset_filter_query_direct(
             cols,
             DatasetName::BalanceHistory.physical_table(),
             "dt.timestamp",
-            target_id,
+            target_address.as_deref(),
+            "wallet_address",
             network,
             time_start,
             time_end,
+            "timestamp",
             limit,
             offset,
         )?;
@@ -3225,18 +3307,25 @@ impl Repository {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<HlPnlSummary>> {
+        let target_address = if let Some(tid) = target_id {
+            self.get_index_target(tid).await?.and_then(|t| t.address)
+        } else {
+            None
+        };
         let cols = "dt.id, dt.wallet_address, dt.coin, dt.network, dt.period_start, \
                     dt.period_end, dt.total_closed_pnl, dt.total_funding, dt.total_fees, \
                     dt.net_pnl, dt.trade_count, dt.fill_count, dt.avg_trade_size, \
                     dt.win_count, dt.loss_count, dt.dataset_version_id, dt.created_at";
-        let (sql, args) = build_dataset_filter_query(
+        let (sql, args) = build_dataset_filter_query_direct(
             cols,
             DatasetName::HlPnlSummary.physical_table(),
             "dt.period_end",
-            target_id,
+            target_address.as_deref(),
+            "wallet_address",
             network,
             time_start,
             time_end,
+            "period_start",
             limit,
             offset,
         )?;
@@ -3271,17 +3360,24 @@ impl Repository {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<HlTradeHistory>> {
+        let target_address = if let Some(tid) = target_id {
+            self.get_index_target(tid).await?.and_then(|t| t.address)
+        } else {
+            None
+        };
         let cols = "dt.id, dt.wallet_address, dt.coin, dt.network, dt.side, dt.entry_price, \
                     dt.exit_price, dt.size, dt.opened_at, dt.closed_at, dt.realized_pnl, \
                     dt.fees, dt.num_fills, dt.dataset_version_id, dt.created_at";
-        let (sql, args) = build_dataset_filter_query(
+        let (sql, args) = build_dataset_filter_query_direct(
             cols,
             DatasetName::HlTradeHistory.physical_table(),
             "dt.closed_at",
-            target_id,
+            target_address.as_deref(),
+            "wallet_address",
             network,
             time_start,
             time_end,
+            "opened_at",
             limit,
             offset,
         )?;
@@ -3318,17 +3414,24 @@ impl Repository {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<ProtocolEvent>> {
+        let target_address = if let Some(tid) = target_id {
+            self.get_index_target(tid).await?.and_then(|t| t.address)
+        } else {
+            None
+        };
         let cols = "dt.id, dt.network, dt.protocol_address, dt.protocol_name, dt.event_type, \
                     dt.event_details, dt.pool_address, dt.raw_event_id, dt.timestamp, \
                     dt.dataset_version_id, dt.created_at";
-        let (sql, args) = build_dataset_filter_query(
+        let (sql, args) = build_dataset_filter_query_direct(
             cols,
             DatasetName::ProtocolEvents.physical_table(),
             "dt.timestamp",
-            target_id,
+            target_address.as_deref(),
+            "protocol_address",
             network,
             time_start,
             time_end,
+            "timestamp",
             limit,
             offset,
         )?;
@@ -3363,18 +3466,25 @@ impl Repository {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<PoolSnapshot>> {
+        let target_address = if let Some(tid) = target_id {
+            self.get_index_target(tid).await?.and_then(|t| t.address)
+        } else {
+            None
+        };
         let cols = "dt.id, dt.network, dt.pool_address, dt.protocol_address, dt.protocol_name, \
                     dt.token0_address, dt.token0_symbol, dt.token1_address, dt.token1_symbol, \
                     dt.reserve0, dt.reserve1, dt.tvl_usd, dt.snapshot_timestamp, dt.block_number, \
                     dt.dataset_version_id, dt.created_at";
-        let (sql, args) = build_dataset_filter_query(
+        let (sql, args) = build_dataset_filter_query_direct(
             cols,
             DatasetName::PoolSnapshots.physical_table(),
             "dt.snapshot_timestamp",
-            target_id,
+            target_address.as_deref(),
+            "pool_address",
             network,
             time_start,
             time_end,
+            "snapshot_timestamp",
             limit,
             offset,
         )?;
@@ -6779,6 +6889,145 @@ mod tests {
         // Time filtering joins raw_transactions and uses rt.timestamp
         assert!(sql.contains("rt.timestamp >="));
         assert!(sql.contains("rt.timestamp <="));
+    }
+
+    // -- P1: build_dataset_filter_query_direct for tables without raw_transaction_id --
+
+    #[test]
+    fn dataset_filter_query_direct_no_filters() {
+        let (sql, _) = build_dataset_filter_query_direct(
+            "dt.id, dt.wallet_address",
+            DatasetName::BalanceHistory.physical_table(),
+            "dt.timestamp",
+            None,
+            "wallet_address",
+            None,
+            None,
+            None,
+            "timestamp",
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(sql.starts_with("SELECT dt.id, dt.wallet_address FROM balance_history dt"));
+        assert!(!sql.contains("JOIN"));
+        assert!(!sql.contains("WHERE"));
+        assert!(sql.contains("ORDER BY dt.timestamp DESC, dt.id DESC"));
+        assert!(sql.contains("LIMIT $1 OFFSET $2"));
+    }
+
+    #[test]
+    fn dataset_filter_query_direct_target_address_only() {
+        let (sql, _) = build_dataset_filter_query_direct(
+            "dt.id",
+            DatasetName::BalanceHistory.physical_table(),
+            "dt.timestamp",
+            Some("0xABC"),
+            "wallet_address",
+            None,
+            None,
+            None,
+            "timestamp",
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(!sql.contains("JOIN"));
+        assert!(sql.contains("WHERE dt.wallet_address = $1"));
+        assert!(sql.contains("LIMIT $2 OFFSET $3"));
+    }
+
+    #[test]
+    fn dataset_filter_query_direct_network_only() {
+        let (sql, _) = build_dataset_filter_query_direct(
+            "dt.id",
+            DatasetName::ProtocolEvents.physical_table(),
+            "dt.timestamp",
+            None,
+            "protocol_address",
+            Some("ethereum-mainnet"),
+            None,
+            None,
+            "timestamp",
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(!sql.contains("JOIN"));
+        assert!(sql.contains("WHERE dt.network = $1"));
+        assert!(sql.contains("LIMIT $2 OFFSET $3"));
+    }
+
+    #[test]
+    fn dataset_filter_query_direct_time_window_only() {
+        let (sql, _) = build_dataset_filter_query_direct(
+            "dt.id",
+            DatasetName::HlPnlSummary.physical_table(),
+            "dt.period_end",
+            None,
+            "wallet_address",
+            None,
+            Some(1700000000),
+            Some(1700100000),
+            "period_start",
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(!sql.contains("JOIN"));
+        assert!(sql.contains("dt.period_start >= $1"));
+        assert!(sql.contains("dt.period_start <= $2"));
+        assert!(sql.contains("LIMIT $3 OFFSET $4"));
+    }
+
+    #[test]
+    fn dataset_filter_query_direct_all_filters() {
+        let (sql, _) = build_dataset_filter_query_direct(
+            "dt.id",
+            DatasetName::PoolSnapshots.physical_table(),
+            "dt.snapshot_timestamp",
+            Some("pool123"),
+            "pool_address",
+            Some("solana-mainnet"),
+            Some(1000),
+            Some(2000),
+            "snapshot_timestamp",
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(!sql.contains("JOIN"));
+        assert!(sql.contains("dt.pool_address = $1"));
+        assert!(sql.contains("dt.network = $2"));
+        assert!(sql.contains("dt.snapshot_timestamp >= $3"));
+        assert!(sql.contains("dt.snapshot_timestamp <= $4"));
+        assert!(sql.contains("LIMIT $5 OFFSET $6"));
+    }
+
+    #[test]
+    fn dataset_filter_query_direct_no_raw_tx_join_for_gold() {
+        // Regression test: Gold tables like balance_history must NOT join
+        // target_matches or raw_transactions since they lack raw_transaction_id.
+        let (sql, _) = build_dataset_filter_query_direct(
+            "dt.*",
+            DatasetName::BalanceHistory.physical_table(),
+            "dt.timestamp",
+            Some("0xWallet"),
+            "wallet_address",
+            Some("solana-mainnet"),
+            Some(1700000000),
+            Some(1700100000),
+            "timestamp",
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(!sql.contains("target_matches"));
+        assert!(!sql.contains("raw_transactions"));
+        assert!(sql.contains("dt.wallet_address = $1"));
+        assert!(sql.contains("dt.network = $2"));
+        assert!(sql.contains("dt.timestamp >= $3"));
+        assert!(sql.contains("dt.timestamp <= $4"));
     }
 
     #[test]
