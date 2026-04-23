@@ -203,12 +203,12 @@ Tenant-scoped dataset queries require `target_id`:
 curl -H "Authorization: Bearer $API_KEY" \
   "http://127.0.0.1:3000/v1/datasets/token_transfers/records?target_id=<TARGET_ID>&network=solana-mainnet&limit=50"
 
-# Check dataset completeness
-curl -H "Authorization: Bearer $API_KEY" \
+# Check dataset completeness (requires legacy/admin key — not tenant-scoped)
+curl -H "Authorization: Bearer $LEGACY_KEY" \
   http://127.0.0.1:3000/v1/datasets/token_transfers/completeness
 
-# Check dataset status (aggregated across targets)
-curl -H "Authorization: Bearer $API_KEY" \
+# Check dataset status (requires legacy/admin key — not tenant-scoped)
+curl -H "Authorization: Bearer $LEGACY_KEY" \
   http://127.0.0.1:3000/v1/datasets/token_transfers/status
 ```
 

@@ -194,7 +194,7 @@ fi
 # ---------------------------------------------------------------------------
 echo "[7/10] Querying token_transfers dataset (tenant-scoped)..."
 DATASET_RESP=$(curl_json GET "$API_URL/v1/datasets/token_transfers/records?target_id=$TARGET_ID&limit=10" "$TENANT_KEY")
-RECORD_COUNT=$(echo "$DATASET_RESP" | python3 -c "import sys, json; d=json.load(sys.stdin); print(len(d.get('records',[])))" 2>/dev/null || echo "0")
+RECORD_COUNT=$(echo "$DATASET_RESP" | python3 -c "import sys, json; d=json.load(sys.stdin); print(len(d) if isinstance(d, list) else len(d.get('records',[])))" 2>/dev/null || echo "0")
 echo "       Records returned: $RECORD_COUNT"
 
 # ---------------------------------------------------------------------------
@@ -202,7 +202,7 @@ echo "       Records returned: $RECORD_COUNT"
 # ---------------------------------------------------------------------------
 echo "[8/10] Creating dataset export job (tenant-scoped)..."
 EXPORT_RESP=$(curl_json POST "$API_URL/v1/export/dataset" "$TENANT_KEY" \
-  "{\"dataset\":\"token_transfers\",\"format\":\"jsonl\",\"target_id\":\"$TARGET_ID\",\"network\":\"$TARGET_NETWORK\",\"sink\":{\"type\":\"local_file\",\"path\":\"smoke-export.jsonl\"}}")
+  "{\"dataset\":\"token_transfers\",\"format\":\"jsonl\",\"target_id\":\"$TARGET_ID\",\"network\":\"$TARGET_NETWORK\",\"sink\":{\"sink_type\":\"local_file\",\"file_path\":\"smoke-export.jsonl\"}}")
 EXPORT_JOB_ID=$(extract_json "$EXPORT_RESP" "id")
 if [[ -z "$EXPORT_JOB_ID" ]]; then
   echo "ERROR: Could not parse export job ID from response: $EXPORT_RESP"
