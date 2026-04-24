@@ -119,14 +119,20 @@ Tenant-scoped API keys (created via `POST /v1/api-keys`) are required for tenant
 ### Ingestion and Jobs
 
 ```bash
-# Trigger ingestion (wallet + network; API auto-creates the target)
+# Trigger wallet ingestion (wallet + network; API auto-creates the target)
 curl -X POST http://127.0.0.1:3000/v1/ingest \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
+  -H Authorization:\ Bearer\ *** \
+  -H Content-Type:\ application/json \
   -d '{"wallet": "<ADDRESS>", "network": "solana-mainnet"}'
 
+# Trigger target-centric ingestion for an existing target
+curl -X POST http://127.0.0.1:3000/v1/targets/<TARGET_ID>/ingest \
+  -H Authorization:\ Bearer\ *** \
+  -H Content-Type:\ application/json \
+  -d '{"mode": "backfill"}'
+
 # Check job status
-curl -H "Authorization: Bearer $API_KEY" \
+curl -H Authorization:\ Bearer\ *** \
   http://127.0.0.1:3000/v1/jobs/<JOB_ID>
 ```
 

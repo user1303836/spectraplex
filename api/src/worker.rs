@@ -16,10 +16,10 @@ use spectraplex_adapters::hyperliquid::HyperliquidAdapter;
 use spectraplex_adapters::repo::{build_checkpoint, Repository};
 use spectraplex_adapters::solana::SolanaAdapter;
 use spectraplex_core::config::AppConfig;
+use spectraplex_core::connector::Connector;
 use spectraplex_core::models::{Chain, ChainIngestor, Transaction};
 use spectraplex_core::provider::{NetworkContext, NetworkId, ProviderRegistry};
-use spectraplex_core::v2::IngestionJob;
-use spectraplex_core::v2::RawTransaction;
+use spectraplex_core::v2::{IndexTarget, IngestionBatch, IngestionJob, RawTransaction, TargetKind};
 use std::collections::HashSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -203,24 +203,28 @@ async fn execute_job(
                 if let Some(tid) = job.target_id {
                     match repo.get_index_target(tid).await {
                         Ok(Some(target)) => {
-                            let mat_scope = serde_json::json!({
-                                "wallet": target.address.unwrap_or_default(),
-                                "network": &job.network,
-                                "ingestion_run_id": run_id.to_string(),
-                            });
-                            if let Err(e) = repo
-                                .create_materialization_run(
-                                    "normalize",
-                                    Some(&mat_scope),
-                                    None,
-                                    None,
-                                    None,
-                                )
-                                .await
-                            {
-                                warn!(job_id = %job_id, error = %e, "Failed to enqueue post-ingest materialization (non-fatal)");
+                            if target.kind == TargetKind::Wallet {
+                                let mat_scope = serde_json::json!({
+                                    "wallet": target.address.unwrap_or_default(),
+                                    "network": &job.network,
+                                    "ingestion_run_id": run_id.to_string(),
+                                });
+                                if let Err(e) = repo
+                                    .create_materialization_run(
+                                        "normalize",
+                                        Some(&mat_scope),
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    warn!(job_id = %job_id, error = %e, "Failed to enqueue post-ingest materialization (non-fatal)");
+                                } else {
+                                    info!(job_id = %job_id, "Enqueued post-ingest materialization run");
+                                }
                             } else {
-                                info!(job_id = %job_id, "Enqueued post-ingest materialization run");
+                                info!(job_id = %job_id, target_kind = ?target.kind, "Skipping wallet-scoped post-ingest materialization for non-wallet target");
                             }
                         }
                         Ok(None) => {
@@ -277,7 +281,108 @@ async fn execute_job(
     }
 }
 
-/// Execute the actual chain ingestion for a job.
+/// Returns true when a target-centric ingestion job should use the V2
+/// Connector abstraction instead of the legacy wallet-shaped ChainIngestor flow.
+fn target_uses_connector_backfill(target: &IndexTarget) -> bool {
+    matches!(
+        (target.chain_family, target.kind),
+        (
+            spectraplex_core::v2::ChainFamily::Hyperliquid,
+            TargetKind::Market
+        )
+    )
+}
+
+async fn run_connector_backfill(
+    repo: &Repository,
+    provider_registry: &ProviderRegistry,
+    job: &IngestionJob,
+    target: &IndexTarget,
+    limit: usize,
+    run_id: Uuid,
+    run_created: bool,
+) -> anyhow::Result<usize> {
+    let net_ctx =
+        NetworkContext::from_registry(provider_registry, &NetworkId::new(job.network.clone()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "network '{}' is not configured in the provider registry; cannot execute ingestion job {}",
+                    job.network,
+                    job.id
+                )
+            })?;
+
+    let source = match target.chain_family {
+        spectraplex_core::v2::ChainFamily::Solana => "rpc",
+        spectraplex_core::v2::ChainFamily::Evm => "rpc",
+        spectraplex_core::v2::ChainFamily::Hyperliquid => "rest",
+    };
+    let checkpoint_cursor = repo
+        .get_checkpoint_v2(target.id, &job.network, source)
+        .await?
+        .map(|cp| cp.cursor);
+
+    let batch: IngestionBatch = match (target.chain_family, target.kind) {
+        (spectraplex_core::v2::ChainFamily::Hyperliquid, TargetKind::Market) => {
+            let adapter = HyperliquidAdapter::from_network_context(&net_ctx);
+            adapter
+                .backfill(target, checkpoint_cursor.as_ref(), limit)
+                .await?
+        }
+        _ => anyhow::bail!(
+            "connector backfill is not supported for target kind {:?} on {:?}",
+            target.kind,
+            target.chain_family
+        ),
+    };
+
+    let count = batch.records.len();
+    let mut v2_records = batch.records;
+    if run_created {
+        for raw in &mut v2_records {
+            raw.ingestion_run_id = Some(run_id);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let v2_deduped: Vec<RawTransaction> = v2_records
+        .into_iter()
+        .filter(|r| seen.insert((r.network.clone(), r.tx_hash.clone())))
+        .collect();
+
+    let canonical_ids = repo
+        .upsert_raw_transactions_returning_ids(&v2_deduped)
+        .await?;
+    let matches = build_target_matches(target.id, &canonical_ids);
+    repo.save_target_matches(&matches).await?;
+
+    let derived_checkpoint = v2_deduped
+        .iter()
+        .filter_map(|raw| {
+            raw.raw_metadata
+                .get("data")
+                .and_then(|data| data.get("time"))
+                .and_then(|value| value.as_i64())
+                .or_else(|| raw.timestamp.checked_mul(1000))
+        })
+        .max()
+        .map(|last_time_ms| spectraplex_core::v2::Checkpoint {
+            id: Uuid::new_v4(),
+            target_id: target.id,
+            network: job.network.clone(),
+            source: source.to_string(),
+            cursor: serde_json::json!({ "last_time_ms": last_time_ms }),
+            updated_at: chrono::Utc::now(),
+        });
+
+    if let Some(cp) = batch.checkpoint.or(derived_checkpoint) {
+        repo.upsert_checkpoint_v2(&cp).await?;
+    }
+
+    Ok(count)
+}
+
+/// Execute one ingestion job end-to-end and return how many records were written.
 ///
 /// This mirrors the logic previously inline in `trigger_ingest`, but works
 /// from the durable `IngestionJob` fields instead of the HTTP request body.
@@ -289,6 +394,36 @@ async fn run_ingestion(
     run_id: Uuid,
     run_created: bool,
 ) -> anyhow::Result<usize> {
+    let target_id = job
+        .target_id
+        .ok_or_else(|| anyhow::anyhow!("ingestion job {} has no target_id", job.id))?;
+    let target = repo
+        .get_index_target(target_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("target {} not found", target_id))?;
+
+    if target.kind != TargetKind::Wallet && !target_uses_connector_backfill(&target) {
+        anyhow::bail!(
+            "ingestion job {} targets unsupported kind {:?} on {:?}",
+            job.id,
+            target.kind,
+            target.chain_family
+        );
+    }
+
+    if target_uses_connector_backfill(&target) {
+        return run_connector_backfill(
+            repo,
+            provider_registry,
+            job,
+            &target,
+            config.ingest_limit,
+            run_id,
+            run_created,
+        )
+        .await;
+    }
+
     // Resolve chain family from network.
     let chain = network_to_chain(&job.network)?;
     let chain_str = match chain {
@@ -297,29 +432,22 @@ async fn run_ingestion(
         Chain::Hyperliquid => "hyperliquid",
     };
 
-    // Resolve wallet address from the target.
-    let wallet = if let Some(target_id) = job.target_id {
-        let target = repo
-            .get_index_target(target_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("target {} not found", target_id))?;
-        target
-            .address
-            .ok_or_else(|| anyhow::anyhow!("target {} has no address", target_id))?
-    } else {
-        anyhow::bail!("ingestion job {} has no target_id", job.id);
-    };
-
-    let target_id = job.target_id;
+    let wallet = target
+        .address
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("target {} has no address", target_id))?;
 
     // Resolve V2 checkpoint for resume. For durable jobs we require a V2
     // network-scoped checkpoint. Falling back to the V1 chain-scoped
     // checkpoint is unsafe for EVM networks because "ethereum" checkpoints
     // are shared across Ethereum/Base/Arbitrum and would resume from the
     // wrong chain's cursor.
-    let checkpoint = if let Some(tid) = target_id {
+    let checkpoint = {
         let source = chain_to_default_source(&chain);
-        match repo.get_checkpoint_v2(tid, &job.network, source).await {
+        match repo
+            .get_checkpoint_v2(target_id, &job.network, source)
+            .await
+        {
             Ok(Some(v2_cp)) => {
                 info!(
                     network = %job.network,
@@ -339,7 +467,6 @@ async fn run_ingestion(
                 None
             }
             Err(e) => {
-                // Surface the error rather than silently falling back.
                 anyhow::bail!(
                     "V2 checkpoint lookup failed for network={}, wallet={}: {e}",
                     job.network,
@@ -347,8 +474,6 @@ async fn run_ingestion(
                 );
             }
         }
-    } else {
-        None
     };
 
     // Resolve network context from registry. Fail-closed: if the requested
@@ -402,8 +527,6 @@ async fn run_ingestion(
         .iter()
         .map(|tx| {
             let mut raw = v1_tx_to_v2_raw(tx, Some(&job.network));
-            // Only stamp ingestion_run_id if the run row was created;
-            // otherwise the FK would reject the insert.
             if run_created {
                 raw.ingestion_run_id = Some(run_id);
             }
@@ -411,41 +534,23 @@ async fn run_ingestion(
         })
         .collect();
 
-    // Deduplicate by (network, tx_hash) — same tx may appear from different calls
     let mut seen = HashSet::new();
     let v2_deduped: Vec<RawTransaction> = v2_records
         .into_iter()
         .filter(|r| seen.insert((r.network.clone(), r.tx_hash.clone())))
         .collect();
 
-    // Write raw_transactions (authoritative)
     let canonical_ids = repo
         .upsert_raw_transactions_returning_ids(&v2_deduped)
         .await?;
 
-    // Write target_matches (authoritative)
-    if let Some(tid) = target_id {
-        let matches = build_target_matches(tid, &canonical_ids);
-        repo.save_target_matches(&matches).await?;
-    }
+    let matches = build_target_matches(target_id, &canonical_ids);
+    repo.save_target_matches(&matches).await?;
 
-    // Write V2 checkpoint (authoritative)
     if let Some(ref v1_cp) = build_checkpoint(chain_str, &wallet, &events) {
-        if let Some(tid) = target_id {
-            let v2_cp = v1_checkpoint_to_v2_with_network(v1_cp, tid, Some(&job.network));
-            repo.upsert_checkpoint_v2(&v2_cp).await?;
-        }
+        let v2_cp = v1_checkpoint_to_v2_with_network(v1_cp, target_id, Some(&job.network));
+        repo.upsert_checkpoint_v2(&v2_cp).await?;
     }
-
-    // --- V1 COMPATIBILITY PROJECTION (best-effort, logged but non-fatal) ---
-    //
-    // Only advance the V1 checkpoint if save_transactions succeeded. If the
-    // V1 transaction write fails (even partially), advancing the checkpoint
-    // would cause legacy readers to skip those transactions permanently on
-    // the next incremental run.
-    //
-    // Controlled by `enable_v1_compat_writes` config. Disabling this is safe
-    // for operators who no longer need V1 tables.
 
     if config.enable_v1_compat_writes {
         let v1_txs_ok = repo.save_transactions(&events).await.is_ok();
@@ -524,5 +629,51 @@ async fn fire_callback_best_effort(url: &str, payload: &serde_json::Value, secre
         Err(e) => {
             warn!(error = %e, url, "Failed to deliver callback");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spectraplex_core::v2::{ChainFamily, IndexTarget, TargetKind, TargetMode};
+
+    #[test]
+    fn target_uses_connector_backfill_for_hyperliquid_market() {
+        let now = chrono::Utc::now();
+        let target = IndexTarget {
+            id: Uuid::new_v4(),
+            kind: TargetKind::Market,
+            network: "hypercore-mainnet".to_string(),
+            chain_family: ChainFamily::Hyperliquid,
+            address: Some("ETH".to_string()),
+            filter_spec: None,
+            mode: TargetMode::Backfill,
+            label: None,
+            owner_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        assert!(target_uses_connector_backfill(&target));
+    }
+
+    #[test]
+    fn target_uses_connector_backfill_stays_legacy_for_wallets() {
+        let now = chrono::Utc::now();
+        let target = IndexTarget {
+            id: Uuid::new_v4(),
+            kind: TargetKind::Wallet,
+            network: "hypercore-mainnet".to_string(),
+            chain_family: ChainFamily::Hyperliquid,
+            address: Some("0xabc".to_string()),
+            filter_spec: None,
+            mode: TargetMode::Backfill,
+            label: None,
+            owner_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        assert!(!target_uses_connector_backfill(&target));
     }
 }
