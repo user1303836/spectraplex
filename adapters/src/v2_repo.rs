@@ -1555,7 +1555,12 @@ fn direct_export_network_scope<'a>(
     target: Option<&'a IndexTarget>,
     requested_network: Option<&'a str>,
 ) -> Option<&'a str> {
-    requested_network.or_else(|| target.map(|t| t.network.as_str()))
+    match (target, requested_network) {
+        (Some(target), Some(network)) if network == target.network => Some(network),
+        (Some(_), Some(_)) => None,
+        (Some(target), None) => Some(target.network.as_str()),
+        (None, network) => network,
+    }
 }
 
 fn direct_export_filter_for_target(
@@ -4210,7 +4215,7 @@ impl Repository {
                     None,
                     export_network,
                 )?;
-                if target_id.is_some() && target_filter.is_none() {
+                if target_id.is_some() && (target_filter.is_none() || export_network.is_none()) {
                     0
                 } else {
                     stream_paged_direct_in_tx(
@@ -4247,7 +4252,7 @@ impl Repository {
                     None,
                     export_network,
                 )?;
-                if target_id.is_some() && target_filter.is_none() {
+                if target_id.is_some() && (target_filter.is_none() || export_network.is_none()) {
                     0
                 } else {
                     stream_paged_direct_in_tx(
@@ -4284,7 +4289,7 @@ impl Repository {
                     None,
                     export_network,
                 )?;
-                if target_id.is_some() && target_filter.is_none() {
+                if target_id.is_some() && (target_filter.is_none() || export_network.is_none()) {
                     0
                 } else {
                     stream_paged_direct_in_tx(
@@ -4320,7 +4325,7 @@ impl Repository {
                     Some("protocol_address"),
                     export_network,
                 )?;
-                if target_id.is_some() && target_filter.is_none() {
+                if target_id.is_some() && (target_filter.is_none() || export_network.is_none()) {
                     0
                 } else {
                     stream_paged_direct_in_tx(
@@ -4358,7 +4363,7 @@ impl Repository {
                     Some("protocol_address"),
                     export_network,
                 )?;
-                if target_id.is_some() && target_filter.is_none() {
+                if target_id.is_some() && (target_filter.is_none() || export_network.is_none()) {
                     0
                 } else {
                     stream_paged_direct_in_tx(
@@ -7467,7 +7472,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_export_network_scope_defaults_to_target_network() {
+    fn direct_export_network_scope_defaults_to_target_network_and_rejects_mismatch() {
         let mut target = make_index_target();
         target.network = "ethereum-mainnet".to_string();
 
@@ -7476,7 +7481,15 @@ mod tests {
             Some("ethereum-mainnet")
         );
         assert_eq!(
+            direct_export_network_scope(Some(&target), Some("ethereum-mainnet")),
+            Some("ethereum-mainnet")
+        );
+        assert_eq!(
             direct_export_network_scope(Some(&target), Some("base-mainnet")),
+            None
+        );
+        assert_eq!(
+            direct_export_network_scope(None, Some("base-mainnet")),
             Some("base-mainnet")
         );
         assert_eq!(direct_export_network_scope(None, None), None);
