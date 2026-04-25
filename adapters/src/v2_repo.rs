@@ -1551,6 +1551,13 @@ fn protocol_target_addresses(
     Ok(addrs)
 }
 
+fn direct_export_network_scope<'a>(
+    target: Option<&'a IndexTarget>,
+    requested_network: Option<&'a str>,
+) -> Option<&'a str> {
+    requested_network.or_else(|| target.map(|t| t.network.as_str()))
+}
+
 fn direct_export_filter_for_target(
     target: Option<&IndexTarget>,
     default_col: &'static str,
@@ -4193,6 +4200,7 @@ impl Repository {
                             dt.timestamp, dt.balance, dt.tx_hash, dt.dataset_version_id, \
                             dt.created_at";
                 let target = Self::direct_export_target(&mut tx, target_id).await?;
+                let export_network = direct_export_network_scope(target.as_ref(), network);
                 let spec = direct_export_filter_spec_for_dataset("balance_history").unwrap();
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
@@ -4200,7 +4208,7 @@ impl Repository {
                     &[TargetKind::Wallet],
                     None,
                     None,
-                    network,
+                    export_network,
                 )?;
                 if target_id.is_some() && target_filter.is_none() {
                     0
@@ -4210,7 +4218,7 @@ impl Repository {
                         cols,
                         spec,
                         target_filter.as_ref(),
-                        network,
+                        export_network,
                         time_start,
                         time_end,
                         page_size,
@@ -4229,6 +4237,7 @@ impl Repository {
                             dt.net_pnl, dt.trade_count, dt.fill_count, dt.avg_trade_size, \
                             dt.win_count, dt.loss_count, dt.dataset_version_id, dt.created_at";
                 let target = Self::direct_export_target(&mut tx, target_id).await?;
+                let export_network = direct_export_network_scope(target.as_ref(), network);
                 let spec = direct_export_filter_spec_for_dataset("hl_pnl_summary").unwrap();
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
@@ -4236,7 +4245,7 @@ impl Repository {
                     &[TargetKind::Wallet],
                     None,
                     None,
-                    network,
+                    export_network,
                 )?;
                 if target_id.is_some() && target_filter.is_none() {
                     0
@@ -4246,7 +4255,7 @@ impl Repository {
                         cols,
                         spec,
                         target_filter.as_ref(),
-                        network,
+                        export_network,
                         time_start,
                         time_end,
                         page_size,
@@ -4265,6 +4274,7 @@ impl Repository {
                             dt.realized_pnl, dt.fees, dt.num_fills, dt.dataset_version_id, \
                             dt.created_at";
                 let target = Self::direct_export_target(&mut tx, target_id).await?;
+                let export_network = direct_export_network_scope(target.as_ref(), network);
                 let spec = direct_export_filter_spec_for_dataset("hl_trade_history").unwrap();
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
@@ -4272,7 +4282,7 @@ impl Repository {
                     &[TargetKind::Wallet],
                     None,
                     None,
-                    network,
+                    export_network,
                 )?;
                 if target_id.is_some() && target_filter.is_none() {
                     0
@@ -4282,7 +4292,7 @@ impl Repository {
                         cols,
                         spec,
                         target_filter.as_ref(),
-                        network,
+                        export_network,
                         time_start,
                         time_end,
                         page_size,
@@ -4300,6 +4310,7 @@ impl Repository {
                             dt.event_type, dt.event_details, dt.pool_address, dt.raw_event_id, \
                             dt.timestamp, dt.dataset_version_id, dt.created_at";
                 let target = Self::direct_export_target(&mut tx, target_id).await?;
+                let export_network = direct_export_network_scope(target.as_ref(), network);
                 let spec = direct_export_filter_spec_for_dataset("protocol_events").unwrap();
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
@@ -4307,7 +4318,7 @@ impl Repository {
                     &[TargetKind::Protocol, TargetKind::Pool],
                     Some("pool_address"),
                     Some("protocol_address"),
-                    network,
+                    export_network,
                 )?;
                 if target_id.is_some() && target_filter.is_none() {
                     0
@@ -4317,7 +4328,7 @@ impl Repository {
                         cols,
                         spec,
                         target_filter.as_ref(),
-                        network,
+                        export_network,
                         time_start,
                         time_end,
                         page_size,
@@ -4337,6 +4348,7 @@ impl Repository {
                             dt.tvl_usd, dt.snapshot_timestamp, dt.block_number, \
                             dt.dataset_version_id, dt.created_at";
                 let target = Self::direct_export_target(&mut tx, target_id).await?;
+                let export_network = direct_export_network_scope(target.as_ref(), network);
                 let spec = direct_export_filter_spec_for_dataset("pool_snapshots").unwrap();
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
@@ -4344,7 +4356,7 @@ impl Repository {
                     &[TargetKind::Protocol, TargetKind::Pool],
                     Some("pool_address"),
                     Some("protocol_address"),
-                    network,
+                    export_network,
                 )?;
                 if target_id.is_some() && target_filter.is_none() {
                     0
@@ -4354,7 +4366,7 @@ impl Repository {
                         cols,
                         spec,
                         target_filter.as_ref(),
-                        network,
+                        export_network,
                         time_start,
                         time_end,
                         page_size,
@@ -7452,6 +7464,22 @@ mod tests {
                 "{dataset} must not join raw_transactions"
             );
         }
+    }
+
+    #[test]
+    fn direct_export_network_scope_defaults_to_target_network() {
+        let mut target = make_index_target();
+        target.network = "ethereum-mainnet".to_string();
+
+        assert_eq!(
+            direct_export_network_scope(Some(&target), None),
+            Some("ethereum-mainnet")
+        );
+        assert_eq!(
+            direct_export_network_scope(Some(&target), Some("base-mainnet")),
+            Some("base-mainnet")
+        );
+        assert_eq!(direct_export_network_scope(None, None), None);
     }
 
     #[test]
