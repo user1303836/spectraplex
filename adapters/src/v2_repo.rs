@@ -1224,25 +1224,21 @@ impl ExportRecordBatch {
 /// query and before every send so lease-loss (heartbeat reporting the
 /// export job was reclaimed) aborts promptly.
 #[allow(clippy::too_many_arguments)]
-async fn stream_paged_in_tx<T, R, B>(
+async fn stream_paged_with_builder_in_tx<T, R, B, Q>(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    cols: &str,
     table: &str,
-    order_col: &str,
-    target_id: Option<Uuid>,
-    network: Option<&str>,
-    time_start: Option<i64>,
-    time_end: Option<i64>,
     page_size: i64,
     hard_cap: i64,
     cancel: &tokio_util::sync::CancellationToken,
     tx_out: &tokio::sync::mpsc::Sender<ExportRecordBatch>,
+    mut build_page_query: Q,
     row_fn: R,
     batch_fn: B,
 ) -> anyhow::Result<usize>
 where
     R: Fn(&sqlx::postgres::PgRow) -> anyhow::Result<T>,
     B: Fn(Vec<T>) -> ExportRecordBatch,
+    Q: FnMut(i64) -> anyhow::Result<(String, sqlx::postgres::PgArguments)>,
 {
     let mut offset: i64 = 0;
     let mut total: usize = 0;
@@ -1251,9 +1247,7 @@ where
             anyhow::bail!("export snapshot cancelled (lease lost or worker shutdown)");
         }
 
-        let (sql, args) = build_dataset_filter_query(
-            cols, table, order_col, target_id, network, time_start, time_end, page_size, offset,
-        )?;
+        let (sql, args) = build_page_query(offset)?;
 
         let rows = sqlx::query_with(&sql, args).fetch_all(&mut **tx).await?;
         let n = rows.len();
@@ -1308,6 +1302,93 @@ where
         }
     }
     Ok(total)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_paged_in_tx<T, R, B>(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cols: &str,
+    table: &str,
+    order_col: &str,
+    target_id: Option<Uuid>,
+    network: Option<&str>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
+    page_size: i64,
+    hard_cap: i64,
+    cancel: &tokio_util::sync::CancellationToken,
+    tx_out: &tokio::sync::mpsc::Sender<ExportRecordBatch>,
+    row_fn: R,
+    batch_fn: B,
+) -> anyhow::Result<usize>
+where
+    R: Fn(&sqlx::postgres::PgRow) -> anyhow::Result<T>,
+    B: Fn(Vec<T>) -> ExportRecordBatch,
+{
+    stream_paged_with_builder_in_tx(
+        tx,
+        table,
+        page_size,
+        hard_cap,
+        cancel,
+        tx_out,
+        |offset| {
+            build_dataset_filter_query(
+                cols, table, order_col, target_id, network, time_start, time_end, page_size, offset,
+            )
+        },
+        row_fn,
+        batch_fn,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_paged_direct_in_tx<T, R, B>(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cols: &str,
+    spec: DirectExportFilterSpec,
+    target_address: Option<&str>,
+    network: Option<&str>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
+    page_size: i64,
+    hard_cap: i64,
+    cancel: &tokio_util::sync::CancellationToken,
+    tx_out: &tokio::sync::mpsc::Sender<ExportRecordBatch>,
+    row_fn: R,
+    batch_fn: B,
+) -> anyhow::Result<usize>
+where
+    R: Fn(&sqlx::postgres::PgRow) -> anyhow::Result<T>,
+    B: Fn(Vec<T>) -> ExportRecordBatch,
+{
+    stream_paged_with_builder_in_tx(
+        tx,
+        spec.table,
+        page_size,
+        hard_cap,
+        cancel,
+        tx_out,
+        |offset| {
+            build_dataset_filter_query_direct(
+                cols,
+                spec.table,
+                spec.order_col,
+                target_address,
+                spec.target_address_col,
+                network,
+                time_start,
+                time_end,
+                spec.time_col,
+                page_size,
+                offset,
+            )
+        },
+        row_fn,
+        batch_fn,
+    )
+    .await
 }
 
 /// Build a filtered SELECT query for a Silver dataset table.
@@ -1392,6 +1473,50 @@ pub fn build_dataset_filter_query(
     args.add(offset).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok((sql, args))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DirectExportFilterSpec {
+    table: &'static str,
+    order_col: &'static str,
+    target_address_col: &'static str,
+    time_col: &'static str,
+}
+
+fn direct_export_filter_spec_for_dataset(dataset: &str) -> Option<DirectExportFilterSpec> {
+    match dataset {
+        "balance_history" => Some(DirectExportFilterSpec {
+            table: DatasetName::BalanceHistory.physical_table(),
+            order_col: "dt.timestamp",
+            target_address_col: "wallet_address",
+            time_col: "timestamp",
+        }),
+        "hl_pnl_summary" => Some(DirectExportFilterSpec {
+            table: DatasetName::HlPnlSummary.physical_table(),
+            order_col: "dt.period_end",
+            target_address_col: "wallet_address",
+            time_col: "period_start",
+        }),
+        "hl_trade_history" => Some(DirectExportFilterSpec {
+            table: DatasetName::HlTradeHistory.physical_table(),
+            order_col: "dt.closed_at",
+            target_address_col: "wallet_address",
+            time_col: "opened_at",
+        }),
+        "protocol_events" => Some(DirectExportFilterSpec {
+            table: DatasetName::ProtocolEvents.physical_table(),
+            order_col: "dt.timestamp",
+            target_address_col: "protocol_address",
+            time_col: "timestamp",
+        }),
+        "pool_snapshots" => Some(DirectExportFilterSpec {
+            table: DatasetName::PoolSnapshots.physical_table(),
+            order_col: "dt.snapshot_timestamp",
+            target_address_col: "pool_address",
+            time_col: "snapshot_timestamp",
+        }),
+        _ => None,
+    }
 }
 
 /// Build a filter query for dataset tables that do NOT have `raw_transaction_id`.
@@ -3746,6 +3871,20 @@ impl Repository {
     /// the disk-write rate rather than buffering whole pages in RAM.
     ///
     /// Returns the total number of records sent.
+    async fn direct_export_target_address(
+        &self,
+        target_id: Option<Uuid>,
+    ) -> anyhow::Result<Option<String>> {
+        match target_id {
+            Some(tid) => Ok(self
+                .get_index_target(tid)
+                .await?
+                .and_then(|t| t.address)
+                .filter(|addr| !addr.is_empty())),
+            None => Ok(None),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn stream_export_snapshot(
         &self,
@@ -3927,91 +4066,107 @@ impl Repository {
                 let cols = "dt.id, dt.wallet_address, dt.asset_symbol, dt.network, \
                             dt.timestamp, dt.balance, dt.tx_hash, dt.dataset_version_id, \
                             dt.created_at";
-                stream_paged_in_tx(
-                    &mut tx,
-                    cols,
-                    DatasetName::BalanceHistory.physical_table(),
-                    "dt.timestamp",
-                    target_id,
-                    network,
-                    time_start,
-                    time_end,
-                    page_size,
-                    hard_cap,
-                    &cancel,
-                    &tx_out,
-                    row_to_balance_snapshot,
-                    ExportRecordBatch::BalanceHistory,
-                )
-                .await?
+                let target_address = self.direct_export_target_address(target_id).await?;
+                if target_id.is_some() && target_address.is_none() {
+                    0
+                } else {
+                    stream_paged_direct_in_tx(
+                        &mut tx,
+                        cols,
+                        direct_export_filter_spec_for_dataset("balance_history").unwrap(),
+                        target_address.as_deref(),
+                        network,
+                        time_start,
+                        time_end,
+                        page_size,
+                        hard_cap,
+                        &cancel,
+                        &tx_out,
+                        row_to_balance_snapshot,
+                        ExportRecordBatch::BalanceHistory,
+                    )
+                    .await?
+                }
             }
             "hl_pnl_summary" => {
                 let cols = "dt.id, dt.wallet_address, dt.coin, dt.network, dt.period_start, \
                             dt.period_end, dt.total_closed_pnl, dt.total_funding, dt.total_fees, \
                             dt.net_pnl, dt.trade_count, dt.fill_count, dt.avg_trade_size, \
                             dt.win_count, dt.loss_count, dt.dataset_version_id, dt.created_at";
-                stream_paged_in_tx(
-                    &mut tx,
-                    cols,
-                    DatasetName::HlPnlSummary.physical_table(),
-                    "dt.period_end",
-                    target_id,
-                    network,
-                    time_start,
-                    time_end,
-                    page_size,
-                    hard_cap,
-                    &cancel,
-                    &tx_out,
-                    row_to_hl_pnl_summary,
-                    ExportRecordBatch::HlPnlSummary,
-                )
-                .await?
+                let target_address = self.direct_export_target_address(target_id).await?;
+                if target_id.is_some() && target_address.is_none() {
+                    0
+                } else {
+                    stream_paged_direct_in_tx(
+                        &mut tx,
+                        cols,
+                        direct_export_filter_spec_for_dataset("hl_pnl_summary").unwrap(),
+                        target_address.as_deref(),
+                        network,
+                        time_start,
+                        time_end,
+                        page_size,
+                        hard_cap,
+                        &cancel,
+                        &tx_out,
+                        row_to_hl_pnl_summary,
+                        ExportRecordBatch::HlPnlSummary,
+                    )
+                    .await?
+                }
             }
             "hl_trade_history" => {
                 let cols = "dt.id, dt.wallet_address, dt.coin, dt.network, dt.side, \
                             dt.entry_price, dt.exit_price, dt.size, dt.opened_at, dt.closed_at, \
                             dt.realized_pnl, dt.fees, dt.num_fills, dt.dataset_version_id, \
                             dt.created_at";
-                stream_paged_in_tx(
-                    &mut tx,
-                    cols,
-                    DatasetName::HlTradeHistory.physical_table(),
-                    "dt.closed_at",
-                    target_id,
-                    network,
-                    time_start,
-                    time_end,
-                    page_size,
-                    hard_cap,
-                    &cancel,
-                    &tx_out,
-                    row_to_hl_trade_history,
-                    ExportRecordBatch::HlTradeHistory,
-                )
-                .await?
+                let target_address = self.direct_export_target_address(target_id).await?;
+                if target_id.is_some() && target_address.is_none() {
+                    0
+                } else {
+                    stream_paged_direct_in_tx(
+                        &mut tx,
+                        cols,
+                        direct_export_filter_spec_for_dataset("hl_trade_history").unwrap(),
+                        target_address.as_deref(),
+                        network,
+                        time_start,
+                        time_end,
+                        page_size,
+                        hard_cap,
+                        &cancel,
+                        &tx_out,
+                        row_to_hl_trade_history,
+                        ExportRecordBatch::HlTradeHistory,
+                    )
+                    .await?
+                }
             }
             "protocol_events" => {
                 let cols = "dt.id, dt.network, dt.protocol_address, dt.protocol_name, \
                             dt.event_type, dt.event_details, dt.pool_address, dt.raw_event_id, \
                             dt.timestamp, dt.dataset_version_id, dt.created_at";
-                stream_paged_in_tx(
-                    &mut tx,
-                    cols,
-                    DatasetName::ProtocolEvents.physical_table(),
-                    "dt.timestamp",
-                    target_id,
-                    network,
-                    time_start,
-                    time_end,
-                    page_size,
-                    hard_cap,
-                    &cancel,
-                    &tx_out,
-                    row_to_protocol_event,
-                    ExportRecordBatch::ProtocolEvents,
-                )
-                .await?
+                let target_address = self.direct_export_target_address(target_id).await?;
+                if target_id.is_some() && target_address.is_none() {
+                    0
+                } else {
+                    stream_paged_direct_in_tx(
+                        &mut tx,
+                        cols,
+                        direct_export_filter_spec_for_dataset("protocol_events").unwrap(),
+                        target_address.as_deref(),
+                        network,
+                        time_start,
+                        time_end,
+                        page_size,
+                        hard_cap,
+                        &cancel,
+                        &tx_out,
+                        row_to_protocol_event,
+                        ExportRecordBatch::ProtocolEvents,
+                    )
+                    .await?
+                }
             }
             "pool_snapshots" => {
                 let cols = "dt.id, dt.network, dt.pool_address, dt.protocol_address, \
@@ -4019,23 +4174,27 @@ impl Repository {
                             dt.token1_address, dt.token1_symbol, dt.reserve0, dt.reserve1, \
                             dt.tvl_usd, dt.snapshot_timestamp, dt.block_number, \
                             dt.dataset_version_id, dt.created_at";
-                stream_paged_in_tx(
-                    &mut tx,
-                    cols,
-                    DatasetName::PoolSnapshots.physical_table(),
-                    "dt.snapshot_timestamp",
-                    target_id,
-                    network,
-                    time_start,
-                    time_end,
-                    page_size,
-                    hard_cap,
-                    &cancel,
-                    &tx_out,
-                    row_to_pool_snapshot,
-                    ExportRecordBatch::PoolSnapshots,
-                )
-                .await?
+                let target_address = self.direct_export_target_address(target_id).await?;
+                if target_id.is_some() && target_address.is_none() {
+                    0
+                } else {
+                    stream_paged_direct_in_tx(
+                        &mut tx,
+                        cols,
+                        direct_export_filter_spec_for_dataset("pool_snapshots").unwrap(),
+                        target_address.as_deref(),
+                        network,
+                        time_start,
+                        time_end,
+                        page_size,
+                        hard_cap,
+                        &cancel,
+                        &tx_out,
+                        row_to_pool_snapshot,
+                        ExportRecordBatch::PoolSnapshots,
+                    )
+                    .await?
+                }
             }
             other => {
                 // Rolling back the snapshot transaction on unknown dataset
@@ -7086,6 +7245,42 @@ mod tests {
         assert!(sql.contains("dt.network = $2"));
         assert!(sql.contains("dt.timestamp >= $3"));
         assert!(sql.contains("dt.timestamp <= $4"));
+    }
+
+    #[test]
+    fn stream_export_gold_tables_without_raw_tx_use_direct_filter_specs() {
+        for dataset in [
+            "balance_history",
+            "hl_pnl_summary",
+            "hl_trade_history",
+            "protocol_events",
+            "pool_snapshots",
+        ] {
+            let spec = direct_export_filter_spec_for_dataset(dataset)
+                .unwrap_or_else(|| panic!("{dataset} should use direct export filtering"));
+            let (sql, _) = build_dataset_filter_query_direct(
+                "dt.id",
+                spec.table,
+                spec.order_col,
+                Some("target-address"),
+                spec.target_address_col,
+                Some("solana-mainnet"),
+                Some(1000),
+                Some(2000),
+                spec.time_col,
+                50,
+                0,
+            )
+            .unwrap();
+            assert!(
+                !sql.contains("target_matches"),
+                "{dataset} must not join target_matches"
+            );
+            assert!(
+                !sql.contains("raw_transactions"),
+                "{dataset} must not join raw_transactions"
+            );
+        }
     }
 
     #[test]
