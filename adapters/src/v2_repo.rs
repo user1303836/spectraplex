@@ -1495,13 +1495,13 @@ fn direct_export_filter_spec_for_dataset(dataset: &str) -> Option<DirectExportFi
             table: DatasetName::HlPnlSummary.physical_table(),
             order_col: "dt.period_end",
             target_address_col: "wallet_address",
-            time_col: "period_start",
+            time_col: "period_end",
         }),
         "hl_trade_history" => Some(DirectExportFilterSpec {
             table: DatasetName::HlTradeHistory.physical_table(),
             order_col: "dt.closed_at",
             target_address_col: "wallet_address",
-            time_col: "opened_at",
+            time_col: "closed_at",
         }),
         "protocol_events" => Some(DirectExportFilterSpec {
             table: DatasetName::ProtocolEvents.physical_table(),
@@ -3871,16 +3871,15 @@ impl Repository {
     /// the disk-write rate rather than buffering whole pages in RAM.
     ///
     /// Returns the total number of records sent.
-    async fn direct_export_target_address(
+    async fn direct_export_target(
         &self,
         target_id: Option<Uuid>,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<Option<IndexTarget>> {
         match target_id {
             Some(tid) => Ok(self
                 .get_index_target(tid)
                 .await?
-                .and_then(|t| t.address)
-                .filter(|addr| !addr.is_empty())),
+                .filter(|target| target.address.as_ref().is_some_and(|addr| !addr.is_empty()))),
             None => Ok(None),
         }
     }
@@ -4066,7 +4065,8 @@ impl Repository {
                 let cols = "dt.id, dt.wallet_address, dt.asset_symbol, dt.network, \
                             dt.timestamp, dt.balance, dt.tx_hash, dt.dataset_version_id, \
                             dt.created_at";
-                let target_address = self.direct_export_target_address(target_id).await?;
+                let target = self.direct_export_target(target_id).await?;
+                let target_address = target.as_ref().and_then(|t| t.address.as_deref());
                 if target_id.is_some() && target_address.is_none() {
                     0
                 } else {
@@ -4074,7 +4074,7 @@ impl Repository {
                         &mut tx,
                         cols,
                         direct_export_filter_spec_for_dataset("balance_history").unwrap(),
-                        target_address.as_deref(),
+                        target_address,
                         network,
                         time_start,
                         time_end,
@@ -4093,7 +4093,8 @@ impl Repository {
                             dt.period_end, dt.total_closed_pnl, dt.total_funding, dt.total_fees, \
                             dt.net_pnl, dt.trade_count, dt.fill_count, dt.avg_trade_size, \
                             dt.win_count, dt.loss_count, dt.dataset_version_id, dt.created_at";
-                let target_address = self.direct_export_target_address(target_id).await?;
+                let target = self.direct_export_target(target_id).await?;
+                let target_address = target.as_ref().and_then(|t| t.address.as_deref());
                 if target_id.is_some() && target_address.is_none() {
                     0
                 } else {
@@ -4101,7 +4102,7 @@ impl Repository {
                         &mut tx,
                         cols,
                         direct_export_filter_spec_for_dataset("hl_pnl_summary").unwrap(),
-                        target_address.as_deref(),
+                        target_address,
                         network,
                         time_start,
                         time_end,
@@ -4120,7 +4121,8 @@ impl Repository {
                             dt.entry_price, dt.exit_price, dt.size, dt.opened_at, dt.closed_at, \
                             dt.realized_pnl, dt.fees, dt.num_fills, dt.dataset_version_id, \
                             dt.created_at";
-                let target_address = self.direct_export_target_address(target_id).await?;
+                let target = self.direct_export_target(target_id).await?;
+                let target_address = target.as_ref().and_then(|t| t.address.as_deref());
                 if target_id.is_some() && target_address.is_none() {
                     0
                 } else {
@@ -4128,7 +4130,7 @@ impl Repository {
                         &mut tx,
                         cols,
                         direct_export_filter_spec_for_dataset("hl_trade_history").unwrap(),
-                        target_address.as_deref(),
+                        target_address,
                         network,
                         time_start,
                         time_end,
@@ -4146,15 +4148,21 @@ impl Repository {
                 let cols = "dt.id, dt.network, dt.protocol_address, dt.protocol_name, \
                             dt.event_type, dt.event_details, dt.pool_address, dt.raw_event_id, \
                             dt.timestamp, dt.dataset_version_id, dt.created_at";
-                let target_address = self.direct_export_target_address(target_id).await?;
+                let target = self.direct_export_target(target_id).await?;
+                let target_address = target.as_ref().and_then(|t| t.address.as_deref());
                 if target_id.is_some() && target_address.is_none() {
                     0
                 } else {
+                    let mut spec =
+                        direct_export_filter_spec_for_dataset("protocol_events").unwrap();
+                    if target.as_ref().is_some_and(|t| t.kind == TargetKind::Pool) {
+                        spec.target_address_col = "pool_address";
+                    }
                     stream_paged_direct_in_tx(
                         &mut tx,
                         cols,
-                        direct_export_filter_spec_for_dataset("protocol_events").unwrap(),
-                        target_address.as_deref(),
+                        spec,
+                        target_address,
                         network,
                         time_start,
                         time_end,
@@ -4174,7 +4182,8 @@ impl Repository {
                             dt.token1_address, dt.token1_symbol, dt.reserve0, dt.reserve1, \
                             dt.tvl_usd, dt.snapshot_timestamp, dt.block_number, \
                             dt.dataset_version_id, dt.created_at";
-                let target_address = self.direct_export_target_address(target_id).await?;
+                let target = self.direct_export_target(target_id).await?;
+                let target_address = target.as_ref().and_then(|t| t.address.as_deref());
                 if target_id.is_some() && target_address.is_none() {
                     0
                 } else {
@@ -4182,7 +4191,7 @@ impl Repository {
                         &mut tx,
                         cols,
                         direct_export_filter_spec_for_dataset("pool_snapshots").unwrap(),
-                        target_address.as_deref(),
+                        target_address,
                         network,
                         time_start,
                         time_end,
