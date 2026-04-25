@@ -31,7 +31,7 @@ Requires Rust (stable) and PostgreSQL 15+. Docker handles Postgres if you don't 
 
 ## Features
 
-**Ingest from any supported chain with a single command.** Point at a wallet, contract, or event filter and Spectraplex pulls raw transactions, logs, and fills into Bronze storage.
+**Ingest from supported wallet and target paths through the API.** Wallet ingest is the stable MVP path; selected non-wallet targets are available only where the support matrix below labels them supported.
 
 **Bronze-native Silver materialization.** Raw data is extracted directly into canonical Silver datasets — token transfers, balance deltas, decoded events, fills, funding, and positions — without V1 compatibility overhead.
 
@@ -91,15 +91,49 @@ All operational state — jobs, streams, exports, materialization runs — is du
 | `protocol_events` | Gold | Protocol events derived from decoded logs |
 | `pool_snapshots` | Gold | Pool state snapshots from events and transfers |
 
+## MVP Support Matrix
+
+Support levels:
+
+- **Stable** — intended for the documented MVP path and covered by local checks or deterministic tests.
+- **Beta** — usable but still needs broader correctness fixtures or provider hardening before production-grade claims.
+- **Experimental** — implemented building blocks exist, but operators should expect sharp edges.
+- **Unsupported** — intentionally not advertised as working yet.
+
+### Target and Ingestion Support
+
+| Target / path | Support | Notes |
+|---------------|---------|-------|
+| Solana wallet via `POST /v1/ingest` or `POST /v1/targets/:id/ingest` | Stable | V2-backed wallet ingest remains the primary stable path for wallet ledger, balance, and export workflows. |
+| EVM wallet via `POST /v1/ingest` or `POST /v1/targets/:id/ingest` | Beta | Wallet ingest exists, but chain-id/finality/reorg hardening must land before production-grade support claims. |
+| Hyperliquid wallet via `POST /v1/ingest` or streams | Beta | REST/WebSocket flows exist, but provider-rate-limit/backoff and gap-detection hardening are still tracked separately. |
+| Hyperliquid market target via `POST /v1/targets/:id/ingest` | Beta | First non-wallet target-centric connector path. This path currently writes Bronze market data; Silver/Gold auto-materialization is not yet part of the market-target contract. |
+| EVM contract/topic target via target-centric ingest | Unsupported | Connector/runtime hardening is intentionally deferred. Do not treat EVM contract/topic targets as a supported runtime path yet. |
+| CLI `normalize` | Legacy compatibility | Available for offline/file-based workflows, but the API ingestion + auto-materialization path is the recommended V2 flow. |
+
+### Dataset and Export Support
+
+| Dataset flow | Support | Notes |
+|--------------|---------|-------|
+| Silver dataset query/export with `target_id` for materialized wallet paths | Stable | Silver tables carry raw lineage and target matching. Tenant requests must include an owned `target_id`. Non-wallet targets are only query/export-supported where their row above says materialization is part of the contract. |
+| `wallet_ledger` Gold query/export | Stable | Target-scoped wallet ledger reads use Gold-specific filtering and include export provenance. |
+| `balance_history` Gold query/export | Beta | Materialized with DB-seeded running balances; keep representative correctness fixtures current before production-grade use. |
+| Hyperliquid Gold datasets (`hl_pnl_summary`, `hl_trade_history`) | Beta | Durable Gold tables exist; correctness depends on fill/funding semantics and provider completeness. |
+| Protocol/TVL Gold datasets (`protocol_events`, `pool_snapshots`) | Experimental | Query/export paths exist, but protocol semantics and TVL calculations need representative fixtures before stable claims. |
+| Dataset completeness/status | Stable for owned targets | Tenant-scoped API keys see owner-filtered target completeness/status; dataset version metadata remains global. |
+| Export provenance sidecars | Stable | Dataset exports include version and completeness metadata when available. |
+
+Known high/critical provider and operational hardening issues are tracked in GitHub issues #248-#267. The support levels above are intentionally conservative until those risks are either fixed or scoped out of a stable path.
+
 ## Supported Path vs Legacy Compatibility
 
 Spectraplex has two operational paths:
 
 **Supported MVP path (recommended):**
-1. Register a target via API (`POST /v1/targets`)
-2. Trigger ingestion via API (`POST /v1/ingest`)
-3. Workers write V2 Bronze (`raw_transactions`) and auto-materialize Silver/Gold
-4. Query or export from durable V2 tables
+1. Register a target via API (`POST /v1/targets`) or use the wallet ingest shortcut
+2. Trigger ingestion via API (`POST /v1/targets/:id/ingest` or `POST /v1/ingest` for wallet shortcuts)
+3. Workers write V2 Bronze (`raw_transactions`); stable wallet paths auto-materialize Silver/Gold
+4. Query or export from durable V2 tables with an owned `target_id`
 
 This path is fully tenant-scoped, survives restarts, and produces completeness/provenance metadata for every export.
 
@@ -294,7 +328,7 @@ curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
 `GET /v1/transactions/:wallet` | `GET /v1/transactions/:wallet/:tx_hash` | `GET /v1/ledger/:wallet` | `GET /v1/export/:wallet` | `GET /v1/balances/:wallet` | `GET /v1/stats/:wallet`
 
 **Targets and networks:**
-`POST /v1/targets` | `GET /v1/targets` | `GET /v1/targets/:target_id` | `GET /v1/networks` | `GET /v1/networks/:network_id`
+`POST /v1/targets` | `GET /v1/targets` | `GET /v1/targets/:target_id` | `POST /v1/targets/:target_id/ingest` | `GET /v1/networks` | `GET /v1/networks/:network_id`
 
 **API keys:**
 `POST /v1/api-keys` | `GET /v1/api-keys` | `DELETE /v1/api-keys/:key_id`
