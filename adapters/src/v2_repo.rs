@@ -4,6 +4,7 @@
 //! `Repository` value they already hold for V1 wallet-scoped queries.
 
 use chrono::{DateTime, Utc};
+use spectraplex_core::connector::ProtocolFilterSpec;
 
 /// V2-backed wallet statistics returned by `get_wallet_stats_v2`.
 pub struct WalletStatsV2 {
@@ -1348,7 +1349,7 @@ async fn stream_paged_direct_in_tx<T, R, B>(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     cols: &str,
     spec: DirectExportFilterSpec,
-    target_address: Option<&str>,
+    target_filter: Option<&DirectExportTargetFilter>,
     network: Option<&str>,
     time_start: Option<i64>,
     time_end: Option<i64>,
@@ -1375,8 +1376,8 @@ where
                 cols,
                 spec.table,
                 spec.order_col,
-                target_address,
-                spec.target_address_col,
+                target_filter.map(|f| f.value.as_str()),
+                target_filter.map_or(spec.target_address_col, |f| f.col),
                 network,
                 time_start,
                 time_end,
@@ -1517,6 +1518,50 @@ fn direct_export_filter_spec_for_dataset(dataset: &str) -> Option<DirectExportFi
         }),
         _ => None,
     }
+}
+
+struct DirectExportTargetFilter {
+    value: String,
+    col: &'static str,
+}
+
+fn protocol_target_name(target: &IndexTarget) -> anyhow::Result<Option<String>> {
+    let Some(filter_spec) = target.filter_spec.as_ref() else {
+        return Ok(None);
+    };
+    let spec: ProtocolFilterSpec = serde_json::from_value(filter_spec.clone())?;
+    Ok((!spec.name.is_empty()).then_some(spec.name))
+}
+
+fn direct_export_filter_for_target(
+    target: Option<&IndexTarget>,
+    default_col: &'static str,
+    pool_col: Option<&'static str>,
+) -> anyhow::Result<Option<DirectExportTargetFilter>> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+
+    if target.kind == TargetKind::Protocol {
+        return Ok(
+            protocol_target_name(target)?.map(|name| DirectExportTargetFilter {
+                value: name,
+                col: "protocol_name",
+            }),
+        );
+    }
+
+    let Some(addr) = target.address.as_ref().filter(|addr| !addr.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(DirectExportTargetFilter {
+        value: addr.clone(),
+        col: if target.kind == TargetKind::Pool {
+            pool_col.unwrap_or(default_col)
+        } else {
+            default_col
+        },
+    }))
 }
 
 /// Build a filter query for dataset tables that do NOT have `raw_transaction_id`.
@@ -3876,10 +3921,7 @@ impl Repository {
         target_id: Option<Uuid>,
     ) -> anyhow::Result<Option<IndexTarget>> {
         match target_id {
-            Some(tid) => Ok(self
-                .get_index_target(tid)
-                .await?
-                .filter(|target| target.address.as_ref().is_some_and(|addr| !addr.is_empty()))),
+            Some(tid) => self.get_index_target(tid).await,
             None => Ok(None),
         }
     }
@@ -4066,15 +4108,20 @@ impl Repository {
                             dt.timestamp, dt.balance, dt.tx_hash, dt.dataset_version_id, \
                             dt.created_at";
                 let target = self.direct_export_target(target_id).await?;
-                let target_address = target.as_ref().and_then(|t| t.address.as_deref());
-                if target_id.is_some() && target_address.is_none() {
+                let spec = direct_export_filter_spec_for_dataset("balance_history").unwrap();
+                let target_filter = direct_export_filter_for_target(
+                    target.as_ref(),
+                    spec.target_address_col,
+                    None,
+                )?;
+                if target_id.is_some() && target_filter.is_none() {
                     0
                 } else {
                     stream_paged_direct_in_tx(
                         &mut tx,
                         cols,
-                        direct_export_filter_spec_for_dataset("balance_history").unwrap(),
-                        target_address,
+                        spec,
+                        target_filter.as_ref(),
                         network,
                         time_start,
                         time_end,
@@ -4094,15 +4141,20 @@ impl Repository {
                             dt.net_pnl, dt.trade_count, dt.fill_count, dt.avg_trade_size, \
                             dt.win_count, dt.loss_count, dt.dataset_version_id, dt.created_at";
                 let target = self.direct_export_target(target_id).await?;
-                let target_address = target.as_ref().and_then(|t| t.address.as_deref());
-                if target_id.is_some() && target_address.is_none() {
+                let spec = direct_export_filter_spec_for_dataset("hl_pnl_summary").unwrap();
+                let target_filter = direct_export_filter_for_target(
+                    target.as_ref(),
+                    spec.target_address_col,
+                    None,
+                )?;
+                if target_id.is_some() && target_filter.is_none() {
                     0
                 } else {
                     stream_paged_direct_in_tx(
                         &mut tx,
                         cols,
-                        direct_export_filter_spec_for_dataset("hl_pnl_summary").unwrap(),
-                        target_address,
+                        spec,
+                        target_filter.as_ref(),
                         network,
                         time_start,
                         time_end,
@@ -4122,15 +4174,20 @@ impl Repository {
                             dt.realized_pnl, dt.fees, dt.num_fills, dt.dataset_version_id, \
                             dt.created_at";
                 let target = self.direct_export_target(target_id).await?;
-                let target_address = target.as_ref().and_then(|t| t.address.as_deref());
-                if target_id.is_some() && target_address.is_none() {
+                let spec = direct_export_filter_spec_for_dataset("hl_trade_history").unwrap();
+                let target_filter = direct_export_filter_for_target(
+                    target.as_ref(),
+                    spec.target_address_col,
+                    None,
+                )?;
+                if target_id.is_some() && target_filter.is_none() {
                     0
                 } else {
                     stream_paged_direct_in_tx(
                         &mut tx,
                         cols,
-                        direct_export_filter_spec_for_dataset("hl_trade_history").unwrap(),
-                        target_address,
+                        spec,
+                        target_filter.as_ref(),
                         network,
                         time_start,
                         time_end,
@@ -4149,20 +4206,20 @@ impl Repository {
                             dt.event_type, dt.event_details, dt.pool_address, dt.raw_event_id, \
                             dt.timestamp, dt.dataset_version_id, dt.created_at";
                 let target = self.direct_export_target(target_id).await?;
-                let target_address = target.as_ref().and_then(|t| t.address.as_deref());
-                if target_id.is_some() && target_address.is_none() {
+                let spec = direct_export_filter_spec_for_dataset("protocol_events").unwrap();
+                let target_filter = direct_export_filter_for_target(
+                    target.as_ref(),
+                    spec.target_address_col,
+                    Some("pool_address"),
+                )?;
+                if target_id.is_some() && target_filter.is_none() {
                     0
                 } else {
-                    let mut spec =
-                        direct_export_filter_spec_for_dataset("protocol_events").unwrap();
-                    if target.as_ref().is_some_and(|t| t.kind == TargetKind::Pool) {
-                        spec.target_address_col = "pool_address";
-                    }
                     stream_paged_direct_in_tx(
                         &mut tx,
                         cols,
                         spec,
-                        target_address,
+                        target_filter.as_ref(),
                         network,
                         time_start,
                         time_end,
@@ -4183,15 +4240,20 @@ impl Repository {
                             dt.tvl_usd, dt.snapshot_timestamp, dt.block_number, \
                             dt.dataset_version_id, dt.created_at";
                 let target = self.direct_export_target(target_id).await?;
-                let target_address = target.as_ref().and_then(|t| t.address.as_deref());
-                if target_id.is_some() && target_address.is_none() {
+                let spec = direct_export_filter_spec_for_dataset("pool_snapshots").unwrap();
+                let target_filter = direct_export_filter_for_target(
+                    target.as_ref(),
+                    spec.target_address_col,
+                    Some("pool_address"),
+                )?;
+                if target_id.is_some() && target_filter.is_none() {
                     0
                 } else {
                     stream_paged_direct_in_tx(
                         &mut tx,
                         cols,
-                        direct_export_filter_spec_for_dataset("pool_snapshots").unwrap(),
-                        target_address,
+                        spec,
+                        target_filter.as_ref(),
                         network,
                         time_start,
                         time_end,
@@ -7290,6 +7352,57 @@ mod tests {
                 "{dataset} must not join raw_transactions"
             );
         }
+    }
+
+    #[test]
+    fn direct_export_filter_for_protocol_target_uses_protocol_name_column() {
+        let mut target = make_index_target();
+        target.kind = TargetKind::Protocol;
+        target.chain_family = ChainFamily::Evm;
+        target.network = "ethereum-mainnet".to_string();
+        target.address = None;
+        target.filter_spec = Some(serde_json::json!({
+            "name": "uniswap_v3",
+            "addresses": {}
+        }));
+
+        let filter = direct_export_filter_for_target(Some(&target), "protocol_address", None)
+            .unwrap()
+            .expect("protocol filter_spec name should produce a direct export filter");
+
+        assert_eq!(filter.value, "uniswap_v3");
+        assert_eq!(filter.col, "protocol_name");
+    }
+
+    #[test]
+    fn direct_export_filter_for_pool_target_uses_pool_column_override() {
+        let mut target = make_index_target();
+        target.kind = TargetKind::Pool;
+        target.chain_family = ChainFamily::Evm;
+        target.network = "ethereum-mainnet".to_string();
+        target.address = Some("0xPool".to_string());
+
+        let filter = direct_export_filter_for_target(
+            Some(&target),
+            "protocol_address",
+            Some("pool_address"),
+        )
+        .unwrap()
+        .expect("pool address should produce a direct export filter");
+
+        assert_eq!(filter.value, "0xPool");
+        assert_eq!(filter.col, "pool_address");
+    }
+
+    #[test]
+    fn direct_export_filter_for_requested_target_without_scope_is_none() {
+        let mut target = make_index_target();
+        target.address = None;
+
+        let filter =
+            direct_export_filter_for_target(Some(&target), "wallet_address", None).unwrap();
+
+        assert!(filter.is_none());
     }
 
     #[test]
