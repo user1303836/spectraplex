@@ -1372,11 +1372,11 @@ where
         cancel,
         tx_out,
         |offset| {
-            build_dataset_filter_query_direct(
+            build_dataset_filter_query_direct_values(
                 cols,
                 spec.table,
                 spec.order_col,
-                target_filter.map(|f| f.value.as_str()),
+                target_filter.map(|f| f.values.as_slice()),
                 target_filter.map_or(spec.target_address_col, |f| f.col),
                 network,
                 time_start,
@@ -1521,41 +1521,63 @@ fn direct_export_filter_spec_for_dataset(dataset: &str) -> Option<DirectExportFi
 }
 
 struct DirectExportTargetFilter {
-    value: String,
+    values: Vec<String>,
     col: &'static str,
 }
 
-fn protocol_target_name(target: &IndexTarget) -> anyhow::Result<Option<String>> {
+fn protocol_target_addresses(
+    target: &IndexTarget,
+    network: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
     let Some(filter_spec) = target.filter_spec.as_ref() else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let spec: ProtocolFilterSpec = serde_json::from_value(filter_spec.clone())?;
-    Ok((!spec.name.is_empty()).then_some(spec.name))
+    let requested_network = network.unwrap_or(target.network.as_str());
+    let mut addrs: Vec<String> = spec
+        .addresses
+        .get(requested_network)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| entry.address.trim())
+                .filter(|addr| !addr.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    addrs.sort();
+    addrs.dedup();
+    Ok(addrs)
 }
 
 fn direct_export_filter_for_target(
     target: Option<&IndexTarget>,
     default_col: &'static str,
     pool_col: Option<&'static str>,
+    protocol_col: Option<&'static str>,
+    network: Option<&str>,
 ) -> anyhow::Result<Option<DirectExportTargetFilter>> {
     let Some(target) = target else {
         return Ok(None);
     };
 
     if target.kind == TargetKind::Protocol {
-        return Ok(
-            protocol_target_name(target)?.map(|name| DirectExportTargetFilter {
-                value: name,
-                col: "protocol_name",
-            }),
-        );
+        let Some(protocol_col) = protocol_col else {
+            return Ok(None);
+        };
+        let values = protocol_target_addresses(target, network)?;
+        return Ok((!values.is_empty()).then_some(DirectExportTargetFilter {
+            values,
+            col: protocol_col,
+        }));
     }
 
     let Some(addr) = target.address.as_ref().filter(|addr| !addr.is_empty()) else {
         return Ok(None);
     };
     Ok(Some(DirectExportTargetFilter {
-        value: addr.clone(),
+        values: vec![addr.clone()],
         col: if target.kind == TargetKind::Pool {
             pool_col.unwrap_or(default_col)
         } else {
@@ -1574,11 +1596,11 @@ fn direct_export_filter_for_target(
 /// `hl_pnl_summary`, `hl_trade_history`, `protocol_events`, and `pool_snapshots`
 /// that lack a `raw_transaction_id` column (P1).
 #[allow(clippy::too_many_arguments)]
-pub fn build_dataset_filter_query_direct(
+fn build_dataset_filter_query_direct_values(
     select_cols: &str,
     table_name: &str,
     order_col: &str,
-    target_address: Option<&str>,
+    target_values: Option<&[String]>,
     target_address_col: &str,
     network: Option<&str>,
     time_start: Option<i64>,
@@ -1593,12 +1615,18 @@ pub fn build_dataset_filter_query_direct(
     let mut n: usize = 0;
     let mut wheres: Vec<String> = Vec::new();
 
-    if let Some(addr) = target_address {
+    if let Some(values) = target_values.filter(|values| !values.is_empty()) {
         n += 1;
-        wheres.push(format!("dt.{target_address_col} = ${n}"));
         use sqlx::Arguments;
-        args.add(addr.to_string())
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if values.len() == 1 {
+            wheres.push(format!("dt.{target_address_col} = ${n}"));
+            args.add(values[0].clone())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        } else {
+            wheres.push(format!("dt.{target_address_col} = ANY(${n})"));
+            args.add(values.to_vec())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
     }
     if let Some(net) = network {
         n += 1;
@@ -1637,6 +1665,36 @@ pub fn build_dataset_filter_query_direct(
     args.add(offset).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok((sql, args))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_dataset_filter_query_direct(
+    select_cols: &str,
+    table_name: &str,
+    order_col: &str,
+    target_address: Option<&str>,
+    target_address_col: &str,
+    network: Option<&str>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
+    time_col: &str,
+    limit: i64,
+    offset: i64,
+) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+    let values = target_address.map(|addr| vec![addr.to_string()]);
+    build_dataset_filter_query_direct_values(
+        select_cols,
+        table_name,
+        order_col,
+        values.as_deref(),
+        target_address_col,
+        network,
+        time_start,
+        time_end,
+        time_col,
+        limit,
+        offset,
+    )
 }
 
 /// Build a batch INSERT for `raw_evm_traces` with ON CONFLICT DO NOTHING.
@@ -4113,6 +4171,8 @@ impl Repository {
                     target.as_ref(),
                     spec.target_address_col,
                     None,
+                    None,
+                    network,
                 )?;
                 if target_id.is_some() && target_filter.is_none() {
                     0
@@ -4146,6 +4206,8 @@ impl Repository {
                     target.as_ref(),
                     spec.target_address_col,
                     None,
+                    None,
+                    network,
                 )?;
                 if target_id.is_some() && target_filter.is_none() {
                     0
@@ -4179,6 +4241,8 @@ impl Repository {
                     target.as_ref(),
                     spec.target_address_col,
                     None,
+                    None,
+                    network,
                 )?;
                 if target_id.is_some() && target_filter.is_none() {
                     0
@@ -4211,6 +4275,8 @@ impl Repository {
                     target.as_ref(),
                     spec.target_address_col,
                     Some("pool_address"),
+                    Some("protocol_address"),
+                    network,
                 )?;
                 if target_id.is_some() && target_filter.is_none() {
                     0
@@ -4245,6 +4311,8 @@ impl Repository {
                     target.as_ref(),
                     spec.target_address_col,
                     Some("pool_address"),
+                    Some("protocol_address"),
+                    network,
                 )?;
                 if target_id.is_some() && target_filter.is_none() {
                     0
@@ -7355,7 +7423,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_export_filter_for_protocol_target_uses_protocol_name_column() {
+    fn direct_export_filter_for_protocol_target_uses_protocol_addresses() {
         let mut target = make_index_target();
         target.kind = TargetKind::Protocol;
         target.chain_family = ChainFamily::Evm;
@@ -7363,15 +7431,29 @@ mod tests {
         target.address = None;
         target.filter_spec = Some(serde_json::json!({
             "name": "uniswap_v3",
-            "addresses": {}
+            "addresses": {
+                "ethereum": [
+                    { "address": "0xProtocolB", "role": "pool", "label": "b" },
+                    { "address": "0xProtocolA", "role": "pool", "label": "a" }
+                ]
+            }
         }));
 
-        let filter = direct_export_filter_for_target(Some(&target), "protocol_address", None)
-            .unwrap()
-            .expect("protocol filter_spec name should produce a direct export filter");
+        let filter = direct_export_filter_for_target(
+            Some(&target),
+            "protocol_address",
+            None,
+            Some("protocol_address"),
+            Some("ethereum"),
+        )
+        .unwrap()
+        .expect("protocol filter_spec addresses should produce a direct export filter");
 
-        assert_eq!(filter.value, "uniswap_v3");
-        assert_eq!(filter.col, "protocol_name");
+        assert_eq!(
+            filter.values,
+            vec!["0xProtocolA".to_string(), "0xProtocolB".to_string()]
+        );
+        assert_eq!(filter.col, "protocol_address");
     }
 
     #[test]
@@ -7386,11 +7468,13 @@ mod tests {
             Some(&target),
             "protocol_address",
             Some("pool_address"),
+            Some("protocol_address"),
+            Some("ethereum"),
         )
         .unwrap()
-        .expect("pool address should produce a direct export filter");
+        .expect("pool targets should prefer the pool column when provided");
 
-        assert_eq!(filter.value, "0xPool");
+        assert_eq!(filter.values, vec!["0xPool".to_string()]);
         assert_eq!(filter.col, "pool_address");
     }
 
@@ -7399,8 +7483,14 @@ mod tests {
         let mut target = make_index_target();
         target.address = None;
 
-        let filter =
-            direct_export_filter_for_target(Some(&target), "wallet_address", None).unwrap();
+        let filter = direct_export_filter_for_target(
+            Some(&target),
+            "wallet_address",
+            None,
+            None,
+            Some("ethereum"),
+        )
+        .unwrap();
 
         assert!(filter.is_none());
     }
