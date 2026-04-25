@@ -3994,13 +3994,21 @@ impl Repository {
     ///
     /// Returns the total number of records sent.
     async fn direct_export_target(
-        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         target_id: Option<Uuid>,
     ) -> anyhow::Result<Option<IndexTarget>> {
-        match target_id {
-            Some(tid) => self.get_index_target(tid).await,
-            None => Ok(None),
-        }
+        let Some(tid) = target_id else {
+            return Ok(None);
+        };
+        let row = sqlx::query(
+            "SELECT id, kind::text, network, chain_family::text, address, filter_spec, \
+             mode::text, label, owner_id, created_at, updated_at \
+             FROM index_targets WHERE id = $1",
+        )
+        .bind(tid)
+        .fetch_optional(&mut **tx)
+        .await?;
+        row.as_ref().map(row_to_index_target).transpose()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4184,7 +4192,7 @@ impl Repository {
                 let cols = "dt.id, dt.wallet_address, dt.asset_symbol, dt.network, \
                             dt.timestamp, dt.balance, dt.tx_hash, dt.dataset_version_id, \
                             dt.created_at";
-                let target = self.direct_export_target(target_id).await?;
+                let target = Self::direct_export_target(&mut tx, target_id).await?;
                 let spec = direct_export_filter_spec_for_dataset("balance_history").unwrap();
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
@@ -4220,7 +4228,7 @@ impl Repository {
                             dt.period_end, dt.total_closed_pnl, dt.total_funding, dt.total_fees, \
                             dt.net_pnl, dt.trade_count, dt.fill_count, dt.avg_trade_size, \
                             dt.win_count, dt.loss_count, dt.dataset_version_id, dt.created_at";
-                let target = self.direct_export_target(target_id).await?;
+                let target = Self::direct_export_target(&mut tx, target_id).await?;
                 let spec = direct_export_filter_spec_for_dataset("hl_pnl_summary").unwrap();
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
@@ -4256,7 +4264,7 @@ impl Repository {
                             dt.entry_price, dt.exit_price, dt.size, dt.opened_at, dt.closed_at, \
                             dt.realized_pnl, dt.fees, dt.num_fills, dt.dataset_version_id, \
                             dt.created_at";
-                let target = self.direct_export_target(target_id).await?;
+                let target = Self::direct_export_target(&mut tx, target_id).await?;
                 let spec = direct_export_filter_spec_for_dataset("hl_trade_history").unwrap();
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
@@ -4291,7 +4299,7 @@ impl Repository {
                 let cols = "dt.id, dt.network, dt.protocol_address, dt.protocol_name, \
                             dt.event_type, dt.event_details, dt.pool_address, dt.raw_event_id, \
                             dt.timestamp, dt.dataset_version_id, dt.created_at";
-                let target = self.direct_export_target(target_id).await?;
+                let target = Self::direct_export_target(&mut tx, target_id).await?;
                 let spec = direct_export_filter_spec_for_dataset("protocol_events").unwrap();
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
@@ -4328,7 +4336,7 @@ impl Repository {
                             dt.token1_address, dt.token1_symbol, dt.reserve0, dt.reserve1, \
                             dt.tvl_usd, dt.snapshot_timestamp, dt.block_number, \
                             dt.dataset_version_id, dt.created_at";
-                let target = self.direct_export_target(target_id).await?;
+                let target = Self::direct_export_target(&mut tx, target_id).await?;
                 let spec = direct_export_filter_spec_for_dataset("pool_snapshots").unwrap();
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
