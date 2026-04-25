@@ -574,6 +574,26 @@ fn default_ingest_mode() -> String {
     "incremental".to_string()
 }
 
+fn target_supports_public_ingest(target: &IndexTarget) -> bool {
+    matches!(
+        (target.chain_family, target.kind),
+        (ChainFamily::Solana, TargetKind::Wallet)
+            | (ChainFamily::Evm, TargetKind::Wallet)
+            | (
+                ChainFamily::Hyperliquid,
+                TargetKind::Wallet | TargetKind::Market
+            )
+    )
+}
+
+fn normalize_target_address(kind: TargetKind, family: ChainFamily, addr: &str) -> String {
+    match (family, kind) {
+        (ChainFamily::Evm, _) => normalize_evm_address(addr),
+        (ChainFamily::Hyperliquid, TargetKind::Wallet) => normalize_evm_address(addr),
+        (ChainFamily::Solana, _) | (ChainFamily::Hyperliquid, _) => normalize_solana_address(addr),
+    }
+}
+
 #[derive(Deserialize)]
 struct BatchIngestRequest {
     wallets: Vec<IngestRequest>,
@@ -2371,10 +2391,9 @@ async fn register_target(
         .ok_or_else(|| AppError::bad_request(format!("Unknown network: {}", req.network)))?;
 
     // Normalize address
-    let address = req.address.map(|addr| match network.chain_family {
-        ChainFamily::Evm | ChainFamily::Hyperliquid => normalize_evm_address(&addr),
-        ChainFamily::Solana => normalize_solana_address(&addr),
-    });
+    let address = req
+        .address
+        .map(|addr| normalize_target_address(kind, network.chain_family, &addr));
 
     let now = chrono::Utc::now();
     let target = IndexTarget {
@@ -2503,14 +2522,15 @@ async fn trigger_target_ingest(
         }
     }
 
-    // The current ingestion worker only supports wallet-style backfill
-    // (fetch_history(wallet, ...)). Reject non-wallet targets until
-    // connector-specific ingestion paths are implemented.
-    if target.kind != TargetKind::Wallet {
+    // Validate that the current runtime can actually execute this target kind.
+    if !target_supports_public_ingest(&target) {
         return Err(AppError::bad_request(format!(
-            "Ingestion for target kind {:?} is not yet supported",
-            target.kind
+            "Ingestion for target kind {:?} on {:?} is not yet supported",
+            target.kind, target.chain_family
         )));
+    }
+    if let Err(errors) = validate_target(&target) {
+        return Err(AppError::bad_request(errors.join("; ")));
     }
 
     // Preflight: ensure the target's network is actually configured in the
@@ -6026,6 +6046,66 @@ mod tests {
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_target_supports_public_ingest_accepts_hyperliquid_market() {
+        let now = chrono::Utc::now();
+        let target = IndexTarget {
+            id: Uuid::new_v4(),
+            kind: TargetKind::Market,
+            network: "hypercore-mainnet".to_string(),
+            chain_family: ChainFamily::Hyperliquid,
+            address: Some("ETH".to_string()),
+            filter_spec: None,
+            mode: TargetMode::Backfill,
+            label: None,
+            owner_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        assert!(target_supports_public_ingest(&target));
+    }
+
+    #[test]
+    fn test_normalize_target_address_preserves_hyperliquid_market_symbol_case() {
+        assert_eq!(
+            normalize_target_address(TargetKind::Market, ChainFamily::Hyperliquid, "ETH"),
+            "ETH"
+        );
+    }
+
+    #[test]
+    fn test_normalize_target_address_lowercases_hyperliquid_wallets() {
+        assert_eq!(
+            normalize_target_address(
+                TargetKind::Wallet,
+                ChainFamily::Hyperliquid,
+                "0xABCD1234EF567890ABCD1234EF567890ABCD1234"
+            ),
+            "0xabcd1234ef567890abcd1234ef567890abcd1234"
+        );
+    }
+
+    #[test]
+    fn test_target_supports_public_ingest_rejects_pool_targets() {
+        let now = chrono::Utc::now();
+        let target = IndexTarget {
+            id: Uuid::new_v4(),
+            kind: TargetKind::Pool,
+            network: "hypercore-mainnet".to_string(),
+            chain_family: ChainFamily::Hyperliquid,
+            address: Some("pool-1".to_string()),
+            filter_spec: None,
+            mode: TargetMode::Backfill,
+            label: None,
+            owner_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        assert!(!target_supports_public_ingest(&target));
     }
 
     #[tokio::test]
