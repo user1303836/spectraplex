@@ -1554,6 +1554,7 @@ fn protocol_target_addresses(
 fn direct_export_filter_for_target(
     target: Option<&IndexTarget>,
     default_col: &'static str,
+    allowed_kinds: &[TargetKind],
     pool_col: Option<&'static str>,
     protocol_col: Option<&'static str>,
     network: Option<&str>,
@@ -1561,23 +1562,41 @@ fn direct_export_filter_for_target(
     let Some(target) = target else {
         return Ok(None);
     };
+    if !allowed_kinds.contains(&target.kind) {
+        return Ok(None);
+    }
 
     if target.kind == TargetKind::Protocol {
         let Some(protocol_col) = protocol_col else {
             return Ok(None);
         };
-        let values = protocol_target_addresses(target, network)?;
+        let mut values = protocol_target_addresses(target, network)?;
+        if values.is_empty() {
+            if let Some(addr) = target
+                .address
+                .as_ref()
+                .map(|addr| addr.trim())
+                .filter(|addr| !addr.is_empty())
+            {
+                values.push(addr.to_owned());
+            }
+        }
         return Ok((!values.is_empty()).then_some(DirectExportTargetFilter {
             values,
             col: protocol_col,
         }));
     }
 
-    let Some(addr) = target.address.as_ref().filter(|addr| !addr.is_empty()) else {
+    let Some(addr) = target
+        .address
+        .as_ref()
+        .map(|addr| addr.trim())
+        .filter(|addr| !addr.is_empty())
+    else {
         return Ok(None);
     };
     Ok(Some(DirectExportTargetFilter {
-        values: vec![addr.clone()],
+        values: vec![addr.to_owned()],
         col: if target.kind == TargetKind::Pool {
             pool_col.unwrap_or(default_col)
         } else {
@@ -4170,6 +4189,7 @@ impl Repository {
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
                     spec.target_address_col,
+                    &[TargetKind::Wallet],
                     None,
                     None,
                     network,
@@ -4205,6 +4225,7 @@ impl Repository {
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
                     spec.target_address_col,
+                    &[TargetKind::Wallet],
                     None,
                     None,
                     network,
@@ -4240,6 +4261,7 @@ impl Repository {
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
                     spec.target_address_col,
+                    &[TargetKind::Wallet],
                     None,
                     None,
                     network,
@@ -4274,6 +4296,7 @@ impl Repository {
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
                     spec.target_address_col,
+                    &[TargetKind::Protocol, TargetKind::Pool],
                     Some("pool_address"),
                     Some("protocol_address"),
                     network,
@@ -4310,6 +4333,7 @@ impl Repository {
                 let target_filter = direct_export_filter_for_target(
                     target.as_ref(),
                     spec.target_address_col,
+                    &[TargetKind::Protocol, TargetKind::Pool],
                     Some("pool_address"),
                     Some("protocol_address"),
                     network,
@@ -7442,6 +7466,7 @@ mod tests {
         let filter = direct_export_filter_for_target(
             Some(&target),
             "protocol_address",
+            &[TargetKind::Protocol],
             None,
             Some("protocol_address"),
             Some("ethereum"),
@@ -7457,6 +7482,54 @@ mod tests {
     }
 
     #[test]
+    fn direct_export_filter_for_protocol_target_falls_back_to_canonical_address() {
+        let mut target = make_index_target();
+        target.kind = TargetKind::Protocol;
+        target.chain_family = ChainFamily::Evm;
+        target.network = "ethereum-mainnet".to_string();
+        target.address = Some("0xCanonicalProtocol".to_string());
+        target.filter_spec = Some(serde_json::json!({
+            "name": "uniswap_v3",
+            "addresses": {}
+        }));
+
+        let filter = direct_export_filter_for_target(
+            Some(&target),
+            "protocol_address",
+            &[TargetKind::Protocol],
+            None,
+            Some("protocol_address"),
+            Some("ethereum"),
+        )
+        .unwrap()
+        .expect("protocol target address should be usable when addresses map is empty");
+
+        assert_eq!(filter.values, vec!["0xCanonicalProtocol".to_string()]);
+        assert_eq!(filter.col, "protocol_address");
+    }
+
+    #[test]
+    fn direct_export_filter_rejects_target_kind_without_dataset_scope() {
+        let mut target = make_index_target();
+        target.kind = TargetKind::Pool;
+        target.chain_family = ChainFamily::Evm;
+        target.network = "ethereum-mainnet".to_string();
+        target.address = Some("0xPool".to_string());
+
+        let filter = direct_export_filter_for_target(
+            Some(&target),
+            "wallet_address",
+            &[TargetKind::Wallet],
+            None,
+            None,
+            Some("ethereum"),
+        )
+        .unwrap();
+
+        assert!(filter.is_none());
+    }
+
+    #[test]
     fn direct_export_filter_for_pool_target_uses_pool_column_override() {
         let mut target = make_index_target();
         target.kind = TargetKind::Pool;
@@ -7467,6 +7540,7 @@ mod tests {
         let filter = direct_export_filter_for_target(
             Some(&target),
             "protocol_address",
+            &[TargetKind::Pool],
             Some("pool_address"),
             Some("protocol_address"),
             Some("ethereum"),
@@ -7486,6 +7560,7 @@ mod tests {
         let filter = direct_export_filter_for_target(
             Some(&target),
             "wallet_address",
+            &[TargetKind::Wallet],
             None,
             None,
             Some("ethereum"),
