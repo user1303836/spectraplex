@@ -11,7 +11,7 @@ use crate::fire_callback;
 use spectraplex_adapters::dual_write::BronzeSilverResult;
 use spectraplex_adapters::repo::Repository;
 use spectraplex_core::config::AppConfig;
-use spectraplex_core::v2::{CompletenessStatus, DatasetCompleteness};
+use spectraplex_core::v2::{CompletenessStatus, DatasetCompleteness, TargetKind};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -389,6 +389,23 @@ pub(crate) async fn execute_normalize(
                 run_id
             )
         })?;
+        if target.kind != TargetKind::Wallet {
+            anyhow::bail!(
+                "ingestion_run {} belongs to non-wallet target {} ({:?})",
+                run_id,
+                tid,
+                target.kind
+            );
+        }
+        if target.network != irun.network {
+            anyhow::bail!(
+                "ingestion_run {} network {} does not match target {} network {}",
+                run_id,
+                irun.network,
+                tid,
+                target.network
+            );
+        }
         let target_addr = target.address.ok_or_else(|| {
             anyhow::anyhow!(
                 "index_target {} for ingestion_run {} has no address",
@@ -438,7 +455,7 @@ pub(crate) async fn execute_normalize(
         // Bronze-native Silver materialization: extract Silver records directly
         // from RawTransaction without reconstructing V1 Transaction values.
         let silver_result = repo
-            .materialize_silver_from_bronze(&raw_txs, Some(&effective_wallet))
+            .materialize_silver_from_bronze(&raw_txs, Some(&effective_wallet), Some(tid))
             .await;
 
         if !silver_result.all_succeeded() {

@@ -35,6 +35,30 @@ use crate::repo::Repository;
 /// Maximum allowed LIMIT for V2 repository queries to prevent unbounded result sets.
 const MAX_QUERY_LIMIT: i64 = 10_000;
 
+const HL_PNL_SUMMARY_CONFLICT_SQL: &str = " ON CONFLICT (id) DO UPDATE SET \
+     total_closed_pnl = EXCLUDED.total_closed_pnl, \
+     total_funding = EXCLUDED.total_funding, \
+     total_fees = EXCLUDED.total_fees, \
+     net_pnl = EXCLUDED.net_pnl, \
+     trade_count = EXCLUDED.trade_count, \
+     fill_count = EXCLUDED.fill_count, \
+     avg_trade_size = EXCLUDED.avg_trade_size, \
+     win_count = EXCLUDED.win_count, \
+     loss_count = EXCLUDED.loss_count, \
+     dataset_version_id = EXCLUDED.dataset_version_id";
+
+const HL_TRADE_HISTORY_CONFLICT_SQL: &str = " ON CONFLICT (id) DO UPDATE SET \
+     side = EXCLUDED.side, \
+     entry_price = EXCLUDED.entry_price, \
+     exit_price = EXCLUDED.exit_price, \
+     size = EXCLUDED.size, \
+     opened_at = EXCLUDED.opened_at, \
+     closed_at = EXCLUDED.closed_at, \
+     realized_pnl = EXCLUDED.realized_pnl, \
+     fees = EXCLUDED.fees, \
+     num_fills = EXCLUDED.num_fills, \
+     dataset_version_id = EXCLUDED.dataset_version_id";
+
 // ---------------------------------------------------------------------------
 // Enum ↔ SQL string helpers
 // ---------------------------------------------------------------------------
@@ -347,7 +371,7 @@ pub fn build_raw_transaction_upsert_returning(
         args.add(tx.ingested_at)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    query.push_str(" ON CONFLICT (network, tx_hash) DO UPDATE SET updated_at = NOW() RETURNING id");
+    query.push_str(" ON CONFLICT (network, tx_hash) DO UPDATE SET updated_at = NOW(), ingestion_run_id = COALESCE(EXCLUDED.ingestion_run_id, raw_transactions.ingestion_run_id) RETURNING id");
     Ok((query, args))
 }
 
@@ -1119,11 +1143,45 @@ pub fn build_dataset_completeness_upsert(
          ON CONFLICT (target_id, dataset_name, network) \
          DO UPDATE SET \
              dataset_version_id = EXCLUDED.dataset_version_id, \
-             status = EXCLUDED.status, \
-             coverage_start = EXCLUDED.coverage_start, \
-             coverage_end = EXCLUDED.coverage_end, \
-             block_start = EXCLUDED.block_start, \
-             block_end = EXCLUDED.block_end, \
+             status = CASE \
+                 WHEN dataset_completeness.dataset_version_id IS NOT DISTINCT FROM EXCLUDED.dataset_version_id \
+                      AND dataset_completeness.status <> 'complete' AND EXCLUDED.status = 'complete' \
+                      AND ( \
+                          (dataset_completeness.coverage_start IS NOT NULL \
+                           AND (EXCLUDED.coverage_start IS NULL OR EXCLUDED.coverage_start > dataset_completeness.coverage_start)) \
+                          OR (dataset_completeness.coverage_end IS NOT NULL \
+                              AND (EXCLUDED.coverage_end IS NULL OR EXCLUDED.coverage_end < dataset_completeness.coverage_end)) \
+                          OR (dataset_completeness.block_start IS NOT NULL \
+                              AND (EXCLUDED.block_start IS NULL OR EXCLUDED.block_start > dataset_completeness.block_start)) \
+                          OR (dataset_completeness.block_end IS NOT NULL \
+                              AND (EXCLUDED.block_end IS NULL OR EXCLUDED.block_end < dataset_completeness.block_end)) \
+                      ) \
+                 THEN dataset_completeness.status \
+                 ELSE EXCLUDED.status END, \
+             coverage_start = CASE \
+                 WHEN dataset_completeness.dataset_version_id IS DISTINCT FROM EXCLUDED.dataset_version_id THEN EXCLUDED.coverage_start \
+                 WHEN EXCLUDED.coverage_start IS NULL THEN dataset_completeness.coverage_start \
+                 WHEN dataset_completeness.coverage_start IS NULL THEN EXCLUDED.coverage_start \
+                 WHEN EXCLUDED.coverage_start < dataset_completeness.coverage_start THEN EXCLUDED.coverage_start \
+                 ELSE dataset_completeness.coverage_start END, \
+             coverage_end = CASE \
+                 WHEN dataset_completeness.dataset_version_id IS DISTINCT FROM EXCLUDED.dataset_version_id THEN EXCLUDED.coverage_end \
+                 WHEN EXCLUDED.coverage_end IS NULL THEN dataset_completeness.coverage_end \
+                 WHEN dataset_completeness.coverage_end IS NULL THEN EXCLUDED.coverage_end \
+                 WHEN EXCLUDED.coverage_end > dataset_completeness.coverage_end THEN EXCLUDED.coverage_end \
+                 ELSE dataset_completeness.coverage_end END, \
+             block_start = CASE \
+                 WHEN dataset_completeness.dataset_version_id IS DISTINCT FROM EXCLUDED.dataset_version_id THEN EXCLUDED.block_start \
+                 WHEN EXCLUDED.block_start IS NULL THEN dataset_completeness.block_start \
+                 WHEN dataset_completeness.block_start IS NULL THEN EXCLUDED.block_start \
+                 WHEN EXCLUDED.block_start < dataset_completeness.block_start THEN EXCLUDED.block_start \
+                 ELSE dataset_completeness.block_start END, \
+             block_end = CASE \
+                 WHEN dataset_completeness.dataset_version_id IS DISTINCT FROM EXCLUDED.dataset_version_id THEN EXCLUDED.block_end \
+                 WHEN EXCLUDED.block_end IS NULL THEN dataset_completeness.block_end \
+                 WHEN dataset_completeness.block_end IS NULL THEN EXCLUDED.block_end \
+                 WHEN EXCLUDED.block_end > dataset_completeness.block_end THEN EXCLUDED.block_end \
+                 ELSE dataset_completeness.block_end END, \
              last_ingestion_run_id = EXCLUDED.last_ingestion_run_id, \
              records_count = EXCLUDED.records_count, \
              gap_ranges = EXCLUDED.gap_ranges, \
@@ -1728,6 +1786,70 @@ pub fn build_dataset_filter_query_direct(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_balance_history_target_filter_query(
+    select_cols: &str,
+    target_id: Uuid,
+    target_address: &str,
+    network: Option<&str>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
+    limit: i64,
+    offset: i64,
+) -> anyhow::Result<(String, sqlx::postgres::PgArguments)> {
+    let limit = limit.min(MAX_QUERY_LIMIT);
+    let mut sql = format!(
+        "SELECT {select_cols} FROM balance_history dt \
+         JOIN raw_transactions rt ON rt.network = dt.network AND rt.tx_hash = dt.tx_hash \
+         JOIN target_matches tm ON tm.raw_transaction_id = rt.id"
+    );
+    let mut args = sqlx::postgres::PgArguments::default();
+    let mut n: usize = 0;
+    let mut wheres: Vec<String> = Vec::new();
+
+    n += 1;
+    wheres.push(format!("tm.target_id = ${n}"));
+    use sqlx::Arguments;
+    args.add(target_id).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    n += 1;
+    wheres.push(format!("dt.wallet_address = ${n}"));
+    args.add(target_address.to_string())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if let Some(net) = network {
+        n += 1;
+        wheres.push(format!("dt.network = ${n}"));
+        args.add(net.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    if let Some(start) = time_start {
+        n += 1;
+        wheres.push(format!("dt.timestamp >= ${n}"));
+        args.add(start).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    if let Some(end) = time_end {
+        n += 1;
+        wheres.push(format!("dt.timestamp <= ${n}"));
+        args.add(end).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    sql.push_str(" WHERE ");
+    sql.push_str(&wheres.join(" AND "));
+
+    n += 1;
+    let lim_n = n;
+    n += 1;
+    let off_n = n;
+    sql.push_str(&format!(
+        " ORDER BY dt.timestamp DESC, dt.id DESC LIMIT ${lim_n} OFFSET ${off_n}"
+    ));
+    args.add(limit).map_err(|e| anyhow::anyhow!("{e}"))?;
+    args.add(offset).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    Ok((sql, args))
+}
+
 /// Build a batch INSERT for `raw_evm_traces` with ON CONFLICT DO NOTHING.
 pub fn build_raw_evm_trace_insert(
     traces: &[RawEvmTrace],
@@ -2174,7 +2296,8 @@ impl Repository {
 
     /// Insert raw transactions and return the canonical database IDs.
     ///
-    /// Uses `ON CONFLICT (network, tx_hash) DO UPDATE SET updated_at = NOW()`
+    /// Uses `ON CONFLICT (network, tx_hash) DO UPDATE` to refresh `updated_at`
+    /// and associate duplicate canonical rows with the current ingestion run,
     /// so that the RETURNING clause always yields the canonical row ID, even
     /// when the raw transaction already exists from a different target's
     /// ingestion. This is critical for multi-target deduplication: the same
@@ -3475,6 +3598,30 @@ impl Repository {
         Ok(())
     }
 
+    /// Refresh dataset_version_id for deterministic balance_history rows already
+    /// represented in storage during an idempotent Gold replay.
+    pub async fn update_balance_snapshot_dataset_versions(
+        &self,
+        ids: &[Uuid],
+        dataset_version_id: Option<Uuid>,
+    ) -> anyhow::Result<u64> {
+        let mut updated = 0u64;
+        for chunk in ids.chunks(500) {
+            let chunk_ids: Vec<Uuid> = chunk.to_vec();
+            let result = sqlx::query(
+                "UPDATE balance_history \
+                 SET dataset_version_id = $1 \
+                 WHERE id = ANY($2)",
+            )
+            .bind(dataset_version_id)
+            .bind(&chunk_ids)
+            .execute(self.pool())
+            .await?;
+            updated += result.rows_affected();
+        }
+        Ok(updated)
+    }
+
     /// Query wallet_ledger records with optional wallet, network, and time-window filters.
     #[allow(clippy::too_many_arguments)]
     pub async fn query_wallet_ledger_records(
@@ -3534,32 +3681,42 @@ impl Repository {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<BalanceSnapshot>> {
-        let target_address = if let Some(tid) = target_id {
-            match self.get_index_target(tid).await? {
-                Some(t) => match t.address {
-                    Some(addr) if !addr.is_empty() => Some(addr),
-                    _ => return Ok(Vec::new()),
-                },
-                None => return Ok(Vec::new()),
-            }
-        } else {
-            None
-        };
         let cols = "dt.id, dt.wallet_address, dt.asset_symbol, dt.network, dt.timestamp, \
                     dt.balance, dt.tx_hash, dt.dataset_version_id, dt.created_at";
-        let (sql, args) = build_dataset_filter_query_direct(
-            cols,
-            DatasetName::BalanceHistory.physical_table(),
-            "dt.timestamp",
-            target_address.as_deref(),
-            "wallet_address",
-            network,
-            time_start,
-            time_end,
-            "timestamp",
-            limit,
-            offset,
-        )?;
+        let (sql, args) = if let Some(tid) = target_id {
+            let target = match self.get_index_target(tid).await? {
+                Some(t) => t,
+                None => return Ok(Vec::new()),
+            };
+            let target_address = match target.address {
+                Some(addr) if !addr.is_empty() => addr,
+                _ => return Ok(Vec::new()),
+            };
+            build_balance_history_target_filter_query(
+                cols,
+                tid,
+                &target_address,
+                network,
+                time_start,
+                time_end,
+                limit,
+                offset,
+            )?
+        } else {
+            build_dataset_filter_query_direct(
+                cols,
+                DatasetName::BalanceHistory.physical_table(),
+                "dt.timestamp",
+                None,
+                "wallet_address",
+                network,
+                time_start,
+                time_end,
+                "timestamp",
+                limit,
+                offset,
+            )?
+        };
         let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
         rows.iter().map(row_to_balance_snapshot).collect()
     }
@@ -3858,7 +4015,7 @@ impl Repository {
                     .push_bind(r.dataset_version_id)
                     .push_bind(r.created_at);
             });
-            query_builder.push(" ON CONFLICT (id) DO NOTHING");
+            query_builder.push(HL_PNL_SUMMARY_CONFLICT_SQL);
             query_builder.build().execute(self.pool()).await?;
         }
         Ok(())
@@ -3889,7 +4046,7 @@ impl Repository {
                     .push_bind(r.dataset_version_id)
                     .push_bind(r.created_at);
             });
-            query_builder.push(" ON CONFLICT (id) DO NOTHING");
+            query_builder.push(HL_TRADE_HISTORY_CONFLICT_SQL);
             query_builder.build().execute(self.pool()).await?;
         }
         Ok(())
@@ -3972,6 +4129,63 @@ impl Repository {
         )
         .bind(wallet_address)
         .bind(network)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_balance_snapshot).collect()
+    }
+
+    pub async fn get_latest_balance_snapshot_before_order(
+        &self,
+        wallet_address: &str,
+        network: &str,
+        asset_symbol: &str,
+        before_timestamp: i64,
+        before_id: Uuid,
+    ) -> anyhow::Result<Option<BalanceSnapshot>> {
+        let row = sqlx::query(
+            "SELECT id, wallet_address, asset_symbol, network, timestamp, balance, tx_hash, \
+             dataset_version_id, created_at \
+             FROM balance_history \
+             WHERE wallet_address = $1 \
+               AND network = $2 \
+               AND asset_symbol = $3 \
+               AND (timestamp < $4 OR (timestamp = $4 AND id < $5)) \
+             ORDER BY timestamp DESC, id DESC, created_at DESC \
+             LIMIT 1",
+        )
+        .bind(wallet_address)
+        .bind(network)
+        .bind(asset_symbol)
+        .bind(before_timestamp)
+        .bind(before_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref().map(row_to_balance_snapshot).transpose()
+    }
+
+    pub async fn get_balance_snapshots_at_or_after_order(
+        &self,
+        wallet_address: &str,
+        network: &str,
+        asset_symbol: &str,
+        at_or_after_timestamp: i64,
+        at_or_after_id: Uuid,
+    ) -> anyhow::Result<Vec<BalanceSnapshot>> {
+        let rows = sqlx::query(
+            "SELECT id, wallet_address, asset_symbol, network, timestamp, balance, tx_hash, \
+             dataset_version_id, created_at \
+             FROM balance_history \
+             WHERE wallet_address = $1 \
+               AND network = $2 \
+               AND asset_symbol = $3 \
+               AND (timestamp > $4 OR (timestamp = $4 AND id >= $5)) \
+             ORDER BY timestamp ASC, id ASC, created_at ASC",
+        )
+        .bind(wallet_address)
+        .bind(network)
+        .bind(asset_symbol)
+        .bind(at_or_after_timestamp)
+        .bind(at_or_after_id)
         .fetch_all(self.pool())
         .await?;
         rows.iter().map(row_to_balance_snapshot).collect()
@@ -6172,7 +6386,7 @@ mod tests {
         assert!(query.starts_with("INSERT INTO raw_transactions"));
         assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9)"));
         assert!(query.ends_with(
-            "ON CONFLICT (network, tx_hash) DO UPDATE SET updated_at = NOW() RETURNING id"
+            "ON CONFLICT (network, tx_hash) DO UPDATE SET updated_at = NOW(), ingestion_run_id = COALESCE(EXCLUDED.ingestion_run_id, raw_transactions.ingestion_run_id) RETURNING id"
         ));
     }
 
@@ -6184,7 +6398,7 @@ mod tests {
         assert!(query.contains("($1, $2, $3, $4, $5, $6, $7, $8, $9)"));
         assert!(query.contains("($10, $11, $12, $13, $14, $15, $16, $17, $18)"));
         assert!(query.ends_with(
-            "ON CONFLICT (network, tx_hash) DO UPDATE SET updated_at = NOW() RETURNING id"
+            "ON CONFLICT (network, tx_hash) DO UPDATE SET updated_at = NOW(), ingestion_run_id = COALESCE(EXCLUDED.ingestion_run_id, raw_transactions.ingestion_run_id) RETURNING id"
         ));
     }
 
@@ -6843,11 +7057,45 @@ mod tests {
         assert!(query.starts_with("INSERT INTO dataset_completeness"));
         assert!(query.contains("ON CONFLICT (target_id, dataset_name, network)"));
         assert!(query.contains("DO UPDATE SET"));
-        assert!(query.contains("status = EXCLUDED.status"));
-        assert!(query.contains("coverage_start = EXCLUDED.coverage_start"));
-        assert!(query.contains("coverage_end = EXCLUDED.coverage_end"));
+        assert!(query.contains("status = CASE"));
+        assert!(query.contains(
+            "dataset_completeness.dataset_version_id IS NOT DISTINCT FROM EXCLUDED.dataset_version_id"
+        ));
+        assert!(query.contains(
+            "AND dataset_completeness.status <> 'complete' AND EXCLUDED.status = 'complete'"
+        ));
+        assert!(query.contains("EXCLUDED.coverage_start > dataset_completeness.coverage_start"));
+        assert!(query.contains("EXCLUDED.coverage_end < dataset_completeness.coverage_end"));
+        assert!(query.contains("EXCLUDED.block_start > dataset_completeness.block_start"));
+        assert!(query.contains("EXCLUDED.block_end < dataset_completeness.block_end"));
+        assert!(query.contains(
+            "dataset_completeness.dataset_version_id IS DISTINCT FROM EXCLUDED.dataset_version_id THEN EXCLUDED.coverage_start"
+        ));
+        assert!(query.contains("THEN dataset_completeness.status"));
+        assert!(query.contains("coverage_start = CASE"));
+        assert!(query.contains("WHEN dataset_completeness.coverage_start IS NULL"));
+        assert!(
+            query.contains("WHEN EXCLUDED.coverage_start < dataset_completeness.coverage_start")
+        );
+        assert!(query.contains("coverage_end = CASE"));
+        assert!(query.contains("WHEN EXCLUDED.coverage_end > dataset_completeness.coverage_end"));
         assert!(query.contains("records_count = EXCLUDED.records_count"));
         assert!(query.contains("updated_at = EXCLUDED.updated_at"));
+    }
+
+    #[test]
+    fn hl_gold_conflict_clauses_refresh_dataset_version() {
+        assert!(HL_PNL_SUMMARY_CONFLICT_SQL.contains("ON CONFLICT (id) DO UPDATE SET"));
+        assert!(HL_PNL_SUMMARY_CONFLICT_SQL.contains("net_pnl = EXCLUDED.net_pnl"));
+        assert!(HL_PNL_SUMMARY_CONFLICT_SQL
+            .contains("dataset_version_id = EXCLUDED.dataset_version_id"));
+        assert!(HL_TRADE_HISTORY_CONFLICT_SQL.contains("ON CONFLICT (id) DO UPDATE SET"));
+        assert!(HL_TRADE_HISTORY_CONFLICT_SQL.contains("side = EXCLUDED.side"));
+        assert!(HL_TRADE_HISTORY_CONFLICT_SQL.contains("opened_at = EXCLUDED.opened_at"));
+        assert!(HL_TRADE_HISTORY_CONFLICT_SQL.contains("closed_at = EXCLUDED.closed_at"));
+        assert!(HL_TRADE_HISTORY_CONFLICT_SQL.contains("realized_pnl = EXCLUDED.realized_pnl"));
+        assert!(HL_TRADE_HISTORY_CONFLICT_SQL
+            .contains("dataset_version_id = EXCLUDED.dataset_version_id"));
     }
 
     #[test]
@@ -7202,6 +7450,32 @@ mod tests {
         )
         .unwrap();
         assert!(sql.contains("dt.network"));
+    }
+
+    #[test]
+    fn balance_history_target_query_uses_target_matches() {
+        let tid = Uuid::new_v4();
+        let (sql, _) = build_balance_history_target_filter_query(
+            "dt.*",
+            tid,
+            "0xabc",
+            Some("ethereum-mainnet"),
+            Some(100),
+            Some(200),
+            50,
+            0,
+        )
+        .unwrap();
+        assert!(sql.contains(
+            "JOIN raw_transactions rt ON rt.network = dt.network AND rt.tx_hash = dt.tx_hash"
+        ));
+        assert!(sql.contains("JOIN target_matches tm ON tm.raw_transaction_id = rt.id"));
+        assert!(sql.contains("tm.target_id = $1"));
+        assert!(sql.contains("dt.wallet_address = $2"));
+        assert!(sql.contains("dt.network = $3"));
+        assert!(sql.contains("dt.timestamp >= $4"));
+        assert!(sql.contains("dt.timestamp <= $5"));
+        assert!(sql.ends_with("ORDER BY dt.timestamp DESC, dt.id DESC LIMIT $6 OFFSET $7"));
     }
 
     #[test]

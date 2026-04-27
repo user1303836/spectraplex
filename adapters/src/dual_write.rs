@@ -7,7 +7,7 @@
 //! V2 writes are best-effort: failures are logged but never abort the V1 path.
 
 use bigdecimal::BigDecimal;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use spectraplex_core::materializer::{
     BalanceSnapshot, DatasetName, DatasetRegistry, DecodedEvent, HlFillRecord, HlFundingPayment,
     NativeBalanceDelta, PoolSnapshot, TokenTransfer, WalletLedgerRecord,
@@ -75,6 +75,76 @@ pub struct GoldMaterializationResult {
     pub protocol_events_failed: usize,
     pub pool_snapshots_written: usize,
     pub pool_snapshots_failed: usize,
+    /// Gold record counts keyed by (dataset_name, network) for datasets that
+    /// were materialized or attempted during this run. Used as the signal for
+    /// which wallet-target completeness rows should be refreshed.
+    pub per_dataset_network_written: HashMap<(String, String), usize>,
+    /// Gold failure counts keyed by (dataset_name, network) so one network's
+    /// partial materialization does not mark other touched networks Partial.
+    pub per_dataset_network_failed: HashMap<(String, String), usize>,
+}
+
+fn increment_gold_dataset_network_count(
+    counts: &mut HashMap<(String, String), usize>,
+    dataset_name: &str,
+    network: &str,
+) {
+    *counts
+        .entry((dataset_name.to_string(), network.to_string()))
+        .or_insert(0) += 1;
+}
+
+fn increment_gold_dataset_network_failures(
+    counts: &mut HashMap<(String, String), usize>,
+    dataset_name: &str,
+    network: &str,
+    failed: usize,
+) {
+    if failed == 0 {
+        return;
+    }
+    *counts
+        .entry((dataset_name.to_string(), network.to_string()))
+        .or_insert(0) += failed;
+}
+
+fn supports_target_scoped_gold_completeness(dataset_name: &str) -> bool {
+    matches!(
+        dataset_name,
+        name if name == DatasetName::WalletLedger.as_sql_str()
+            || name == DatasetName::BalanceHistory.as_sql_str()
+    )
+}
+
+fn gold_dataset_record_counts(result: &GoldMaterializationResult) -> Vec<(&str, &str, usize)> {
+    let mut counts: Vec<(&str, &str, usize)> = result
+        .per_dataset_network_written
+        .iter()
+        .filter_map(|((dataset_name, network), records_count)| {
+            (*records_count > 0 && supports_target_scoped_gold_completeness(dataset_name))
+                .then_some((dataset_name.as_str(), network.as_str(), *records_count))
+        })
+        .collect();
+    counts.sort_unstable_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
+    counts
+}
+
+fn gold_wallet_dataset_status(
+    result: &GoldMaterializationResult,
+    dataset_name: &str,
+    network: &str,
+) -> CompletenessStatus {
+    let failed = result
+        .per_dataset_network_failed
+        .get(&(dataset_name.to_string(), network.to_string()))
+        .copied()
+        .unwrap_or(0);
+
+    if failed == 0 {
+        CompletenessStatus::Complete
+    } else {
+        CompletenessStatus::Partial
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,6 +1347,7 @@ impl Repository {
         &self,
         raw_txs: &[RawTransaction],
         wallet_address: Option<&str>,
+        wallet_target_id: Option<Uuid>,
     ) -> BronzeSilverResult {
         if raw_txs.is_empty() {
             return BronzeSilverResult::default();
@@ -1527,6 +1598,7 @@ impl Repository {
                         &all_decoded_events,
                         &all_hl_fills,
                         &all_hl_funding,
+                        wallet_target_id,
                     )
                     .await;
                 result.gold_wallet_ledger_written = gold_result.wallet_ledger_written;
@@ -1738,6 +1810,7 @@ impl Repository {
         decoded_events: &[DecodedEvent],
         hl_fills: &[HlFillRecord],
         hl_funding: &[HlFundingPayment],
+        wallet_target_id: Option<Uuid>,
     ) -> GoldMaterializationResult {
         let mut result = GoldMaterializationResult::default();
 
@@ -1987,10 +2060,30 @@ impl Repository {
             match self.save_wallet_ledger_records(&ledger_records).await {
                 Ok(()) => {
                     result.wallet_ledger_written = n;
+                    for record in &ledger_records {
+                        increment_gold_dataset_network_count(
+                            &mut result.per_dataset_network_written,
+                            DatasetName::WalletLedger.as_sql_str(),
+                            &record.network,
+                        );
+                    }
                     info!(count = n, "Gold: wallet_ledger records written");
                 }
                 Err(e) => {
                     result.wallet_ledger_failed = n;
+                    for record in &ledger_records {
+                        increment_gold_dataset_network_failures(
+                            &mut result.per_dataset_network_failed,
+                            DatasetName::WalletLedger.as_sql_str(),
+                            &record.network,
+                            1,
+                        );
+                        increment_gold_dataset_network_count(
+                            &mut result.per_dataset_network_written,
+                            DatasetName::WalletLedger.as_sql_str(),
+                            &record.network,
+                        );
+                    }
                     warn!(error = %e, count = n, "Gold: wallet_ledger write failed");
                 }
             }
@@ -1998,8 +2091,26 @@ impl Repository {
 
         // --- balance_history: seed from DB, then apply incrementally ---
         {
-            let mut balance_events: Vec<(String, String, i64, String, BigDecimal, Uuid)> =
-                Vec::new();
+            #[derive(Clone)]
+            struct BalanceEvent {
+                network: String,
+                asset: String,
+                timestamp: i64,
+                tx_hash: String,
+                delta: BigDecimal,
+                snapshot_id: Uuid,
+            }
+
+            let balance_snapshot_id =
+                |asset: &str, timestamp: i64, tx_hash: &str, source_id: Uuid| {
+                    let id_key = format!(
+                        "bh:{}:{}:{}:{}:{}",
+                        wallet_address, asset, timestamp, tx_hash, source_id
+                    );
+                    Uuid::new_v5(&Uuid::NAMESPACE_URL, id_key.as_bytes())
+                };
+
+            let mut balance_events: Vec<BalanceEvent> = Vec::new();
 
             for transfer in token_transfers {
                 let from_match =
@@ -2025,14 +2136,15 @@ impl Repository {
                 } else {
                     transfer.amount.clone()
                 };
-                balance_events.push((
-                    transfer.network.clone(),
+                let snapshot_id = balance_snapshot_id(&asset, timestamp, &tx_hash, transfer.id);
+                balance_events.push(BalanceEvent {
+                    network: transfer.network.clone(),
                     asset,
                     timestamp,
                     tx_hash,
                     delta,
-                    transfer.id,
-                ));
+                    snapshot_id,
+                });
             }
 
             for delta in native_deltas {
@@ -2043,96 +2155,239 @@ impl Repository {
                 let raw_tx = raw_tx_id.and_then(|id| raw_tx_map.get(&id));
                 let tx_hash = raw_tx.map(|r| r.tx_hash.clone()).unwrap_or_default();
                 let timestamp = raw_tx.map(|r| r.timestamp).unwrap_or(0);
-                balance_events.push((
-                    delta.network.clone(),
-                    delta.native_token.clone(),
+                let snapshot_id =
+                    balance_snapshot_id(&delta.native_token, timestamp, &tx_hash, delta.id);
+                balance_events.push(BalanceEvent {
+                    network: delta.network.clone(),
+                    asset: delta.native_token.clone(),
                     timestamp,
                     tx_hash,
-                    delta.delta.clone(),
-                    delta.id,
-                ));
+                    delta: delta.delta.clone(),
+                    snapshot_id,
+                });
             }
 
             if !balance_events.is_empty() {
-                // Collect unique networks to seed balances per network.
-                let mut networks: HashSet<String> = HashSet::new();
-                for (net, _, _, _, _, _) in &balance_events {
-                    networks.insert(net.clone());
+                #[derive(Clone)]
+                struct BalanceRecomputeEvent {
+                    id: Uuid,
+                    network: String,
+                    asset: String,
+                    timestamp: i64,
+                    tx_hash: String,
+                    delta: BigDecimal,
+                    created_at: DateTime<Utc>,
                 }
 
-                let mut running_balances: HashMap<(String, String), BigDecimal> = HashMap::new();
-                let mut latest_ts: HashMap<(String, String), i64> = HashMap::new();
-                for network in &networks {
-                    match self
-                        .get_latest_balance_snapshots(wallet_address, network)
+                // Sort by a total deterministic order. The deterministic snapshot_id
+                // is part of the replay order so split ingestion runs that share a
+                // timestamp still seed from, and apply after, already-materialized
+                // same-timestamp rows for the same asset.
+                balance_events.sort_by(|a, b| {
+                    a.network
+                        .cmp(&b.network)
+                        .then_with(|| a.asset.cmp(&b.asset))
+                        .then_with(|| a.timestamp.cmp(&b.timestamp))
+                        .then_with(|| a.snapshot_id.cmp(&b.snapshot_id))
+                });
+
+                let mut first_event_by_key: HashMap<(String, String), (i64, Uuid)> = HashMap::new();
+                let mut incoming_by_key: HashMap<(String, String), Vec<BalanceEvent>> =
+                    HashMap::new();
+                let mut incoming_ids: HashSet<Uuid> = HashSet::new();
+                for event in balance_events {
+                    incoming_ids.insert(event.snapshot_id);
+                    first_event_by_key
+                        .entry((event.network.clone(), event.asset.clone()))
+                        .or_insert((event.timestamp, event.snapshot_id));
+                    incoming_by_key
+                        .entry((event.network.clone(), event.asset.clone()))
+                        .or_default()
+                        .push(event);
+                }
+
+                let mut snapshots: Vec<BalanceSnapshot> = Vec::new();
+                for ((network, asset), incoming_events) in incoming_by_key {
+                    let Some((first_ts, first_id)) = first_event_by_key
+                        .get(&(network.clone(), asset.clone()))
+                        .copied()
+                    else {
+                        continue;
+                    };
+
+                    let seed = match self
+                        .get_latest_balance_snapshot_before_order(
+                            wallet_address,
+                            &network,
+                            &asset,
+                            first_ts,
+                            first_id,
+                        )
                         .await
                     {
-                        Ok(snapshots) => {
-                            for snap in snapshots {
-                                let key = (snap.network.clone(), snap.asset_symbol.clone());
-                                running_balances.insert(key.clone(), snap.balance);
-                                latest_ts.insert(key, snap.timestamp);
-                            }
-                        }
+                        Ok(seed) => seed,
                         Err(e) => {
+                            let skipped = incoming_events.len();
+                            result.balance_history_failed += skipped;
+                            increment_gold_dataset_network_failures(
+                                &mut result.per_dataset_network_failed,
+                                DatasetName::BalanceHistory.as_sql_str(),
+                                &network,
+                                skipped,
+                            );
+                            for _ in 0..skipped {
+                                increment_gold_dataset_network_count(
+                                    &mut result.per_dataset_network_written,
+                                    DatasetName::BalanceHistory.as_sql_str(),
+                                    &network,
+                                );
+                            }
                             warn!(
                                 error = %e,
                                 network = %network,
-                                "Failed to query latest balance snapshots — skipping balance_history for this network"
+                                asset = %asset,
+                                skipped = skipped,
+                                "Failed to query prior balance snapshot — marking balance_history partial for this asset/network"
                             );
-                            balance_events.retain(|(net, _, _, _, _, _)| net != network);
-                        }
-                    }
-                }
-
-                // Sort by (network, asset, timestamp) for deterministic application.
-                balance_events.sort_by(|a, b| {
-                    a.0.cmp(&b.0)
-                        .then_with(|| a.1.cmp(&b.1))
-                        .then_with(|| a.2.cmp(&b.2))
-                });
-
-                let mut snapshots: Vec<BalanceSnapshot> = Vec::new();
-                for (network, asset, timestamp, tx_hash, delta, source_id) in balance_events {
-                    // Skip events already represented in the DB to avoid double-counting.
-                    if let Some(&ts) = latest_ts.get(&(network.clone(), asset.clone())) {
-                        if timestamp <= ts {
                             continue;
                         }
+                    };
+
+                    let suffix = match self
+                        .get_balance_snapshots_at_or_after_order(
+                            wallet_address,
+                            &network,
+                            &asset,
+                            first_ts,
+                            first_id,
+                        )
+                        .await
+                    {
+                        Ok(suffix) => suffix,
+                        Err(e) => {
+                            let skipped = incoming_events.len();
+                            result.balance_history_failed += skipped;
+                            increment_gold_dataset_network_failures(
+                                &mut result.per_dataset_network_failed,
+                                DatasetName::BalanceHistory.as_sql_str(),
+                                &network,
+                                skipped,
+                            );
+                            for _ in 0..skipped {
+                                increment_gold_dataset_network_count(
+                                    &mut result.per_dataset_network_written,
+                                    DatasetName::BalanceHistory.as_sql_str(),
+                                    &network,
+                                );
+                            }
+                            warn!(
+                                error = %e,
+                                network = %network,
+                                asset = %asset,
+                                skipped = skipped,
+                                "Failed to query balance_history suffix — marking balance_history partial for this asset/network"
+                            );
+                            continue;
+                        }
+                    };
+
+                    let has_existing_suffix =
+                        suffix.iter().any(|snap| !incoming_ids.contains(&snap.id));
+                    if has_existing_suffix {
+                        let skipped = incoming_events.len();
+                        result.balance_history_failed += skipped;
+                        increment_gold_dataset_network_failures(
+                            &mut result.per_dataset_network_failed,
+                            DatasetName::BalanceHistory.as_sql_str(),
+                            &network,
+                            skipped,
+                        );
+                        for _ in 0..skipped {
+                            increment_gold_dataset_network_count(
+                                &mut result.per_dataset_network_written,
+                                DatasetName::BalanceHistory.as_sql_str(),
+                                &network,
+                            );
+                        }
+                        warn!(
+                            network = %network,
+                            asset = %asset,
+                            skipped = skipped,
+                            "Skipping balance_history backfill because existing suffix rows lack stored deltas/source order for safe recomputation"
+                        );
+                        continue;
                     }
 
-                    let key = (network.clone(), asset.clone());
-                    let balance = running_balances
-                        .entry(key)
-                        .or_insert_with(|| BigDecimal::from(0));
-                    *balance += &delta;
+                    let mut recompute_events: Vec<BalanceRecomputeEvent> = incoming_events
+                        .into_iter()
+                        .map(|event| BalanceRecomputeEvent {
+                            id: event.snapshot_id,
+                            network: event.network,
+                            asset: event.asset,
+                            timestamp: event.timestamp,
+                            tx_hash: event.tx_hash,
+                            delta: event.delta,
+                            created_at: now,
+                        })
+                        .collect();
 
-                    let id_key = format!(
-                        "bh:{}:{}:{}:{}:{}",
-                        wallet_address, asset, timestamp, tx_hash, source_id
-                    );
-                    snapshots.push(BalanceSnapshot {
-                        id: Uuid::new_v5(&Uuid::NAMESPACE_URL, id_key.as_bytes()),
-                        wallet_address: wallet_address.to_string(),
-                        asset_symbol: asset,
-                        network,
-                        timestamp,
-                        balance: balance.clone(),
-                        tx_hash,
-                        dataset_version_id: bh_version_id,
-                        created_at: now,
+                    // Only incoming deterministic rows are safe to replay here. Any
+                    // existing suffix rows were fail-closed above because the current
+                    // schema does not store per-row deltas/source order for lossless
+                    // downstream recomputation.
+
+                    recompute_events.sort_by(|a, b| {
+                        a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id))
                     });
+
+                    let mut balance = seed
+                        .map(|snap| snap.balance)
+                        .unwrap_or_else(|| BigDecimal::from(0));
+                    for event in recompute_events {
+                        balance += &event.delta;
+                        snapshots.push(BalanceSnapshot {
+                            id: event.id,
+                            wallet_address: wallet_address.to_string(),
+                            asset_symbol: event.asset,
+                            network: event.network,
+                            timestamp: event.timestamp,
+                            balance: balance.clone(),
+                            tx_hash: event.tx_hash,
+                            dataset_version_id: bh_version_id,
+                            created_at: event.created_at,
+                        });
+                    }
                 }
 
                 if !snapshots.is_empty() {
                     let n = snapshots.len();
                     match self.save_balance_snapshots(&snapshots).await {
                         Ok(()) => {
-                            result.balance_history_written = n;
+                            result.balance_history_written += n;
+                            for snapshot in &snapshots {
+                                increment_gold_dataset_network_count(
+                                    &mut result.per_dataset_network_written,
+                                    DatasetName::BalanceHistory.as_sql_str(),
+                                    &snapshot.network,
+                                );
+                            }
                             info!(count = n, "Gold: balance_history records written");
                         }
                         Err(e) => {
-                            result.balance_history_failed = n;
+                            result.balance_history_failed += n;
+                            for snapshot in &snapshots {
+                                increment_gold_dataset_network_failures(
+                                    &mut result.per_dataset_network_failed,
+                                    DatasetName::BalanceHistory.as_sql_str(),
+                                    &snapshot.network,
+                                    1,
+                                );
+                                increment_gold_dataset_network_count(
+                                    &mut result.per_dataset_network_written,
+                                    DatasetName::BalanceHistory.as_sql_str(),
+                                    &snapshot.network,
+                                );
+                            }
                             warn!(error = %e, count = n, "Gold: balance_history write failed");
                         }
                     }
@@ -2165,10 +2420,30 @@ impl Repository {
                 match self.save_hl_pnl_summary(&summaries).await {
                     Ok(()) => {
                         result.hl_pnl_summary_written = n;
+                        for summary in &summaries {
+                            increment_gold_dataset_network_count(
+                                &mut result.per_dataset_network_written,
+                                DatasetName::HlPnlSummary.as_sql_str(),
+                                &summary.network,
+                            );
+                        }
                         info!(count = n, "Gold: hl_pnl_summary records written");
                     }
                     Err(e) => {
                         result.hl_pnl_summary_failed = n;
+                        for summary in &summaries {
+                            increment_gold_dataset_network_failures(
+                                &mut result.per_dataset_network_failed,
+                                DatasetName::HlPnlSummary.as_sql_str(),
+                                &summary.network,
+                                1,
+                            );
+                            increment_gold_dataset_network_count(
+                                &mut result.per_dataset_network_written,
+                                DatasetName::HlPnlSummary.as_sql_str(),
+                                &summary.network,
+                            );
+                        }
                         warn!(error = %e, count = n, "Gold: hl_pnl_summary write failed");
                     }
                 }
@@ -2191,10 +2466,30 @@ impl Repository {
                 match self.save_hl_trade_history(&trades).await {
                     Ok(()) => {
                         result.hl_trade_history_written = n;
+                        for trade in &trades {
+                            increment_gold_dataset_network_count(
+                                &mut result.per_dataset_network_written,
+                                DatasetName::HlTradeHistory.as_sql_str(),
+                                &trade.network,
+                            );
+                        }
                         info!(count = n, "Gold: hl_trade_history records written");
                     }
                     Err(e) => {
                         result.hl_trade_history_failed = n;
+                        for trade in &trades {
+                            increment_gold_dataset_network_failures(
+                                &mut result.per_dataset_network_failed,
+                                DatasetName::HlTradeHistory.as_sql_str(),
+                                &trade.network,
+                                1,
+                            );
+                            increment_gold_dataset_network_count(
+                                &mut result.per_dataset_network_written,
+                                DatasetName::HlTradeHistory.as_sql_str(),
+                                &trade.network,
+                            );
+                        }
                         warn!(error = %e, count = n, "Gold: hl_trade_history write failed");
                     }
                 }
@@ -2263,7 +2558,198 @@ impl Repository {
             }
         }
 
+        self.update_gold_completeness(
+            raw_txs,
+            wallet_address,
+            wallet_target_id,
+            &gold_versions,
+            &result,
+        )
+        .await;
+
         result
+    }
+
+    async fn count_gold_wallet_dataset_records(
+        &self,
+        dataset_name: &str,
+        target_id: Uuid,
+        wallet_address: &str,
+        network: &str,
+    ) -> anyhow::Result<i64> {
+        if dataset_name == DatasetName::WalletLedger.as_sql_str() {
+            return sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM wallet_ledger wl \
+                 JOIN target_matches tm ON tm.raw_transaction_id = wl.raw_transaction_id \
+                 WHERE wl.wallet_address = $1 AND wl.network = $2 AND tm.target_id = $3",
+            )
+            .bind(wallet_address)
+            .bind(network)
+            .bind(target_id)
+            .fetch_one(self.pool())
+            .await
+            .map_err(Into::into);
+        }
+
+        let query = if dataset_name == DatasetName::BalanceHistory.as_sql_str() {
+            "SELECT COUNT(*) FROM balance_history bh \
+             JOIN raw_transactions rt ON rt.network = bh.network AND rt.tx_hash = bh.tx_hash \
+             JOIN target_matches tm ON tm.raw_transaction_id = rt.id \
+             WHERE bh.wallet_address = $1 AND bh.network = $2 AND tm.target_id = $3"
+        } else {
+            anyhow::bail!("unsupported target-scoped Gold wallet dataset: {dataset_name}");
+        };
+
+        sqlx::query_scalar::<_, i64>(query)
+            .bind(wallet_address)
+            .bind(network)
+            .bind(target_id)
+            .fetch_one(self.pool())
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Update dataset completeness for Gold datasets materialized for a wallet.
+    async fn update_gold_completeness(
+        &self,
+        raw_txs: &[RawTransaction],
+        wallet_address: &str,
+        wallet_target_id: Option<Uuid>,
+        dataset_versions: &HashMap<String, Uuid>,
+        result: &GoldMaterializationResult,
+    ) {
+        let dataset_counts = gold_dataset_record_counts(result);
+        if dataset_counts.is_empty() {
+            return;
+        }
+
+        let mut net_groups: HashMap<&str, Vec<&RawTransaction>> = HashMap::new();
+        for raw in raw_txs {
+            net_groups
+                .entry(raw.network.as_str())
+                .or_default()
+                .push(raw);
+        }
+
+        for (dataset_name, network, _records_count) in &dataset_counts {
+            let Some(group_txs) = net_groups.get(network) else {
+                continue;
+            };
+
+            let target_id = if let Some(target_id) = wallet_target_id {
+                match self.get_index_target(target_id).await {
+                    Ok(Some(target))
+                        if wallet_target_matches_completeness(&target, wallet_address, network) =>
+                    {
+                        target.id
+                    }
+                    Ok(Some(target)) => {
+                        warn!(
+                            target_id = %target.id,
+                            target_kind = ?target.kind,
+                            target_network = %target.network,
+                            target_address = ?target.address,
+                            wallet = %wallet_address,
+                            network = %network,
+                            "Skipping Gold completeness update for mismatched wallet target"
+                        );
+                        continue;
+                    }
+                    Ok(None) => {
+                        warn!(
+                            target_id = %target_id,
+                            wallet = %wallet_address,
+                            network = %network,
+                            "Skipping Gold completeness update because provided wallet target was not found"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            target_id = %target_id,
+                            wallet = %wallet_address,
+                            network = %network,
+                            "Failed to validate provided wallet target for Gold completeness update"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                match self
+                    .get_index_target_by_address(TargetKind::Wallet, network, wallet_address, None)
+                    .await
+                {
+                    Ok(Some(target)) => target.id,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            wallet = %wallet_address,
+                            network = %network,
+                            "Failed to look up target for Gold completeness update"
+                        );
+                        continue;
+                    }
+                }
+            };
+
+            let coverage_start = group_txs.iter().map(|raw| raw.timestamp).min();
+            let coverage_end = group_txs.iter().map(|raw| raw.timestamp).max();
+            let block_start = group_txs.iter().filter_map(|raw| raw.block_number).min();
+            let block_end = group_txs.iter().filter_map(|raw| raw.block_number).max();
+            let run_id = group_txs.iter().find_map(|raw| raw.ingestion_run_id);
+            let now = Utc::now();
+
+            let total_records_count = match self
+                .count_gold_wallet_dataset_records(dataset_name, target_id, wallet_address, network)
+                .await
+            {
+                Ok(count) => count,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        dataset = %dataset_name,
+                        wallet = %wallet_address,
+                        network = %network,
+                        "Failed to count Gold dataset records for completeness update"
+                    );
+                    continue;
+                }
+            };
+            let status = gold_wallet_dataset_status(result, dataset_name, network);
+            let dc = DatasetCompleteness {
+                id: Uuid::new_v5(
+                    &Uuid::NAMESPACE_URL,
+                    format!("{}:{}:{}", target_id, dataset_name, network).as_bytes(),
+                ),
+                target_id,
+                dataset_name: (*dataset_name).to_string(),
+                dataset_version_id: dataset_versions.get(*dataset_name).copied(),
+                network: (*network).to_string(),
+                status,
+                coverage_start,
+                coverage_end,
+                block_start,
+                block_end,
+                last_ingestion_run_id: run_id,
+                records_count: total_records_count,
+                gap_ranges: None,
+                notes: None,
+                created_at: now,
+                updated_at: now,
+            };
+
+            if let Err(e) = self.upsert_dataset_completeness(&dc).await {
+                warn!(
+                    error = %e,
+                    target_id = %target_id,
+                    dataset = %dataset_name,
+                    network = %network,
+                    "Failed to update Gold dataset completeness"
+                );
+            }
+        }
     }
 
     /// Update dataset completeness for each (target, dataset, network) touched
@@ -2385,6 +2871,23 @@ fn normalize_address_for_comparison(addr: &str) -> String {
     }
 }
 
+fn wallet_target_matches_completeness(
+    target: &IndexTarget,
+    wallet_address: &str,
+    network: &str,
+) -> bool {
+    if target.kind != TargetKind::Wallet || target.network != network {
+        return false;
+    }
+
+    let Some(target_address) = target.address.as_deref() else {
+        return false;
+    };
+
+    normalize_address_for_comparison(target_address)
+        == normalize_address_for_comparison(wallet_address)
+}
+
 // ---------------------------------------------------------------------------
 // Helpers for stamping dataset_version_id on Silver records
 // ---------------------------------------------------------------------------
@@ -2474,6 +2977,77 @@ mod tests {
         );
     }
 
+    fn test_index_target(kind: TargetKind, network: &str, address: Option<&str>) -> IndexTarget {
+        let now = Utc::now();
+        IndexTarget {
+            id: Uuid::new_v4(),
+            kind,
+            network: network.to_string(),
+            chain_family: ChainFamily::Evm,
+            address: address.map(str::to_string),
+            filter_spec: None,
+            mode: TargetMode::Backfill,
+            label: None,
+            owner_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn wallet_target_matches_completeness_validates_kind_network_and_address() {
+        let target = test_index_target(
+            TargetKind::Wallet,
+            "ethereum-mainnet",
+            Some("0xABCDEF0000000000000000000000000000000000"),
+        );
+        assert!(wallet_target_matches_completeness(
+            &target,
+            "0xabcdef0000000000000000000000000000000000",
+            "ethereum-mainnet"
+        ));
+
+        let wrong_kind = test_index_target(
+            TargetKind::Contract,
+            "ethereum-mainnet",
+            Some("0xabcdef0000000000000000000000000000000000"),
+        );
+        assert!(!wallet_target_matches_completeness(
+            &wrong_kind,
+            "0xabcdef0000000000000000000000000000000000",
+            "ethereum-mainnet"
+        ));
+
+        let wrong_network = test_index_target(
+            TargetKind::Wallet,
+            "base-mainnet",
+            Some("0xabcdef0000000000000000000000000000000000"),
+        );
+        assert!(!wallet_target_matches_completeness(
+            &wrong_network,
+            "0xabcdef0000000000000000000000000000000000",
+            "ethereum-mainnet"
+        ));
+
+        let wrong_address = test_index_target(
+            TargetKind::Wallet,
+            "ethereum-mainnet",
+            Some("0x1111110000000000000000000000000000000000"),
+        );
+        assert!(!wallet_target_matches_completeness(
+            &wrong_address,
+            "0xabcdef0000000000000000000000000000000000",
+            "ethereum-mainnet"
+        ));
+
+        let missing_address = test_index_target(TargetKind::Wallet, "ethereum-mainnet", None);
+        assert!(!wallet_target_matches_completeness(
+            &missing_address,
+            "0xabcdef0000000000000000000000000000000000",
+            "ethereum-mainnet"
+        ));
+    }
+
     // -- chain_to_default_source (Rollout Plan Section 2.4) --
 
     #[test]
@@ -2489,6 +3063,184 @@ mod tests {
     #[test]
     fn chain_to_source_hyperliquid() {
         assert_eq!(chain_to_default_source(&Chain::Hyperliquid), "rest");
+    }
+
+    // -- Gold completeness provenance helpers --
+
+    #[test]
+    fn gold_dataset_record_counts_includes_only_written_gold_datasets() {
+        let mut result = GoldMaterializationResult {
+            wallet_ledger_written: 2,
+            wallet_ledger_failed: 1,
+            balance_history_written: 1,
+            balance_history_failed: 0,
+            hl_pnl_summary_written: 0,
+            hl_pnl_summary_failed: 3,
+            hl_trade_history_written: 4,
+            hl_trade_history_failed: 0,
+            protocol_events_written: 0,
+            protocol_events_failed: 0,
+            pool_snapshots_written: 0,
+            pool_snapshots_failed: 1,
+            per_dataset_network_written: HashMap::new(),
+            per_dataset_network_failed: HashMap::new(),
+        };
+        increment_gold_dataset_network_count(
+            &mut result.per_dataset_network_written,
+            DatasetName::WalletLedger.as_sql_str(),
+            "solana-mainnet",
+        );
+        increment_gold_dataset_network_count(
+            &mut result.per_dataset_network_written,
+            DatasetName::WalletLedger.as_sql_str(),
+            "solana-mainnet",
+        );
+        increment_gold_dataset_network_count(
+            &mut result.per_dataset_network_written,
+            DatasetName::BalanceHistory.as_sql_str(),
+            "ethereum-mainnet",
+        );
+        increment_gold_dataset_network_count(
+            &mut result.per_dataset_network_written,
+            DatasetName::HlTradeHistory.as_sql_str(),
+            "hypercore-mainnet",
+        );
+        increment_gold_dataset_network_count(
+            &mut result.per_dataset_network_written,
+            DatasetName::HlTradeHistory.as_sql_str(),
+            "hypercore-mainnet",
+        );
+        increment_gold_dataset_network_count(
+            &mut result.per_dataset_network_written,
+            DatasetName::HlTradeHistory.as_sql_str(),
+            "hypercore-mainnet",
+        );
+        increment_gold_dataset_network_count(
+            &mut result.per_dataset_network_written,
+            DatasetName::HlTradeHistory.as_sql_str(),
+            "hypercore-mainnet",
+        );
+        increment_gold_dataset_network_count(
+            &mut result.per_dataset_network_written,
+            DatasetName::ProtocolEvents.as_sql_str(),
+            "ethereum-mainnet",
+        );
+        increment_gold_dataset_network_count(
+            &mut result.per_dataset_network_written,
+            DatasetName::PoolSnapshots.as_sql_str(),
+            "ethereum-mainnet",
+        );
+
+        let counts = gold_dataset_record_counts(&result);
+
+        assert_eq!(
+            counts,
+            vec![
+                (
+                    DatasetName::BalanceHistory.as_sql_str(),
+                    "ethereum-mainnet",
+                    1,
+                ),
+                (DatasetName::WalletLedger.as_sql_str(), "solana-mainnet", 2,),
+            ]
+        );
+    }
+
+    #[test]
+    fn gold_wallet_dataset_status_is_scoped_to_dataset_and_network_failures() {
+        let mut result = GoldMaterializationResult::default();
+        increment_gold_dataset_network_failures(
+            &mut result.per_dataset_network_failed,
+            DatasetName::WalletLedger.as_sql_str(),
+            "solana-mainnet",
+            1,
+        );
+        increment_gold_dataset_network_failures(
+            &mut result.per_dataset_network_failed,
+            DatasetName::HlPnlSummary.as_sql_str(),
+            "hypercore-mainnet",
+            2,
+        );
+
+        assert_eq!(
+            gold_wallet_dataset_status(
+                &result,
+                DatasetName::WalletLedger.as_sql_str(),
+                "solana-mainnet"
+            ),
+            CompletenessStatus::Partial
+        );
+        assert_eq!(
+            gold_wallet_dataset_status(
+                &result,
+                DatasetName::WalletLedger.as_sql_str(),
+                "ethereum-mainnet"
+            ),
+            CompletenessStatus::Complete
+        );
+        assert_eq!(
+            gold_wallet_dataset_status(
+                &result,
+                DatasetName::BalanceHistory.as_sql_str(),
+                "ethereum-mainnet"
+            ),
+            CompletenessStatus::Complete
+        );
+        assert_eq!(
+            gold_wallet_dataset_status(
+                &result,
+                DatasetName::HlPnlSummary.as_sql_str(),
+                "hypercore-mainnet"
+            ),
+            CompletenessStatus::Partial
+        );
+        assert_eq!(
+            gold_wallet_dataset_status(
+                &result,
+                DatasetName::HlTradeHistory.as_sql_str(),
+                "hypercore-mainnet"
+            ),
+            CompletenessStatus::Complete
+        );
+    }
+
+    #[test]
+    fn gold_wallet_dataset_status_does_not_cross_mark_balance_history_networks_partial() {
+        let mut result = GoldMaterializationResult::default();
+        increment_gold_dataset_network_count(
+            &mut result.per_dataset_network_written,
+            DatasetName::BalanceHistory.as_sql_str(),
+            "ethereum-mainnet",
+        );
+        increment_gold_dataset_network_count(
+            &mut result.per_dataset_network_written,
+            DatasetName::BalanceHistory.as_sql_str(),
+            "base-mainnet",
+        );
+        increment_gold_dataset_network_failures(
+            &mut result.per_dataset_network_failed,
+            DatasetName::BalanceHistory.as_sql_str(),
+            "ethereum-mainnet",
+            1,
+        );
+        result.balance_history_failed = 1;
+
+        assert_eq!(
+            gold_wallet_dataset_status(
+                &result,
+                DatasetName::BalanceHistory.as_sql_str(),
+                "ethereum-mainnet"
+            ),
+            CompletenessStatus::Partial
+        );
+        assert_eq!(
+            gold_wallet_dataset_status(
+                &result,
+                DatasetName::BalanceHistory.as_sql_str(),
+                "base-mainnet"
+            ),
+            CompletenessStatus::Complete
+        );
     }
 
     // -- V1 → V2 Transaction conversion --
