@@ -200,7 +200,11 @@ async fn worker_tick(
                         "Materialization run completed (worker)"
                     );
                     match task_repo
-                        .complete_materialization_run(run_id, &task_worker_id, count as i64)
+                        .complete_materialization_run(
+                            run_id,
+                            &task_worker_id,
+                            usize_to_i64_or_max(count),
+                        )
                         .await
                     {
                         Ok(()) => {
@@ -236,7 +240,7 @@ async fn worker_tick(
                                                 block_start: None,
                                                 block_end: None,
                                                 last_ingestion_run_id: Some(irun_id),
-                                                records_count: *ds_count as i64,
+                                                records_count: usize_to_i64_or_max(*ds_count),
                                                 gap_ranges: None,
                                                 notes: None,
                                                 created_at: chrono::Utc::now(),
@@ -473,6 +477,10 @@ pub(crate) async fn execute_normalize(
     anyhow::bail!("normalize requires an ingestion_run_id; enqueue a materialization run from an ingestion job or stream flush")
 }
 
+fn usize_to_i64_or_max(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// Chain-aware address comparison: case-insensitive for EVM (0x-prefixed),
 /// exact match for everything else (Solana base58 is case-sensitive).
 fn addrs_match(a: &str, b: &str) -> bool {
@@ -481,5 +489,18 @@ fn addrs_match(a: &str, b: &str) -> bool {
         a.eq_ignore_ascii_case(b)
     } else {
         a == b
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usize_to_i64_or_max_saturates() {
+        assert_eq!(usize_to_i64_or_max(42), 42);
+        assert_eq!(usize_to_i64_or_max(i64::MAX as usize), i64::MAX);
+        assert_eq!(usize_to_i64_or_max(i64::MAX as usize + 1), i64::MAX);
+        assert_eq!(usize_to_i64_or_max(usize::MAX), i64::MAX);
     }
 }
