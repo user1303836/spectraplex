@@ -50,6 +50,10 @@ fn u64_to_i64_or_max(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+fn u64_to_u128(value: u64) -> u128 {
+    u128::from(value)
+}
+
 fn usize_to_u64_or_max(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -437,7 +441,7 @@ impl EvmAdapter {
                             if let Ok(Some(receipt)) =
                                 self.provider.get_transaction_receipt(tx.tx_hash()).await
                             {
-                                gas_used = Some(receipt.gas_used as u128);
+                                gas_used = Some(u64_to_u128(receipt.gas_used));
                                 effective_gas_price = Some(receipt.effective_gas_price);
                             }
                         }
@@ -1335,6 +1339,12 @@ mod tests {
         let normal: u64 = 1_700_000_000;
         let result = u64_to_i64_or_max(normal);
         assert_eq!(result, 1_700_000_000i64);
+    }
+
+    #[test]
+    fn test_gas_used_u128_conversion_preserves_u64_max() {
+        assert_eq!(u64_to_u128(42), 42_u128);
+        assert_eq!(u64_to_u128(u64::MAX), u128::from(u64::MAX));
     }
 
     #[test]
