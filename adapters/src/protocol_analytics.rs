@@ -103,21 +103,8 @@ pub fn compute_pool_snapshots(
     let protocol_address = latest.program_or_contract.clone();
 
     // Extract reserve values from decoded_fields if available
-    let reserve0 = latest
-        .decoded_fields
-        .get("reserve0")
-        .or_else(|| latest.decoded_fields.get("amount0"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<BigDecimal>().ok())
-        .unwrap_or_else(|| BigDecimal::from(0));
-
-    let reserve1 = latest
-        .decoded_fields
-        .get("reserve1")
-        .or_else(|| latest.decoded_fields.get("amount1"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<BigDecimal>().ok())
-        .unwrap_or_else(|| BigDecimal::from(0));
+    let reserve0 = decoded_decimal_field(&latest.decoded_fields, "reserve0", "amount0");
+    let reserve1 = decoded_decimal_field(&latest.decoded_fields, "reserve1", "amount1");
 
     vec![PoolSnapshot {
         id: Uuid::new_v5(
@@ -140,6 +127,26 @@ pub fn compute_pool_snapshots(
         dataset_version_id: latest.dataset_version_id,
         created_at: now,
     }]
+}
+
+fn json_decimal(value: &serde_json::Value) -> Option<BigDecimal> {
+    match value {
+        serde_json::Value::String(value) => value.parse::<BigDecimal>().ok(),
+        serde_json::Value::Number(value) => value.to_string().parse::<BigDecimal>().ok(),
+        _ => None,
+    }
+}
+
+fn decoded_decimal_field(
+    fields: &serde_json::Value,
+    primary_key: &str,
+    fallback_key: &str,
+) -> BigDecimal {
+    fields
+        .get(primary_key)
+        .and_then(json_decimal)
+        .or_else(|| fields.get(fallback_key).and_then(json_decimal))
+        .unwrap_or_else(|| BigDecimal::from(0))
 }
 
 /// Build per-protocol activity analytics from protocol event records.
@@ -395,6 +402,55 @@ mod tests {
             snapshots[0].reserve1,
             BigDecimal::from_str("2000000").unwrap()
         );
+    }
+
+    #[test]
+    fn compute_pool_snapshots_accepts_numeric_reserve_fields() {
+        let events = vec![make_decoded_event(
+            "0xUniswap",
+            Some("Swap"),
+            "ethereum-mainnet",
+            serde_json::json!({"reserve0": 1000, "reserve1": 2000000.5}),
+        )];
+
+        let snapshots = compute_pool_snapshots(
+            &events,
+            &[],
+            "0xPool",
+            ("0xWETH", Some("WETH")),
+            ("0xUSDC", Some("USDC")),
+        );
+
+        assert_eq!(snapshots[0].reserve0, BigDecimal::from(1000));
+        assert_eq!(
+            snapshots[0].reserve1,
+            BigDecimal::from_str("2000000.5").unwrap()
+        );
+    }
+
+    #[test]
+    fn compute_pool_snapshots_uses_amount_fallback_after_invalid_reserve() {
+        let events = vec![make_decoded_event(
+            "0xUniswap",
+            Some("Swap"),
+            "ethereum-mainnet",
+            serde_json::json!({
+                "reserve0": "not-a-decimal",
+                "amount0": 42,
+                "amount1": "84"
+            }),
+        )];
+
+        let snapshots = compute_pool_snapshots(
+            &events,
+            &[],
+            "0xPool",
+            ("0xWETH", Some("WETH")),
+            ("0xUSDC", Some("USDC")),
+        );
+
+        assert_eq!(snapshots[0].reserve0, BigDecimal::from(42));
+        assert_eq!(snapshots[0].reserve1, BigDecimal::from(84));
     }
 
     #[test]
