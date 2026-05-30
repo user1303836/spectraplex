@@ -187,7 +187,7 @@ async fn execute_job(
                     run_id,
                     "completed",
                     Some(chrono::Utc::now()),
-                    count as i64,
+                    usize_to_i64_or_max(count),
                     None,
                 )
                 .await;
@@ -592,6 +592,10 @@ fn network_to_source(network: &str) -> String {
     }
 }
 
+fn usize_to_i64_or_max(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// Best-effort callback delivery using the SSRF-safe client. Pins DNS at
 /// send time and disables redirects to prevent DNS rebinding and
 /// redirect-based SSRF, matching the protections in `fire_callback`.
@@ -636,6 +640,14 @@ async fn fire_callback_best_effort(url: &str, payload: &serde_json::Value, secre
 mod tests {
     use super::*;
     use spectraplex_core::v2::{ChainFamily, IndexTarget, TargetKind, TargetMode};
+
+    #[test]
+    fn usize_to_i64_or_max_saturates() {
+        assert_eq!(usize_to_i64_or_max(42), 42);
+        assert_eq!(usize_to_i64_or_max(i64::MAX as usize), i64::MAX);
+        assert_eq!(usize_to_i64_or_max(i64::MAX as usize + 1), i64::MAX);
+        assert_eq!(usize_to_i64_or_max(usize::MAX), i64::MAX);
+    }
 
     #[test]
     fn target_uses_connector_backfill_for_hyperliquid_market() {
