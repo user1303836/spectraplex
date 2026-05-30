@@ -47,11 +47,32 @@ API_PID=""
 TARGET_WALLET="So11111111111111111111111111111111111111112"
 TARGET_NETWORK="solana-mainnet"
 
+usage() {
+  cat <<'USAGE'
+Usage: ./scripts/smoke-test.sh [--skip-ingest]
+
+Options:
+  --skip-ingest  Skip provider-dependent ingestion and job polling.
+  -h, --help     Show this help message.
+USAGE
+}
+
 SKIP_INGEST=false
 for arg in "$@"; do
-  if [[ "$arg" == "--skip-ingest" ]]; then
-    SKIP_INGEST=true
-  fi
+  case "$arg" in
+    --skip-ingest)
+      SKIP_INGEST=true
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "ERROR: Unknown option: $arg" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
 done
 
 # ---------------------------------------------------------------------------
