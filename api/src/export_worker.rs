@@ -264,6 +264,7 @@ async fn execute_export_job(
             let prov_cs = _export_meta.completeness_status.as_deref();
             let prov_cc = _export_meta.completeness_coverage.as_ref();
             let prov_lri = _export_meta.last_ingestion_run_id;
+            let status_record_count = Some(record_count_i32_or_max(record_count));
 
             let result_location = format!("exports/{}.{}", job_id, ext);
 
@@ -276,7 +277,7 @@ async fn execute_export_job(
                     repo,
                     job_id,
                     "delivering",
-                    Some(record_count as i32),
+                    status_record_count,
                     Some(&result_location),
                     None,
                     worker_id,
@@ -320,7 +321,7 @@ async fn execute_export_job(
                         repo,
                         job_id,
                         "failed",
-                        Some(record_count as i32),
+                        status_record_count,
                         Some(&result_location),
                         Some(&err_msg),
                         worker_id,
@@ -361,7 +362,7 @@ async fn execute_export_job(
                         repo,
                         job_id,
                         "failed",
-                        Some(record_count as i32),
+                        status_record_count,
                         Some(&result_location),
                         Some(&err_msg),
                         worker_id,
@@ -451,7 +452,7 @@ async fn execute_export_job(
                             repo,
                             job_id,
                             "completed",
-                            Some(record_count as i32),
+                            status_record_count,
                             Some(&result_location),
                             None,
                             worker_id,
@@ -470,7 +471,7 @@ async fn execute_export_job(
                             repo,
                             job_id,
                             "failed",
-                            Some(record_count as i32),
+                            status_record_count,
                             Some(&result_location),
                             Some(&err_msg),
                             worker_id,
@@ -496,7 +497,7 @@ async fn execute_export_job(
                     repo,
                     job_id,
                     "delivering",
-                    Some(record_count as i32),
+                    status_record_count,
                     Some(&result_location),
                     None,
                     worker_id,
@@ -538,7 +539,7 @@ async fn execute_export_job(
                         repo,
                         job_id,
                         "failed",
-                        Some(record_count as i32),
+                        status_record_count,
                         Some(&result_location),
                         Some(&err_msg),
                         worker_id,
@@ -579,7 +580,7 @@ async fn execute_export_job(
                         repo,
                         job_id,
                         "failed",
-                        Some(record_count as i32),
+                        status_record_count,
                         Some(&result_location),
                         Some(&err_msg),
                         worker_id,
@@ -605,7 +606,7 @@ async fn execute_export_job(
                     repo,
                     job_id,
                     "completed",
-                    Some(record_count as i32),
+                    status_record_count,
                     Some(&result_location),
                     None,
                     worker_id,
@@ -662,6 +663,10 @@ async fn execute_export_job(
 
     // Stop heartbeat after all writes and status updates are done.
     heartbeat_cancel.cancel();
+}
+
+fn record_count_i32_or_max(record_count: usize) -> i32 {
+    i32::try_from(record_count).unwrap_or(i32::MAX)
 }
 
 /// Wrapper around `update_export_job_status` that treats `Ok(false)` (lost
@@ -795,4 +800,17 @@ fn parse_filters(
     let time_end = filters.get("time_end").and_then(|v| v.as_i64());
 
     (target_id, network, time_start, time_end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_count_i32_or_max_saturates() {
+        assert_eq!(record_count_i32_or_max(42), 42);
+        assert_eq!(record_count_i32_or_max(i32::MAX as usize), i32::MAX);
+        assert_eq!(record_count_i32_or_max(i32::MAX as usize + 1), i32::MAX);
+        assert_eq!(record_count_i32_or_max(usize::MAX), i32::MAX);
+    }
 }
