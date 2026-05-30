@@ -17,23 +17,52 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$PROJECT_DIR"
 
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+compose() {
+  if command -v docker-compose >/dev/null 2>&1 && docker-compose version >/dev/null 2>&1; then
+    docker-compose "$@"
+  elif command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    docker compose "$@"
+  else
+    fail "Docker Compose is required. Install either 'docker-compose' or Docker with the 'docker compose' plugin."
+  fi
+}
+
+wait_for_postgres() {
+  for _ in {1..30}; do
+    if command -v pg_isready >/dev/null 2>&1; then
+      if pg_isready -h localhost -p 5432 -U spectraplex >/dev/null 2>&1; then
+        return 0
+      fi
+    fi
+
+    if compose exec -T postgres pg_isready -U spectraplex >/dev/null 2>&1; then
+      return 0
+    fi
+
+    sleep 1
+  done
+
+  return 1
+}
+
 if [[ "${1:-}" == "stop" ]]; then
   echo "Stopping local dev services..."
-  docker-compose down 2>/dev/null || docker compose down 2>/dev/null
+  compose down
   echo "Done."
   exit 0
 fi
 
 echo "Starting Postgres for local development..."
-docker-compose up -d postgres 2>/dev/null || docker compose up -d postgres 2>/dev/null
+compose up -d postgres
 
-# Wait for readiness
-for i in {1..30}; do
-  if pg_isready -h localhost -p 5432 -U spectraplex >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
+if ! wait_for_postgres; then
+  fail "Postgres did not become ready on localhost:5432 within 30 seconds. Check Docker Compose logs and local port usage."
+fi
 
 echo ""
 echo "Postgres is ready on localhost:5432"
