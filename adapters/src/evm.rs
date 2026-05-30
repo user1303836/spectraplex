@@ -54,6 +54,10 @@ fn usize_to_u64_or_max(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+fn duration_millis_u64_or_max(value: Duration) -> u64 {
+    u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn next_block_after_i64(last_block: i64) -> Option<u64> {
     u64::try_from(last_block)
         .ok()
@@ -201,7 +205,7 @@ impl EvmAdapter {
                         warn!(
                             attempt = attempt + 1,
                             max_retries = RPC_MAX_RETRIES,
-                            delay_ms = delay.as_millis() as u64,
+                            delay_ms = duration_millis_u64_or_max(delay),
                             error = %e,
                             "RPC get_logs failed, retrying"
                         );
@@ -1331,6 +1335,12 @@ mod tests {
         let normal: u64 = 1_700_000_000;
         let result = u64_to_i64_or_max(normal);
         assert_eq!(result, 1_700_000_000i64);
+    }
+
+    #[test]
+    fn test_duration_millis_u64_or_max_saturates() {
+        assert_eq!(duration_millis_u64_or_max(Duration::from_millis(42)), 42);
+        assert_eq!(duration_millis_u64_or_max(Duration::MAX), u64::MAX);
     }
 
     #[test]
