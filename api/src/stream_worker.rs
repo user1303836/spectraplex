@@ -620,7 +620,7 @@ async fn flush_stream_batch(
         .filter(|r| seen.insert((r.network.clone(), r.tx_hash.clone())))
         .collect();
 
-    let record_count = v2_deduped.len() as i64;
+    let record_count = usize_to_i64_or_max(v2_deduped.len());
 
     match repo
         .upsert_raw_transactions_returning_ids(&v2_deduped)
@@ -776,6 +776,10 @@ fn cursor_tx_count(sub: &StreamSubscription) -> u64 {
         .unwrap_or(0)
 }
 
+fn usize_to_i64_or_max(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// Extract last_slot from cursor_state JSON, default 0.
 fn cursor_last_slot(sub: &StreamSubscription) -> u64 {
     sub.cursor_state
@@ -839,5 +843,18 @@ async fn reconcile(
                 stream.cancel.cancel();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usize_to_i64_or_max_saturates() {
+        assert_eq!(usize_to_i64_or_max(42), 42);
+        assert_eq!(usize_to_i64_or_max(i64::MAX as usize), i64::MAX);
+        assert_eq!(usize_to_i64_or_max(i64::MAX as usize + 1), i64::MAX);
+        assert_eq!(usize_to_i64_or_max(usize::MAX), i64::MAX);
     }
 }
