@@ -501,8 +501,8 @@ pub fn extract_evm_decoded_events(
         let log_index = raw_metadata
             .get("logIndex")
             .or_else(|| raw_metadata.get("log_index"))
-            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(hex_to_i64_opt)))
-            .unwrap_or(0) as i32;
+            .map(|v| evm_log_index_or_default(v, 0))
+            .unwrap_or(0);
 
         let topic0 = topics.first().and_then(|t| t.as_str());
 
@@ -547,8 +547,8 @@ pub fn extract_evm_decoded_events(
             let log_index = log
                 .get("logIndex")
                 .or_else(|| log.get("log_index"))
-                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(hex_to_i64_opt)))
-                .unwrap_or(idx as i64) as i32;
+                .map(|v| evm_log_index_or_default(v, usize_to_i32_or_max(idx)))
+                .unwrap_or_else(|| usize_to_i32_or_max(idx));
 
             let topic0 = topics.first().and_then(|t| t.as_str());
 
@@ -655,6 +655,18 @@ fn decode_evm_event_fields(
 fn hex_to_i64_opt(hex: &str) -> Option<i64> {
     let stripped = hex.strip_prefix("0x").unwrap_or(hex);
     i64::from_str_radix(stripped, 16).ok()
+}
+
+fn evm_log_index_or_default(value: &serde_json::Value, default: i32) -> i32 {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(hex_to_i64_opt))
+        .and_then(|n| if n >= 0 { i32::try_from(n).ok() } else { None })
+        .unwrap_or(default)
+}
+
+fn usize_to_i32_or_max(value: usize) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -937,6 +949,15 @@ mod tests {
             hex_to_u128_or_zero("0x100000000000000000000000000000000"),
             0
         );
+    }
+
+    #[test]
+    fn test_evm_log_index_or_default() {
+        assert_eq!(evm_log_index_or_default(&json!(7), 99), 7);
+        assert_eq!(evm_log_index_or_default(&json!("0x10"), 99), 16);
+        assert_eq!(evm_log_index_or_default(&json!(-1), 99), 99);
+        assert_eq!(evm_log_index_or_default(&json!("0x80000000"), 99), 99);
+        assert_eq!(evm_log_index_or_default(&json!("not-a-log-index"), 99), 99);
     }
 
     #[test]
