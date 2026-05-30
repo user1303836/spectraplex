@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "1480e3b82150",
+  "strategy": "manual-commit",
+  "branch": "codex/require-solana-grpc-message",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "adapters/src/solana_grpc.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/14/80e3b82150/0/metadata.json",
+      "transcript": "/14/80e3b82150/0/full.jsonl",
+      "context": "/14/80e3b82150/0/context.md",
+      "content_hash": "/14/80e3b82150/0/content_hash.txt",
+      "prompt": "/14/80e3b82150/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 1
+  }
+}
