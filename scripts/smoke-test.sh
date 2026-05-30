@@ -90,7 +90,25 @@ curl_json() {
 extract_json() {
   local json="$1"
   local key="$2"
-  echo "$json" | python3 -c "import sys, json; print(json.load(sys.stdin)['$key'])" 2>/dev/null || true
+  echo "$json" | jq -r --arg key "$key" 'if type == "object" then (.[$key] // empty) else empty end' 2>/dev/null || true
+}
+
+extract_json_or_default() {
+  local json="$1"
+  local key="$2"
+  local default="$3"
+  echo "$json" | jq -r --arg key "$key" --arg default "$default" 'if type == "object" then (.[$key] // $default) else $default end' 2>/dev/null || echo "$default"
+}
+
+count_json_collection() {
+  local json="$1"
+  local key="${2:-}"
+  echo "$json" | jq -r --arg key "$key" '
+    if type == "array" then length
+    elif type == "object" then ((.[$key] // []) | if type == "array" then length else 0 end)
+    else 0
+    end
+  ' 2>/dev/null || echo "0"
 }
 
 fail() {
@@ -139,7 +157,7 @@ wait_for_postgres() {
 
 require_command curl "Install curl to call the local API."
 require_command cargo "Install Rust/Cargo to build spectraplex-api."
-require_command python3 "Install python3 for JSON response parsing in the smoke script."
+require_command jq "Install jq for JSON response parsing in the smoke script."
 
 echo "=== Spectraplex Smoke Test ==="
 echo ""
@@ -237,7 +255,7 @@ echo "[6/10] Polling job status..."
 if [[ -n "$JOB_ID" ]]; then
   for i in {1..30}; do
     JOB_STATUS=$(curl_json GET "$API_URL/v1/jobs/$JOB_ID" "$TENANT_KEY")
-    STATUS=$(echo "$JOB_STATUS" | python3 -c "import sys, json; print(json.load(sys.stdin).get('state','unknown'))" 2>/dev/null || echo "unknown")
+    STATUS=$(extract_json_or_default "$JOB_STATUS" "state" "unknown")
     echo "       Job status: $STATUS"
     if [[ "$STATUS" == "completed" || "$STATUS" == "failed" ]]; then
       break
@@ -261,7 +279,7 @@ fi
 # ---------------------------------------------------------------------------
 echo "[7/10] Querying token_transfers dataset (tenant-scoped)..."
 DATASET_RESP=$(curl_json GET "$API_URL/v1/datasets/token_transfers/records?target_id=$TARGET_ID&limit=10" "$TENANT_KEY")
-RECORD_COUNT=$(echo "$DATASET_RESP" | python3 -c "import sys, json; d=json.load(sys.stdin); print(len(d) if isinstance(d, list) else len(d.get('records',[])))" 2>/dev/null || echo "0")
+RECORD_COUNT=$(count_json_collection "$DATASET_RESP" "records")
 echo "       Records returned: $RECORD_COUNT"
 
 # ---------------------------------------------------------------------------
@@ -282,7 +300,7 @@ echo "       Export job created: $EXPORT_JOB_ID"
 # ---------------------------------------------------------------------------
 echo "[9/10] Verifying API key lifecycle..."
 LIST_RESP=$(curl_json GET "$API_URL/v1/api-keys" "$TENANT_KEY")
-KEY_COUNT=$(echo "$LIST_RESP" | python3 -c "import sys, json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+KEY_COUNT=$(count_json_collection "$LIST_RESP")
 echo "       Listed $KEY_COUNT active key(s)"
 
 # ---------------------------------------------------------------------------
@@ -290,7 +308,7 @@ echo "       Listed $KEY_COUNT active key(s)"
 # ---------------------------------------------------------------------------
 echo "[10/10] Verifying target listing..."
 TARGETS_RESP=$(curl_json GET "$API_URL/v1/targets?limit=10" "$TENANT_KEY")
-TARGET_COUNT=$(echo "$TARGETS_RESP" | python3 -c "import sys, json; d=json.load(sys.stdin); print(len(d) if isinstance(d, list) else len(d.get('targets',[])))" 2>/dev/null || echo "0")
+TARGET_COUNT=$(count_json_collection "$TARGETS_RESP" "targets")
 echo "       Listed $TARGET_COUNT target(s)"
 
 echo ""
