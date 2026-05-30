@@ -42,6 +42,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 API_URL="http://localhost:3000"
 LEGACY_KEY="admin-smoke-test-key"
 TENANT_KEY=""
+API_KEY_ID=""
 API_PID=""
 TARGET_WALLET="So11111111111111111111111111111111111111112"
 TARGET_NETWORK="solana-mainnet"
@@ -110,6 +111,17 @@ count_json_collection() {
     else 0
     end
   ' 2>/dev/null || echo "0"
+}
+
+json_collection_contains_id() {
+  local json="$1"
+  local key="${2:-}"
+  local id="$3"
+  echo "$json" | jq -e --arg key "$key" --arg id "$id" '
+    (if type == "array" then . elif type == "object" then (.[$key] // []) else [] end)
+    | map(select(.id == $id))
+    | length > 0
+  ' >/dev/null 2>&1
 }
 
 fail() {
@@ -229,9 +241,10 @@ fi
 # ---------------------------------------------------------------------------
 echo "[3/10] Creating tenant API key..."
 CREATE_RESP=$(curl_json POST "$API_URL/v1/api-keys" "$LEGACY_KEY" '{"name":"smoke-test-key"}')
+API_KEY_ID=$(extract_json "$CREATE_RESP" "id")
 TENANT_KEY=$(extract_json "$CREATE_RESP" "key")
-if [[ -z "$TENANT_KEY" ]]; then
-  echo "ERROR: Could not parse API key from response: $CREATE_RESP"
+if [[ -z "$API_KEY_ID" || -z "$TENANT_KEY" ]]; then
+  echo "ERROR: Could not parse API key ID/key from response: $CREATE_RESP"
   exit 1
 fi
 echo "       Created tenant key: ${TENANT_KEY:0:12}..."
@@ -321,6 +334,12 @@ echo "[9/10] Verifying API key lifecycle..."
 LIST_RESP=$(curl_json GET "$API_URL/v1/api-keys" "$TENANT_KEY")
 KEY_COUNT=$(count_json_collection "$LIST_RESP")
 echo "       Listed $KEY_COUNT active key(s)"
+if [[ "$KEY_COUNT" -lt 1 ]]; then
+  fail "Expected at least one active API key in list response."
+fi
+if ! json_collection_contains_id "$LIST_RESP" "" "$API_KEY_ID"; then
+  fail "Created API key $API_KEY_ID was not returned by the API key list endpoint."
+fi
 
 # ---------------------------------------------------------------------------
 # 10. Verify target is listable
@@ -329,6 +348,12 @@ echo "[10/10] Verifying target listing..."
 TARGETS_RESP=$(curl_json GET "$API_URL/v1/targets?limit=10" "$TENANT_KEY")
 TARGET_COUNT=$(count_json_collection "$TARGETS_RESP" "targets")
 echo "       Listed $TARGET_COUNT target(s)"
+if [[ "$TARGET_COUNT" -lt 1 ]]; then
+  fail "Expected at least one target in list response."
+fi
+if ! json_collection_contains_id "$TARGETS_RESP" "targets" "$TARGET_ID"; then
+  fail "Created target $TARGET_ID was not returned by the target list endpoint."
+fi
 
 echo ""
 echo "=== Smoke test completed successfully ==="
