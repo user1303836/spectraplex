@@ -789,6 +789,10 @@ pub(crate) async fn build_ssrf_safe_client(
         .map_err(|e| format!("failed to build HTTP client: {e}"))
 }
 
+fn retry_backoff_delay(base_delay_ms: u64, attempt: u32) -> Duration {
+    Duration::from_millis(base_delay_ms.saturating_mul(2u64.saturating_pow(attempt)))
+}
+
 pub(crate) async fn fire_callback(url: &str, payload: &serde_json::Value, secret: Option<&str>) {
     const MAX_RETRIES: u32 = 3;
     const BASE_DELAY_MS: u64 = 500;
@@ -834,7 +838,7 @@ pub(crate) async fn fire_callback(url: &str, payload: &serde_json::Value, secret
                 }
                 // Server error (5xx): retry
                 if attempt + 1 < MAX_RETRIES {
-                    let delay = Duration::from_millis(BASE_DELAY_MS * 2u64.pow(attempt));
+                    let delay = retry_backoff_delay(BASE_DELAY_MS, attempt);
                     warn!(
                         status = %status, url, attempt = attempt + 1,
                         "Callback returned server error, retrying in {}ms", delay.as_millis()
@@ -846,7 +850,7 @@ pub(crate) async fn fire_callback(url: &str, payload: &serde_json::Value, secret
             }
             Err(e) => {
                 if attempt + 1 < MAX_RETRIES {
-                    let delay = Duration::from_millis(BASE_DELAY_MS * 2u64.pow(attempt));
+                    let delay = retry_backoff_delay(BASE_DELAY_MS, attempt);
                     warn!(
                         error = %e, url, attempt = attempt + 1,
                         "Callback request failed, retrying in {}ms", delay.as_millis()
@@ -4831,6 +4835,20 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
         // With a fake DB pool the query fails, but format validation passes (not 400)
         assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_retry_backoff_delay_saturates() {
+        assert_eq!(retry_backoff_delay(500, 0), Duration::from_millis(500));
+        assert_eq!(retry_backoff_delay(500, 1), Duration::from_millis(1000));
+        assert_eq!(
+            retry_backoff_delay(u64::MAX, 1),
+            Duration::from_millis(u64::MAX)
+        );
+        assert_eq!(
+            retry_backoff_delay(2, u32::MAX),
+            Duration::from_millis(u64::MAX)
+        );
     }
 
     #[tokio::test]
