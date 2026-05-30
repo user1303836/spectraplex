@@ -11,6 +11,16 @@ env:
   SQLX_OFFLINE: true
 
 jobs:
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
+
   fmt:
     name: Formatting
     runs-on: ubuntu-latest
