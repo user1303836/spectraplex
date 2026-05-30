@@ -23,6 +23,50 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How often the worker sends heartbeats while executing a run.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+#[derive(Debug, PartialEq, Eq)]
+struct MaterializationScope {
+    wallet: String,
+    network: Option<String>,
+    callback_url: Option<String>,
+    ingestion_run_id: Option<Uuid>,
+}
+
+fn optional_scope_string(scope: &serde_json::Value, key: &str) -> Option<String> {
+    scope
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn parse_materialization_scope(scope: &serde_json::Value) -> Result<MaterializationScope, String> {
+    let wallet = scope
+        .get("wallet")
+        .and_then(|v| v.as_str())
+        .filter(|wallet| !wallet.is_empty())
+        .ok_or_else(|| "missing or empty wallet in scope".to_string())?
+        .to_string();
+
+    let ingestion_run_id = match scope.get("ingestion_run_id") {
+        Some(value) => {
+            let run_id = value
+                .as_str()
+                .ok_or_else(|| "invalid ingestion_run_id in scope".to_string())?;
+            Some(
+                Uuid::parse_str(run_id)
+                    .map_err(|_| "invalid ingestion_run_id in scope".to_string())?,
+            )
+        }
+        None => None,
+    };
+
+    Ok(MaterializationScope {
+        wallet,
+        network: optional_scope_string(scope, "network"),
+        callback_url: optional_scope_string(scope, "callback_url"),
+        ingestion_run_id,
+    })
+}
+
 /// Spawn the materialize worker loop. Returns immediately; the worker runs
 /// until `cancel` is triggered.
 pub fn spawn_materialize_worker(
@@ -96,27 +140,21 @@ async fn worker_tick(
         info!(run_id = %run.id, worker_id = %worker_id, "Claimed materialization run");
 
         // Extract wallet, network, callback_url, and optional ingestion_run_id from scope JSON.
-        let (wallet, _network, callback_url, ingestion_run_id) = match &run.scope {
-            Some(scope) => {
-                let w = scope
-                    .get("wallet")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let n = scope
-                    .get("network")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let cb = scope
-                    .get("callback_url")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let run_id = scope
-                    .get("ingestion_run_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| Uuid::parse_str(s).ok());
-                (w, n, cb, run_id)
-            }
+        let MaterializationScope {
+            wallet,
+            network: _network,
+            callback_url,
+            ingestion_run_id,
+        } = match &run.scope {
+            Some(scope) => match parse_materialization_scope(scope) {
+                Ok(scope) => scope,
+                Err(message) => {
+                    let _ = repo
+                        .fail_materialization_run(run.id, worker_id, &message)
+                        .await;
+                    continue;
+                }
+            },
             None => {
                 let _ = repo
                     .fail_materialization_run(run.id, worker_id, "missing scope")
@@ -124,13 +162,6 @@ async fn worker_tick(
                 continue;
             }
         };
-
-        if wallet.is_empty() {
-            let _ = repo
-                .fail_materialization_run(run.id, worker_id, "empty wallet in scope")
-                .await;
-            continue;
-        }
 
         // Spawn the execution as a concurrent task so the worker loop can
         // continue claiming more runs while this one executes.
@@ -502,5 +533,46 @@ mod tests {
         assert_eq!(usize_to_i64_or_max(i64::MAX as usize), i64::MAX);
         assert_eq!(usize_to_i64_or_max(i64::MAX as usize + 1), i64::MAX);
         assert_eq!(usize_to_i64_or_max(usize::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn parse_materialization_scope_accepts_valid_scope() {
+        let run_id = Uuid::new_v4();
+        let scope = serde_json::json!({
+            "wallet": "0xwallet",
+            "network": "ethereum-mainnet",
+            "callback_url": "https://example.com/callback",
+            "ingestion_run_id": run_id.to_string(),
+        });
+
+        let parsed = parse_materialization_scope(&scope).unwrap();
+        assert_eq!(parsed.wallet, "0xwallet");
+        assert_eq!(parsed.network.as_deref(), Some("ethereum-mainnet"));
+        assert_eq!(
+            parsed.callback_url.as_deref(),
+            Some("https://example.com/callback")
+        );
+        assert_eq!(parsed.ingestion_run_id, Some(run_id));
+    }
+
+    #[test]
+    fn parse_materialization_scope_rejects_missing_wallet() {
+        let scope = serde_json::json!({
+            "ingestion_run_id": Uuid::new_v4().to_string(),
+        });
+
+        let error = parse_materialization_scope(&scope).unwrap_err();
+        assert_eq!(error, "missing or empty wallet in scope");
+    }
+
+    #[test]
+    fn parse_materialization_scope_rejects_invalid_ingestion_run_id() {
+        let scope = serde_json::json!({
+            "wallet": "0xwallet",
+            "ingestion_run_id": "not-a-uuid",
+        });
+
+        let error = parse_materialization_scope(&scope).unwrap_err();
+        assert_eq!(error, "invalid ingestion_run_id in scope");
     }
 }
