@@ -222,6 +222,10 @@ fn parse_ledger_update(
     }
 }
 
+fn u64_to_i64_or_max(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 // ---------------------------------------------------------------------------
 // Token Transfer extraction (P3-W2)
 // ---------------------------------------------------------------------------
@@ -576,9 +580,9 @@ pub fn extract_hl_fill_records(
         closed_pnl,
         fee,
         fee_token: fill.fee_token,
-        fill_time: fill.time as i64,
-        order_id: fill.oid.map(|v| v as i64),
-        trade_id: fill.tid.map(|v| v as i64),
+        fill_time: u64_to_i64_or_max(fill.time),
+        order_id: fill.oid.map(u64_to_i64_or_max),
+        trade_id: fill.tid.map(u64_to_i64_or_max),
         dataset_version_id: None,
         created_at: Utc::now(),
     }]
@@ -627,7 +631,7 @@ pub fn extract_hl_funding_payments(
         coin: funding.coin,
         amount,
         funding_rate,
-        payment_time: funding.time as i64,
+        payment_time: u64_to_i64_or_max(funding.time),
         dataset_version_id: None,
         created_at: Utc::now(),
     }]
@@ -873,6 +877,13 @@ mod tests {
             chain: Chain::Hyperliquid,
             raw_metadata: serde_json::json!({ "type": raw_type, "data": data }),
         }
+    }
+
+    #[test]
+    fn test_u64_to_i64_or_max() {
+        assert_eq!(u64_to_i64_or_max(42), 42);
+        assert_eq!(u64_to_i64_or_max(i64::MAX as u64), i64::MAX);
+        assert_eq!(u64_to_i64_or_max(u64::MAX), i64::MAX);
     }
 
     #[test]
@@ -1292,6 +1303,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_extract_hl_fill_record_saturates_large_numeric_fields() {
+        let metadata = serde_json::json!({
+            "type": "fill",
+            "data": {
+                "coin": "ETH",
+                "px": "3500.0",
+                "sz": "2.0",
+                "side": "B",
+                "time": u64::MAX,
+                "hash": "0xfill-overflow",
+                "oid": u64::MAX,
+                "tid": u64::MAX
+            }
+        });
+
+        let fills = extract_hl_fill_records(None, "hypercore-mainnet", &metadata);
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].fill_time, i64::MAX);
+        assert_eq!(fills[0].order_id, Some(i64::MAX));
+        assert_eq!(fills[0].trade_id, Some(i64::MAX));
+    }
+
     // -- HlFundingPayment extraction tests (P3-W4) --
 
     #[test]
@@ -1360,6 +1395,24 @@ mod tests {
             payments.is_empty(),
             "fills should not produce funding payments"
         );
+    }
+
+    #[test]
+    fn test_extract_hl_funding_payment_saturates_large_time() {
+        let metadata = serde_json::json!({
+            "type": "funding",
+            "data": {
+                "time": u64::MAX,
+                "coin": "ETH",
+                "usdc": "-2.50",
+                "fundingRate": "0.0001"
+            }
+        });
+
+        let payments = extract_hl_funding_payments(None, "hypercore-mainnet", &metadata);
+
+        assert_eq!(payments.len(), 1);
+        assert_eq!(payments[0].payment_time, i64::MAX);
     }
 
     // -- HlPositionChange extraction tests (P3-W4) --
