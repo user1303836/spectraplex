@@ -11,7 +11,7 @@ use crate::fire_callback;
 use spectraplex_adapters::dual_write::BronzeSilverResult;
 use spectraplex_adapters::repo::Repository;
 use spectraplex_core::config::AppConfig;
-use spectraplex_core::v2::{CompletenessStatus, DatasetCompleteness, TargetKind};
+use spectraplex_core::v2::{CompletenessStatus, DatasetCompleteness, IngestionRun, TargetKind};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -250,47 +250,51 @@ async fn worker_tick(
                                 // under non-authoritative scope values.
                                 let wm_resolved = match task_repo.get_ingestion_run(irun_id).await {
                                     Ok(Some(irun)) => {
-                                        // Upsert dataset completeness for each materialized dataset.
-                                        for (dataset_name, ds_count) in &silver_result.per_dataset {
-                                            let status = if silver_result.all_succeeded() {
-                                                CompletenessStatus::Complete
-                                            } else {
-                                                CompletenessStatus::Partial
-                                            };
-                                            let dc = DatasetCompleteness {
-                                                id: Uuid::new_v4(),
-                                                target_id: irun
-                                                    .target_id
-                                                    .unwrap_or_else(Uuid::new_v4),
-                                                dataset_name: dataset_name.clone(),
-                                                dataset_version_id: None,
-                                                network: irun.network.clone(),
-                                                status,
-                                                coverage_start: silver_result.coverage_start,
-                                                coverage_end: silver_result.coverage_end,
-                                                block_start: None,
-                                                block_end: None,
-                                                last_ingestion_run_id: Some(irun_id),
-                                                records_count: usize_to_i64_or_max(*ds_count),
-                                                gap_ranges: None,
-                                                notes: None,
-                                                created_at: chrono::Utc::now(),
-                                                updated_at: chrono::Utc::now(),
-                                            };
-                                            if let Err(e) =
-                                                task_repo.upsert_dataset_completeness(&dc).await
-                                            {
-                                                warn!(run_id = %run_id, dataset = %dataset_name, error = %e, "Failed to upsert dataset completeness (non-fatal)");
+                                        match dataset_completeness_for_ingestion_run(
+                                            &irun,
+                                            &silver_result,
+                                        ) {
+                                            Some(completeness_records) => {
+                                                for dc in completeness_records {
+                                                    let dataset_name = dc.dataset_name.clone();
+                                                    if let Err(e) = task_repo
+                                                        .upsert_dataset_completeness(&dc)
+                                                        .await
+                                                    {
+                                                        warn!(run_id = %run_id, dataset = %dataset_name, error = %e, "Failed to upsert dataset completeness (non-fatal)");
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                warn!(
+                                                    run_id = %run_id,
+                                                    ingestion_run_id = %irun_id,
+                                                    "Skipping dataset completeness because ingestion run has no target_id"
+                                                );
                                             }
                                         }
 
                                         let w = if let Some(tid) = irun.target_id {
-                                            task_repo
-                                                .get_index_target(tid)
-                                                .await
-                                                .ok()
-                                                .flatten()
-                                                .and_then(|t| t.address)
+                                            match task_repo.get_index_target(tid).await {
+                                                Ok(Some(target)) => target.address,
+                                                Ok(None) => {
+                                                    warn!(
+                                                        run_id = %run_id,
+                                                        target_id = %tid,
+                                                        "Could not resolve authoritative scope for watermark because target was not found"
+                                                    );
+                                                    None
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        run_id = %run_id,
+                                                        target_id = %tid,
+                                                        error = %e,
+                                                        "Failed to resolve authoritative scope for watermark"
+                                                    );
+                                                    None
+                                                }
+                                            }
                                         } else {
                                             None
                                         };
@@ -512,6 +516,44 @@ fn usize_to_i64_or_max(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+fn dataset_completeness_for_ingestion_run(
+    irun: &IngestionRun,
+    silver_result: &BronzeSilverResult,
+) -> Option<Vec<DatasetCompleteness>> {
+    let target_id = irun.target_id?;
+    let status = if silver_result.all_succeeded() {
+        CompletenessStatus::Complete
+    } else {
+        CompletenessStatus::Partial
+    };
+    let now = chrono::Utc::now();
+
+    Some(
+        silver_result
+            .per_dataset
+            .iter()
+            .map(|(dataset_name, ds_count)| DatasetCompleteness {
+                id: Uuid::new_v4(),
+                target_id,
+                dataset_name: dataset_name.clone(),
+                dataset_version_id: None,
+                network: irun.network.clone(),
+                status,
+                coverage_start: silver_result.coverage_start,
+                coverage_end: silver_result.coverage_end,
+                block_start: None,
+                block_end: None,
+                last_ingestion_run_id: Some(irun.id),
+                records_count: usize_to_i64_or_max(*ds_count),
+                gap_ranges: None,
+                notes: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .collect(),
+    )
+}
+
 /// Chain-aware address comparison: case-insensitive for EVM (0x-prefixed),
 /// exact match for everything else (Solana base58 is case-sensitive).
 fn addrs_match(a: &str, b: &str) -> bool {
@@ -533,6 +575,74 @@ mod tests {
         assert_eq!(usize_to_i64_or_max(i64::MAX as usize), i64::MAX);
         assert_eq!(usize_to_i64_or_max(i64::MAX as usize + 1), i64::MAX);
         assert_eq!(usize_to_i64_or_max(usize::MAX), i64::MAX);
+    }
+
+    fn test_ingestion_run(target_id: Option<Uuid>) -> IngestionRun {
+        IngestionRun {
+            id: Uuid::new_v4(),
+            target_id,
+            network: "ethereum-mainnet".to_string(),
+            source: "rpc".to_string(),
+            mode: spectraplex_core::v2::IngestionJobMode::Incremental,
+            status: spectraplex_core::v2::IngestionJobStatus::Completed,
+            started_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            records_written: 0,
+            error_message: None,
+            cursor_state: None,
+        }
+    }
+
+    fn test_silver_result(total_failed: usize) -> BronzeSilverResult {
+        let mut per_dataset = std::collections::HashMap::new();
+        per_dataset.insert("token_transfers".to_string(), 7);
+
+        BronzeSilverResult {
+            total_written: 7,
+            total_failed,
+            per_dataset,
+            coverage_start: Some(10),
+            coverage_end: Some(20),
+            ..BronzeSilverResult::default()
+        }
+    }
+
+    #[test]
+    fn dataset_completeness_for_ingestion_run_skips_missing_target_id() {
+        let irun = test_ingestion_run(None);
+        let silver_result = test_silver_result(0);
+
+        assert!(dataset_completeness_for_ingestion_run(&irun, &silver_result).is_none());
+    }
+
+    #[test]
+    fn dataset_completeness_for_ingestion_run_uses_authoritative_target() {
+        let target_id = Uuid::new_v4();
+        let irun = test_ingestion_run(Some(target_id));
+        let silver_result = test_silver_result(0);
+
+        let records = dataset_completeness_for_ingestion_run(&irun, &silver_result).unwrap();
+
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.target_id, target_id);
+        assert_eq!(record.dataset_name, "token_transfers");
+        assert_eq!(record.network, "ethereum-mainnet");
+        assert_eq!(record.status, CompletenessStatus::Complete);
+        assert_eq!(record.coverage_start, Some(10));
+        assert_eq!(record.coverage_end, Some(20));
+        assert_eq!(record.last_ingestion_run_id, Some(irun.id));
+        assert_eq!(record.records_count, 7);
+    }
+
+    #[test]
+    fn dataset_completeness_for_ingestion_run_marks_partial_failures() {
+        let irun = test_ingestion_run(Some(Uuid::new_v4()));
+        let silver_result = test_silver_result(1);
+
+        let records = dataset_completeness_for_ingestion_run(&irun, &silver_result).unwrap();
+
+        assert_eq!(records[0].status, CompletenessStatus::Partial);
     }
 
     #[test]
