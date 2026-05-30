@@ -290,22 +290,19 @@ impl HyperliquidAdapter {
             .ok_or_else(|| anyhow::anyhow!("wallet target must have an address"))?;
 
         let resume_ms = cursor_to_start_time_ms(cursor);
+        let resume_ms_u64 = i64_to_u64_or_zero(resume_ms);
         let network = &target.network;
         let mut records = Vec::new();
 
         // 1. Fills — no startTime param, filter client-side
         let fills = self.fetch_user_fills(wallet_str).await?;
-        for fill in fills
-            .iter()
-            .filter(|f| f.time >= resume_ms as u64)
-            .take(limit)
-        {
+        for fill in fills.iter().filter(|f| f.time >= resume_ms_u64).take(limit) {
             let raw = serde_json::to_value(fill)?;
             records.push(RawTransaction {
                 id: Uuid::new_v4(),
                 network: network.clone(),
                 tx_hash: fill.hash.clone(),
-                timestamp: (fill.time / 1000) as i64,
+                timestamp: unix_ms_to_secs_i64(fill.time),
                 block_number: None,
                 raw_metadata: serde_json::json!({ "type": "fill", "data": raw }),
                 source: "hl-rest-wallet-backfill".to_string(),
@@ -328,7 +325,7 @@ impl HyperliquidAdapter {
                     id: Uuid::new_v4(),
                     network: network.clone(),
                     tx_hash: hash,
-                    timestamp: (entry.time / 1000) as i64,
+                    timestamp: unix_ms_to_secs_i64(entry.time),
                     block_number: None,
                     raw_metadata: serde_json::json!({ "type": "funding", "data": raw }),
                     source: "hl-rest-wallet-backfill".to_string(),
@@ -350,7 +347,7 @@ impl HyperliquidAdapter {
                     id: Uuid::new_v4(),
                     network: network.clone(),
                     tx_hash: update.hash.clone(),
-                    timestamp: (update.time / 1000) as i64,
+                    timestamp: unix_ms_to_secs_i64(update.time),
                     block_number: None,
                     raw_metadata: serde_json::json!({ "type": "ledger_update", "data": raw }),
                     source: "hl-rest-wallet-backfill".to_string(),
@@ -413,7 +410,7 @@ impl HyperliquidAdapter {
                     id: Uuid::new_v4(),
                     network: network.clone(),
                     tx_hash: hash,
-                    timestamp: (rate.time / 1000) as i64,
+                    timestamp: unix_ms_to_secs_i64(rate.time),
                     block_number: None,
                     raw_metadata: serde_json::json!({ "type": "funding_rate", "data": raw }),
                     source: "hl-rest-market-backfill".to_string(),
@@ -448,8 +445,27 @@ fn cursor_to_start_time_ms(cursor: Option<&serde_json::Value>) -> i64 {
     cursor
         .and_then(|c| c.get("last_time_ms"))
         .and_then(|v| v.as_i64())
-        .map(|ms| ms + 1) // advance past last seen
+        .map(resume_after_ms)
         .unwrap_or(0)
+}
+
+fn resume_after_ms(last_time_ms: i64) -> i64 {
+    last_time_ms.saturating_add(1).max(0)
+}
+
+fn timestamp_secs_to_resume_ms(last_timestamp_secs: i64) -> i64 {
+    last_timestamp_secs
+        .saturating_mul(1000)
+        .saturating_add(1)
+        .max(0)
+}
+
+fn i64_to_u64_or_zero(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
+}
+
+fn unix_ms_to_secs_i64(time_ms: u64) -> i64 {
+    i64::try_from(time_ms / 1000).unwrap_or(i64::MAX)
 }
 
 /// Source string for V2 Hyperliquid ingestion paths.
@@ -642,23 +658,20 @@ impl ChainIngestor for HyperliquidAdapter {
         // Add 1ms to avoid re-fetching the last seen event.
         let resume_ms = checkpoint
             .and_then(|cp| cp.last_timestamp)
-            .map(|ts| (ts * 1000) + 1)
+            .map(timestamp_secs_to_resume_ms)
             .unwrap_or(0);
+        let resume_ms_u64 = i64_to_u64_or_zero(resume_ms);
 
         // 1. Fetch fills (trades) — the fills endpoint has no startTime param,
         //    so we filter client-side.
         let fills = self.fetch_user_fills(wallet).await?;
-        for fill in fills
-            .iter()
-            .filter(|f| f.time >= resume_ms as u64)
-            .take(limit)
-        {
+        for fill in fills.iter().filter(|f| f.time >= resume_ms_u64).take(limit) {
             let raw = serde_json::to_value(fill)?;
             transactions.push(Transaction {
                 id: Uuid::new_v4(),
                 user_id,
                 wallet_address: wallet.to_string(),
-                timestamp: (fill.time / 1000) as i64,
+                timestamp: unix_ms_to_secs_i64(fill.time),
                 tx_hash: fill.hash.clone(),
                 chain: Chain::Hyperliquid,
                 raw_metadata: serde_json::json!({ "type": "fill", "data": raw }),
@@ -677,7 +690,7 @@ impl ChainIngestor for HyperliquidAdapter {
                 id: Uuid::new_v4(),
                 user_id,
                 wallet_address: wallet.to_string(),
-                timestamp: (entry.time / 1000) as i64,
+                timestamp: unix_ms_to_secs_i64(entry.time),
                 tx_hash: hash,
                 chain: Chain::Hyperliquid,
                 raw_metadata: serde_json::json!({ "type": "funding", "data": raw }),
@@ -692,7 +705,7 @@ impl ChainIngestor for HyperliquidAdapter {
                 id: Uuid::new_v4(),
                 user_id,
                 wallet_address: wallet.to_string(),
-                timestamp: (update.time / 1000) as i64,
+                timestamp: unix_ms_to_secs_i64(update.time),
                 tx_hash: update.hash.clone(),
                 chain: Chain::Hyperliquid,
                 raw_metadata: serde_json::json!({ "type": "ledger_update", "data": raw }),
@@ -1431,9 +1444,43 @@ mod tests {
     }
 
     #[test]
+    fn test_cursor_to_start_time_ms_saturates_max_value() {
+        let cursor = serde_json::json!({ "last_time_ms": i64::MAX });
+        assert_eq!(cursor_to_start_time_ms(Some(&cursor)), i64::MAX);
+    }
+
+    #[test]
+    fn test_cursor_to_start_time_ms_clamps_negative_value() {
+        let cursor = serde_json::json!({ "last_time_ms": -5_i64 });
+        assert_eq!(cursor_to_start_time_ms(Some(&cursor)), 0);
+    }
+
+    #[test]
     fn test_cursor_to_start_time_ms_missing_key() {
         let cursor = serde_json::json!({ "other_key": 123 });
         assert_eq!(cursor_to_start_time_ms(Some(&cursor)), 0);
+    }
+
+    #[test]
+    fn test_timestamp_secs_to_resume_ms_boundaries() {
+        assert_eq!(
+            timestamp_secs_to_resume_ms(1_700_000_000),
+            1_700_000_000_001
+        );
+        assert_eq!(timestamp_secs_to_resume_ms(-5), 0);
+        assert_eq!(timestamp_secs_to_resume_ms(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn test_i64_to_u64_or_zero() {
+        assert_eq!(i64_to_u64_or_zero(42), 42);
+        assert_eq!(i64_to_u64_or_zero(-1), 0);
+    }
+
+    #[test]
+    fn test_unix_ms_to_secs_i64_boundaries() {
+        assert_eq!(unix_ms_to_secs_i64(1_700_000_000_999), 1_700_000_000);
+        assert_eq!(unix_ms_to_secs_i64(u64::MAX), 18_446_744_073_709_551);
     }
 
     #[test]
