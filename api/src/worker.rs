@@ -203,12 +203,9 @@ async fn execute_job(
                 if let Some(tid) = job.target_id {
                     match repo.get_index_target(tid).await {
                         Ok(Some(target)) => {
-                            if target.kind == TargetKind::Wallet {
-                                let mat_scope = serde_json::json!({
-                                    "wallet": target.address.unwrap_or_default(),
-                                    "network": &job.network,
-                                    "ingestion_run_id": run_id.to_string(),
-                                });
+                            if let Some(mat_scope) =
+                                auto_materialization_scope(&target, &job.network, run_id)
+                            {
                                 if let Err(e) = repo
                                     .create_materialization_run(
                                         "normalize",
@@ -223,6 +220,12 @@ async fn execute_job(
                                 } else {
                                     info!(job_id = %job_id, "Enqueued post-ingest materialization run");
                                 }
+                            } else if target.kind == TargetKind::Wallet {
+                                warn!(
+                                    job_id = %job_id,
+                                    target_id = %tid,
+                                    "Skipping post-ingest materialization for wallet target without an address"
+                                );
                             } else {
                                 info!(job_id = %job_id, target_kind = ?target.kind, "Skipping wallet-scoped post-ingest materialization for non-wallet target");
                             }
@@ -592,6 +595,27 @@ fn usize_to_i64_or_max(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+fn auto_materialization_scope(
+    target: &IndexTarget,
+    network: &str,
+    run_id: Uuid,
+) -> Option<serde_json::Value> {
+    if target.kind != TargetKind::Wallet {
+        return None;
+    }
+
+    let wallet = target
+        .address
+        .as_deref()
+        .filter(|address| !address.is_empty())?;
+
+    Some(serde_json::json!({
+        "wallet": wallet,
+        "network": network,
+        "ingestion_run_id": run_id.to_string(),
+    }))
+}
+
 fn requested_by_user_id(requested_by: Option<&str>, target_owner_id: Option<Uuid>) -> Uuid {
     let requested_by = requested_by
         .map(str::trim)
@@ -666,6 +690,58 @@ mod tests {
         assert_eq!(usize_to_i64_or_max(i64::MAX as usize), i64::MAX);
         assert_eq!(usize_to_i64_or_max(i64::MAX as usize + 1), i64::MAX);
         assert_eq!(usize_to_i64_or_max(usize::MAX), i64::MAX);
+    }
+
+    fn test_target(kind: TargetKind, address: Option<&str>) -> IndexTarget {
+        let now = chrono::Utc::now();
+        IndexTarget {
+            id: Uuid::new_v4(),
+            kind,
+            network: "ethereum-mainnet".to_string(),
+            chain_family: ChainFamily::Evm,
+            address: address.map(str::to_string),
+            filter_spec: None,
+            mode: TargetMode::Backfill,
+            label: None,
+            owner_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn auto_materialization_scope_builds_wallet_scope() {
+        let run_id = Uuid::new_v4();
+        let target = test_target(TargetKind::Wallet, Some("0xabc"));
+
+        let scope = auto_materialization_scope(&target, "ethereum-mainnet", run_id).unwrap();
+
+        assert_eq!(scope["wallet"], "0xabc");
+        assert_eq!(scope["network"], "ethereum-mainnet");
+        assert_eq!(scope["ingestion_run_id"], run_id.to_string());
+    }
+
+    #[test]
+    fn auto_materialization_scope_skips_wallet_without_address() {
+        assert!(auto_materialization_scope(
+            &test_target(TargetKind::Wallet, None),
+            "ethereum-mainnet",
+            Uuid::new_v4()
+        )
+        .is_none());
+        assert!(auto_materialization_scope(
+            &test_target(TargetKind::Wallet, Some("")),
+            "ethereum-mainnet",
+            Uuid::new_v4()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn auto_materialization_scope_skips_non_wallet_targets() {
+        let target = test_target(TargetKind::Market, Some("ETH"));
+
+        assert!(auto_materialization_scope(&target, "ethereum-mainnet", Uuid::new_v4()).is_none());
     }
 
     #[test]
