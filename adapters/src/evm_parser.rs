@@ -376,12 +376,9 @@ fn token_symbol(contract_address: &str) -> String {
     }
 }
 
-/// Normalize a raw token amount by dividing by 10^decimals.
 /// Normalize a BigDecimal raw amount by dividing by 10^decimals.
 fn normalize_bigdecimal(raw: BigDecimal, decimals: u32) -> BigDecimal {
-    use std::str::FromStr;
-    let divisor = BigDecimal::from_str(&format!("1{}", "0".repeat(decimals as usize)))
-        .unwrap_or_else(|_| BigDecimal::from(1));
+    let divisor = BigDecimal::new(1.into(), -i64::from(decimals));
     raw / divisor
 }
 
