@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "5a5783aa26c3",
+  "strategy": "manual-commit",
+  "branch": "codex/remove-more-guarded-unwraps",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "adapters/src/evm.rs",
+    "cli/src/main.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/5a/5783aa26c3/0/metadata.json",
+      "transcript": "/5a/5783aa26c3/0/full.jsonl",
+      "context": "/5a/5783aa26c3/0/context.md",
+      "content_hash": "/5a/5783aa26c3/0/content_hash.txt",
+      "prompt": "/5a/5783aa26c3/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 1
+  }
+}
