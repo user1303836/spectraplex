@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "6c17d8c0f61b",
+  "strategy": "manual-commit",
+  "branch": "codex/name-solana-token-amount-parser",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "adapters/src/solana_parser.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/6c/17d8c0f61b/0/metadata.json",
+      "transcript": "/6c/17d8c0f61b/0/full.jsonl",
+      "context": "/6c/17d8c0f61b/0/context.md",
+      "content_hash": "/6c/17d8c0f61b/0/content_hash.txt",
+      "prompt": "/6c/17d8c0f61b/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 1
+  }
+}
