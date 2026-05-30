@@ -12,6 +12,10 @@ use spectraplex_core::materializer::{
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+fn usize_to_i64_or_max(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// Compute PnL summary records from fills and funding payments.
 ///
 /// Groups fills by (wallet_address, coin) — aggregating closed_pnl, fees,
@@ -47,13 +51,13 @@ pub fn compute_pnl_summary(
             win_count: 0,
             loss_count: 0,
         });
-        agg.fill_count += 1;
+        agg.fill_count = agg.fill_count.saturating_add(1);
         if let Some(ref cpnl) = fill.closed_pnl {
             agg.total_closed_pnl += cpnl;
             if cpnl > &BigDecimal::from(0) {
-                agg.win_count += 1;
+                agg.win_count = agg.win_count.saturating_add(1);
             } else if cpnl < &BigDecimal::from(0) {
-                agg.loss_count += 1;
+                agg.loss_count = agg.loss_count.saturating_add(1);
             }
         }
         if let Some(ref fee) = fill.fee {
@@ -79,7 +83,7 @@ pub fn compute_pnl_summary(
     let mut results: Vec<HlPnlSummary> = map
         .into_iter()
         .map(|(coin, agg)| {
-            let trade_count = agg.win_count + agg.loss_count;
+            let trade_count = agg.win_count.saturating_add(agg.loss_count);
             let avg_trade_size = if agg.trade_sizes.is_empty() {
                 BigDecimal::from(0)
             } else {
@@ -87,7 +91,7 @@ pub fn compute_pnl_summary(
                     .trade_sizes
                     .iter()
                     .fold(BigDecimal::from(0), |acc, s| acc + s);
-                total_size / BigDecimal::from(agg.trade_sizes.len() as i64)
+                total_size / BigDecimal::from(usize_to_i64_or_max(agg.trade_sizes.len()))
             };
             let net_pnl = &agg.total_closed_pnl + &agg.total_funding - &agg.total_fees;
             let id_key = format!(
@@ -183,7 +187,7 @@ pub fn build_trade_history(
                         .map(|f| f.side.clone())
                         .unwrap_or_default();
                     let opened_at = open_fills.first().map(|f| f.fill_time).unwrap_or(0);
-                    let num_fills = (open_fills.len() + 1) as i64;
+                    let num_fills = usize_to_i64_or_max(open_fills.len().saturating_add(1));
                     let fill_ids: Vec<Uuid> = open_fills
                         .iter()
                         .map(|f| f.id)
@@ -282,11 +286,15 @@ pub fn build_trader_analytics(
         .iter()
         .fold(BigDecimal::from(0), |acc, t| acc + &t.size * &t.entry_price);
 
-    let total_trades = trade_histories.len() as i64;
+    let total_trades = usize_to_i64_or_max(trade_histories.len());
 
-    let total_wins: i64 = pnl_summaries.iter().map(|s| s.win_count).sum();
-    let total_losses: i64 = pnl_summaries.iter().map(|s| s.loss_count).sum();
-    let total_resolved = total_wins + total_losses;
+    let total_wins: i64 = pnl_summaries
+        .iter()
+        .fold(0_i64, |acc, s| acc.saturating_add(s.win_count));
+    let total_losses: i64 = pnl_summaries
+        .iter()
+        .fold(0_i64, |acc, s| acc.saturating_add(s.loss_count));
+    let total_resolved = total_wins.saturating_add(total_losses);
     let win_rate = if total_resolved > 0 {
         total_wins as f64 / total_resolved as f64
     } else {
@@ -307,7 +315,7 @@ pub fn build_trader_analytics(
             .entry(t.coin.clone())
             .or_insert_with(|| (BigDecimal::from(0), BigDecimal::from(0), 0, 0, 0));
         entry.1 += &t.size * &t.entry_price;
-        entry.2 += 1;
+        entry.2 = entry.2.saturating_add(1);
     }
 
     let mut coin_breakdown: Vec<CoinPnlSummary> = coin_map
@@ -372,7 +380,7 @@ pub fn build_market_analytics(
         });
         entry.volume += &t.size * &t.entry_price;
         entry.traders.insert(t.wallet_address.clone());
-        entry.trade_count += 1;
+        entry.trade_count = entry.trade_count.saturating_add(1);
         entry.sizes.push(t.size.clone());
     }
 
@@ -390,7 +398,7 @@ pub fn build_market_analytics(
                 BigDecimal::from(0)
             } else {
                 let sum: BigDecimal = agg.sizes.iter().fold(BigDecimal::from(0), |acc, s| acc + s);
-                sum / BigDecimal::from(agg.sizes.len() as i64)
+                sum / BigDecimal::from(usize_to_i64_or_max(agg.sizes.len()))
             };
             CoinMarketSummary {
                 coin,
@@ -477,6 +485,16 @@ mod tests {
             dataset_version_id: None,
             created_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn usize_to_i64_or_max_saturates() {
+        assert_eq!(usize_to_i64_or_max(0), 0);
+        assert_eq!(usize_to_i64_or_max(42), 42);
+        assert_eq!(
+            usize_to_i64_or_max(usize::MAX),
+            i64::try_from(usize::MAX).unwrap_or(i64::MAX)
+        );
     }
 
     #[test]
