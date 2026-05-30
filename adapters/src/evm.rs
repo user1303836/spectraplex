@@ -33,6 +33,9 @@ const RPC_RETRY_BASE_MS: u64 = 100;
 /// Maximum block range per eth_getLogs request.
 const DEFAULT_BLOCK_CHUNK: u64 = 2000;
 
+/// Default rate limit for EVM RPC calls, in requests per second.
+const DEFAULT_RPC_RATE_LIMIT_PER_SECOND: u32 = 5;
+
 /// Number of blocks per chunk when scanning for native ETH transfers via
 /// `eth_getBlockByNumber`. Full-block fetches are much heavier than log
 /// queries (1 RPC call per block), so scanning is done in chunks of this
@@ -82,8 +85,10 @@ impl EvmAdapter {
             .build()?;
         let provider = ProviderBuilder::new().connect_reqwest(client, url.clone());
 
-        // 5 requests per second by default (safe for public RPCs)
-        let quota = Quota::per_second(NonZeroU32::new(5).unwrap());
+        let quota = Quota::per_second(
+            NonZeroU32::new(DEFAULT_RPC_RATE_LIMIT_PER_SECOND)
+                .ok_or_else(|| anyhow::anyhow!("EVM RPC rate limit must be non-zero"))?,
+        );
         let limiter = RateLimiter::direct(quota);
 
         let trace_http_client = reqwest::Client::builder()
@@ -1284,8 +1289,9 @@ mod tests {
     use chrono::Utc;
 
     #[test]
-    fn test_adapter_block_chunk_default() {
+    fn test_adapter_defaults() {
         assert_eq!(DEFAULT_BLOCK_CHUNK, 2000);
+        assert_eq!(DEFAULT_RPC_RATE_LIMIT_PER_SECOND, 5);
     }
 
     #[test]
