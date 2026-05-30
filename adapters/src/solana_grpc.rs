@@ -766,17 +766,19 @@ fn build_raw_metadata(
 ) -> anyhow::Result<serde_json::Value> {
     let signature = bs58::encode(&tx_info.signature).into_string();
 
-    let account_keys: Vec<String> = tx_info
+    let transaction = tx_info
         .transaction
         .as_ref()
-        .and_then(|tx| tx.message.as_ref())
-        .map(|msg| {
-            msg.account_keys
-                .iter()
-                .map(|k| bs58::encode(k).into_string())
-                .collect()
-        })
-        .unwrap_or_default();
+        .ok_or_else(|| anyhow::anyhow!("Solana gRPC transaction update missing transaction"))?;
+    let message = transaction
+        .message
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Solana gRPC transaction update missing message"))?;
+    let account_keys: Vec<String> = message
+        .account_keys
+        .iter()
+        .map(|k| bs58::encode(k).into_string())
+        .collect();
 
     let (pre_balances, post_balances, fee, pre_token_balances, post_token_balances, log_messages) =
         if let Some(meta) = &tx_info.meta {
@@ -969,6 +971,43 @@ mod tests {
         let decoded = bs58::decode(&transaction.tx_hash).into_vec().unwrap();
         assert_eq!(decoded.len(), 64);
         assert!(decoded.iter().all(|&b| b == 1));
+    }
+
+    #[test]
+    fn test_convert_grpc_transaction_missing_transaction_errors() {
+        let mut tx_info = make_test_tx_info(vec![0], vec![0], vec![vec![0u8; 32]]);
+        tx_info.transaction = None;
+
+        let err = convert_grpc_transaction(&tx_info, 100)
+            .expect_err("missing gRPC transaction should fail conversion");
+
+        assert!(
+            err.to_string().contains("missing transaction"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_convert_grpc_to_raw_transaction_missing_message_errors() {
+        let mut tx_info = make_test_tx_info(vec![0], vec![0], vec![vec![0u8; 32]]);
+        tx_info
+            .transaction
+            .as_mut()
+            .expect("test fixture should include transaction")
+            .message = None;
+
+        let err = convert_grpc_to_raw_transaction(
+            &tx_info,
+            100,
+            "solana-mainnet",
+            "solana-grpc-wallet-stream",
+        )
+        .expect_err("missing gRPC message should fail conversion");
+
+        assert!(
+            err.to_string().contains("missing message"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
