@@ -40,6 +40,7 @@ use crate::export_csv::{
     write_wallet_ledger_csv_rows,
 };
 use crate::ExportMetadata;
+use anyhow::Context;
 use serde::Serialize;
 use spectraplex_adapters::repo::Repository;
 use spectraplex_adapters::v2_repo::ExportRecordBatch;
@@ -96,17 +97,18 @@ pub(crate) async fn fetch_export_metadata(
     dataset: &str,
     target_id: Option<Uuid>,
     network: Option<&str>,
-) -> ExportMetadata {
+) -> anyhow::Result<ExportMetadata> {
     let active_version = repo
         .get_active_dataset_version(dataset)
         .await
-        .ok()
-        .flatten();
+        .with_context(|| format!("fetch active dataset version for export dataset {dataset}"))?;
 
     let completeness_records = repo
         .list_completeness_filtered(dataset, target_id, network)
         .await
-        .unwrap_or_default();
+        .with_context(|| {
+            format!("fetch dataset completeness records for export dataset {dataset}")
+        })?;
 
     let has_unknown_version = completeness_records
         .iter()
@@ -125,8 +127,11 @@ pub(crate) async fn fetch_export_metadata(
             [version_id] => repo
                 .get_dataset_version_by_id(*version_id)
                 .await
-                .ok()
-                .flatten(),
+                .with_context(|| {
+                    format!(
+                        "fetch completeness dataset version {version_id} for export dataset {dataset}"
+                    )
+                })?,
             _ => None,
         }
     };
@@ -198,7 +203,7 @@ pub(crate) async fn fetch_export_metadata(
             .find_map(|c| c.last_ingestion_run_id);
     }
 
-    meta
+    Ok(meta)
 }
 
 /// Return the canonical CSV header line for a given dataset name, or
@@ -318,7 +323,7 @@ pub(crate) async fn write_export_to_file(
     output_path: &str,
     cancel: CancellationToken,
 ) -> anyhow::Result<(usize, ExportMetadata)> {
-    let meta = fetch_export_metadata(repo, dataset, target_id, network).await;
+    let meta = fetch_export_metadata(repo, dataset, target_id, network).await?;
 
     // Reject unknown datasets before opening the file so we don't leave
     // an empty artifact behind.
@@ -585,7 +590,8 @@ mod tests {
             Some(target.id),
             Some("solana-mainnet"),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(meta.dataset_version_id, Some(old_version.id));
         assert_eq!(meta.dataset_version, Some(1));
@@ -655,8 +661,9 @@ mod tests {
                 .unwrap();
         }
 
-        let meta =
-            fetch_export_metadata(&repo, "wallet_ledger", None, Some("solana-mainnet")).await;
+        let meta = fetch_export_metadata(&repo, "wallet_ledger", None, Some("solana-mainnet"))
+            .await
+            .unwrap();
 
         assert_eq!(meta.dataset_version_id, None);
         assert_eq!(meta.dataset_version, None);
@@ -715,14 +722,34 @@ mod tests {
                 .unwrap();
         }
 
-        let meta =
-            fetch_export_metadata(&repo, "wallet_ledger", None, Some("solana-mainnet")).await;
+        let meta = fetch_export_metadata(&repo, "wallet_ledger", None, Some("solana-mainnet"))
+            .await
+            .unwrap();
 
         assert_eq!(meta.dataset_version_id, None);
         assert_eq!(meta.dataset_version, None);
         assert_eq!(meta.completeness_status.as_deref(), Some("complete"));
 
         pool.close().await;
+        drop_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_export_metadata_propagates_repository_errors() {
+        require_pg!();
+        let (repo, pool, db_name) = setup_test_repo("provenance_error").await;
+        pool.close().await;
+
+        let err = fetch_export_metadata(&repo, "wallet_ledger", None, Some("solana-mainnet"))
+            .await
+            .expect_err("closed repository pool should fail metadata lookup");
+
+        assert!(
+            err.to_string()
+                .contains("fetch active dataset version for export dataset wallet_ledger"),
+            "unexpected error: {err:#}"
+        );
+
         drop_test_db(&db_name).await;
     }
 }
