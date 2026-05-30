@@ -3173,6 +3173,15 @@ fn wallet_ledger_to_tax_csv(records: &[WalletLedgerRecord]) -> Vec<u8> {
     buf
 }
 
+fn sink_config_to_json(
+    sink_config: Option<&SinkConfig>,
+) -> Result<Option<serde_json::Value>, AppError> {
+    sink_config
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| AppError::internal(format!("Failed to serialize sink config: {e}")))
+}
+
 async fn create_export_job(
     State(state): State<Arc<AppState>>,
     Extension(owner): Extension<AuthenticatedOwner>,
@@ -3210,10 +3219,7 @@ async fn create_export_job(
     });
 
     // Build sink_config JSON if provided
-    let sink_config_json = req
-        .sink
-        .as_ref()
-        .map(|sc| serde_json::to_value(sc).unwrap_or_default());
+    let sink_config_json = sink_config_to_json(req.sink.as_ref())?;
 
     // Enqueue a durable export job in Postgres
     let dataset_name: DatasetName = req.dataset.parse().map_err(|_| {
@@ -7129,6 +7135,30 @@ mod tests {
         };
         let err = validate_sink_config(&config, "/tmp").await.unwrap_err();
         assert!(err.message.contains("HTTP(S)"));
+    }
+
+    #[test]
+    fn test_sink_config_to_json_preserves_config() {
+        let mut headers = HashMap::new();
+        headers.insert("x-spectraplex-token".to_string(), "secret".to_string());
+        let config = SinkConfig {
+            sink_type: SinkType::Webhook,
+            file_path: None,
+            url: Some("https://example.com/export".to_string()),
+            headers: Some(headers),
+            connection_string: None,
+            table: None,
+        };
+
+        let json = sink_config_to_json(Some(&config)).unwrap().unwrap();
+        assert_eq!(json["sink_type"], "webhook");
+        assert_eq!(json["url"], "https://example.com/export");
+        assert_eq!(json["headers"]["x-spectraplex-token"], "secret");
+    }
+
+    #[test]
+    fn test_sink_config_to_json_none() {
+        assert!(sink_config_to_json(None).unwrap().is_none());
     }
 
     #[tokio::test]
