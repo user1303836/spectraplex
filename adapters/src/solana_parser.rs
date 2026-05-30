@@ -34,7 +34,7 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
 
                 // Fee payer always pays the fee, even when the transaction fails
                 if is_fee_payer && fee_lamports > 0 {
-                    let fee_amount = lamports_to_sol(-(fee_lamports as i128));
+                    let fee_amount = lamports_to_sol(-i128::from(fee_lamports));
                     entries.push(LedgerEntry {
                         id: deterministic_id(tx.id, entry_index),
                         transaction_id: tx.id,
@@ -56,7 +56,7 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
                     if is_fee_payer {
                         // Net transfer amount = total balance change + fee
                         // (since fee is included in the balance change)
-                        let transfer_lamports = lamport_change + fee_lamports as i128;
+                        let transfer_lamports = lamport_change + i128::from(fee_lamports);
                         if transfer_lamports != 0 {
                             let transfer_amount = lamports_to_sol(transfer_lamports);
                             entries.push(LedgerEntry {
@@ -108,7 +108,7 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
 
                 if owner_match {
                     let mint = post.mint.clone();
-                    let decimals = post.ui_token_amount.decimals as u32;
+                    let decimals = u32::from(post.ui_token_amount.decimals);
 
                     let pre_raw = pre_token_balances
                         .iter()
@@ -146,8 +146,18 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
 /// Extract the raw lamport balance change for a given account index.
 /// Uses i128 to avoid truncation when u64 values exceed i64::MAX.
 fn extract_sol_change_lamports(meta: &UiTransactionStatusMeta, wallet_index: usize) -> i128 {
-    let pre = meta.pre_balances.get(wallet_index).copied().unwrap_or(0) as i128;
-    let post = meta.post_balances.get(wallet_index).copied().unwrap_or(0) as i128;
+    let pre = meta
+        .pre_balances
+        .get(wallet_index)
+        .copied()
+        .map(i128::from)
+        .unwrap_or(0);
+    let post = meta
+        .post_balances
+        .get(wallet_index)
+        .copied()
+        .map(i128::from)
+        .unwrap_or(0);
     post - pre
 }
 
@@ -171,6 +181,10 @@ fn token_delta_raw(post_raw: i128, pre_raw: i128) -> i128 {
 
 fn token_delta_magnitude(delta_raw: i128) -> i128 {
     delta_raw.saturating_abs()
+}
+
+fn token_decimals_i32(decimals: u32) -> i32 {
+    i32::try_from(decimals).unwrap_or(i32::MAX)
 }
 
 /// Lookup a human-readable symbol for well-known SPL tokens.
@@ -240,7 +254,7 @@ pub fn extract_solana_token_transfers(
                 };
 
                 let mint = post.mint.clone();
-                let decimals = post.ui_token_amount.decimals as u32;
+                let decimals = u32::from(post.ui_token_amount.decimals);
 
                 let pre_raw = pre_token_balances
                     .iter()
@@ -280,7 +294,7 @@ pub fn extract_solana_token_transfers(
                     from_address: from,
                     to_address: to,
                     amount,
-                    decimals: decimals as i32,
+                    decimals: token_decimals_i32(decimals),
                     transfer_index,
                     dataset_version_id: None,
                     created_at: Utc::now(),
@@ -336,8 +350,18 @@ pub fn extract_solana_native_balance_deltas(
     let mut deltas = Vec::new();
 
     for (idx, account) in account_keys.iter().enumerate() {
-        let pre = meta.pre_balances.get(idx).copied().unwrap_or(0) as i128;
-        let post = meta.post_balances.get(idx).copied().unwrap_or(0) as i128;
+        let pre = meta
+            .pre_balances
+            .get(idx)
+            .copied()
+            .map(i128::from)
+            .unwrap_or(0);
+        let post = meta
+            .post_balances
+            .get(idx)
+            .copied()
+            .map(i128::from)
+            .unwrap_or(0);
         let change = post - pre;
 
         if change == 0 {
@@ -427,7 +451,7 @@ pub fn extract_solana_decoded_events(
                     solana_transaction_status::UiInstruction::Compiled(compiled_ix) => {
                         let program_id = message
                             .account_keys
-                            .get(compiled_ix.program_id_index as usize)
+                            .get(usize::from(compiled_ix.program_id_index))
                             .map(|k| k.pubkey.clone())
                             .unwrap_or_else(|| format!("index:{}", compiled_ix.program_id_index));
 
@@ -437,7 +461,7 @@ pub fn extract_solana_decoded_events(
                             .map(|&idx| {
                                 message
                                     .account_keys
-                                    .get(idx as usize)
+                                    .get(usize::from(idx))
                                     .map(|k| k.pubkey.clone())
                                     .unwrap_or_else(|| format!("index:{idx}"))
                             })
@@ -709,7 +733,7 @@ mod tests {
 
     #[test]
     fn test_lamports_to_sol_beyond_i64_max() {
-        let large: i128 = i64::MAX as i128 + 1_000_000_000;
+        let large: i128 = i128::from(i64::MAX) + 1_000_000_000;
         let result = lamports_to_sol(large);
         assert_eq!(result, BigDecimal::new(large.into(), 9));
     }
@@ -737,6 +761,16 @@ mod tests {
         assert_eq!(token_delta_magnitude(7), 7);
         assert_eq!(token_delta_magnitude(-7), 7);
         assert_eq!(token_delta_magnitude(i128::MIN), i128::MAX);
+    }
+
+    #[test]
+    fn test_token_decimals_i32_saturates() {
+        assert_eq!(token_decimals_i32(9), 9);
+        assert_eq!(
+            token_decimals_i32(u32::try_from(i32::MAX).unwrap()),
+            i32::MAX
+        );
+        assert_eq!(token_decimals_i32(u32::MAX), i32::MAX);
     }
 
     #[test]
