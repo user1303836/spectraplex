@@ -16,6 +16,24 @@ use crate::hyperliquid_ws::HyperliquidWsClient;
 
 const HL_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 
+async fn ensure_success_response(
+    resp: reqwest::Response,
+    endpoint: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+
+    let text = match resp.text().await {
+        Ok(text) if text.is_empty() => "<empty response body>".to_string(),
+        Ok(text) => text,
+        Err(e) => format!("<failed to read response body: {e}>"),
+    };
+
+    anyhow::bail!("Hyperliquid {endpoint} returned {status}: {text}");
+}
+
 pub struct HyperliquidAdapter {
     client: reqwest::Client,
     base_url: String,
@@ -187,11 +205,7 @@ impl HyperliquidAdapter {
             user: wallet,
         };
         let resp = self.client.post(&self.base_url).json(&body).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Hyperliquid userFills returned {}: {}", status, text);
-        }
+        let resp = ensure_success_response(resp, "userFills").await?;
         let fills: Vec<HlFill> = resp.json().await?;
         Ok(fills)
     }
@@ -207,11 +221,7 @@ impl HyperliquidAdapter {
             start_time,
         };
         let resp = self.client.post(&self.base_url).json(&body).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Hyperliquid userFunding returned {}: {}", status, text);
-        }
+        let resp = ensure_success_response(resp, "userFunding").await?;
         let funding: Vec<HlFundingEntry> = resp.json().await?;
         Ok(funding)
     }
@@ -227,15 +237,7 @@ impl HyperliquidAdapter {
             start_time,
         };
         let resp = self.client.post(&self.base_url).json(&body).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Hyperliquid userNonFundingLedgerUpdates returned {}: {}",
-                status,
-                text
-            );
-        }
+        let resp = ensure_success_response(resp, "userNonFundingLedgerUpdates").await?;
         let updates: Vec<HlLedgerUpdate> = resp.json().await?;
         Ok(updates)
     }
@@ -263,11 +265,7 @@ impl HyperliquidAdapter {
             end_time,
         };
         let resp = self.client.post(&self.base_url).json(&body).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Hyperliquid fundingHistory returned {}: {}", status, text);
-        }
+        let resp = ensure_success_response(resp, "fundingHistory").await?;
         let rates: Vec<HlFundingRate> = resp.json().await?;
         Ok(rates)
     }
@@ -1423,6 +1421,36 @@ mod tests {
             "expected timeout error, got: {}",
             err_chain
         );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_non_success_response_empty_body_is_descriptive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut stream = stream;
+                    let mut buf = vec![0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let response = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        let adapter = HyperliquidAdapter::with_base_url(&base_url);
+        let result = adapter.fetch_user_fills("0xtest").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Hyperliquid userFills returned 429"));
+        assert!(err.contains("<empty response body>"));
 
         server.abort();
     }
