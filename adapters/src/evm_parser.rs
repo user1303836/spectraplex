@@ -88,7 +88,7 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
 
     // 2. Native ETH value (if present in metadata, e.g. from transaction receipt)
     if let Some(value_hex) = tx.raw_metadata.get("value").and_then(|v| v.as_str()) {
-        let wei = hex_to_u128(value_hex);
+        let wei = hex_to_u128_or_zero(value_hex);
         if wei > 0 {
             let eth_amount = wei_to_eth(wei);
 
@@ -143,8 +143,8 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
             .get("effective_gas_price")
             .and_then(|g| g.as_str()),
     ) {
-        let gas_used = hex_to_u128(gas_used_hex);
-        let gas_price = hex_to_u128(gas_price_hex);
+        let gas_used = hex_to_u128_or_zero(gas_used_hex);
+        let gas_price = hex_to_u128_or_zero(gas_price_hex);
         let fee_wei = gas_used.saturating_mul(gas_price);
 
         if fee_wei > 0 {
@@ -207,8 +207,8 @@ fn hex_to_bigdecimal(hex: &str) -> anyhow::Result<BigDecimal> {
 }
 
 /// Parse a hex string (with optional 0x prefix) into u128.
-/// Suitable for values known to fit in u128 (e.g., gas values).
-fn hex_to_u128(hex: &str) -> u128 {
+/// Returns zero for empty, invalid, or overflowing values.
+fn hex_to_u128_or_zero(hex: &str) -> u128 {
     let stripped = hex.strip_prefix("0x").unwrap_or(hex);
     if stripped.is_empty() {
         return 0;
@@ -900,11 +900,20 @@ mod tests {
     }
 
     #[test]
-    fn test_hex_to_u128() {
-        assert_eq!(hex_to_u128("0x0"), 0);
-        assert_eq!(hex_to_u128("0x1"), 1);
-        assert_eq!(hex_to_u128("0xde0b6b3a7640000"), 1_000_000_000_000_000_000);
-        assert_eq!(hex_to_u128("0x5208"), 21000);
+    fn test_hex_to_u128_or_zero() {
+        assert_eq!(hex_to_u128_or_zero("0x0"), 0);
+        assert_eq!(hex_to_u128_or_zero("0x1"), 1);
+        assert_eq!(
+            hex_to_u128_or_zero("0xde0b6b3a7640000"),
+            1_000_000_000_000_000_000
+        );
+        assert_eq!(hex_to_u128_or_zero("0x5208"), 21000);
+        assert_eq!(hex_to_u128_or_zero("0x"), 0);
+        assert_eq!(hex_to_u128_or_zero("0xGG"), 0);
+        assert_eq!(
+            hex_to_u128_or_zero("0x100000000000000000000000000000000"),
+            0
+        );
     }
 
     #[test]
