@@ -23,64 +23,64 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
     if let Some(topics) = tx.raw_metadata.get("topics").and_then(|t| t.as_array()) {
         if let Some(topic0) = topics.first().and_then(|t| t.as_str()) {
             if topic0 == ERC20_TRANSFER_TOPIC && topics.len() >= 3 {
-                let from = topic_to_address(topics[1].as_str().unwrap_or_default());
-                let to = topic_to_address(topics[2].as_str().unwrap_or_default());
+                if let Some((from, to)) = erc20_transfer_topic_addresses(topics) {
+                    // Decode uint256 amount from data field
+                    let data_hex = tx
+                        .raw_metadata
+                        .get("data")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("0x0");
+                    match hex_to_bigdecimal(data_hex) {
+                        Ok(amount_bd) => {
+                            // The contract address is the token address
+                            let token_address = tx
+                                .raw_metadata
+                                .get("address")
+                                .and_then(|a| a.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
 
-                // Decode uint256 amount from data field
-                let data_hex = tx
-                    .raw_metadata
-                    .get("data")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("0x0");
-                let amount_bd = match hex_to_bigdecimal(data_hex) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(tx_hash = %tx.tx_hash, field = "data", raw = %data_hex, "Skipping ERC-20 transfer with malformed amount: {e}");
-                        return Ok(entries);
+                            let decimals = token_decimals(&token_address);
+                            let symbol = token_symbol(&token_address);
+                            let normalized = normalize_bigdecimal(amount_bd, decimals);
+
+                            // Determine if this wallet sent or received
+                            if from == wallet {
+                                // Outgoing transfer
+                                entries.push(LedgerEntry {
+                                    id: deterministic_id(tx.id, entry_index),
+                                    transaction_id: tx.id,
+                                    user_id: tx.user_id,
+                                    wallet_address: tx.wallet_address.clone(),
+                                    asset_symbol: symbol.clone(),
+                                    amount: negate(normalized.clone()),
+                                    entry_type: EntryType::Transfer,
+                                    fiat_value: None,
+                                });
+                                entry_index += 1;
+                            }
+
+                            if to == wallet {
+                                // Incoming transfer
+                                entries.push(LedgerEntry {
+                                    id: deterministic_id(tx.id, entry_index),
+                                    transaction_id: tx.id,
+                                    user_id: tx.user_id,
+                                    wallet_address: tx.wallet_address.clone(),
+                                    asset_symbol: symbol,
+                                    amount: normalized,
+                                    entry_type: EntryType::Transfer,
+                                    fiat_value: None,
+                                });
+                                entry_index += 1;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(tx_hash = %tx.tx_hash, field = "data", raw = %data_hex, "Skipping ERC-20 transfer with malformed amount: {e}");
+                        }
                     }
-                };
-
-                // The contract address is the token address
-                let token_address = tx
-                    .raw_metadata
-                    .get("address")
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                let decimals = token_decimals(&token_address);
-                let symbol = token_symbol(&token_address);
-                let normalized = normalize_bigdecimal(amount_bd, decimals);
-
-                // Determine if this wallet sent or received
-                if from == wallet {
-                    // Outgoing transfer
-                    entries.push(LedgerEntry {
-                        id: deterministic_id(tx.id, entry_index),
-                        transaction_id: tx.id,
-                        user_id: tx.user_id,
-                        wallet_address: tx.wallet_address.clone(),
-                        asset_symbol: symbol.clone(),
-                        amount: negate(normalized.clone()),
-                        entry_type: EntryType::Transfer,
-                        fiat_value: None,
-                    });
-                    entry_index += 1;
-                }
-
-                if to == wallet {
-                    // Incoming transfer
-                    entries.push(LedgerEntry {
-                        id: deterministic_id(tx.id, entry_index),
-                        transaction_id: tx.id,
-                        user_id: tx.user_id,
-                        wallet_address: tx.wallet_address.clone(),
-                        asset_symbol: symbol,
-                        amount: normalized,
-                        entry_type: EntryType::Transfer,
-                        fiat_value: None,
-                    });
-                    entry_index += 1;
+                } else {
+                    warn!(tx_hash = %tx.tx_hash, "Skipping ERC-20 transfer with malformed address topics");
                 }
             }
         }
@@ -178,6 +178,18 @@ fn topic_to_address(topic: &str) -> String {
     } else {
         stripped.to_string()
     }
+}
+
+fn topic_address_at(topics: &[serde_json::Value], index: usize) -> Option<String> {
+    topics.get(index)?.as_str().map(topic_to_address)
+}
+
+fn erc20_transfer_topic_addresses(topics: &[serde_json::Value]) -> Option<(String, String)> {
+    Some((topic_address_at(topics, 1)?, topic_address_at(topics, 2)?))
+}
+
+fn erc20_approval_topic_addresses(topics: &[serde_json::Value]) -> Option<(String, String)> {
+    Some((topic_address_at(topics, 1)?, topic_address_at(topics, 2)?))
 }
 
 /// Parse a hex string (with optional 0x prefix) into BigDecimal.
@@ -418,8 +430,10 @@ pub fn extract_evm_token_transfers(
         return vec![];
     }
 
-    let from = topic_to_address(topics[1].as_str().unwrap_or_default());
-    let to = topic_to_address(topics[2].as_str().unwrap_or_default());
+    let Some((from, to)) = erc20_transfer_topic_addresses(topics) else {
+        warn!("Skipping EVM token transfer with malformed address topics");
+        return vec![];
+    };
 
     let data_hex = raw_metadata
         .get("data")
@@ -583,8 +597,6 @@ fn decode_evm_event_fields(
 ) -> (Option<String>, serde_json::Value) {
     match topic0 {
         Some(t) if t == ERC20_TRANSFER_TOPIC && topics.len() >= 3 => {
-            let from = topic_to_address(topics[1].as_str().unwrap_or_default());
-            let to = topic_to_address(topics[2].as_str().unwrap_or_default());
             let value = match hex_to_bigdecimal(data_hex) {
                 Ok(v) => v.to_string(),
                 Err(e) => {
@@ -592,18 +604,26 @@ fn decode_evm_event_fields(
                     data_hex.to_string()
                 }
             };
-            (
-                Some("Transfer".to_string()),
-                serde_json::json!({
-                    "from": from,
-                    "to": to,
-                    "value": value,
-                }),
-            )
+            if let Some((from, to)) = erc20_transfer_topic_addresses(topics) {
+                (
+                    Some("Transfer".to_string()),
+                    serde_json::json!({
+                        "from": from,
+                        "to": to,
+                        "value": value,
+                    }),
+                )
+            } else {
+                warn!("Decoded Transfer event has malformed address topics");
+                (
+                    Some("Transfer".to_string()),
+                    serde_json::json!({
+                        "value": value,
+                    }),
+                )
+            }
         }
         Some(t) if t == ERC20_APPROVAL_TOPIC && topics.len() >= 3 => {
-            let owner = topic_to_address(topics[1].as_str().unwrap_or_default());
-            let spender = topic_to_address(topics[2].as_str().unwrap_or_default());
             let value = match hex_to_bigdecimal(data_hex) {
                 Ok(v) => v.to_string(),
                 Err(e) => {
@@ -611,14 +631,24 @@ fn decode_evm_event_fields(
                     data_hex.to_string()
                 }
             };
-            (
-                Some("Approval".to_string()),
-                serde_json::json!({
-                    "owner": owner,
-                    "spender": spender,
-                    "value": value,
-                }),
-            )
+            if let Some((owner, spender)) = erc20_approval_topic_addresses(topics) {
+                (
+                    Some("Approval".to_string()),
+                    serde_json::json!({
+                        "owner": owner,
+                        "spender": spender,
+                        "value": value,
+                    }),
+                )
+            } else {
+                warn!("Decoded Approval event has malformed address topics");
+                (
+                    Some("Approval".to_string()),
+                    serde_json::json!({
+                        "value": value,
+                    }),
+                )
+            }
         }
         Some(_) => {
             // Unknown event — provide indexed topics and data
@@ -701,7 +731,7 @@ impl Materializer for EvmLedgerMaterializer {
     }
 
     fn parser_hash(&self) -> &str {
-        "sha256:evm_ledger_v1_b7e4d1f5"
+        "sha256:evm_ledger_v1_d2a9f8c1"
     }
 
     fn chain_family(&self) -> ChainFamily {
@@ -733,7 +763,7 @@ impl Materializer for EvmTokenTransferMaterializer {
     }
 
     fn parser_hash(&self) -> &str {
-        "sha256:evm_token_transfers_v1_a1c5e7b9"
+        "sha256:evm_token_transfers_v1_f4b2c8e0"
     }
 
     fn chain_family(&self) -> ChainFamily {
@@ -765,7 +795,7 @@ impl Materializer for EvmDecodedEventMaterializer {
     }
 
     fn parser_hash(&self) -> &str {
-        "sha256:evm_decoded_events_v1_c8d4f2a6"
+        "sha256:evm_decoded_events_v1_9e1d7b3a"
     }
 
     fn chain_family(&self) -> ChainFamily {
@@ -920,6 +950,58 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].asset_symbol, "ETH");
         assert!(entries[0].amount < BigDecimal::from(0)); // fee is negative
+        assert!(matches!(entries[0].entry_type, EntryType::Fee));
+    }
+
+    #[test]
+    fn test_parse_erc20_transfer_malformed_amount_keeps_gas_fee() {
+        let wallet = "0xabcdef1234567890abcdef1234567890abcdef12";
+        let from_padded = format!(
+            "0x000000000000000000000000{}",
+            "1111111111111111111111111111111111111111"
+        );
+        let to_padded = format!("0x000000000000000000000000{}", &wallet[2..]);
+        let metadata = json!({
+            "topics": [
+                ERC20_TRANSFER_TOPIC,
+                from_padded,
+                to_padded,
+            ],
+            "data": "0xGG",
+            "address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "gas_used": "0x5208",
+            "effective_gas_price": "0x3b9aca00",
+        });
+
+        let tx = make_tx(metadata);
+        let entries = parse_evm_transaction(&tx).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].asset_symbol, "ETH");
+        assert!(matches!(entries[0].entry_type, EntryType::Fee));
+    }
+
+    #[test]
+    fn test_parse_erc20_transfer_non_string_address_topic_keeps_gas_fee_only() {
+        let wallet = "0xabcdef1234567890abcdef1234567890abcdef12";
+        let to_padded = format!("0x000000000000000000000000{}", &wallet[2..]);
+        let metadata = json!({
+            "topics": [
+                ERC20_TRANSFER_TOPIC,
+                123,
+                to_padded,
+            ],
+            "data": "0x0000000000000000000000000000000000000000000000000de0b6b3a7640000",
+            "address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "gas_used": "0x5208",
+            "effective_gas_price": "0x3b9aca00",
+        });
+
+        let tx = make_tx(metadata);
+        let entries = parse_evm_transaction(&tx).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].asset_symbol, "ETH");
         assert!(matches!(entries[0].entry_type, EntryType::Fee));
     }
 
@@ -1239,6 +1321,27 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_evm_token_transfer_requires_string_address_topics() {
+        let to_padded = format!(
+            "0x000000000000000000000000{}",
+            "2222222222222222222222222222222222222222"
+        );
+        let metadata = json!({
+            "topics": [
+                ERC20_TRANSFER_TOPIC,
+                123,
+                to_padded,
+            ],
+            "data": "0x0000000000000000000000000000000000000000000000000000000005f5e100",
+            "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        });
+
+        let transfers = extract_evm_token_transfers(None, "ethereum-mainnet", &metadata);
+
+        assert!(transfers.is_empty());
+    }
+
+    #[test]
     fn test_deterministic_ids_are_stable() {
         let tx = make_tx(json!({
             "topics": [],
@@ -1295,6 +1398,32 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_evm_decoded_events_transfer_omits_malformed_address_fields() {
+        let to_padded = format!(
+            "0x000000000000000000000000{}",
+            "2222222222222222222222222222222222222222"
+        );
+        let metadata = json!({
+            "topics": [
+                ERC20_TRANSFER_TOPIC,
+                123,
+                to_padded,
+            ],
+            "data": "0x0000000000000000000000000000000000000000000000000000000005f5e100",
+            "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        });
+
+        let events = extract_evm_decoded_events(None, "ethereum-mainnet", &metadata);
+
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.event_name, Some("Transfer".to_string()));
+        assert!(e.decoded_fields.get("from").is_none());
+        assert!(e.decoded_fields.get("to").is_none());
+        assert_eq!(e.decoded_fields.get("value"), Some(&json!("100000000")));
+    }
+
+    #[test]
     fn test_extract_evm_decoded_events_approval() {
         let owner_padded = format!(
             "0x000000000000000000000000{}",
@@ -1321,6 +1450,32 @@ mod tests {
         assert_eq!(e.event_name, Some("Approval".to_string()));
         assert!(e.decoded_fields.get("owner").is_some());
         assert!(e.decoded_fields.get("spender").is_some());
+        assert!(e.decoded_fields.get("value").is_some());
+    }
+
+    #[test]
+    fn test_extract_evm_decoded_events_approval_omits_malformed_address_fields() {
+        let spender_padded = format!(
+            "0x000000000000000000000000{}",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        let metadata = json!({
+            "topics": [
+                ERC20_APPROVAL_TOPIC,
+                123,
+                spender_padded,
+            ],
+            "data": "0x00000000000000000000000000000000ffffffffffffffffffffffffffffffff",
+            "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        });
+
+        let events = extract_evm_decoded_events(None, "ethereum-mainnet", &metadata);
+
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.event_name, Some("Approval".to_string()));
+        assert!(e.decoded_fields.get("owner").is_none());
+        assert!(e.decoded_fields.get("spender").is_none());
         assert!(e.decoded_fields.get("value").is_some());
     }
 
