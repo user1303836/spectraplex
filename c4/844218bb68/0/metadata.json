@@ -1,0 +1,33 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "c4844218bb68",
+  "session_id": "35401bb1-a5cd-4702-bbdc-98a04b2c5028",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-30T14:18:59.025765Z",
+  "branch": "codex/check-solana-parser-conversions",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "adapters/src/solana_parser.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "93349860d764",
+  "checkpoint_transcript_start": 23,
+  "transcript_lines_at_start": 23,
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-05-30T14:18:58.941445Z",
+    "agent_lines": 46,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 46,
+    "agent_percentage": 100
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/35401bb1-a5cd-4702-bbdc-98a04b2c5028.jsonl"
+}
