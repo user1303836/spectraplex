@@ -42,6 +42,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 API_URL="http://localhost:3000"
 LEGACY_KEY="admin-smoke-test-key"
 TENANT_KEY=""
+API_PID=""
 TARGET_WALLET="So11111111111111111111111111111111111111112"
 TARGET_NETWORK="solana-mainnet"
 
@@ -155,6 +156,22 @@ wait_for_postgres() {
   return 1
 }
 
+wait_for_api() {
+  for _ in {1..30}; do
+    if curl -sf "$API_URL/health" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    if [[ -n "$API_PID" ]] && ! kill -0 "$API_PID" 2>/dev/null; then
+      return 2
+    fi
+
+    sleep 1
+  done
+
+  return 1
+}
+
 require_command curl "Install curl to call the local API."
 require_command cargo "Install Rust/Cargo to build spectraplex-api."
 require_command jq "Install jq for JSON response parsing in the smoke script."
@@ -186,24 +203,26 @@ export SPECTRAPLEX_CONFIG="$SCRIPT_DIR/smoke-config.toml"
 "$PROJECT_DIR/target/debug/spectraplex-api" &
 API_PID=$!
 
-for i in {1..30}; do
-  if curl -sf "$API_URL/health" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
-echo "       API running on $API_URL (PID $API_PID)"
-
 cleanup() {
   echo ""
   echo "=== Cleaning up ==="
-  if kill -0 "$API_PID" 2>/dev/null; then
+  if [[ -n "$API_PID" ]] && kill -0 "$API_PID" 2>/dev/null; then
     kill "$API_PID" 2>/dev/null || true
     wait "$API_PID" 2>/dev/null || true
   fi
   echo "       Done."
 }
 trap cleanup EXIT
+
+if wait_for_api; then
+  echo "       API running on $API_URL (PID $API_PID)"
+else
+  status=$?
+  if [[ "$status" -eq 2 ]]; then
+    fail "API process exited before $API_URL/health became healthy."
+  fi
+  fail "API did not become healthy at $API_URL/health within 30 seconds."
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Create a tenant-scoped API key
