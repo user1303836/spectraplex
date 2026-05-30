@@ -126,6 +126,26 @@ pub struct HlFundingRate {
     pub time: u64,
 }
 
+fn funding_rate_raw_transaction(
+    rate: &HlFundingRate,
+    network: &str,
+) -> anyhow::Result<RawTransaction> {
+    let raw = serde_json::to_value(rate)?;
+    let hash = format!("funding-rate-{}-{}", rate.coin, rate.time);
+
+    Ok(RawTransaction {
+        id: Uuid::new_v4(),
+        network: network.to_string(),
+        tx_hash: hash,
+        timestamp: unix_ms_to_secs_i64(rate.time),
+        block_number: None,
+        raw_metadata: serde_json::json!({ "type": "funding_rate", "data": raw }),
+        source: "hl-rest-market-backfill".to_string(),
+        ingestion_run_id: None,
+        ingested_at: Utc::now(),
+    })
+}
+
 impl Default for HyperliquidAdapter {
     fn default() -> Self {
         Self::new()
@@ -401,22 +421,8 @@ impl HyperliquidAdapter {
         let records: Vec<RawTransaction> = rates
             .iter()
             .take(limit)
-            .map(|rate| {
-                let raw = serde_json::to_value(rate).unwrap_or_default();
-                let hash = format!("funding-rate-{}-{}", rate.coin, rate.time);
-                RawTransaction {
-                    id: Uuid::new_v4(),
-                    network: network.clone(),
-                    tx_hash: hash,
-                    timestamp: unix_ms_to_secs_i64(rate.time),
-                    block_number: None,
-                    raw_metadata: serde_json::json!({ "type": "funding_rate", "data": raw }),
-                    source: "hl-rest-market-backfill".to_string(),
-                    ingestion_run_id: None,
-                    ingested_at: Utc::now(),
-                }
-            })
-            .collect();
+            .map(|rate| funding_rate_raw_transaction(rate, network))
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         info!(
             "Hyperliquid V2 market backfill: collected {} records for {}",
@@ -820,6 +826,22 @@ mod tests {
         assert_eq!(rates[0].funding_rate, "0.0001");
         assert_eq!(rates[0].premium, "0.00005");
         assert_eq!(rates[1].time, 1700003600000);
+    }
+
+    #[test]
+    fn funding_rate_raw_transaction_preserves_rate_payload() {
+        let rates: Vec<HlFundingRate> =
+            serde_json::from_str(sample_funding_history_json()).unwrap();
+
+        let record = funding_rate_raw_transaction(&rates[0], "hypercore-mainnet").unwrap();
+
+        assert_eq!(record.network, "hypercore-mainnet");
+        assert_eq!(record.tx_hash, "funding-rate-ETH-1700000000000");
+        assert_eq!(record.timestamp, 1_700_000_000);
+        assert_eq!(record.source, "hl-rest-market-backfill");
+        assert_eq!(record.raw_metadata["type"], "funding_rate");
+        assert_eq!(record.raw_metadata["data"]["fundingRate"], "0.0001");
+        assert_eq!(record.raw_metadata["data"]["premium"], "0.00005");
     }
 
     // -----------------------------------------------------------------------
