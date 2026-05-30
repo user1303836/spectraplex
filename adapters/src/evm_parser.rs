@@ -88,50 +88,51 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
 
     // 2. Native ETH value (if present in metadata, e.g. from transaction receipt)
     if let Some(value_hex) = tx.raw_metadata.get("value").and_then(|v| v.as_str()) {
-        let wei = hex_to_u128_or_zero(value_hex);
-        if wei > 0 {
-            let eth_amount = wei_to_eth(wei);
+        if let Ok(wei) = hex_to_bigdecimal(value_hex) {
+            if wei > BigDecimal::from(0) {
+                let eth_amount = wei_to_eth(wei);
 
-            // Determine direction from "from"/"to" fields if present
-            let from = tx
-                .raw_metadata
-                .get("from")
-                .and_then(|f| f.as_str())
-                .unwrap_or_default()
-                .to_lowercase();
-            let to = tx
-                .raw_metadata
-                .get("to")
-                .and_then(|t| t.as_str())
-                .unwrap_or_default()
-                .to_lowercase();
+                // Determine direction from "from"/"to" fields if present
+                let from = tx
+                    .raw_metadata
+                    .get("from")
+                    .and_then(|f| f.as_str())
+                    .unwrap_or_default()
+                    .to_lowercase();
+                let to = tx
+                    .raw_metadata
+                    .get("to")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    .to_lowercase();
 
-            if from == wallet {
-                entries.push(LedgerEntry {
-                    id: deterministic_id(tx.id, entry_index),
-                    transaction_id: tx.id,
-                    user_id: tx.user_id,
-                    wallet_address: tx.wallet_address.clone(),
-                    asset_symbol: "ETH".to_string(),
-                    amount: negate(eth_amount.clone()),
-                    entry_type: EntryType::Transfer,
-                    fiat_value: None,
-                });
-                entry_index += 1;
-            }
+                if from == wallet {
+                    entries.push(LedgerEntry {
+                        id: deterministic_id(tx.id, entry_index),
+                        transaction_id: tx.id,
+                        user_id: tx.user_id,
+                        wallet_address: tx.wallet_address.clone(),
+                        asset_symbol: "ETH".to_string(),
+                        amount: negate(eth_amount.clone()),
+                        entry_type: EntryType::Transfer,
+                        fiat_value: None,
+                    });
+                    entry_index += 1;
+                }
 
-            if to == wallet {
-                entries.push(LedgerEntry {
-                    id: deterministic_id(tx.id, entry_index),
-                    transaction_id: tx.id,
-                    user_id: tx.user_id,
-                    wallet_address: tx.wallet_address.clone(),
-                    asset_symbol: "ETH".to_string(),
-                    amount: eth_amount,
-                    entry_type: EntryType::Transfer,
-                    fiat_value: None,
-                });
-                entry_index += 1;
+                if to == wallet {
+                    entries.push(LedgerEntry {
+                        id: deterministic_id(tx.id, entry_index),
+                        transaction_id: tx.id,
+                        user_id: tx.user_id,
+                        wallet_address: tx.wallet_address.clone(),
+                        asset_symbol: "ETH".to_string(),
+                        amount: eth_amount,
+                        entry_type: EntryType::Transfer,
+                        fiat_value: None,
+                    });
+                    entry_index += 1;
+                }
             }
         }
     }
@@ -148,7 +149,7 @@ pub fn parse_evm_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEntry
         let fee_wei = gas_used.saturating_mul(gas_price);
 
         if fee_wei > 0 {
-            let fee_eth = wei_to_eth(fee_wei);
+            let fee_eth = wei_to_eth(BigDecimal::from(fee_wei));
             entries.push(LedgerEntry {
                 id: deterministic_id(tx.id, entry_index),
                 transaction_id: tx.id,
@@ -216,12 +217,10 @@ fn hex_to_u128_or_zero(hex: &str) -> u128 {
     u128::from_str_radix(stripped, 16).unwrap_or(0)
 }
 
-/// Convert wei (u128) to ETH as BigDecimal (divide by 10^18).
-fn wei_to_eth(wei: u128) -> BigDecimal {
-    use bigdecimal::FromPrimitive;
-    let wei_bd = BigDecimal::from_u128(wei).unwrap_or_default();
-    let divisor = BigDecimal::from_u128(1_000_000_000_000_000_000u128).unwrap_or_default();
-    wei_bd / divisor
+/// Convert wei to ETH as BigDecimal (divide by 10^18).
+fn wei_to_eth(wei: BigDecimal) -> BigDecimal {
+    let divisor = BigDecimal::new(1.into(), -18);
+    wei / divisor
 }
 
 /// Lookup the number of decimals for well-known ERC-20 tokens.
@@ -870,6 +869,30 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].asset_symbol, "ETH");
+        assert!(entries[0].amount > BigDecimal::from(0));
+    }
+
+    #[test]
+    fn test_parse_native_eth_transfer_over_u128() {
+        let wallet = "0xabcdef1234567890abcdef1234567890abcdef12";
+        let value = "0x100000000000000000000000000000000";
+        let metadata = json!({
+            "topics": [],
+            "data": "0x",
+            "value": value,
+            "from": "0x1111111111111111111111111111111111111111",
+            "to": wallet,
+        });
+
+        let tx = make_tx(metadata);
+        let entries = parse_evm_transaction(&tx).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].asset_symbol, "ETH");
+        assert_eq!(
+            entries[0].amount,
+            wei_to_eth(hex_to_bigdecimal(value).unwrap())
+        );
         assert!(entries[0].amount > BigDecimal::from(0));
     }
 
