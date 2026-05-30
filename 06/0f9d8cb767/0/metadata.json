@@ -1,0 +1,33 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "060f9d8cb767",
+  "session_id": "35401bb1-a5cd-4702-bbdc-98a04b2c5028",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-30T14:14:31.694555Z",
+  "branch": "codex/check-evm-parser-conversions",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "adapters/src/evm_parser.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "93349860d764",
+  "checkpoint_transcript_start": 23,
+  "transcript_lines_at_start": 23,
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-05-30T14:14:31.618066Z",
+    "agent_lines": 19,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 19,
+    "agent_percentage": 100
+  },
+  "transcript_path": ".claude/projects/-Users-user1303836-Development-spectraplex/35401bb1-a5cd-4702-bbdc-98a04b2c5028.jsonl"
+}
