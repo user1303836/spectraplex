@@ -138,6 +138,10 @@ enum Commands {
     ListNetworks,
 }
 
+fn checkpoint_slot_to_u64(slot: i64) -> Option<u64> {
+    u64::try_from(slot).ok()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -326,8 +330,8 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(ref endpoint) = grpc_url {
                             let adapter = SolanaGrpcAdapter::new(endpoint, x_token.clone());
                             if let Some(ref cp) = checkpoint {
-                                if let Some(slot) = cp.last_slot {
-                                    adapter.checkpoint().update(slot as u64);
+                                if let Some(slot) = cp.last_slot.and_then(checkpoint_slot_to_u64) {
+                                    adapter.checkpoint().update(slot);
                                 }
                             }
                             adapter
@@ -765,6 +769,12 @@ mod tests {
         assert_eq!(cp.last_timestamp, Some(400));
         assert_eq!(cp.last_slot, Some(6000 - 32)); // finality buffer applied
         assert_eq!(cp.last_block, None);
+    }
+
+    #[test]
+    fn test_checkpoint_slot_to_u64_rejects_negative_slot() {
+        assert_eq!(checkpoint_slot_to_u64(-1), None);
+        assert_eq!(checkpoint_slot_to_u64(42), Some(42));
     }
 
     #[test]

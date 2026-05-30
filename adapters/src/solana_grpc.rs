@@ -52,6 +52,10 @@ impl Default for GrpcStreamConfig {
     }
 }
 
+fn u64_to_i64_or_max(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// Tracks the last processed slot for checkpoint-based reconnection.
 #[derive(Clone)]
 pub struct SlotCheckpoint {
@@ -442,7 +446,7 @@ pub fn convert_grpc_to_raw_transaction(
         network: network.to_string(),
         tx_hash,
         timestamp,
-        block_number: Some(slot as i64),
+        block_number: Some(u64_to_i64_or_max(slot)),
         raw_metadata,
         source: source.to_string(),
         ingestion_run_id: None,
@@ -1367,6 +1371,20 @@ mod tests {
         let raw_tx = result.unwrap();
         assert_eq!(raw_tx.source, "solana-grpc-account-stream");
         assert_eq!(raw_tx.block_number, Some(700));
+    }
+
+    #[test]
+    fn test_convert_grpc_to_raw_transaction_saturates_slot_block_number() {
+        let tx_info = make_test_tx_info(vec![1000], vec![900], vec![vec![1u8; 32]]);
+        let raw_tx = convert_grpc_to_raw_transaction(
+            &tx_info,
+            u64::MAX,
+            "solana-mainnet",
+            "solana-grpc-wallet-backfill",
+        )
+        .unwrap();
+
+        assert_eq!(raw_tx.block_number, Some(i64::MAX));
     }
 
     #[test]

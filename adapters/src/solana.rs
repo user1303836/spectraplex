@@ -15,6 +15,10 @@ use spectraplex_core::v2::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
+fn u64_to_i64_or_max(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 pub struct SolanaAdapter {
     client: Arc<RpcClient>,
     network: String,
@@ -224,7 +228,7 @@ impl Connector for SolanaAdapter {
                             network: network.clone(),
                             tx_hash: sig_info.signature.clone(),
                             timestamp: tx.block_time.unwrap_or(0),
-                            block_number: Some(slot as i64),
+                            block_number: Some(u64_to_i64_or_max(slot)),
                             raw_metadata,
                             source: "solana-rpc-wallet-backfill".to_string(),
                             ingestion_run_id: None,
@@ -370,6 +374,13 @@ mod tests {
         // Invalid base58 signature should return None gracefully
         let sig = cursor_to_until_sig(Some(&cursor));
         assert!(sig.is_none());
+    }
+
+    #[test]
+    fn test_u64_to_i64_or_max_saturates() {
+        assert_eq!(u64_to_i64_or_max(42), 42);
+        assert_eq!(u64_to_i64_or_max(i64::MAX as u64), i64::MAX);
+        assert_eq!(u64_to_i64_or_max(u64::MAX), i64::MAX);
     }
 
     #[test]
