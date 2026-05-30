@@ -173,18 +173,18 @@ impl EvmAdapter {
             match self.provider.get_logs(filter).await {
                 Ok(logs) => return Ok(logs),
                 Err(e) => {
-                    last_err = Some(e);
                     if attempt + 1 < RPC_MAX_RETRIES {
                         let delay = Duration::from_millis(RPC_RETRY_BASE_MS * 2u64.pow(attempt));
                         warn!(
                             attempt = attempt + 1,
                             max_retries = RPC_MAX_RETRIES,
                             delay_ms = delay.as_millis() as u64,
-                            error = %last_err.as_ref().unwrap(),
+                            error = %e,
                             "RPC get_logs failed, retrying"
                         );
                         tokio::time::sleep(delay).await;
                     }
+                    last_err = Some(e);
                 }
             }
         }

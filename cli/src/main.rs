@@ -619,8 +619,7 @@ async fn main() -> anyhow::Result<()> {
             network,
         } => {
             let input_str = input.to_string_lossy();
-            let transactions = if input_str.starts_with("db:") {
-                let wallet = input_str.strip_prefix("db:").unwrap();
+            let transactions = if let Some(wallet) = input_str.strip_prefix("db:") {
                 let p = pool
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("--db-url is required for db: input"))?;
