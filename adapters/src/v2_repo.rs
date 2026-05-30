@@ -35,6 +35,10 @@ use crate::repo::Repository;
 /// Maximum allowed LIMIT for V2 repository queries to prevent unbounded result sets.
 const MAX_QUERY_LIMIT: i64 = 10_000;
 
+fn usize_to_i64_or_max(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 const HL_PNL_SUMMARY_CONFLICT_SQL: &str = " ON CONFLICT (id) DO UPDATE SET \
      total_closed_pnl = EXCLUDED.total_closed_pnl, \
      total_funding = EXCLUDED.total_funding, \
@@ -1313,6 +1317,7 @@ where
         if n == 0 {
             break;
         }
+        let page_len = usize_to_i64_or_max(n);
 
         let records: Vec<T> = rows
             .iter()
@@ -1343,11 +1348,11 @@ where
             }
         }
 
-        total += n;
-        offset += n as i64;
+        total = total.saturating_add(n);
+        offset = offset.saturating_add(page_len);
 
         // Short page means the snapshot is exhausted for this dataset.
-        if (n as i64) < page_size {
+        if page_len < page_size {
             break;
         }
         if offset >= hard_cap {
@@ -6202,6 +6207,14 @@ fn row_to_dataset_watermark(row: &sqlx::postgres::PgRow) -> anyhow::Result<Datas
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn usize_to_i64_or_max_saturates() {
+        assert_eq!(usize_to_i64_or_max(42), 42);
+        assert_eq!(usize_to_i64_or_max(i64::MAX as usize), i64::MAX);
+        assert_eq!(usize_to_i64_or_max(i64::MAX as usize + 1), i64::MAX);
+        assert_eq!(usize_to_i64_or_max(usize::MAX), i64::MAX);
+    }
 
     // -- Enum helper roundtrips --
 
