@@ -95,7 +95,10 @@ curl_json() {
   fi
 
   local resp
-  resp=$("${cmd[@]}")
+  if ! resp=$("${cmd[@]}"); then
+    echo "ERROR: curl request failed: $method $url" >&2
+    return 1
+  fi
   local http_code
   http_code=$(echo "$resp" | tail -n1)
   local body_lines
