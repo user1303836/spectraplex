@@ -46,6 +46,24 @@ const NATIVE_TX_BLOCK_CHUNK: u64 = 50;
 const ERC20_TRANSFER_TOPIC: &str =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
+fn u64_to_i64_or_max(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn usize_to_u64_or_max(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn next_block_after_i64(last_block: i64) -> Option<u64> {
+    u64::try_from(last_block)
+        .ok()
+        .map(|block| block.saturating_add(1))
+}
+
+fn default_from_block(latest_block: u64, limit: usize, block_chunk: u64) -> u64 {
+    latest_block.saturating_sub(usize_to_u64_or_max(limit).saturating_mul(block_chunk))
+}
+
 /// EVM chain adapter that fetches logs and transactions via JSON-RPC.
 ///
 /// Implements both the legacy `ChainIngestor` trait (wallet-only, V1) and
@@ -608,14 +626,14 @@ impl EvmAdapter {
                 }
             }
 
-            let timestamp = i64::try_from(block_timestamp).unwrap_or(i64::MAX);
+            let timestamp = u64_to_i64_or_max(block_timestamp);
 
             records.push(RawTransaction {
                 id: Uuid::new_v4(),
                 network: self.network.clone(),
                 tx_hash,
                 timestamp,
-                block_number: log.block_number.map(|n| n as i64),
+                block_number: log.block_number.map(u64_to_i64_or_max),
                 raw_metadata,
                 source: source.to_string(),
                 ingestion_run_id: None,
@@ -673,13 +691,13 @@ impl EvmAdapter {
             if existing_hashes.contains(&ntx.tx_hash) {
                 continue;
             }
-            let timestamp = i64::try_from(ntx.block_timestamp).unwrap_or(i64::MAX);
+            let timestamp = u64_to_i64_or_max(ntx.block_timestamp);
             records.push(RawTransaction {
                 id: Uuid::new_v4(),
                 network: self.network.clone(),
                 tx_hash: ntx.tx_hash.clone(),
                 timestamp,
-                block_number: Some(ntx.block_number as i64),
+                block_number: Some(u64_to_i64_or_max(ntx.block_number)),
                 raw_metadata: ntx.to_raw_metadata(),
                 source: "evm-rpc-wallet-backfill-native".to_string(),
                 ingestion_run_id: None,
@@ -1079,10 +1097,10 @@ impl ChainIngestor for EvmAdapter {
         let latest_block = self.provider.get_block_number().await?;
 
         let from_block = if let Some(block) = checkpoint.and_then(|cp| cp.last_block) {
-            (block as u64).saturating_add(1)
+            next_block_after_i64(block)
+                .unwrap_or_else(|| default_from_block(latest_block, limit, self.block_chunk))
         } else {
-            let total_blocks = (limit as u64) * self.block_chunk;
-            latest_block.saturating_sub(total_blocks)
+            default_from_block(latest_block, limit, self.block_chunk)
         };
 
         // Fetch both ERC-20 Transfer logs and native ETH transactions.
@@ -1270,13 +1288,12 @@ fn cursor_to_from_block(
         }
         // V1 compat cursor
         if let Some(last_block) = c.get("last_block").and_then(|v| v.as_i64()) {
-            if last_block >= 0 {
-                return (last_block as u64).saturating_add(1);
+            if let Some(next_block) = next_block_after_i64(last_block) {
+                return next_block;
             }
         }
     }
-    let total_blocks = (limit as u64) * block_chunk;
-    latest_block.saturating_sub(total_blocks)
+    default_from_block(latest_block, limit, block_chunk)
 }
 
 // ---------------------------------------------------------------------------
@@ -1308,12 +1325,23 @@ mod tests {
     #[test]
     fn test_timestamp_overflow_saturates() {
         let huge: u64 = u64::MAX;
-        let result = i64::try_from(huge).unwrap_or(i64::MAX);
+        let result = u64_to_i64_or_max(huge);
         assert_eq!(result, i64::MAX);
 
         let normal: u64 = 1_700_000_000;
-        let result = i64::try_from(normal).unwrap_or(i64::MAX);
+        let result = u64_to_i64_or_max(normal);
         assert_eq!(result, 1_700_000_000i64);
+    }
+
+    #[test]
+    fn test_default_from_block_saturates_large_limit() {
+        assert_eq!(default_from_block(100, usize::MAX, 2), 0);
+    }
+
+    #[test]
+    fn test_next_block_after_i64_rejects_negative_block() {
+        assert_eq!(next_block_after_i64(-1), None);
+        assert_eq!(next_block_after_i64(0), Some(1));
     }
 
     // -- parse_b256 --
@@ -1387,6 +1415,13 @@ mod tests {
         let cursor = json!({"v1_compat": true, "last_block": 17_000_000i64});
         let from = cursor_to_from_block(Some(&cursor), 20_000_000, 10, 2000);
         assert_eq!(from, 17_000_001);
+    }
+
+    #[test]
+    fn test_cursor_to_from_block_v1_negative_uses_default() {
+        let cursor = json!({"v1_compat": true, "last_block": -1i64});
+        let from = cursor_to_from_block(Some(&cursor), 20_000_000, 10, 2000);
+        assert_eq!(from, 19_980_000);
     }
 
     // -- Connector capabilities --
