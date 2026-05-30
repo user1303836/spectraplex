@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "8211948b7f0a",
+  "strategy": "manual-commit",
+  "branch": "codex/describe-hyperliquid-error-bodies",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "adapters/src/hyperliquid.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/82/11948b7f0a/0/metadata.json",
+      "transcript": "/82/11948b7f0a/0/full.jsonl",
+      "context": "/82/11948b7f0a/0/context.md",
+      "content_hash": "/82/11948b7f0a/0/content_hash.txt",
+      "prompt": "/82/11948b7f0a/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 1
+  }
+}
