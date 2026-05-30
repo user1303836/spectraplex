@@ -191,17 +191,9 @@ fn hex_to_bigdecimal(hex: &str) -> anyhow::Result<BigDecimal> {
     let mut result = BigDecimal::from(0);
     let base = BigDecimal::from(16);
     for ch in stripped.chars() {
-        let digit = match ch.to_ascii_lowercase() {
-            '0'..='9' => ch as u32 - '0' as u32,
-            'a'..='f' => ch as u32 - 'a' as u32 + 10,
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "Invalid hex character '{}' in value: {}",
-                    ch,
-                    hex
-                ))
-            }
-        };
+        let digit = ch
+            .to_digit(16)
+            .ok_or_else(|| anyhow::anyhow!("Invalid hex character '{}' in value: {}", ch, hex))?;
         result = result * &base + BigDecimal::from(digit);
     }
     Ok(result)
@@ -381,6 +373,10 @@ fn normalize_bigdecimal(raw: BigDecimal, decimals: u32) -> BigDecimal {
     raw / divisor
 }
 
+fn token_decimals_i32(decimals: u32) -> i32 {
+    i32::try_from(decimals).unwrap_or(i32::MAX)
+}
+
 /// Negate a BigDecimal value.
 fn negate(val: BigDecimal) -> BigDecimal {
     -val
@@ -456,7 +452,7 @@ pub fn extract_evm_token_transfers(
         from_address: from,
         to_address: to,
         amount: normalized,
-        decimals: decimals as i32,
+        decimals: token_decimals_i32(decimals),
         transfer_index: 0,
         dataset_version_id: None,
         created_at: Utc::now(),
@@ -993,6 +989,16 @@ mod tests {
     }
 
     #[test]
+    fn test_token_decimals_i32_saturates() {
+        assert_eq!(token_decimals_i32(18), 18);
+        assert_eq!(
+            token_decimals_i32(u32::try_from(i32::MAX).unwrap()),
+            i32::MAX
+        );
+        assert_eq!(token_decimals_i32(u32::MAX), i32::MAX);
+    }
+
+    #[test]
     fn test_token_symbol_known() {
         assert_eq!(
             token_symbol("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
@@ -1102,6 +1108,7 @@ mod tests {
     fn test_hex_to_bigdecimal() {
         // Small value
         assert_eq!(hex_to_bigdecimal("0xff").unwrap(), BigDecimal::from(255));
+        assert_eq!(hex_to_bigdecimal("0xFf").unwrap(), BigDecimal::from(255));
         // u128 max = 0xffffffffffffffffffffffffffffffff
         let u128_max = hex_to_bigdecimal("0xffffffffffffffffffffffffffffffff").unwrap();
         assert_eq!(u128_max, BigDecimal::from(u128::MAX));
