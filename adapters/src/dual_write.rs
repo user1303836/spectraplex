@@ -129,6 +129,10 @@ fn gold_dataset_record_counts(result: &GoldMaterializationResult) -> Vec<(&str, 
     counts
 }
 
+fn usize_to_i64_or_max(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 fn gold_wallet_dataset_status(
     result: &GoldMaterializationResult,
     dataset_name: &str,
@@ -1680,7 +1684,7 @@ impl Repository {
                             block_start,
                             block_end,
                             last_ingestion_run_id: run_id,
-                            records_count: count as i64,
+                            records_count: usize_to_i64_or_max(count),
                             gap_ranges: None,
                             notes: None,
                             created_at: Utc::now(),
@@ -2834,7 +2838,7 @@ impl Repository {
                     block_start,
                     block_end,
                     last_ingestion_run_id: None,
-                    records_count: total_records as i64,
+                    records_count: usize_to_i64_or_max(total_records),
                     gap_ranges: None,
                     notes: None,
                     created_at: now,
@@ -3144,6 +3148,14 @@ mod tests {
                 (DatasetName::WalletLedger.as_sql_str(), "solana-mainnet", 2,),
             ]
         );
+    }
+
+    #[test]
+    fn usize_to_i64_or_max_saturates() {
+        assert_eq!(usize_to_i64_or_max(42), 42);
+        assert_eq!(usize_to_i64_or_max(i64::MAX as usize), i64::MAX);
+        assert_eq!(usize_to_i64_or_max(i64::MAX as usize + 1), i64::MAX);
+        assert_eq!(usize_to_i64_or_max(usize::MAX), i64::MAX);
     }
 
     #[test]
