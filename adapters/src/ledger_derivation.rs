@@ -16,6 +16,14 @@ use uuid::Uuid;
 
 use crate::deterministic_id;
 
+const BALANCE_HISTORY_ID_OFFSET: u32 = 10_000;
+
+fn balance_history_id_index(index: usize) -> u32 {
+    u32::try_from(index)
+        .unwrap_or(u32::MAX)
+        .saturating_add(BALANCE_HISTORY_ID_OFFSET)
+}
+
 // ---------------------------------------------------------------------------
 // Address normalization helper
 // ---------------------------------------------------------------------------
@@ -841,7 +849,7 @@ pub fn derive_balance_history(
             snapshots.push(BalanceSnapshot {
                 id: deterministic_id(
                     entry.raw_transaction_id.unwrap_or(Uuid::nil()),
-                    i as u32 + 10000,
+                    balance_history_id_index(i),
                 ),
                 wallet_address: wallet.to_string(),
                 asset_symbol: asset.clone(),
@@ -2111,6 +2119,13 @@ mod tests {
     // -----------------------------------------------------------------------
     // P5-W1: balance_history derivation tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn balance_history_id_index_saturates() {
+        assert_eq!(balance_history_id_index(0), BALANCE_HISTORY_ID_OFFSET);
+        assert_eq!(balance_history_id_index(42), BALANCE_HISTORY_ID_OFFSET + 42);
+        assert_eq!(balance_history_id_index(usize::MAX), u32::MAX);
+    }
 
     #[test]
     fn balance_history_computes_running_balance() {
