@@ -259,8 +259,6 @@ async fn execute_export_job(
                 return;
             }
 
-            let has_sink = job.sink_config.is_some();
-
             let prov_dv_id = _export_meta.dataset_version_id;
             let prov_dv = _export_meta.dataset_version;
             let prov_cs = _export_meta.completeness_status.as_deref();
@@ -269,7 +267,7 @@ async fn execute_export_job(
 
             let result_location = format!("exports/{}.{}", job_id, ext);
 
-            if has_sink {
+            if let Some(sink_value) = job.sink_config.as_ref() {
                 // Transition to 'delivering'. update_or_abort only
                 // writes the row if we still own the lease (Ok(true)).
                 // If Ok(false) ("someone else took over"), we clean up
@@ -395,7 +393,6 @@ async fn execute_export_job(
                 // into memory (fixes PR #238 [P2] sink-OOM concern):
                 // LocalFileSink does a streaming `io::copy`; WebhookSink
                 // uses `ReaderStream` for a streaming request body.
-                let sink_value = job.sink_config.as_ref().unwrap();
                 let delivery_result = match serde_json::from_value::<SinkConfig>(sink_value.clone())
                 {
                     Ok(sink_config) => match build_sink(&sink_config, export_dir) {

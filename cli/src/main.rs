@@ -208,11 +208,11 @@ async fn main() -> anyhow::Result<()> {
             // MUST resolve it. Silently falling back to --rpc / --grpc-url
             // would connect to the wrong network (e.g. --network base-mainnet
             // but --rpc points to Ethereum mainnet).
-            if network.is_some() && net_ctx.is_none() {
+            if let (Some(network), None) = (network.as_deref(), net_ctx.as_ref()) {
                 anyhow::bail!(
                     "network '{}' is not configured in the provider registry. \
                      Check spectraplex.toml or SPECTRAPLEX_* environment variables.",
-                    network.as_deref().unwrap()
+                    network
                 );
             }
 
