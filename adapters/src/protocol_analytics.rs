@@ -45,6 +45,12 @@ fn classify_event(event_name: Option<&str>) -> &'static str {
     }
 }
 
+fn saturating_usize_sum(values: impl IntoIterator<Item = usize>) -> usize {
+    values
+        .into_iter()
+        .fold(0_usize, |acc, value| acc.saturating_add(value))
+}
+
 /// Compute protocol event records from decoded_events.
 ///
 /// Groups decoded events by their `program_or_contract` (treated as the
@@ -89,12 +95,10 @@ pub fn compute_pool_snapshots(
 ) -> Vec<PoolSnapshot> {
     let now = chrono::Utc::now();
 
-    if decoded_events.is_empty() {
-        return Vec::new();
-    }
-
     // Derive a single snapshot from the latest event
-    let latest = decoded_events.iter().max_by_key(|e| e.created_at).unwrap();
+    let Some(latest) = decoded_events.iter().max_by_key(|e| e.created_at) else {
+        return Vec::new();
+    };
 
     let protocol_address = latest.program_or_contract.clone();
 
@@ -152,7 +156,8 @@ pub fn build_protocol_activity(
         if event.protocol_address != protocol_address {
             continue;
         }
-        *type_counts.entry(event.event_type.clone()).or_insert(0) += 1;
+        let type_count = type_counts.entry(event.event_type.clone()).or_insert(0);
+        *type_count = (*type_count).saturating_add(1);
 
         // Extract participant addresses from event_details if available
         if let Some(from) = event.event_details.get("from").and_then(|v| v.as_str()) {
@@ -176,7 +181,7 @@ pub fn build_protocol_activity(
         time_end = Some(time_end.map_or(event.timestamp, |t: i64| t.max(event.timestamp)));
     }
 
-    let total_events: usize = type_counts.values().sum();
+    let total_events = saturating_usize_sum(type_counts.values().copied());
 
     let event_counts_by_type = type_counts
         .into_iter()
@@ -319,6 +324,12 @@ mod tests {
         assert_eq!(classify_event(Some("Transfer")), "transfer");
         assert_eq!(classify_event(Some("Approval")), "other");
         assert_eq!(classify_event(None), "other");
+    }
+
+    #[test]
+    fn saturating_usize_sum_clamps() {
+        assert_eq!(saturating_usize_sum([1, 2, 3]), 6);
+        assert_eq!(saturating_usize_sum([usize::MAX, 1]), usize::MAX);
     }
 
     #[test]
