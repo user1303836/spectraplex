@@ -1,4 +1,14 @@
-target
 .git
+target/
+node_modules/
+.smithers/
+.claude/
+.entire/
+design/
+
+workflow.tsx
+package.json
+bun.lock
+
 *.md
 .env
