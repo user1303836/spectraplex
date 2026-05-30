@@ -113,10 +113,10 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
                     let pre_raw = pre_token_balances
                         .iter()
                         .find(|p| p.account_index == post.account_index)
-                        .and_then(|p| p.ui_token_amount.amount.parse::<i128>().ok())
+                        .map(|p| parse_token_amount_or_zero(&p.ui_token_amount.amount))
                         .unwrap_or(0);
 
-                    let post_raw = post.ui_token_amount.amount.parse::<i128>().unwrap_or(0);
+                    let post_raw = parse_token_amount_or_zero(&post.ui_token_amount.amount);
                     let delta_raw = post_raw - pre_raw;
 
                     if delta_raw != 0 {
@@ -159,6 +159,10 @@ fn lamports_to_sol(lamports: i128) -> BigDecimal {
 /// Convert raw token amount to BigDecimal using the token's decimals.
 fn token_raw_to_decimal(raw: i128, decimals: u32) -> BigDecimal {
     BigDecimal::new(raw.into(), i64::from(decimals))
+}
+
+fn parse_token_amount_or_zero(amount: &str) -> i128 {
+    amount.parse::<i128>().unwrap_or(0)
 }
 
 /// Lookup a human-readable symbol for well-known SPL tokens.
@@ -233,10 +237,10 @@ pub fn extract_solana_token_transfers(
                 let pre_raw = pre_token_balances
                     .iter()
                     .find(|p| p.account_index == post.account_index)
-                    .and_then(|p| p.ui_token_amount.amount.parse::<i128>().ok())
+                    .map(|p| parse_token_amount_or_zero(&p.ui_token_amount.amount))
                     .unwrap_or(0);
 
-                let post_raw = post.ui_token_amount.amount.parse::<i128>().unwrap_or(0);
+                let post_raw = parse_token_amount_or_zero(&post.ui_token_amount.amount);
                 let delta_raw = post_raw - pre_raw;
 
                 if delta_raw == 0 {
@@ -700,6 +704,17 @@ mod tests {
         let large: i128 = i64::MAX as i128 + 1_000_000_000;
         let result = lamports_to_sol(large);
         assert_eq!(result, BigDecimal::new(large.into(), 9));
+    }
+
+    #[test]
+    fn test_parse_token_amount_or_zero() {
+        assert_eq!(parse_token_amount_or_zero("123456789"), 123456789);
+        assert_eq!(parse_token_amount_or_zero("-42"), -42);
+        assert_eq!(parse_token_amount_or_zero("not-a-number"), 0);
+        assert_eq!(
+            parse_token_amount_or_zero("170141183460469231731687303715884105728"),
+            0
+        );
     }
 
     #[test]
