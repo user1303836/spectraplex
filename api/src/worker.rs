@@ -491,11 +491,7 @@ async fn run_ingestion(
             })?;
 
     let limit = config.ingest_limit;
-    let user_id = job
-        .requested_by
-        .as_ref()
-        .and_then(|s| s.parse::<Uuid>().ok())
-        .unwrap_or_else(Uuid::new_v4);
+    let user_id = requested_by_user_id(job.requested_by.as_deref(), target.owner_id);
 
     let events: Vec<Transaction> = match chain {
         Chain::Hyperliquid => {
@@ -596,6 +592,29 @@ fn usize_to_i64_or_max(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+fn requested_by_user_id(requested_by: Option<&str>, target_owner_id: Option<Uuid>) -> Uuid {
+    let requested_by = requested_by
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(value) = requested_by {
+        if let Ok(user_id) = Uuid::parse_str(value) {
+            return user_id;
+        }
+    }
+
+    if let Some(owner_id) = target_owner_id {
+        return owner_id;
+    }
+
+    if let Some(value) = requested_by {
+        let name = format!("spectraplex:ingestion:requested_by:{value}");
+        return Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes());
+    }
+
+    Uuid::new_v4()
+}
+
 /// Best-effort callback delivery using the SSRF-safe client. Pins DNS at
 /// send time and disables redirects to prevent DNS rebinding and
 /// redirect-based SSRF, matching the protections in `fire_callback`.
@@ -647,6 +666,49 @@ mod tests {
         assert_eq!(usize_to_i64_or_max(i64::MAX as usize), i64::MAX);
         assert_eq!(usize_to_i64_or_max(i64::MAX as usize + 1), i64::MAX);
         assert_eq!(usize_to_i64_or_max(usize::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn requested_by_user_id_accepts_uuid_requester() {
+        let requested_by = Uuid::new_v4();
+        let owner_id = Uuid::new_v4();
+
+        assert_eq!(
+            requested_by_user_id(Some(&requested_by.to_string()), Some(owner_id)),
+            requested_by
+        );
+    }
+
+    #[test]
+    fn requested_by_user_id_uses_target_owner_for_legacy_requester() {
+        let owner_id = Uuid::new_v4();
+
+        assert_eq!(requested_by_user_id(Some("api"), Some(owner_id)), owner_id);
+    }
+
+    #[test]
+    fn requested_by_user_id_uses_target_owner_when_requester_missing() {
+        let owner_id = Uuid::new_v4();
+
+        assert_eq!(requested_by_user_id(None, Some(owner_id)), owner_id);
+    }
+
+    #[test]
+    fn requested_by_user_id_synthesizes_stable_legacy_requester_id() {
+        let first = requested_by_user_id(Some("api"), None);
+        let second = requested_by_user_id(Some("api"), None);
+        let different = requested_by_user_id(Some("worker"), None);
+
+        assert_eq!(first, second);
+        assert_ne!(first, different);
+    }
+
+    #[test]
+    fn requested_by_user_id_generates_when_requester_and_owner_missing() {
+        assert_ne!(
+            requested_by_user_id(None, None),
+            requested_by_user_id(None, None)
+        );
     }
 
     #[test]
