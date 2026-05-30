@@ -188,7 +188,36 @@ async fn execute_export_job(
         });
     }
 
-    let (target_id, network, time_start, time_end) = parse_filters(&job.filters);
+    let ExportFilters {
+        target_id,
+        network,
+        time_start,
+        time_end,
+    } = match parse_filters(&job.filters) {
+        Ok(filters) => filters,
+        Err(e) => {
+            let err_msg = format!("Invalid export filters: {e}");
+            error!(job_id = %job_id, error = %err_msg, "Export job failed");
+            let _ = update_or_abort(
+                repo,
+                job_id,
+                "failed",
+                None,
+                None,
+                Some(&err_msg),
+                worker_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            heartbeat_cancel.cancel();
+            return;
+        }
+    };
 
     let format = job.format;
 
@@ -776,30 +805,55 @@ async fn write_provenance_file(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq, Default)]
+struct ExportFilters {
+    target_id: Option<Uuid>,
+    network: Option<String>,
+    time_start: Option<i64>,
+    time_end: Option<i64>,
+}
+
+fn parse_optional_uuid(filters: &serde_json::Value, key: &str) -> anyhow::Result<Option<Uuid>> {
+    match filters.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Uuid::parse_str(value)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("invalid {key}: {e}")),
+        Some(_) => anyhow::bail!("invalid {key}: expected UUID string"),
+    }
+}
+
+fn parse_optional_string(filters: &serde_json::Value, key: &str) -> anyhow::Result<Option<String>> {
+    match filters.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => anyhow::bail!("invalid {key}: expected string"),
+    }
+}
+
+fn parse_optional_i64(filters: &serde_json::Value, key: &str) -> anyhow::Result<Option<i64>> {
+    match filters.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("invalid {key}: expected integer")),
+    }
+}
+
 /// Parse the filters JSON value from an export job into individual query
 /// parameters.
-fn parse_filters(
-    filters: &Option<serde_json::Value>,
-) -> (Option<Uuid>, Option<String>, Option<i64>, Option<i64>) {
+fn parse_filters(filters: &Option<serde_json::Value>) -> anyhow::Result<ExportFilters> {
     let Some(filters) = filters else {
-        return (None, None, None, None);
+        return Ok(ExportFilters::default());
     };
 
-    let target_id = filters
-        .get("target_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<Uuid>().ok());
-
-    let network = filters
-        .get("network")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    let time_start = filters.get("time_start").and_then(|v| v.as_i64());
-
-    let time_end = filters.get("time_end").and_then(|v| v.as_i64());
-
-    (target_id, network, time_start, time_end)
+    Ok(ExportFilters {
+        target_id: parse_optional_uuid(filters, "target_id")?,
+        network: parse_optional_string(filters, "network")?,
+        time_start: parse_optional_i64(filters, "time_start")?,
+        time_end: parse_optional_i64(filters, "time_end")?,
+    })
 }
 
 #[cfg(test)]
@@ -812,5 +866,47 @@ mod tests {
         assert_eq!(record_count_i32_or_max(i32::MAX as usize), i32::MAX);
         assert_eq!(record_count_i32_or_max(i32::MAX as usize + 1), i32::MAX);
         assert_eq!(record_count_i32_or_max(usize::MAX), i32::MAX);
+    }
+
+    #[test]
+    fn parse_filters_accepts_valid_filters() {
+        let target_id = Uuid::new_v4();
+        let filters = Some(serde_json::json!({
+            "target_id": target_id.to_string(),
+            "network": "ethereum-mainnet",
+            "time_start": 1_700_000_000_i64,
+            "time_end": 1_700_010_000_i64,
+        }));
+
+        let parsed = parse_filters(&filters).unwrap();
+        assert_eq!(parsed.target_id, Some(target_id));
+        assert_eq!(parsed.network.as_deref(), Some("ethereum-mainnet"));
+        assert_eq!(parsed.time_start, Some(1_700_000_000_i64));
+        assert_eq!(parsed.time_end, Some(1_700_010_000_i64));
+    }
+
+    #[test]
+    fn parse_filters_accepts_missing_filters() {
+        assert_eq!(parse_filters(&None).unwrap(), ExportFilters::default());
+    }
+
+    #[test]
+    fn parse_filters_rejects_invalid_target_id() {
+        let filters = Some(serde_json::json!({
+            "target_id": "not-a-uuid",
+        }));
+
+        let error = parse_filters(&filters).unwrap_err().to_string();
+        assert!(error.contains("invalid target_id"));
+    }
+
+    #[test]
+    fn parse_filters_rejects_non_integer_time() {
+        let filters = Some(serde_json::json!({
+            "time_start": "yesterday",
+        }));
+
+        let error = parse_filters(&filters).unwrap_err().to_string();
+        assert!(error.contains("invalid time_start"));
     }
 }
