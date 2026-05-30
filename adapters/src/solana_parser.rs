@@ -117,7 +117,7 @@ pub fn parse_solana_transaction(tx: &Transaction) -> anyhow::Result<Vec<LedgerEn
                         .unwrap_or(0);
 
                     let post_raw = parse_token_amount_or_zero(&post.ui_token_amount.amount);
-                    let delta_raw = post_raw - pre_raw;
+                    let delta_raw = token_delta_raw(post_raw, pre_raw);
 
                     if delta_raw != 0 {
                         let amount = token_raw_to_decimal(delta_raw, decimals);
@@ -163,6 +163,14 @@ fn token_raw_to_decimal(raw: i128, decimals: u32) -> BigDecimal {
 
 fn parse_token_amount_or_zero(amount: &str) -> i128 {
     amount.parse::<i128>().unwrap_or(0)
+}
+
+fn token_delta_raw(post_raw: i128, pre_raw: i128) -> i128 {
+    post_raw.saturating_sub(pre_raw)
+}
+
+fn token_delta_magnitude(delta_raw: i128) -> i128 {
+    delta_raw.saturating_abs()
 }
 
 /// Lookup a human-readable symbol for well-known SPL tokens.
@@ -241,13 +249,13 @@ pub fn extract_solana_token_transfers(
                     .unwrap_or(0);
 
                 let post_raw = parse_token_amount_or_zero(&post.ui_token_amount.amount);
-                let delta_raw = post_raw - pre_raw;
+                let delta_raw = token_delta_raw(post_raw, pre_raw);
 
                 if delta_raw == 0 {
                     continue;
                 }
 
-                let amount = token_raw_to_decimal(delta_raw.unsigned_abs() as i128, decimals);
+                let amount = token_raw_to_decimal(token_delta_magnitude(delta_raw), decimals);
                 let symbol = spl_token_symbol(&mint);
 
                 let (from, to) = if delta_raw > 0 {
@@ -715,6 +723,20 @@ mod tests {
             parse_token_amount_or_zero("170141183460469231731687303715884105728"),
             0
         );
+    }
+
+    #[test]
+    fn test_token_delta_raw_saturates() {
+        assert_eq!(token_delta_raw(10, 3), 7);
+        assert_eq!(token_delta_raw(i128::MAX, -1), i128::MAX);
+        assert_eq!(token_delta_raw(i128::MIN, 1), i128::MIN);
+    }
+
+    #[test]
+    fn test_token_delta_magnitude_saturates() {
+        assert_eq!(token_delta_magnitude(7), 7);
+        assert_eq!(token_delta_magnitude(-7), 7);
+        assert_eq!(token_delta_magnitude(i128::MIN), i128::MAX);
     }
 
     #[test]
