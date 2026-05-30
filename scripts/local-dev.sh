@@ -17,6 +17,17 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$PROJECT_DIR"
 
+usage() {
+  cat <<'USAGE'
+Usage: ./scripts/local-dev.sh [stop]
+
+Commands:
+  start (default)  Start Postgres for local development.
+  stop             Stop local development services.
+  -h, --help       Show this help message.
+USAGE
+}
+
 fail() {
   echo "ERROR: $*" >&2
   exit 1
@@ -50,12 +61,25 @@ wait_for_postgres() {
   return 1
 }
 
-if [[ "${1:-}" == "stop" ]]; then
-  echo "Stopping local dev services..."
-  compose down
-  echo "Done."
-  exit 0
-fi
+case "${1:-start}" in
+  start)
+    ;;
+  stop)
+    echo "Stopping local dev services..."
+    compose down
+    echo "Done."
+    exit 0
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    echo "ERROR: Unknown command: $1" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
 
 echo "Starting Postgres for local development..."
 compose up -d postgres
