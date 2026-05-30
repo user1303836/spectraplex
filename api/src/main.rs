@@ -696,6 +696,22 @@ fn clamp_offset(offset: Option<i64>) -> i64 {
     offset.unwrap_or(0).max(0)
 }
 
+fn u64_to_usize_or_max(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn nonnegative_i64_to_usize_or_max(value: i64) -> usize {
+    usize::try_from(value.max(0)).unwrap_or(usize::MAX)
+}
+
+fn nonnegative_i64_to_u64(value: i64) -> u64 {
+    u64::try_from(value.max(0)).unwrap_or(0)
+}
+
+fn nonnegative_i32_to_usize(value: i32) -> Option<usize> {
+    usize::try_from(value).ok()
+}
+
 fn validate_date_range(from: Option<i64>, to: Option<i64>) -> Result<(), AppError> {
     if let (Some(f), Some(t)) = (from, to) {
         if f > t {
@@ -1162,7 +1178,7 @@ impl ExportSink for LocalFileSink {
 
         let bytes_written = tokio::fs::metadata(&self.path)
             .await
-            .map(|m| m.len() as usize)
+            .map(|m| u64_to_usize_or_max(m.len()))
             .unwrap_or(0);
 
         Ok(DeliveryReceipt {
@@ -1310,7 +1326,7 @@ impl ExportSink for WebhookSink {
         Ok(DeliveryReceipt {
             sink_type: SinkType::Webhook,
             destination: self.url.clone(),
-            bytes_written: size as usize,
+            bytes_written: u64_to_usize_or_max(size),
             delivered_at: chrono::Utc::now(),
         })
     }
@@ -2322,7 +2338,8 @@ async fn list_streams(
                 .as_ref()
                 .and_then(|c| c.get("last_slot").and_then(|v| v.as_u64()))
                 .unwrap_or(0);
-            let uptime_secs = (chrono::Utc::now() - sub.created_at).num_seconds().max(0) as u64;
+            let uptime_secs =
+                nonnegative_i64_to_u64((chrono::Utc::now() - sub.created_at).num_seconds());
             StreamInfo {
                 id: sub.id,
                 chain,
@@ -2466,8 +2483,8 @@ async fn list_targets(
     // is done in SQL without LIMIT/OFFSET). For legacy mode, the repo query
     // already applied LIMIT/OFFSET.
     let paginated: Vec<IndexTarget> = if owner.0.is_some() {
-        let offset_usize = offset as usize;
-        let limit_usize = limit as usize;
+        let offset_usize = nonnegative_i64_to_usize_or_max(offset);
+        let limit_usize = nonnegative_i64_to_usize_or_max(limit);
         targets
             .into_iter()
             .skip(offset_usize)
@@ -3256,7 +3273,7 @@ fn export_job_to_status(job: &ExportJob) -> ExportJobStatus {
         state,
         dataset: job.dataset.to_string(),
         format: job.format.to_string(),
-        record_count: job.record_count.map(|n| n as usize),
+        record_count: job.record_count.and_then(nonnegative_i32_to_usize),
         message: job.error_message.clone(),
         delivered_to,
         delivery_status: if job.sink_config.is_some() {
@@ -4028,6 +4045,34 @@ mod tests {
     #[test]
     fn test_clamp_offset_negative() {
         assert_eq!(clamp_offset(Some(-5)), 0);
+    }
+
+    #[test]
+    fn test_u64_to_usize_or_max_saturates() {
+        assert_eq!(u64_to_usize_or_max(42), 42);
+        assert_eq!(u64_to_usize_or_max(u64::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn test_nonnegative_i64_to_usize_or_max_clamps_negative_and_saturates() {
+        assert_eq!(nonnegative_i64_to_usize_or_max(-1), 0);
+        assert_eq!(nonnegative_i64_to_usize_or_max(42), 42);
+        assert_eq!(
+            nonnegative_i64_to_usize_or_max(i64::MAX),
+            usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+        );
+    }
+
+    #[test]
+    fn test_nonnegative_i64_to_u64_clamps_negative() {
+        assert_eq!(nonnegative_i64_to_u64(-1), 0);
+        assert_eq!(nonnegative_i64_to_u64(42), 42);
+    }
+
+    #[test]
+    fn test_nonnegative_i32_to_usize_rejects_negative() {
+        assert_eq!(nonnegative_i32_to_usize(-1), None);
+        assert_eq!(nonnegative_i32_to_usize(42), Some(42));
     }
 
     #[test]
