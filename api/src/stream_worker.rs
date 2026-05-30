@@ -23,8 +23,8 @@ use spectraplex_core::config::AppConfig;
 use spectraplex_core::models::{Chain, Transaction};
 use spectraplex_core::provider::{NetworkContext, NetworkId, ProviderCapability, ProviderRegistry};
 use spectraplex_core::v2::{
-    Checkpoint, IngestionJobMode, IngestionJobStatus, IngestionRun, RawTransaction, StreamSource,
-    StreamSubscription,
+    Checkpoint, IndexTarget, IngestionJobMode, IngestionJobStatus, IngestionRun, RawTransaction,
+    StreamSource, StreamSubscription, TargetKind,
 };
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -683,15 +683,9 @@ async fn flush_stream_batch(
                 if let Some(tid) = target_id {
                     match repo.get_index_target(tid).await {
                         Ok(Some(target)) => {
-                            let wallet = target.address.unwrap_or_default();
-                            if !wallet.is_empty()
-                                && target.kind == spectraplex_core::v2::TargetKind::Wallet
+                            if let Some(mat_scope) =
+                                stream_materialization_scope(&target, network, run_id)
                             {
-                                let mat_scope = serde_json::json!({
-                                    "wallet": wallet,
-                                    "network": network,
-                                    "ingestion_run_id": run_id.to_string(),
-                                });
                                 if let Err(e) = repo
                                     .create_materialization_run(
                                         "normalize",
@@ -706,6 +700,12 @@ async fn flush_stream_batch(
                                 } else {
                                     info!(subscription_id = %sub_id, run_id = %run_id, "Enqueued post-stream materialization run");
                                 }
+                            } else if target.kind == TargetKind::Wallet {
+                                warn!(
+                                    subscription_id = %sub_id,
+                                    target_id = %tid,
+                                    "Skipping post-stream materialization for wallet target without an address"
+                                );
                             }
                         }
                         Ok(None) => {
@@ -780,6 +780,27 @@ fn usize_to_i64_or_max(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+fn stream_materialization_scope(
+    target: &IndexTarget,
+    network: &str,
+    run_id: Uuid,
+) -> Option<serde_json::Value> {
+    if target.kind != TargetKind::Wallet {
+        return None;
+    }
+
+    let wallet = target
+        .address
+        .as_deref()
+        .filter(|address| !address.is_empty())?;
+
+    Some(serde_json::json!({
+        "wallet": wallet,
+        "network": network,
+        "ingestion_run_id": run_id.to_string(),
+    }))
+}
+
 /// Extract last_slot from cursor_state JSON, default 0.
 fn cursor_last_slot(sub: &StreamSubscription) -> u64 {
     sub.cursor_state
@@ -849,6 +870,7 @@ async fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spectraplex_core::v2::{ChainFamily, TargetMode};
 
     #[test]
     fn usize_to_i64_or_max_saturates() {
@@ -856,5 +878,57 @@ mod tests {
         assert_eq!(usize_to_i64_or_max(i64::MAX as usize), i64::MAX);
         assert_eq!(usize_to_i64_or_max(i64::MAX as usize + 1), i64::MAX);
         assert_eq!(usize_to_i64_or_max(usize::MAX), i64::MAX);
+    }
+
+    fn test_target(kind: TargetKind, address: Option<&str>) -> IndexTarget {
+        let now = chrono::Utc::now();
+        IndexTarget {
+            id: Uuid::new_v4(),
+            kind,
+            network: "solana-mainnet".to_string(),
+            chain_family: ChainFamily::Solana,
+            address: address.map(str::to_string),
+            filter_spec: None,
+            mode: TargetMode::Stream,
+            label: None,
+            owner_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn stream_materialization_scope_builds_wallet_scope() {
+        let run_id = Uuid::new_v4();
+        let target = test_target(TargetKind::Wallet, Some("wallet-address"));
+
+        let scope = stream_materialization_scope(&target, "solana-mainnet", run_id).unwrap();
+
+        assert_eq!(scope["wallet"], "wallet-address");
+        assert_eq!(scope["network"], "solana-mainnet");
+        assert_eq!(scope["ingestion_run_id"], run_id.to_string());
+    }
+
+    #[test]
+    fn stream_materialization_scope_skips_wallet_without_address() {
+        assert!(stream_materialization_scope(
+            &test_target(TargetKind::Wallet, None),
+            "solana-mainnet",
+            Uuid::new_v4()
+        )
+        .is_none());
+        assert!(stream_materialization_scope(
+            &test_target(TargetKind::Wallet, Some("")),
+            "solana-mainnet",
+            Uuid::new_v4()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn stream_materialization_scope_skips_non_wallet_targets() {
+        let target = test_target(TargetKind::Program, Some("program-address"));
+
+        assert!(stream_materialization_scope(&target, "solana-mainnet", Uuid::new_v4()).is_none());
     }
 }
