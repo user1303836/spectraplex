@@ -4,7 +4,6 @@ use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, UiTransactionStatusMeta,
 };
 use spectraplex_core::models::{EntryType, LedgerEntry, Transaction};
-use std::str::FromStr;
 
 use crate::deterministic_id;
 
@@ -154,16 +153,12 @@ fn extract_sol_change_lamports(meta: &UiTransactionStatusMeta, wallet_index: usi
 
 /// Convert lamports (i128) to SOL as BigDecimal without floating-point precision loss.
 fn lamports_to_sol(lamports: i128) -> BigDecimal {
-    let raw = BigDecimal::from_str(&format!("{}", lamports)).unwrap();
-    let divisor = BigDecimal::from_str("1000000000").unwrap();
-    raw / divisor
+    BigDecimal::new(lamports.into(), 9)
 }
 
 /// Convert raw token amount to BigDecimal using the token's decimals.
 fn token_raw_to_decimal(raw: i128, decimals: u32) -> BigDecimal {
-    let raw_bd = BigDecimal::from_str(&format!("{}", raw)).unwrap();
-    let divisor = BigDecimal::from_str(&format!("1{}", "0".repeat(decimals as usize))).unwrap();
-    raw_bd / divisor
+    BigDecimal::new(raw.into(), i64::from(decimals))
 }
 
 /// Lookup a human-readable symbol for well-known SPL tokens.
@@ -687,7 +682,6 @@ impl Materializer for SolanaDecodedEventMaterializer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
 
     #[test]
     fn test_lamports_to_sol_large_positive() {
@@ -705,9 +699,7 @@ mod tests {
     fn test_lamports_to_sol_beyond_i64_max() {
         let large: i128 = i64::MAX as i128 + 1_000_000_000;
         let result = lamports_to_sol(large);
-        let expected = BigDecimal::from_str(&format!("{}", large)).unwrap()
-            / BigDecimal::from_str("1000000000").unwrap();
-        assert_eq!(result, expected);
+        assert_eq!(result, BigDecimal::new(large.into(), 9));
     }
 
     #[test]
