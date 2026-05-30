@@ -1,0 +1,8 @@
+# Session Context
+
+## User Prompts
+
+### Prompt 1
+
+There is a single PR open. Deep dive the repo for context, then review that PR. If it looks good, merge it. If it doesnt, make fixes where necessary.
+
