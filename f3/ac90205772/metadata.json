@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "f3ac90205772",
+  "strategy": "manual-commit",
+  "branch": "codex/smoke-arg-validation",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "scripts/smoke-test.sh"
+  ],
+  "sessions": [
+    {
+      "metadata": "/f3/ac90205772/0/metadata.json",
+      "transcript": "/f3/ac90205772/0/full.jsonl",
+      "context": "/f3/ac90205772/0/context.md",
+      "content_hash": "/f3/ac90205772/0/content_hash.txt",
+      "prompt": "/f3/ac90205772/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 1
+  }
+}
