@@ -242,8 +242,21 @@ impl HyperliquidAdapter {
         };
         let resp = self.client.post(&self.base_url).json(&body).send().await?;
         let resp = ensure_success_response(resp, "userFunding").await?;
-        let funding: Vec<HlFundingEntry> = resp.json().await?;
-        Ok(funding)
+        let values: Vec<serde_json::Value> = resp.json().await?;
+        values
+            .into_iter()
+            .map(|value| {
+                let normalized = if value["delta"].is_object() {
+                    let mut delta = value["delta"].clone();
+                    delta["time"] = value["time"].clone();
+                    delta["hash"] = value["hash"].clone();
+                    delta
+                } else {
+                    value
+                };
+                Ok(serde_json::from_value(normalized)?)
+            })
+            .collect()
     }
 
     pub async fn fetch_user_ledger_updates(
@@ -307,70 +320,67 @@ impl HyperliquidAdapter {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("wallet target must have an address"))?;
 
-        let resume_ms = cursor_to_start_time_ms(cursor);
-        let resume_ms_u64 = i64_to_u64_or_zero(resume_ms);
-        let network = &target.network;
+        anyhow::ensure!(
+            (1..=100_000).contains(&limit),
+            "Hyperliquid limit must be 1–100000"
+        );
+        let mut next = cursor.cloned().unwrap_or_else(|| serde_json::json!({}));
         let mut records = Vec::new();
-
-        // 1. Fills — no startTime param, filter client-side
-        let fills = self.fetch_user_fills(wallet_str).await?;
-        for fill in fills.iter().filter(|f| f.time >= resume_ms_u64).take(limit) {
-            let raw = serde_json::to_value(fill)?;
-            records.push(RawTransaction {
-                id: Uuid::new_v4(),
-                network: network.clone(),
-                tx_hash: fill.hash.clone(),
-                timestamp: unix_ms_to_secs_i64(fill.time),
-                block_number: None,
-                raw_metadata: serde_json::json!({ "type": "fill", "data": raw }),
-                source: "hl-rest-wallet-backfill".to_string(),
-                ingestion_run_id: None,
-                ingested_at: Utc::now(),
-            });
-        }
-
-        // 2. Funding payments
-        let remaining = limit.saturating_sub(records.len());
-        if remaining > 0 {
-            let funding = self.fetch_user_funding(wallet_str, resume_ms).await?;
-            for entry in funding.iter().take(remaining) {
-                let raw = serde_json::to_value(entry)?;
-                let hash = entry
-                    .hash
-                    .clone()
-                    .unwrap_or_else(|| format!("funding-{}-{}", entry.coin, entry.time));
+        // Independent cursors prevent a full fills page from starving older funding
+        // and ledger updates. Never truncate in the middle of a millisecond.
+        for (kind, field) in [
+            ("fill", "fills_ms"),
+            ("funding", "funding_ms"),
+            ("ledger_update", "ledger_ms"),
+        ] {
+            let start = next[field].as_i64().map(resume_after_ms).unwrap_or(0);
+            let values: Vec<serde_json::Value> = match kind {
+                "fill" => {
+                    let resp = self.client.post(&self.base_url).json(&serde_json::json!({
+                        "type": "userFillsByTime", "user": wallet_str, "startTime": start, "aggregateByTime": false,
+                    })).send().await?;
+                    let fills: Vec<HlFill> = ensure_success_response(resp, "userFillsByTime")
+                        .await?
+                        .json()
+                        .await?;
+                    fills
+                        .into_iter()
+                        .map(serde_json::to_value)
+                        .collect::<Result<_, _>>()?
+                }
+                "funding" => self
+                    .fetch_user_funding(wallet_str, start)
+                    .await?
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<_, _>>()?,
+                _ => self
+                    .fetch_user_ledger_updates(wallet_str, start)
+                    .await?
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<_, _>>()?,
+            };
+            let values = bounded_time_window(
+                values,
+                start,
+                limit,
+                if kind == "fill" { 2000 } else { 500 },
+            )?;
+            for data in values {
+                let time = data["time"]
+                    .as_i64()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid Hyperliquid event time"))?;
+                next[field] = serde_json::json!(time);
+                // An order hash can have multiple fills and appear in both users'
+                // histories. Keep the original in data.hash, not as the unique key.
+                let identity = serde_json::to_vec(&(wallet_str.to_lowercase(), kind, &data))?;
+                let event_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, &identity);
                 records.push(RawTransaction {
-                    id: Uuid::new_v4(),
-                    network: network.clone(),
-                    tx_hash: hash,
-                    timestamp: unix_ms_to_secs_i64(entry.time),
-                    block_number: None,
-                    raw_metadata: serde_json::json!({ "type": "funding", "data": raw }),
-                    source: "hl-rest-wallet-backfill".to_string(),
-                    ingestion_run_id: None,
-                    ingested_at: Utc::now(),
-                });
-            }
-        }
-
-        // 3. Non-funding ledger updates
-        let remaining = limit.saturating_sub(records.len());
-        if remaining > 0 {
-            let ledger_updates = self
-                .fetch_user_ledger_updates(wallet_str, resume_ms)
-                .await?;
-            for update in ledger_updates.iter().take(remaining) {
-                let raw = serde_json::to_value(update)?;
-                records.push(RawTransaction {
-                    id: Uuid::new_v4(),
-                    network: network.clone(),
-                    tx_hash: update.hash.clone(),
-                    timestamp: unix_ms_to_secs_i64(update.time),
-                    block_number: None,
-                    raw_metadata: serde_json::json!({ "type": "ledger_update", "data": raw }),
-                    source: "hl-rest-wallet-backfill".to_string(),
-                    ingestion_run_id: None,
-                    ingested_at: Utc::now(),
+                    id: Uuid::new_v4(), network: target.network.clone(), tx_hash: format!("hl-{kind}-{event_id}"),
+                    timestamp: time / 1000, block_number: None,
+                    raw_metadata: serde_json::json!({"type": kind, "wallet": wallet_str, "data": data}),
+                    source: "hl-rest-wallet-backfill".into(), ingestion_run_id: None, ingested_at: Utc::now(),
                 });
             }
         }
@@ -383,7 +393,14 @@ impl HyperliquidAdapter {
 
         Ok(IngestionBatch {
             records,
-            checkpoint: None,
+            checkpoint: Some(spectraplex_core::v2::Checkpoint {
+                id: Uuid::new_v4(),
+                target_id: target.id,
+                network: target.network.clone(),
+                source: "rest".into(),
+                cursor: next,
+                updated_at: Utc::now(),
+            }),
             run_metadata: None,
         })
     }
@@ -441,6 +458,39 @@ impl HyperliquidAdapter {
 // ---------------------------------------------------------------------------
 // Cursor helpers
 // ---------------------------------------------------------------------------
+
+fn bounded_time_window(
+    mut values: Vec<serde_json::Value>,
+    start: i64,
+    limit: usize,
+    provider_cap: usize,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    anyhow::ensure!(
+        values
+            .iter()
+            .all(|v| v["time"].as_i64().is_some_and(|t| t >= 0)),
+        "Invalid event timestamp"
+    );
+    let saturated = values.len() >= provider_cap;
+    values.retain(|v| v["time"].as_i64().unwrap() >= start);
+    values.sort_by_key(|v| v["time"].as_i64().unwrap());
+    if saturated {
+        // The provider might have more events at its last timestamp. Defer that
+        // entire timestamp to the next request instead of silently dropping ties.
+        if let Some(last) = values.last().map(|v| v["time"].as_i64().unwrap()) {
+            values.retain(|v| v["time"].as_i64().unwrap() < last);
+            anyhow::ensure!(
+                !values.is_empty(),
+                "Provider page saturated at one timestamp; cannot advance safely"
+            );
+        }
+    }
+    if values.len() > limit {
+        let boundary = values[limit - 1]["time"].as_i64().unwrap();
+        values.retain(|v| v["time"].as_i64().unwrap() <= boundary);
+    }
+    Ok(values)
+}
 
 /// Extract start time in milliseconds from a V2 checkpoint cursor.
 ///
@@ -971,6 +1021,22 @@ mod tests {
     // V2 wallet backfill with mock server
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn bounded_windows_keep_ties_and_defer_saturated_tail() {
+        let values = vec![
+            serde_json::json!({"time":3}),
+            serde_json::json!({"time":2}),
+            serde_json::json!({"time":1}),
+            serde_json::json!({"time":2}),
+        ];
+        let page = bounded_time_window(values.clone(), 0, 2, 500).unwrap();
+        assert_eq!(page.len(), 3);
+        assert_eq!(page.last().unwrap()["time"], 2);
+        let page = bounded_time_window(values, 0, 50, 4).unwrap();
+        assert_eq!(page.len(), 3);
+        assert!(bounded_time_window(vec![serde_json::json!({"time":1}); 500], 0, 50, 500).is_err());
+    }
+
     #[tokio::test]
     async fn test_v2_wallet_backfill_with_mock_server() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1033,7 +1099,12 @@ mod tests {
 
         // Verify record types
         assert_eq!(batch.records[0].raw_metadata["type"], "fill");
-        assert_eq!(batch.records[0].tx_hash, "0xtest1");
+        assert!(batch.records[0].tx_hash.starts_with("hl-fill-"));
+        assert_eq!(batch.records[0].raw_metadata["data"]["hash"], "0xtest1");
+        let checkpoint = batch.checkpoint.as_ref().unwrap();
+        for field in ["fills_ms", "funding_ms", "ledger_ms"] {
+            assert_eq!(checkpoint.cursor[field], 1700000000000_i64);
+        }
         assert_eq!(batch.records[1].raw_metadata["type"], "funding");
         assert_eq!(batch.records[2].raw_metadata["type"], "ledger_update");
 
@@ -1089,8 +1160,8 @@ mod tests {
         );
 
         // Cursor at the same time as the mock fill (1700000000000ms)
-        // cursor_to_start_time_ms adds 1, so resume_ms = 1700000000001 > fill time
-        let cursor = serde_json::json!({ "last_time_ms": 1700000000000_i64 });
+        // Each stream resumes independently; funding is not skipped by the fill cursor.
+        let cursor = serde_json::json!({ "fills_ms": 1700000000000_i64 });
         let batch = adapter.backfill(&target, Some(&cursor), 100).await.unwrap();
 
         // Fill should be filtered out

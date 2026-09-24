@@ -11,10 +11,148 @@ pub mod protocol_analytics;
 pub mod repo;
 pub mod solana;
 pub mod solana_grpc;
+mod solana_history;
 pub mod solana_parser;
 pub mod v2_repo;
+mod workbench_repo;
 
 use uuid::Uuid;
+
+/// Validate supported payload shapes and amounts before import or materialization.
+pub fn validate_import_payload(
+    family: spectraplex_core::v2::ChainFamily,
+    raw: &serde_json::Value,
+) -> anyhow::Result<()> {
+    use spectraplex_core::v2::ChainFamily;
+    anyhow::ensure!(raw.is_object(), "raw_metadata must be an object");
+    let decimal = |text: &str| -> anyhow::Result<()> {
+        anyhow::ensure!(text.len() <= 256, "Decimal amount is too long");
+        let _: bigdecimal::BigDecimal = text.parse()?;
+        Ok(())
+    };
+    match family {
+        ChainFamily::Solana => {
+            let tx: solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta =
+                serde_json::from_value(raw.clone())?;
+            let meta = tx
+                .transaction
+                .meta
+                .ok_or_else(|| anyhow::anyhow!("Solana metadata is required"))?;
+            anyhow::ensure!(
+                meta.pre_balances.len() == meta.post_balances.len(),
+                "Solana balance array length mismatch"
+            );
+            for balances in [&meta.pre_token_balances, &meta.post_token_balances] {
+                if let solana_transaction_status::option_serializer::OptionSerializer::Some(
+                    balances,
+                ) = balances
+                {
+                    for balance in balances {
+                        let _: u64 = balance.ui_token_amount.amount.parse()?;
+                    }
+                }
+            }
+        }
+        ChainFamily::Evm => {
+            anyhow::ensure!(
+                (raw["topics"].is_array() && raw["data"].is_string() && raw["address"].is_string())
+                    || (raw["from"].is_string() && raw["value"].is_string())
+                    || raw["logs"].is_array(),
+                "EVM payload must be an RPC log or transaction"
+            );
+            fn check_evm_fields(raw: &serde_json::Value) -> anyhow::Result<()> {
+                anyhow::ensure!(raw.is_object(), "EVM log must be an object");
+                for field in ["value", "gas_used", "effective_gas_price", "data"] {
+                    if let Some(value) = raw.get(field) {
+                        let text = value
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("{field} must be a hex string"))?;
+                        anyhow::ensure!(
+                            text.starts_with("0x")
+                                && text[2..].bytes().all(|b| b.is_ascii_hexdigit()),
+                            "Invalid hex in {field}"
+                        );
+                        if field != "data" {
+                            anyhow::ensure!(
+                                text.len() <= 66 && text.len() > 2,
+                                "Invalid uint256 in {field}"
+                            );
+                        }
+                    }
+                }
+                if let Some(topics) = raw.get("topics") {
+                    let topics = topics
+                        .as_array()
+                        .ok_or_else(|| anyhow::anyhow!("topics must be an array"))?;
+                    anyhow::ensure!(
+                        topics.len() <= 4
+                            && topics
+                                .iter()
+                                .all(|t| t.as_str().is_some_and(|s| s.len() == 66
+                                    && s.starts_with("0x")
+                                    && s[2..].bytes().all(|b| b.is_ascii_hexdigit()))),
+                        "Invalid EVM topics"
+                    );
+                }
+                Ok(())
+            }
+            check_evm_fields(raw)?;
+            if let Some(logs) = raw["logs"].as_array() {
+                for log in logs {
+                    check_evm_fields(log)?;
+                }
+            }
+            if let Some(hints) = raw["token_decimals"].as_object() {
+                anyhow::ensure!(
+                    hints.values().all(|v| v.as_u64().is_some_and(|n| n <= 255)),
+                    "Token decimals must be integers 0–255"
+                );
+            }
+        }
+        ChainFamily::Hyperliquid => match raw["type"].as_str() {
+            Some("fill") => {
+                let fill: hyperliquid::HlFill = serde_json::from_value(raw["data"].clone())?;
+                for text in [
+                    Some(fill.px.as_str()),
+                    Some(fill.sz.as_str()),
+                    fill.fee.as_deref(),
+                    fill.closed_pnl.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    decimal(text)?;
+                }
+            }
+            Some("funding") => {
+                let funding: hyperliquid::HlFundingEntry =
+                    serde_json::from_value(raw["data"].clone())?;
+                decimal(&funding.usdc)?;
+                if let Some(rate) = funding.funding_rate {
+                    decimal(&rate)?;
+                }
+            }
+            Some("ledger_update") => {
+                let update: hyperliquid::HlLedgerUpdate =
+                    serde_json::from_value(raw["data"].clone())?;
+                if matches!(update.delta["type"].as_str(), Some("deposit" | "withdraw")) {
+                    decimal(
+                        update.delta["usdc"]
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("Ledger usdc amount is required"))?,
+                    )?;
+                }
+            }
+            Some("funding_rate") => {
+                let rate: hyperliquid::HlFundingRate = serde_json::from_value(raw["data"].clone())?;
+                decimal(&rate.funding_rate)?;
+                decimal(&rate.premium)?;
+            }
+            _ => anyhow::bail!("Unknown Hyperliquid payload type"),
+        },
+    }
+    Ok(())
+}
 
 const LEDGER_ENTRY_NS: Uuid = Uuid::from_bytes([
     0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,

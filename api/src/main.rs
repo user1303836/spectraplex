@@ -3,6 +3,8 @@ mod export_stream;
 mod export_worker;
 mod materialize_worker;
 mod stream_worker;
+mod web;
+mod workbench;
 mod worker;
 
 use axum::{
@@ -290,6 +292,11 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::load()?;
     config.validate()?;
+    anyhow::ensure!(
+        config.api_key.is_some(),
+        "Set SPECTRAPLEX_API_KEY (or run ./scripts/setup.sh) before starting the API"
+    );
+    tokio::fs::create_dir_all(&config.export_dir).await?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -369,7 +376,44 @@ async fn main() -> anyhow::Result<()> {
         worker_cancel.clone(),
     );
 
+    let app = app_router(shared_state);
+    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
+    info!(version = env!("CARGO_PKG_VERSION"), "Listening on {}", addr);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            info!("Shutdown signal received");
+            worker_cancel.cancel();
+        })
+        .await?;
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+fn app_router(shared_state: Arc<AppState>) -> Router {
     let protected = Router::new()
+        .route("/v1/session", get(workbench::session))
+        .route("/v1/jobs", get(workbench::jobs))
+        .route("/v1/demo/{chain}", post(workbench::demo))
+        .route(
+            "/v1/targets/{target_id}/import",
+            post(workbench::import_records),
+        )
         .route("/v1/ingest", post(trigger_ingest))
         .route("/v1/ingest/batch", post(trigger_batch_ingest))
         .route("/v1/normalize", post(trigger_normalize))
@@ -433,8 +477,11 @@ async fn main() -> anyhow::Result<()> {
             require_auth,
         ));
 
-    let app = Router::new()
+    Router::new()
+        .route("/", get(web::index))
+        .route("/assets/{name}", get(web::asset))
         .route("/health", get(health_check))
+        .route("/ready", get(readiness_check))
         .merge(protected)
         .layer(axum::extract::DefaultBodyLimit::max(1_048_576))
         .layer(TimeoutLayer::with_status_code(
@@ -442,24 +489,24 @@ async fn main() -> anyhow::Result<()> {
             Duration::from_secs(60),
         ))
         .layer(TraceLayer::new_for_http())
-        .with_state(shared_state);
-
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
-    info!("Listening on {}", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("Shutdown signal received");
-            worker_cancel.cancel();
-        })
-        .await?;
-
-    Ok(())
+        .layer(middleware::from_fn(web::security_headers))
+        .with_state(shared_state)
 }
 
 async fn health_check() -> &'static str {
     "OK"
+}
+
+async fn readiness_check(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    tokio::time::timeout(Duration::from_secs(3), state.repo.check_connection())
+        .await
+        .map_err(|_| AppError::service_unavailable("Database unavailable"))?
+        .map_err(|_| AppError::service_unavailable("Database unavailable"))?;
+    Ok(Json(
+        serde_json::json!({"status": "ready", "version": env!("CARGO_PKG_VERSION")}),
+    ))
 }
 
 async fn require_auth(
@@ -668,6 +715,9 @@ struct ExportJobRequest {
 #[derive(Serialize)]
 struct DatasetInfo {
     name: String,
+    tier: String,
+    queryable: bool,
+    chain_families: Vec<ChainFamily>,
     latest_version: Option<i32>,
     latest_version_status: Option<String>,
 }
@@ -1898,11 +1948,7 @@ fn format_entry_type(et: &spectraplex_core::models::EntryType) -> &'static str {
 }
 
 fn csv_escape(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
-    }
+    export_csv::csv_escape(s)
 }
 
 async fn export_ledger(
@@ -2771,6 +2817,7 @@ async fn get_network(
 /// is kept for backward-compatible test assertions and `join()` in error
 /// messages.
 const QUERYABLE_DATASETS: &[&str] = &[
+    "raw_transactions",
     "token_transfers",
     "native_balance_deltas",
     "decoded_events",
@@ -2813,6 +2860,9 @@ async fn list_all_datasets(
             .map_err(AppError::internal)?;
         datasets.push(DatasetInfo {
             name: sql_name.to_string(),
+            tier: ds.tier().to_string(),
+            queryable: DatasetRegistry::is_queryable(sql_name),
+            chain_families: ds.chain_families().to_vec(),
             latest_version: latest.as_ref().map(|v| v.version),
             latest_version_status: latest.as_ref().map(|v| v.status.to_string()),
         });
@@ -2840,7 +2890,7 @@ async fn query_dataset_records(
     State(state): State<Arc<AppState>>,
     Extension(owner): Extension<AuthenticatedOwner>,
     Path(name): Path<String>,
-    Query(params): Query<DatasetQueryParams>,
+    Query(mut params): Query<DatasetQueryParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Tenant isolation: require target_id and validate ownership.
     if let Some(_owner_id) = owner.0 {
@@ -2858,11 +2908,42 @@ async fn query_dataset_records(
         )));
     }
     validate_date_range(params.time_start, params.time_end)?;
+    if let Some(target_id) = params.target_id {
+        let target = state
+            .repo
+            .get_index_target(target_id)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::not_found("Target not found"))?;
+        if params
+            .network
+            .as_ref()
+            .is_some_and(|network| network != &target.network)
+        {
+            return Err(AppError::bad_request("network does not match target"));
+        }
+        params.network = Some(target.network);
+    }
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
     let net = params.network.as_deref();
 
     let result = match name.as_str() {
+        "raw_transactions" => {
+            let records = state
+                .repo
+                .query_raw_transactions(
+                    params.target_id,
+                    net,
+                    params.time_start,
+                    params.time_end,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(AppError::internal)?;
+            serde_json::to_value(records).map_err(AppError::internal)?
+        }
         "token_transfers" => {
             let records = state
                 .repo
@@ -3058,6 +3139,7 @@ async fn query_dataset_records(
 /// Derived from `DatasetRegistry::exportable()` — the static `&[&str]` form
 /// is kept for backward-compatible test assertions.
 const EXPORTABLE_DATASETS: &[&str] = &[
+    "raw_transactions",
     "token_transfers",
     "native_balance_deltas",
     "decoded_events",
@@ -3348,10 +3430,17 @@ async fn get_export_job_status(
     }
 }
 
+#[derive(Deserialize)]
+struct DownloadParams {
+    #[serde(default)]
+    provenance: bool,
+}
+
 async fn download_export(
     State(state): State<Arc<AppState>>,
     Extension(owner): Extension<AuthenticatedOwner>,
     Path(job_id): Path<Uuid>,
+    Query(params): Query<DownloadParams>,
 ) -> Result<Response, AppError> {
     let job = state
         .repo
@@ -3372,13 +3461,24 @@ async fn download_export(
                 .as_deref()
                 .ok_or_else(|| AppError::internal("Export result location missing"))?;
 
-            let file_path = format!("{}/{}", state.config.export_dir, result_location);
-            let body = tokio::fs::read(&file_path)
+            let file_path = if params.provenance {
+                format!(
+                    "{}/exports/{}.provenance.json",
+                    state.config.export_dir, job_id
+                )
+            } else {
+                format!("{}/{}", state.config.export_dir, result_location)
+            };
+            let file = tokio::fs::File::open(&file_path)
                 .await
-                .map_err(|e| AppError::internal(format!("Failed to read export file: {e}")))?;
+                .map_err(|e| AppError::internal(format!("Failed to open export file: {e}")))?;
+            let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
 
-            let format = job.format;
-            let ct = content_type_for_format(format);
+            let ct = if params.provenance {
+                "application/json"
+            } else {
+                content_type_for_format(job.format)
+            };
 
             let sanitize = |s: &str| -> String {
                 s.chars()
@@ -3386,7 +3486,11 @@ async fn download_export(
                     .collect()
             };
             let safe_dataset = sanitize(job.dataset.as_sql_str());
-            let safe_format = sanitize(&job.format.to_string());
+            let safe_format = if params.provenance {
+                "provenance.json".into()
+            } else {
+                sanitize(&job.format.to_string())
+            };
             let disposition = format!(
                 "attachment; filename=\"{}-{}.{}\"",
                 safe_dataset, job_id, safe_format,
@@ -3913,74 +4017,7 @@ mod tests {
     }
 
     fn test_router_with_state(state: Arc<AppState>) -> Router {
-        let protected = Router::new()
-            .route("/v1/ingest", post(trigger_ingest))
-            .route("/v1/ingest/batch", post(trigger_batch_ingest))
-            .route("/v1/normalize", post(trigger_normalize))
-            .route("/v1/jobs/{job_id}", get(get_job_status))
-            .route("/v1/transactions/{wallet}", get(get_transactions))
-            .route("/v1/ledger/{wallet}", get(get_ledger))
-            .route("/v1/export/{wallet}", get(export_ledger))
-            .route("/v1/balances/{wallet}", get(get_balances))
-            .route(
-                "/v1/transactions/{wallet}/{tx_hash}",
-                get(get_single_transaction),
-            )
-            .route("/v1/stats/{wallet}", get(get_wallet_stats))
-            .route("/v1/stream/start", post(start_stream))
-            .route("/v1/stream/{stream_id}/stop", post(stop_stream))
-            .route("/v1/streams", get(list_streams))
-            .route("/v1/targets", post(register_target))
-            .route("/v1/targets", get(list_targets))
-            .route("/v1/targets/{target_id}", get(get_target))
-            .route(
-                "/v1/targets/{target_id}/ingest",
-                post(trigger_target_ingest),
-            )
-            .route("/v1/api-keys", post(create_api_key_handler))
-            .route("/v1/api-keys", get(list_api_keys_handler))
-            .route("/v1/api-keys/{key_id}", delete(revoke_api_key_handler))
-            .route("/v1/networks", get(list_networks))
-            .route("/v1/networks/{network_id}", get(get_network))
-            .route("/v1/datasets", get(list_all_datasets))
-            .route(
-                "/v1/datasets/{name}/versions",
-                get(list_dataset_versions_handler),
-            )
-            .route("/v1/datasets/{name}/records", get(query_dataset_records))
-            .route(
-                "/v1/datasets/{name}/completeness",
-                get(get_dataset_completeness_handler),
-            )
-            .route(
-                "/v1/datasets/{name}/status",
-                get(get_dataset_status_handler),
-            )
-            .route("/v1/export/dataset", post(create_export_job))
-            .route("/v1/export/jobs/{job_id}", get(get_export_job_status))
-            .route("/v1/export/jobs/{job_id}/download", get(download_export))
-            .route("/v1/export/tax", get(tax_export))
-            .route("/v1/forensics/activity", get(forensics_activity_handler))
-            .route("/v1/analytics/hl/trader", get(hl_trader_analytics_handler))
-            .route("/v1/analytics/hl/market", get(hl_market_analytics_handler))
-            .route(
-                "/v1/analytics/protocol/activity",
-                get(protocol_activity_handler),
-            )
-            .route("/v1/analytics/protocol/tvl", get(protocol_tvl_handler))
-            .layer(middleware::from_fn_with_state(
-                Arc::clone(&state),
-                rate_limit_middleware,
-            ))
-            .layer(middleware::from_fn_with_state(
-                Arc::clone(&state),
-                require_auth,
-            ));
-
-        Router::new()
-            .route("/health", get(health_check))
-            .merge(protected)
-            .with_state(state)
+        app_router(state)
     }
 
     #[test]
@@ -6245,7 +6282,7 @@ mod tests {
 
     #[test]
     fn test_queryable_datasets_count() {
-        assert_eq!(QUERYABLE_DATASETS.len(), 12);
+        assert_eq!(QUERYABLE_DATASETS.len(), 13);
     }
 
     #[test]
@@ -6294,6 +6331,9 @@ mod tests {
     fn test_dataset_info_serialization() {
         let info = DatasetInfo {
             name: "token_transfers".to_string(),
+            tier: "silver".into(),
+            queryable: true,
+            chain_families: vec![ChainFamily::Solana],
             latest_version: Some(1),
             latest_version_status: Some("active".to_string()),
         };
@@ -6307,6 +6347,9 @@ mod tests {
     fn test_dataset_info_serialization_no_version() {
         let info = DatasetInfo {
             name: "positions".to_string(),
+            tier: "silver".into(),
+            queryable: true,
+            chain_families: vec![ChainFamily::Hyperliquid],
             latest_version: None,
             latest_version_status: None,
         };
@@ -8067,7 +8110,7 @@ mod tests {
 
     #[test]
     fn test_exportable_datasets_includes_gold() {
-        assert_eq!(EXPORTABLE_DATASETS.len(), 12);
+        assert_eq!(EXPORTABLE_DATASETS.len(), 13);
         assert!(EXPORTABLE_DATASETS.contains(&"wallet_ledger"));
         assert!(EXPORTABLE_DATASETS.contains(&"balance_history"));
         assert!(EXPORTABLE_DATASETS.contains(&"hl_pnl_summary"));

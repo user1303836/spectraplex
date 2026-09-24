@@ -46,6 +46,7 @@ async fn pg_is_available() -> bool {
 macro_rules! require_pg {
     () => {
         if !pg_is_available().await {
+            assert!(std::env::var_os("TEST_DATABASE_URL").is_none(), "Configured test PostgreSQL is unavailable; refusing to skip integration coverage");
             eprintln!(
                 "SKIPPED: PostgreSQL not available at {} — set TEST_DATABASE_URL or start PostgreSQL",
                 base_url()
@@ -133,6 +134,129 @@ fn make_target(
         created_at: now,
         updated_at: now,
     }
+}
+
+#[tokio::test]
+async fn connector_commit_is_atomic_and_lease_fenced() {
+    require_pg!();
+    use spectraplex_adapters::v2_repo::EnqueueIngestionJobParams;
+    use spectraplex_core::v2::{
+        Checkpoint, IngestionJobMode, IngestionJobStatus, IngestionRun, RawTransaction,
+    };
+    let (repo, pool, db) = setup_test_repo("atomic_connector").await;
+    let target = repo
+        .create_index_target(&make_target(
+            TargetKind::Wallet,
+            ChainFamily::Evm,
+            "ethereum-mainnet",
+            Some("0x1111111111111111111111111111111111111111"),
+            None,
+        ))
+        .await
+        .unwrap();
+    let job = repo
+        .enqueue_ingestion_job(&EnqueueIngestionJobParams {
+            target_id: Some(target.id),
+            network: &target.network,
+            mode: "incremental",
+            priority: 0,
+            idempotency_key: None,
+            requested_by: None,
+            callback_url: None,
+        })
+        .await
+        .unwrap();
+    repo.claim_ingestion_job("owner").await.unwrap().unwrap();
+    let now = Utc::now();
+    let run = IngestionRun {
+        id: Uuid::new_v4(),
+        target_id: Some(target.id),
+        network: target.network.clone(),
+        source: "rpc".into(),
+        mode: IngestionJobMode::Incremental,
+        status: IngestionJobStatus::Running,
+        started_at: now,
+        finished_at: None,
+        records_written: 0,
+        error_message: None,
+        cursor_state: None,
+    };
+    repo.create_ingestion_run(&run).await.unwrap();
+    let raw = RawTransaction {
+        id: Uuid::new_v4(),
+        network: target.network.clone(),
+        tx_hash: "test-atomic".into(),
+        timestamp: 1,
+        block_number: Some(1),
+        raw_metadata: serde_json::json!({}),
+        source: "rpc".into(),
+        ingestion_run_id: Some(run.id),
+        ingested_at: now,
+    };
+    let cp = Checkpoint {
+        id: Uuid::new_v4(),
+        target_id: target.id,
+        network: target.network.clone(),
+        source: "rpc".into(),
+        cursor: serde_json::json!({"last_block":1}),
+        updated_at: now,
+    };
+    sqlx::raw_sql("CREATE FUNCTION reject_materialization() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected outbox failure'; END $$; CREATE TRIGGER reject_materialization BEFORE INSERT ON materialization_runs FOR EACH ROW EXECUTE FUNCTION reject_materialization();").execute(&pool).await.unwrap();
+    assert!(repo
+        .commit_connector_batch(
+            &target,
+            run.id,
+            std::slice::from_ref(&raw),
+            Some(&cp),
+            (job.id, "owner")
+        )
+        .await
+        .is_err());
+    for table in [
+        "raw_transactions",
+        "target_matches",
+        "ingestion_run_transactions",
+        "checkpoints",
+        "materialization_runs",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "partial commit in {table}");
+    }
+    sqlx::query("DROP TRIGGER reject_materialization ON materialization_runs")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(repo
+        .commit_connector_batch(
+            &target,
+            run.id,
+            std::slice::from_ref(&raw),
+            Some(&cp),
+            (job.id, "stale-owner")
+        )
+        .await
+        .is_err());
+    repo.commit_connector_batch(&target, run.id, &[raw], Some(&cp), (job.id, "owner"))
+        .await
+        .unwrap();
+    for table in [
+        "raw_transactions",
+        "target_matches",
+        "ingestion_run_transactions",
+        "checkpoints",
+        "materialization_runs",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "missing durable write in {table}");
+    }
+    pool.close().await;
+    drop_test_db(&db).await;
 }
 
 fn make_evm_tx_with_transfer(tx_hash: &str, wallet: &str) -> Transaction {

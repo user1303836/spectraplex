@@ -28,6 +28,8 @@ use crate::v2::ChainFamily;
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum DatasetName {
+    /// Canonical Bronze payloads, including non-wallet target data.
+    RawTransactions,
     /// Financial ledger for tax/portfolio (existing Silver dataset).
     LedgerEntries,
     /// Canonical token transfer records across chains.
@@ -64,6 +66,7 @@ impl DatasetName {
     /// serialization of the enum.
     pub fn as_sql_str(&self) -> &'static str {
         match self {
+            DatasetName::RawTransactions => "raw_transactions",
             DatasetName::LedgerEntries => "ledger_entries",
             DatasetName::TokenTransfers => "token_transfers",
             DatasetName::NativeBalanceDeltas => "native_balance_deltas",
@@ -92,6 +95,7 @@ impl DatasetName {
     /// | `positions`        | `hl_position_changes`  |
     pub fn physical_table(&self) -> &'static str {
         match self {
+            DatasetName::RawTransactions => "raw_transactions",
             DatasetName::LedgerEntries => "ledger_entries",
             DatasetName::TokenTransfers => "token_transfers",
             DatasetName::NativeBalanceDeltas => "native_balance_deltas",
@@ -127,6 +131,7 @@ impl DatasetName {
     /// Returns the dataset tier (Bronze, Silver, or Gold).
     pub fn tier(&self) -> DatasetTier {
         match self {
+            DatasetName::RawTransactions => DatasetTier::Bronze,
             DatasetName::LedgerEntries
             | DatasetName::TokenTransfers
             | DatasetName::NativeBalanceDeltas
@@ -147,7 +152,7 @@ impl DatasetName {
     /// Returns the chain families that can produce this dataset.
     pub fn chain_families(&self) -> &'static [ChainFamily] {
         match self {
-            DatasetName::TokenTransfers => &[
+            DatasetName::RawTransactions | DatasetName::TokenTransfers => &[
                 ChainFamily::Solana,
                 ChainFamily::Evm,
                 ChainFamily::Hyperliquid,
@@ -178,6 +183,7 @@ impl DatasetName {
     /// Returns all dataset names as a slice.
     pub fn all() -> &'static [DatasetName] {
         &[
+            DatasetName::RawTransactions,
             DatasetName::LedgerEntries,
             DatasetName::TokenTransfers,
             DatasetName::NativeBalanceDeltas,
@@ -272,6 +278,7 @@ impl DatasetRegistry {
     /// `/v1/ledger/:wallet` endpoint.
     pub fn queryable() -> &'static [DatasetName] {
         &[
+            DatasetName::RawTransactions,
             DatasetName::TokenTransfers,
             DatasetName::NativeBalanceDeltas,
             DatasetName::DecodedEvents,
@@ -293,6 +300,7 @@ impl DatasetRegistry {
     /// `/v1/export/:wallet` endpoint.
     pub fn exportable() -> &'static [DatasetName] {
         &[
+            DatasetName::RawTransactions,
             DatasetName::TokenTransfers,
             DatasetName::NativeBalanceDeltas,
             DatasetName::DecodedEvents,
@@ -719,7 +727,7 @@ pub struct TokenTransfer {
     pub to_address: String,
     /// Transfer amount (positive = movement from sender to receiver).
     pub amount: BigDecimal,
-    /// Token decimals used for normalization.
+    /// Token decimals used for normalization; -1 means unknown, with amount in raw units.
     pub decimals: i32,
     /// Ordinal position within the same (raw_transaction_id, from, to, token) group.
     pub transfer_index: i32,
@@ -1232,14 +1240,15 @@ mod tests {
     use strum::IntoEnumIterator;
 
     #[test]
-    fn dataset_name_count_is_thirteen() {
-        assert_eq!(DatasetName::all().len(), 13);
-        assert_eq!(DatasetName::iter().count(), 13);
+    fn dataset_name_count_matches_registry() {
+        assert_eq!(DatasetName::all().len(), 14);
+        assert_eq!(DatasetName::iter().count(), 14);
     }
 
     #[test]
     fn dataset_name_serde_roundtrip() {
         let cases = [
+            (DatasetName::RawTransactions, "\"raw_transactions\""),
             (DatasetName::LedgerEntries, "\"ledger_entries\""),
             (DatasetName::TokenTransfers, "\"token_transfers\""),
             (
@@ -1257,7 +1266,11 @@ mod tests {
             (DatasetName::ProtocolEvents, "\"protocol_events\""),
             (DatasetName::PoolSnapshots, "\"pool_snapshots\""),
         ];
-        assert_eq!(cases.len(), 13, "must cover all 13 datasets");
+        assert_eq!(
+            cases.len(),
+            DatasetName::all().len(),
+            "must cover every dataset"
+        );
         for (variant, expected_json) in cases {
             let json = serde_json::to_string(&variant).unwrap();
             assert_eq!(json, expected_json, "serialize {variant:?}");
@@ -2477,7 +2490,8 @@ mod tests {
 
     #[test]
     fn silver_gold_partitions_cover_all_datasets() {
-        let mut all_partitioned: Vec<DatasetName> = Vec::new();
+        let mut all_partitioned = vec![DatasetName::RawTransactions];
+        assert_eq!(DatasetName::RawTransactions.tier(), DatasetTier::Bronze);
         all_partitioned.extend_from_slice(DatasetName::silver());
         all_partitioned.extend_from_slice(DatasetName::gold());
         all_partitioned.sort_by_key(|d| d.as_sql_str());
@@ -2487,7 +2501,7 @@ mod tests {
 
         assert_eq!(
             all_partitioned, all_datasets,
-            "silver() + gold() must cover all datasets exactly once"
+            "Bronze + silver() + gold() must cover all datasets exactly once"
         );
     }
 
@@ -2577,8 +2591,7 @@ mod tests {
     #[test]
     fn registry_queryable_contains_all_non_legacy_datasets() {
         let queryable = DatasetRegistry::queryable();
-        // All 12 non-legacy datasets should be queryable.
-        assert_eq!(queryable.len(), 12);
+        assert_eq!(queryable.len(), 13);
         // LedgerEntries should not be in the queryable list.
         assert!(
             !queryable.contains(&DatasetName::LedgerEntries),
@@ -2589,7 +2602,7 @@ mod tests {
     #[test]
     fn registry_exportable_contains_all_non_legacy_datasets() {
         let exportable = DatasetRegistry::exportable();
-        assert_eq!(exportable.len(), 12);
+        assert_eq!(exportable.len(), 13);
         assert!(
             !exportable.contains(&DatasetName::LedgerEntries),
             "LedgerEntries served via legacy endpoint, not dataset export"

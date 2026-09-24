@@ -81,6 +81,7 @@ case "${1:-start}" in
     ;;
 esac
 
+"$SCRIPT_DIR/setup.sh"
 echo "Starting Postgres for local development..."
 compose up -d postgres
 
@@ -92,7 +93,7 @@ echo ""
 echo "Postgres is ready on localhost:5432"
 echo ""
 echo "Next steps:"
-echo "  1. Copy spectraplex.toml.example to spectraplex.toml and edit as needed."
-echo "  2. Run: cargo run --bin spectraplex-api"
+echo "  1. Run: cargo run --bin spectraplex-api"
+echo "  2. Open http://localhost:3000; connect with the key in .env."
 echo "  3. Test: ./scripts/smoke-test.sh"
 echo ""

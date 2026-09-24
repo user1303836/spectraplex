@@ -196,6 +196,7 @@ fn erc20_approval_topic_addresses(topics: &[serde_json::Value]) -> Option<(Strin
 /// Handles full uint256 range without truncation.
 fn hex_to_bigdecimal(hex: &str) -> anyhow::Result<BigDecimal> {
     let stripped = hex.strip_prefix("0x").unwrap_or(hex);
+    anyhow::ensure!(stripped.len() <= 64, "Hex amount exceeds uint256");
     if stripped.is_empty() {
         return Ok(BigDecimal::from(0));
     }
@@ -209,6 +210,73 @@ fn hex_to_bigdecimal(hex: &str) -> anyhow::Result<BigDecimal> {
         result = result * &base + BigDecimal::from(digit);
     }
     Ok(result)
+}
+
+/// Known top-level native value and execution gas flows only. Never fabricates
+/// pre/post account balances or treats internal calls as fully indexed.
+pub(crate) fn native_flows(
+    raw: &serde_json::Value,
+    wallet: &str,
+) -> anyhow::Result<Vec<(&'static str, BigDecimal)>> {
+    let from = raw["from"]
+        .as_str()
+        .is_some_and(|v| v.eq_ignore_ascii_case(wallet));
+    let to = raw["to"]
+        .as_str()
+        .is_some_and(|v| v.eq_ignore_ascii_case(wallet));
+    let mut flows = Vec::new();
+    if from != to && raw["status"].as_str() != Some("0x0") {
+        if let Some(value) = raw["value"].as_str() {
+            let amount = wei_to_eth(hex_to_bigdecimal(value)?);
+            if amount != BigDecimal::from(0) {
+                flows.push(("transfer", if from { -amount } else { amount }));
+            }
+        }
+    }
+    if from {
+        if let (Some(gas), Some(price)) = (
+            raw["gas_used"].as_str(),
+            raw["effective_gas_price"].as_str(),
+        ) {
+            let fee = wei_to_eth(hex_to_bigdecimal(gas)? * hex_to_bigdecimal(price)?);
+            if fee != BigDecimal::from(0) {
+                flows.push(("fee", -fee));
+            }
+        }
+    }
+    Ok(flows)
+}
+
+#[cfg(test)]
+mod native_flow_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn outbound_inbound_failed_and_self_transfers_charge_only_sender_gas() {
+        let mut raw = serde_json::json!({"from":"0xa", "to":"0xb", "value":"0xde0b6b3a7640000", "gas_used":"0x5208", "effective_gas_price":"0x3b9aca00", "status":"0x1"});
+        let fee = BigDecimal::from_str("-0.000021").unwrap();
+        assert_eq!(
+            native_flows(&raw, "0xA").unwrap(),
+            vec![("transfer", BigDecimal::from(-1)), ("fee", fee.clone())]
+        );
+        assert_eq!(
+            native_flows(&raw, "0xb").unwrap(),
+            vec![("transfer", BigDecimal::from(1))]
+        );
+        raw["status"] = serde_json::json!("0x0");
+        assert_eq!(
+            native_flows(&raw, "0xa").unwrap(),
+            vec![("fee", fee.clone())]
+        );
+        assert!(native_flows(&raw, "0xb").unwrap().is_empty());
+        raw["status"] = serde_json::json!("0x1");
+        raw["to"] = serde_json::json!("0xa");
+        assert_eq!(native_flows(&raw, "0xa").unwrap(), vec![("fee", fee)]);
+        raw["to"] = serde_json::json!("0xb");
+        raw["value"] = serde_json::json!("not-hex");
+        assert!(native_flows(&raw, "0xa").is_err());
+    }
 }
 
 /// Parse a hex string (with optional 0x prefix) into u128.
@@ -225,6 +293,10 @@ fn hex_to_u128_or_zero(hex: &str) -> u128 {
 fn wei_to_eth(wei: BigDecimal) -> BigDecimal {
     let divisor = BigDecimal::new(1.into(), -18);
     wei / divisor
+}
+
+pub(crate) fn known_token_decimals(address: &str) -> Option<u32> {
+    (token_symbol(address) != address).then(|| token_decimals(address))
 }
 
 /// Lookup the number of decimals for well-known ERC-20 tokens.
@@ -415,6 +487,24 @@ pub fn extract_evm_token_transfers(
     raw_metadata: &serde_json::Value,
 ) -> Vec<TokenTransfer> {
     let mut transfers = Vec::new();
+    if raw_metadata["status"].as_str() == Some("0x0") {
+        return transfers;
+    }
+    if let Some(logs) = raw_metadata["logs"].as_array() {
+        for (index, log) in logs.iter().enumerate() {
+            let mut enriched_log = log.clone();
+            enriched_log["token_decimals"] = raw_metadata["token_decimals"].clone();
+            for mut transfer in extract_evm_token_transfers(raw_tx_id, network, &enriched_log) {
+                transfer.transfer_index = log
+                    .get("logIndex")
+                    .or_else(|| log.get("log_index"))
+                    .map(|v| evm_log_index_or_default(v, usize_to_i32_or_max(index)))
+                    .unwrap_or_else(|| usize_to_i32_or_max(index));
+                transfers.push(transfer);
+            }
+        }
+        return transfers;
+    }
 
     let topics = match raw_metadata.get("topics").and_then(|t| t.as_array()) {
         Some(t) => t,
@@ -426,7 +516,7 @@ pub fn extract_evm_token_transfers(
         None => return vec![],
     };
 
-    if topic0 != ERC20_TRANSFER_TOPIC || topics.len() < 3 {
+    if topic0 != ERC20_TRANSFER_TOPIC || topics.len() != 3 {
         return vec![];
     }
 
@@ -453,9 +543,15 @@ pub fn extract_evm_token_transfers(
         .unwrap_or("unknown")
         .to_string();
 
-    let decimals = token_decimals(&token_address);
+    let decimals = raw_metadata["token_decimals"][token_address.to_lowercase()]
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n <= 255)
+        .or_else(|| known_token_decimals(&token_address));
     let symbol = token_symbol(&token_address);
-    let normalized = normalize_bigdecimal(amount_bd, decimals);
+    let normalized = decimals
+        .map(|d| normalize_bigdecimal(amount_bd.clone(), d))
+        .unwrap_or(amount_bd);
 
     transfers.push(TokenTransfer {
         id: Uuid::new_v4(),
@@ -466,7 +562,7 @@ pub fn extract_evm_token_transfers(
         from_address: from,
         to_address: to,
         amount: normalized,
-        decimals: token_decimals_i32(decimals),
+        decimals: decimals.map(token_decimals_i32).unwrap_or(-1),
         transfer_index: 0,
         dataset_version_id: None,
         created_at: Utc::now(),
@@ -496,7 +592,11 @@ pub fn extract_evm_decoded_events(
     let mut events = Vec::new();
 
     // Handle single-log format (topics/data/address at top level)
-    if let Some(topics) = raw_metadata.get("topics").and_then(|t| t.as_array()) {
+    if let Some(topics) = raw_metadata
+        .get("topics")
+        .and_then(|t| t.as_array())
+        .filter(|_| !raw_metadata["logs"].is_array())
+    {
         let address = raw_metadata
             .get("address")
             .and_then(|a| a.as_str())

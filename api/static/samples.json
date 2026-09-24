@@ -1,0 +1,259 @@
+{
+  "solana": {
+    "network": "solana-demo",
+    "wallet": "So11111111111111111111111111111111111111112",
+    "label": "Sample \u00b7 Solana wallet",
+    "records": [
+      {
+        "tx_hash": "sample-solana-1",
+        "timestamp": 1735693200,
+        "block_number": 300000001,
+        "raw_metadata": {
+          "slot": 300000001,
+          "blockTime": 1735693200,
+          "version": 0,
+          "transaction": {
+            "signatures": [
+              "5555555555555555555555555555555555555555555555555555555555555555555555555555555555555555"
+            ],
+            "message": {
+              "header": {
+                "numRequiredSignatures": 1,
+                "numReadonlySignedAccounts": 0,
+                "numReadonlyUnsignedAccounts": 0
+              },
+              "accountKeys": [
+                "So11111111111111111111111111111111111111112",
+                "11111111111111111111111111111111"
+              ],
+              "recentBlockhash": "11111111111111111111111111111111",
+              "instructions": []
+            }
+          },
+          "meta": {
+            "err": null,
+            "status": {
+              "Ok": null
+            },
+            "fee": 5000,
+            "preBalances": [
+              2000000000,
+              0
+            ],
+            "postBalances": [
+              1749995000,
+              250000000
+            ],
+            "preTokenBalances": [],
+            "postTokenBalances": [],
+            "innerInstructions": [],
+            "logMessages": [],
+            "loadedAddresses": {
+              "writable": [],
+              "readonly": []
+            }
+          }
+        }
+      },
+      {
+        "tx_hash": "sample-solana-2",
+        "timestamp": 1735696800,
+        "block_number": 300000002,
+        "raw_metadata": {
+          "slot": 300000002,
+          "blockTime": 1735696800,
+          "version": 0,
+          "transaction": {
+            "signatures": [
+              "5555555555555555555555555555555555555555555555555555555555555555555555555555555555555555"
+            ],
+            "message": {
+              "header": {
+                "numRequiredSignatures": 1,
+                "numReadonlySignedAccounts": 0,
+                "numReadonlyUnsignedAccounts": 0
+              },
+              "accountKeys": [
+                "11111111111111111111111111111111",
+                "So11111111111111111111111111111111111111112"
+              ],
+              "recentBlockhash": "11111111111111111111111111111111",
+              "instructions": []
+            }
+          },
+          "meta": {
+            "err": null,
+            "status": {
+              "Ok": null
+            },
+            "fee": 5000,
+            "preBalances": [
+              2000000000,
+              1749995000
+            ],
+            "postBalances": [
+              999995000,
+              2749995000
+            ],
+            "preTokenBalances": [
+              {
+                "accountIndex": 1,
+                "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "owner": "So11111111111111111111111111111111111111112",
+                "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "uiTokenAmount": {
+                  "amount": "0",
+                  "decimals": 6,
+                  "uiAmount": 0.0,
+                  "uiAmountString": "0.0"
+                }
+              }
+            ],
+            "postTokenBalances": [
+              {
+                "accountIndex": 1,
+                "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "owner": "So11111111111111111111111111111111111111112",
+                "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "uiTokenAmount": {
+                  "amount": "150000000",
+                  "decimals": 6,
+                  "uiAmount": 150.0,
+                  "uiAmountString": "150.0"
+                }
+              }
+            ],
+            "innerInstructions": [],
+            "logMessages": [],
+            "loadedAddresses": {
+              "writable": [],
+              "readonly": []
+            }
+          }
+        }
+      }
+    ]
+  },
+  "ethereum": {
+    "network": "ethereum-demo",
+    "wallet": "0x1111111111111111111111111111111111111111",
+    "label": "Sample \u00b7 Ethereum wallet",
+    "records": [
+      {
+        "tx_hash": "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "timestamp": 1735693200,
+        "block_number": 21000001,
+        "raw_metadata": {
+          "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+          "topics": [
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+            "0x0000000000000000000000002222222222222222222222222222222222222222",
+            "0x0000000000000000000000001111111111111111111111111111111111111111"
+          ],
+          "data": "0x000000000000000000000000000000000000000000000000000000000ee6b280",
+          "logIndex": "0x1",
+          "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000001"
+        }
+      },
+      {
+        "tx_hash": "0x0000000000000000000000000000000000000000000000000000000000000002",
+        "timestamp": 1735696800,
+        "block_number": 21000002,
+        "raw_metadata": {
+          "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+          "topics": [
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+            "0x0000000000000000000000001111111111111111111111111111111111111111",
+            "0x0000000000000000000000002222222222222222222222222222222222222222"
+          ],
+          "data": "0x00000000000000000000000000000000000000000000000000000000047868c0",
+          "logIndex": "0x2",
+          "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000002"
+        }
+      }
+    ]
+  },
+  "hyperliquid": {
+    "network": "hypercore-demo",
+    "wallet": "0x1111111111111111111111111111111111111111",
+    "label": "Sample \u00b7 Hyperliquid trader",
+    "records": [
+      {
+        "tx_hash": "sample-hl-1",
+        "timestamp": 1735693200,
+        "raw_metadata": {
+          "type": "ledger_update",
+          "data": {
+            "time": 1735693200000,
+            "hash": "sample-deposit",
+            "delta": {
+              "type": "deposit",
+              "usdc": "1000"
+            }
+          }
+        }
+      },
+      {
+        "tx_hash": "sample-hl-2",
+        "timestamp": 1735696800,
+        "raw_metadata": {
+          "type": "fill",
+          "data": {
+            "time": 1735696800000,
+            "coin": "ETH",
+            "px": "2000",
+            "sz": "1",
+            "side": "B",
+            "dir": "Open Long",
+            "startPosition": "0",
+            "closedPnl": "0",
+            "fee": "1",
+            "feeToken": "USDC",
+            "hash": "sample-open",
+            "tid": 1,
+            "oid": 1,
+            "crossed": true
+          }
+        }
+      },
+      {
+        "tx_hash": "sample-hl-3",
+        "timestamp": 1735700400,
+        "raw_metadata": {
+          "type": "fill",
+          "data": {
+            "time": 1735700400000,
+            "coin": "ETH",
+            "px": "2100",
+            "sz": "1",
+            "side": "A",
+            "dir": "Close Long",
+            "startPosition": "1",
+            "closedPnl": "100",
+            "fee": "1.05",
+            "feeToken": "USDC",
+            "hash": "sample-close",
+            "tid": 2,
+            "oid": 2,
+            "crossed": true
+          }
+        }
+      },
+      {
+        "tx_hash": "sample-hl-4",
+        "timestamp": 1735704000,
+        "raw_metadata": {
+          "type": "funding",
+          "data": {
+            "time": 1735704000000,
+            "coin": "ETH",
+            "usdc": "2.5",
+            "szi": "0",
+            "fundingRate": "0.0001",
+            "hash": "sample-funding"
+          }
+        }
+      }
+    ]
+  }
+}

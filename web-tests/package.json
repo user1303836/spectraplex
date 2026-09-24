@@ -1,0 +1,7 @@
+{
+  "name": "spectraplex-browser-checks",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node workbench.mjs" },
+  "devDependencies": { "playwright": "1.58.2", "axe-core": "4.11.1" }
+}

@@ -25,9 +25,18 @@ use spectraplex_core::materializer::{
 };
 use std::io::Write;
 
-/// Quote a CSV field if it contains any of `,`, `"`, or newline.
+/// Escape textual fields and neutralize spreadsheet formula prefixes.
+/// Numeric amounts are emitted separately and retain their numeric representation.
 pub(crate) fn csv_escape(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
+    let protected;
+    let s = if s.trim_start().starts_with(['=', '+', '-', '@']) || s.starts_with(['\t', '\r', '\n'])
+    {
+        protected = format!("'{s}");
+        protected.as_str()
+    } else {
+        s
+    };
+    if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
@@ -56,7 +65,7 @@ pub(crate) fn write_token_transfers_csv_rows<W: Write>(
                 .unwrap_or_default(),
             csv_escape(&r.network),
             csv_escape(&r.token_address),
-            r.token_symbol.as_deref().unwrap_or(""),
+            csv_escape(r.token_symbol.as_deref().unwrap_or("")),
             csv_escape(&r.from_address),
             csv_escape(&r.to_address),
             r.amount,
@@ -166,13 +175,13 @@ pub(crate) fn write_hl_fills_csv_rows<W: Write>(
             csv_escape(&r.side),
             r.price,
             r.size,
-            r.direction.as_deref().unwrap_or(""),
+            csv_escape(r.direction.as_deref().unwrap_or("")),
             r.closed_pnl
                 .as_ref()
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
             r.fee.as_ref().map(|v| v.to_string()).unwrap_or_default(),
-            r.fee_token.as_deref().unwrap_or(""),
+            csv_escape(r.fee_token.as_deref().unwrap_or("")),
             r.fill_time,
             r.order_id.map(|v| v.to_string()).unwrap_or_default(),
             r.trade_id.map(|v| v.to_string()).unwrap_or_default(),
@@ -247,7 +256,7 @@ pub(crate) fn write_hl_positions_csv_rows<W: Write>(
             csv_escape(&r.side),
             r.size_delta,
             r.price,
-            r.direction.as_deref().unwrap_or(""),
+            csv_escape(r.direction.as_deref().unwrap_or("")),
             csv_escape(&r.source_event),
             r.dataset_version_id
                 .map(|u| u.to_string())
@@ -285,12 +294,12 @@ pub(crate) fn write_wallet_ledger_csv_rows<W: Write>(
             csv_escape(&r.entry_type),
             csv_escape(&r.asset_symbol),
             r.amount,
-            r.counterparty_address.as_deref().unwrap_or(""),
+            csv_escape(r.counterparty_address.as_deref().unwrap_or("")),
             r.fee_amount
                 .as_ref()
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
-            r.fee_asset.as_deref().unwrap_or(""),
+            csv_escape(r.fee_asset.as_deref().unwrap_or("")),
             r.cost_basis
                 .as_ref()
                 .map(|v| v.to_string())
@@ -437,10 +446,10 @@ pub(crate) fn write_protocol_events_csv_rows<W: Write>(
             r.id,
             csv_escape(&r.network),
             csv_escape(&r.protocol_address),
-            r.protocol_name.as_deref().unwrap_or(""),
+            csv_escape(r.protocol_name.as_deref().unwrap_or("")),
             csv_escape(&r.event_type),
             csv_escape(&r.event_details.to_string()),
-            r.pool_address.as_deref().unwrap_or(""),
+            csv_escape(r.pool_address.as_deref().unwrap_or("")),
             r.raw_event_id.map(|u| u.to_string()).unwrap_or_default(),
             r.timestamp,
             r.dataset_version_id
@@ -472,11 +481,11 @@ pub(crate) fn write_pool_snapshots_csv_rows<W: Write>(
             csv_escape(&r.network),
             csv_escape(&r.pool_address),
             csv_escape(&r.protocol_address),
-            r.protocol_name.as_deref().unwrap_or(""),
+            csv_escape(r.protocol_name.as_deref().unwrap_or("")),
             csv_escape(&r.token0_address),
-            r.token0_symbol.as_deref().unwrap_or(""),
+            csv_escape(r.token0_symbol.as_deref().unwrap_or("")),
             csv_escape(&r.token1_address),
-            r.token1_symbol.as_deref().unwrap_or(""),
+            csv_escape(r.token1_symbol.as_deref().unwrap_or("")),
             r.reserve0,
             r.reserve1,
             r.tvl_usd
@@ -511,28 +520,42 @@ pub(crate) fn write_wallet_ledger_tax_csv_rows<W: Write>(
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
             .unwrap_or_else(|| r.timestamp.to_string());
 
-        let (sent_asset, sent_amount, recv_asset, recv_amount) = if r.amount < BigDecimal::from(0) {
-            (
-                r.asset_symbol.as_str(),
-                r.amount.abs().to_string(),
-                "",
-                String::new(),
-            )
+        let (sent_asset, sent_amount, recv_asset, recv_amount) =
+            if r.entry_type == "fee" && r.amount < BigDecimal::from(0) {
+                ("", String::new(), "", String::new())
+            } else if r.amount < BigDecimal::from(0) {
+                (
+                    r.asset_symbol.as_str(),
+                    r.amount.abs().to_string(),
+                    "",
+                    String::new(),
+                )
+            } else {
+                (
+                    "",
+                    String::new(),
+                    r.asset_symbol.as_str(),
+                    r.amount.to_string(),
+                )
+            };
+
+        // A dedicated fee row is a fee, not both a sent amount and a fee.
+        // Maker rebates are receipts, not a receipt plus a negative fee.
+        let (fee_asset, fee_amount) = if r.entry_type == "fee" {
+            if r.amount < BigDecimal::from(0) {
+                (r.asset_symbol.as_str(), r.amount.abs().to_string())
+            } else {
+                ("", String::new())
+            }
         } else {
             (
-                "",
-                String::new(),
-                r.asset_symbol.as_str(),
-                r.amount.to_string(),
+                r.fee_asset.as_deref().unwrap_or(""),
+                r.fee_amount
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
             )
         };
-
-        let fee_asset = r.fee_asset.as_deref().unwrap_or("");
-        let fee_amount = r
-            .fee_amount
-            .as_ref()
-            .map(|v| v.to_string())
-            .unwrap_or_default();
         let cost_basis = r
             .cost_basis
             .as_ref()
@@ -568,4 +591,58 @@ pub(crate) fn write_wallet_ledger_tax_csv_rows<W: Write>(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tax_csv_does_not_double_count_dedicated_fees_or_rebates() {
+        let mut record = WalletLedgerRecord {
+            id: uuid::Uuid::nil(),
+            raw_transaction_id: None,
+            wallet_address: "wallet".into(),
+            network: "network".into(),
+            tx_hash: "hash".into(),
+            timestamp: 1,
+            entry_type: "fee".into(),
+            asset_symbol: "USDC".into(),
+            amount: BigDecimal::from(-1),
+            counterparty_address: None,
+            fee_amount: Some(BigDecimal::from(1)),
+            fee_asset: Some("USDC".into()),
+            cost_basis: None,
+            proceeds: None,
+            dataset_version_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let mut bytes = Vec::new();
+        write_wallet_ledger_tax_csv_rows(std::slice::from_ref(&record), &mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let fields: Vec<_> = text.trim_end().split(',').collect();
+        assert_eq!(&fields[2..8], &["", "", "", "", "USDC", "1"]);
+        record.amount = BigDecimal::from(1);
+        record.fee_amount = Some(BigDecimal::from(-1));
+        let mut bytes = Vec::new();
+        write_wallet_ledger_tax_csv_rows(&[record], &mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let fields: Vec<_> = text.trim_end().split(',').collect();
+        assert_eq!(&fields[2..8], &["", "", "USDC", "1", "", ""]);
+    }
+    #[test]
+    fn textual_cells_cannot_execute_spreadsheet_formulas() {
+        for value in [
+            "=1+1", "+SUM(1)", "-command", "@SUM(1)", "  =cmd", "\tcmd", "\rcmd",
+        ] {
+            let escaped = csv_escape(value);
+            assert!(
+                escaped.starts_with('\'') || escaped.starts_with("\"'"),
+                "{escaped}"
+            );
+        }
+        assert_eq!(csv_escape("a\rb"), "\"a\rb\"");
+        assert_eq!(csv_escape("a,\"b\""), "\"a,\"\"b\"\"\"");
+        assert_eq!(csv_escape("ETH"), "ETH");
+    }
 }

@@ -94,6 +94,11 @@ pub fn compute_pool_snapshots(
     token1: (&str, Option<&str>),
 ) -> Vec<PoolSnapshot> {
     let now = chrono::Utc::now();
+    // Never publish a fabricated pool with unidentified assets. The generic
+    // wallet decoder does not establish token pairs or authoritative reserves.
+    if token0.0.is_empty() || token1.0.is_empty() {
+        return Vec::new();
+    }
 
     // Derive a single snapshot from the latest event
     let Some(latest) = decoded_events.iter().max_by_key(|e| e.created_at) else {

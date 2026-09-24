@@ -26,7 +26,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(about = "Spectraplex CLI", long_about = None)]
+#[command(version, about = "Spectraplex CLI (direct database / legacy file tools)", long_about = None)]
 struct Cli {
     #[arg(global = true, long, env = "DATABASE_URL")]
     db_url: Option<String>,

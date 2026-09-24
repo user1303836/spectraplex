@@ -1,20 +1,23 @@
+#[cfg(test)]
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
 use chrono::Utc;
-use solana_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient};
-use solana_sdk::{pubkey::Pubkey, signature::Signature};
-use solana_transaction_status::UiTransactionEncoding;
+use solana_client::nonblocking::rpc_client::RpcClient;
+#[cfg(test)]
+use solana_sdk::signature::Signature;
 use spectraplex_core::connector::{Connector, ConnectorCapabilities};
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
 use spectraplex_core::provider::{NetworkContext, ProviderCapability};
-use spectraplex_core::v2::{
-    ChainFamily, IndexTarget, IngestionBatch, RawTransaction, TargetKind, TargetMode,
-};
-use tracing::{info, warn};
+use spectraplex_core::v2::{ChainFamily, IndexTarget, IngestionBatch, TargetKind, TargetMode};
+
+#[cfg(test)]
+use spectraplex_core::v2::RawTransaction;
 use uuid::Uuid;
 
+#[cfg(test)]
 fn u64_to_i64_or_max(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -76,63 +79,31 @@ impl ChainIngestor for SolanaAdapter {
         user_id: Uuid,
         checkpoint: Option<&IndexerCheckpoint>,
     ) -> anyhow::Result<Vec<Transaction>> {
-        let client = self.client.clone();
-        let wallet = wallet.to_string();
-        let until_sig = checkpoint
-            .and_then(|cp| cp.last_signature.clone())
-            .and_then(|s| Signature::from_str(&s).ok());
-
-        tokio::task::spawn_blocking(move || {
-            let pubkey = Pubkey::from_str(&wallet)?;
-            let config = GetConfirmedSignaturesForAddress2Config {
-                until: until_sig,
-                limit: Some(limit),
-                ..Default::default()
-            };
-            let signatures = client.get_signatures_for_address_with_config(&pubkey, config)?;
-
-            let mut transactions = Vec::new();
-
-            for sig_info in signatures.iter().take(limit) {
-                let sig = Signature::from_str(&sig_info.signature)?;
-
-                match client.get_transaction(&sig, UiTransactionEncoding::Json) {
-                    Ok(tx) => {
-                        let raw_metadata = match serde_json::to_value(&tx) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                warn!(
-                                    tx_hash = %sig_info.signature,
-                                    error = %e,
-                                    "Failed to serialize transaction metadata, using empty object"
-                                );
-                                serde_json::Value::Object(Default::default())
-                            }
-                        };
-
-                        transactions.push(Transaction {
-                            id: Uuid::new_v4(),
-                            user_id,
-                            wallet_address: wallet.to_string(),
-                            timestamp: tx.block_time.unwrap_or(0),
-                            tx_hash: sig_info.signature.clone(),
-                            chain: Chain::Solana,
-                            raw_metadata,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(
-                            tx_hash = %sig_info.signature,
-                            error = %e,
-                            "Failed to fetch transaction, skipping"
-                        );
-                    }
-                }
-            }
-
-            Ok(transactions)
-        })
-        .await?
+        let cursor = checkpoint.map(
+            |cp| serde_json::json!({"last_signature": cp.last_signature, "incremental": true}),
+        );
+        let batch = crate::solana_history::fetch(
+            self.client.clone(),
+            wallet.into(),
+            self.network.clone(),
+            cursor,
+            limit,
+            Uuid::nil(),
+        )
+        .await?;
+        Ok(batch
+            .records
+            .into_iter()
+            .map(|raw| Transaction {
+                id: raw.id,
+                user_id,
+                wallet_address: wallet.into(),
+                timestamp: raw.timestamp,
+                tx_hash: raw.tx_hash,
+                chain: Chain::Solana,
+                raw_metadata: raw.raw_metadata,
+            })
+            .collect())
     }
 }
 
@@ -141,6 +112,7 @@ impl ChainIngestor for SolanaAdapter {
 // ---------------------------------------------------------------------------
 
 /// Extract a cursor with {last_signature} for Solana RPC pagination.
+#[cfg(test)]
 fn cursor_to_until_sig(cursor: Option<&serde_json::Value>) -> Option<Signature> {
     cursor
         .and_then(|c| c.get("last_signature"))
@@ -183,82 +155,15 @@ impl Connector for SolanaAdapter {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("wallet target must have an address"))?;
 
-        let client = self.client.clone();
-        let wallet = wallet_str.to_string();
-        let network = target.network.clone();
-        let until_sig = cursor_to_until_sig(cursor);
-
-        info!(
-            "Solana RPC V2 backfill: fetching up to {} signatures for wallet {}",
-            limit, wallet
-        );
-
-        let records = tokio::task::spawn_blocking(move || {
-            let pubkey = Pubkey::from_str(&wallet)?;
-            let config = GetConfirmedSignaturesForAddress2Config {
-                until: until_sig,
-                limit: Some(limit),
-                ..Default::default()
-            };
-            let signatures = client.get_signatures_for_address_with_config(&pubkey, config)?;
-
-            let mut records = Vec::new();
-
-            for sig_info in signatures.iter().take(limit) {
-                let sig = Signature::from_str(&sig_info.signature)?;
-
-                match client.get_transaction(&sig, UiTransactionEncoding::Json) {
-                    Ok(tx) => {
-                        let raw_metadata = match serde_json::to_value(&tx) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                warn!(
-                                    tx_hash = %sig_info.signature,
-                                    error = %e,
-                                    "Failed to serialize transaction metadata, using empty object"
-                                );
-                                serde_json::Value::Object(Default::default())
-                            }
-                        };
-
-                        let slot = tx.slot;
-
-                        records.push(RawTransaction {
-                            id: Uuid::new_v4(),
-                            network: network.clone(),
-                            tx_hash: sig_info.signature.clone(),
-                            timestamp: tx.block_time.unwrap_or(0),
-                            block_number: Some(u64_to_i64_or_max(slot)),
-                            raw_metadata,
-                            source: "solana-rpc-wallet-backfill".to_string(),
-                            ingestion_run_id: None,
-                            ingested_at: Utc::now(),
-                        });
-                    }
-                    Err(e) => {
-                        warn!(
-                            tx_hash = %sig_info.signature,
-                            error = %e,
-                            "Failed to fetch transaction, skipping"
-                        );
-                    }
-                }
-            }
-
-            Ok::<Vec<RawTransaction>, anyhow::Error>(records)
-        })
-        .await??;
-
-        info!(
-            "Solana RPC V2 backfill: collected {} records",
-            records.len()
-        );
-
-        Ok(IngestionBatch {
-            records,
-            checkpoint: None,
-            run_metadata: None,
-        })
+        crate::solana_history::fetch(
+            self.client.clone(),
+            wallet_str.into(),
+            target.network.clone(),
+            cursor.cloned(),
+            limit,
+            target.id,
+        )
+        .await
     }
 }
 

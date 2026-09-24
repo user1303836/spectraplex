@@ -148,13 +148,30 @@ async fn execute_job(
         error_message: None,
         cursor_state: None,
     };
-    let run_created = repo.create_ingestion_run(&run).await.is_ok();
-    if !run_created {
-        warn!(job_id = %job_id, "Failed to create ingestion run; raw_transactions will not carry ingestion_run_id");
+    if let Err(error) = repo.create_ingestion_run(&run).await {
+        heartbeat_cancel.cancel();
+        let _ = repo
+            .fail_ingestion_job(
+                job_id,
+                worker_id,
+                &format!("Cannot create provenance run: {error}"),
+            )
+            .await;
+        return;
     }
+    let run_created = true;
 
     // Execute the actual ingestion.
-    let result = run_ingestion(repo, config, provider_registry, job, run_id, run_created).await;
+    let result = run_ingestion(
+        repo,
+        config,
+        provider_registry,
+        job,
+        run_id,
+        run_created,
+        worker_id,
+    )
+    .await;
 
     // Stop heartbeat.
     heartbeat_cancel.cancel();
@@ -205,6 +222,7 @@ async fn execute_job(
                         Ok(Some(target)) => {
                             if let Some(mat_scope) =
                                 auto_materialization_scope(&target, &job.network, run_id)
+                                    .filter(|_| !target_uses_connector_backfill(&target))
                             {
                                 if let Err(e) = repo
                                     .create_materialization_run(
@@ -220,13 +238,15 @@ async fn execute_job(
                                 } else {
                                     info!(job_id = %job_id, "Enqueued post-ingest materialization run");
                                 }
-                            } else if target.kind == TargetKind::Wallet {
+                            } else if target.kind == TargetKind::Wallet
+                                && !target_uses_connector_backfill(&target)
+                            {
                                 warn!(
                                     job_id = %job_id,
                                     target_id = %tid,
                                     "Skipping post-ingest materialization for wallet target without an address"
                                 );
-                            } else {
+                            } else if !target_uses_connector_backfill(&target) {
                                 info!(job_id = %job_id, target_kind = ?target.kind, "Skipping wallet-scoped post-ingest materialization for non-wallet target");
                             }
                         }
@@ -253,8 +273,8 @@ async fn execute_job(
             }
         }
         Err(e) => {
-            let err_msg = e.to_string();
-            error!(job_id = %job_id, error = %err_msg, "Ingestion job failed");
+            let err_msg = public_ingestion_error(&e.to_string());
+            error!(job_id = %job_id, error = %e, "Ingestion job failed");
             // Update ingestion run.
             let _ = repo
                 .update_ingestion_run_status(
@@ -284,14 +304,33 @@ async fn execute_job(
     }
 }
 
+// Upstream errors may echo credential-bearing URLs or provider tokens. Keep
+// detailed diagnostics in operator logs, not tenant-visible jobs or callbacks.
+fn public_ingestion_error(message: &str) -> String {
+    if message.starts_with("RPC chain ID mismatch:")
+        || message.starts_with("More new Solana activity than ingest_limit")
+    {
+        message.to_string()
+    } else {
+        "Could not ingest activity. Check the server logs and provider configuration, then retry."
+            .into()
+    }
+}
+
 /// Returns true when a target-centric ingestion job should use the V2
 /// Connector abstraction instead of the legacy wallet-shaped ChainIngestor flow.
 fn target_uses_connector_backfill(target: &IndexTarget) -> bool {
     matches!(
         (target.chain_family, target.kind),
         (
+            spectraplex_core::v2::ChainFamily::Solana,
+            TargetKind::Wallet
+        ) | (
             spectraplex_core::v2::ChainFamily::Hyperliquid,
-            TargetKind::Market
+            TargetKind::Wallet | TargetKind::Market
+        ) | (
+            spectraplex_core::v2::ChainFamily::Evm,
+            TargetKind::Wallet | TargetKind::Contract | TargetKind::TopicFilter
         )
     )
 }
@@ -303,7 +342,7 @@ async fn run_connector_backfill(
     target: &IndexTarget,
     limit: usize,
     run_id: Uuid,
-    run_created: bool,
+    worker_id: &str,
 ) -> anyhow::Result<usize> {
     let net_ctx =
         NetworkContext::from_registry(provider_registry, &NetworkId::new(job.network.clone()))
@@ -326,7 +365,25 @@ async fn run_connector_backfill(
         .map(|cp| cp.cursor);
 
     let batch: IngestionBatch = match (target.chain_family, target.kind) {
-        (spectraplex_core::v2::ChainFamily::Hyperliquid, TargetKind::Market) => {
+        (spectraplex_core::v2::ChainFamily::Solana, TargetKind::Wallet) => {
+            let mut cursor = checkpoint_cursor
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({}));
+            cursor["incremental"] =
+                serde_json::json!(job.mode == spectraplex_core::v2::IngestionJobMode::Incremental);
+            SolanaAdapter::from_network_context(&net_ctx)?
+                .backfill(target, Some(&cursor), limit)
+                .await?
+        }
+        (spectraplex_core::v2::ChainFamily::Evm, _) => {
+            EvmAdapter::from_network_context(&net_ctx)?
+                .backfill(target, checkpoint_cursor.as_ref(), limit)
+                .await?
+        }
+        (
+            spectraplex_core::v2::ChainFamily::Hyperliquid,
+            TargetKind::Wallet | TargetKind::Market,
+        ) => {
             let adapter = HyperliquidAdapter::from_network_context(&net_ctx);
             adapter
                 .backfill(target, checkpoint_cursor.as_ref(), limit)
@@ -341,10 +398,8 @@ async fn run_connector_backfill(
 
     let count = batch.records.len();
     let mut v2_records = batch.records;
-    if run_created {
-        for raw in &mut v2_records {
-            raw.ingestion_run_id = Some(run_id);
-        }
+    for raw in &mut v2_records {
+        raw.ingestion_run_id = Some(run_id);
     }
 
     let mut seen = HashSet::new();
@@ -352,12 +407,6 @@ async fn run_connector_backfill(
         .into_iter()
         .filter(|r| seen.insert((r.network.clone(), r.tx_hash.clone())))
         .collect();
-
-    let canonical_ids = repo
-        .upsert_raw_transactions_returning_ids(&v2_deduped)
-        .await?;
-    let matches = build_target_matches(target.id, &canonical_ids);
-    repo.save_target_matches(&matches).await?;
 
     let derived_checkpoint = v2_deduped
         .iter()
@@ -378,9 +427,15 @@ async fn run_connector_backfill(
             updated_at: chrono::Utc::now(),
         });
 
-    if let Some(cp) = batch.checkpoint.or(derived_checkpoint) {
-        repo.upsert_checkpoint_v2(&cp).await?;
-    }
+    let checkpoint = batch.checkpoint.or(derived_checkpoint);
+    repo.commit_connector_batch(
+        target,
+        run_id,
+        &v2_deduped,
+        checkpoint.as_ref(),
+        (job.id, worker_id),
+    )
+    .await?;
 
     Ok(count)
 }
@@ -396,6 +451,7 @@ async fn run_ingestion(
     job: &IngestionJob,
     run_id: Uuid,
     run_created: bool,
+    worker_id: &str,
 ) -> anyhow::Result<usize> {
     let target_id = job
         .target_id
@@ -422,7 +478,7 @@ async fn run_ingestion(
             &target,
             config.ingest_limit,
             run_id,
-            run_created,
+            worker_id,
         )
         .await;
     }
@@ -788,6 +844,18 @@ mod tests {
     }
 
     #[test]
+    fn provider_credentials_never_enter_public_job_errors() {
+        for error in [
+            "error sending request for url (https://rpc.example/PRIVATE_KEY)",
+            "provider: invalid API key PRIVATE_KEY",
+        ] {
+            assert!(!public_ingestion_error(error).contains("PRIVATE_KEY"));
+        }
+        let mismatch = "RPC chain ID mismatch: expected 1 for ethereum-mainnet, got 2";
+        assert_eq!(public_ingestion_error(mismatch), mismatch);
+    }
+
+    #[test]
     fn target_uses_connector_backfill_for_hyperliquid_market() {
         let now = chrono::Utc::now();
         let target = IndexTarget {
@@ -808,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn target_uses_connector_backfill_stays_legacy_for_wallets() {
+    fn target_uses_connector_backfill_for_wallets() {
         let now = chrono::Utc::now();
         let target = IndexTarget {
             id: Uuid::new_v4(),
@@ -824,6 +892,6 @@ mod tests {
             updated_at: now,
         };
 
-        assert!(!target_uses_connector_backfill(&target));
+        assert!(target_uses_connector_backfill(&target));
     }
 }

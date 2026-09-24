@@ -63,12 +63,12 @@ impl std::fmt::Debug for ProviderConfig {
         f.debug_struct("ProviderConfig")
             .field("network", &self.network)
             .field("kind", &self.kind)
-            .field("url", &self.url)
+            .field("url", &"[REDACTED]")
             .field("priority", &self.priority)
             .field("capabilities", &self.capabilities)
             .field("token_env", &"[REDACTED]")
             .field("token", &"[REDACTED]")
-            .field("headers", &self.headers)
+            .field("headers", &"[REDACTED]")
             .finish()
     }
 }
@@ -246,6 +246,20 @@ impl AppConfig {
                 "export_dir must not be empty".to_string(),
             ));
         }
+        if self
+            .api_key
+            .as_ref()
+            .is_some_and(|key| key.trim().is_empty())
+        {
+            return Err(ConfigError::Validation(
+                "api_key must not be blank".to_string(),
+            ));
+        }
+        if self.ingest_limit == 0 || self.ingest_limit > 100_000 {
+            return Err(ConfigError::Validation(
+                "ingest_limit must be between 1 and 100000".to_string(),
+            ));
+        }
         if let Some(ref secret) = self.callback_hmac_secret {
             if secret.trim().is_empty() {
                 return Err(ConfigError::Validation(
@@ -257,9 +271,24 @@ impl AppConfig {
     }
 
     pub fn load() -> Result<Self, Box<figment::Error>> {
+        let path = std::env::var_os("SPECTRAPLEX_CONFIG");
+        if let Some(ref path) = path {
+            if !std::path::Path::new(path).is_file() {
+                return Err(Box::new(figment::Error::from(
+                    "SPECTRAPLEX_CONFIG must name an existing file",
+                )));
+            }
+        }
+        Self::load_from(
+            path.as_deref()
+                .unwrap_or_else(|| std::ffi::OsStr::new("spectraplex.toml")),
+        )
+    }
+
+    pub fn load_from(path: impl AsRef<std::path::Path>) -> Result<Self, Box<figment::Error>> {
         Figment::new()
             .merge(Serialized::defaults(AppConfig::default()))
-            .merge(Toml::file("spectraplex.toml"))
+            .merge(Toml::file(path))
             .merge(Env::prefixed("SPECTRAPLEX_"))
             .merge(Env::raw().only(&[
                 "DATABASE_URL",
@@ -485,6 +514,31 @@ mod tests {
             std::env::remove_var("DATABASE_URL");
             std::env::remove_var("SPECTRAPLEX_PORT");
         }
+    }
+
+    #[test]
+    fn test_load_explicit_config_file() {
+        let path =
+            std::env::temp_dir().join(format!("spectraplex-config-{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "ingest_limit = 4321\n").unwrap();
+        let config = AppConfig::load_from(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(config.ingest_limit, 4321);
+    }
+
+    #[test]
+    fn test_invalid_ingest_limits_and_blank_key() {
+        let mut config = AppConfig {
+            database_url: "postgres://localhost/test".into(),
+            ..AppConfig::default()
+        };
+        for limit in [0, 100_001] {
+            config.ingest_limit = limit;
+            assert!(config.validate().is_err());
+        }
+        config.ingest_limit = 50;
+        config.api_key = Some("  ".into());
+        assert!(config.validate().is_err());
     }
 
     #[test]

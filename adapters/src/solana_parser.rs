@@ -245,62 +245,68 @@ pub fn extract_solana_token_transfers(
     let mut group_counts: std::collections::HashMap<(String, String, String), i32> =
         std::collections::HashMap::new();
 
-    if let OptionSerializer::Some(pre_token_balances) = &meta.pre_token_balances {
-        if let OptionSerializer::Some(post_token_balances) = &meta.post_token_balances {
-            for post in post_token_balances {
-                let owner = match &post.owner {
-                    OptionSerializer::Some(o) => o.clone(),
-                    _ => continue,
-                };
-
-                let mint = post.mint.clone();
-                let decimals = u32::from(post.ui_token_amount.decimals);
-
-                let pre_raw = pre_token_balances
-                    .iter()
-                    .find(|p| p.account_index == post.account_index)
-                    .map(|p| parse_token_amount_or_zero(&p.ui_token_amount.amount))
-                    .unwrap_or(0);
-
-                let post_raw = parse_token_amount_or_zero(&post.ui_token_amount.amount);
-                let delta_raw = token_delta_raw(post_raw, pre_raw);
-
-                if delta_raw == 0 {
-                    continue;
-                }
-
-                let amount = token_raw_to_decimal(token_delta_magnitude(delta_raw), decimals);
-                let symbol = spl_token_symbol(&mint);
-
-                let (from, to) = if delta_raw > 0 {
-                    // Incoming: unknown sender -> owner
-                    ("unknown".to_string(), owner)
-                } else {
-                    // Outgoing: owner -> unknown receiver
-                    (owner, "unknown".to_string())
-                };
-
-                let key = (from.clone(), to.clone(), mint.clone());
-                let idx = group_counts.entry(key).or_insert(0);
-                let transfer_index = *idx;
-                *idx += 1;
-
-                transfers.push(TokenTransfer {
-                    id: Uuid::new_v4(),
-                    raw_transaction_id: raw_tx_id,
-                    network: network.to_string(),
-                    token_address: mint,
-                    token_symbol: Some(symbol),
-                    from_address: from,
-                    to_address: to,
-                    amount,
-                    decimals: token_decimals_i32(decimals),
-                    transfer_index,
-                    dataset_version_id: None,
-                    created_at: Utc::now(),
-                });
-            }
+    let pre = match &meta.pre_token_balances {
+        OptionSerializer::Some(v) => v.as_slice(),
+        _ => &[],
+    };
+    let post = match &meta.post_token_balances {
+        OptionSerializer::Some(v) => v.as_slice(),
+        _ => &[],
+    };
+    let mut seen = std::collections::HashSet::new();
+    // Union both sides: closed accounts disappear from postTokenBalances;
+    // ownership changes must debit the former owner and credit the new owner.
+    for entry in post.iter().chain(pre) {
+        let owner = match &entry.owner {
+            OptionSerializer::Some(owner) => owner,
+            _ => continue,
+        };
+        if !seen.insert((entry.account_index, &entry.mint, owner)) {
+            continue;
         }
+        let matches = |p: &&solana_transaction_status::UiTransactionTokenBalance| {
+            p.account_index == entry.account_index
+                && p.mint == entry.mint
+                && matches!(&p.owner, OptionSerializer::Some(o) if o == owner)
+        };
+        let pre_raw = pre
+            .iter()
+            .find(matches)
+            .map(|p| parse_token_amount_or_zero(&p.ui_token_amount.amount))
+            .unwrap_or(0);
+        let post_raw = post
+            .iter()
+            .find(matches)
+            .map(|p| parse_token_amount_or_zero(&p.ui_token_amount.amount))
+            .unwrap_or(0);
+        let delta = token_delta_raw(post_raw, pre_raw);
+        if delta == 0 {
+            continue;
+        }
+        let decimals = u32::from(entry.ui_token_amount.decimals);
+        let (from, to) = if delta > 0 {
+            ("unknown".to_string(), owner.clone())
+        } else {
+            (owner.clone(), "unknown".to_string())
+        };
+        let index = group_counts
+            .entry((from.clone(), to.clone(), entry.mint.clone()))
+            .or_default();
+        transfers.push(TokenTransfer {
+            id: Uuid::new_v4(),
+            raw_transaction_id: raw_tx_id,
+            network: network.into(),
+            token_address: entry.mint.clone(),
+            token_symbol: Some(spl_token_symbol(&entry.mint)),
+            from_address: from,
+            to_address: to,
+            amount: token_raw_to_decimal(token_delta_magnitude(delta), decimals),
+            decimals: token_decimals_i32(decimals),
+            transfer_index: *index,
+            dataset_version_id: None,
+            created_at: Utc::now(),
+        });
+        *index += 1;
     }
 
     transfers
@@ -341,7 +347,14 @@ pub fn extract_solana_native_balance_deltas(
                 solana_transaction_status::UiMessage::Parsed(msg) => {
                     msg.account_keys.iter().map(|k| k.pubkey.clone()).collect()
                 }
-                solana_transaction_status::UiMessage::Raw(msg) => msg.account_keys.clone(),
+                solana_transaction_status::UiMessage::Raw(msg) => {
+                    let mut keys = msg.account_keys.clone();
+                    if let OptionSerializer::Some(loaded) = &meta.loaded_addresses {
+                        keys.extend(loaded.writable.iter().cloned());
+                        keys.extend(loaded.readonly.iter().cloned());
+                    }
+                    keys
+                }
             }
         } else {
             return vec![];
@@ -802,6 +815,39 @@ mod tests {
 
         let change = extract_sol_change_lamports(&meta, 0);
         assert_eq!(change, 1_000_000_000i128);
+    }
+
+    #[test]
+    fn v0_loaded_accounts_and_closed_token_accounts_are_not_lost() {
+        let mut raw = serde_json::json!({
+            "slot": 1, "blockTime": 1, "version": 0,
+            "transaction": {"signatures": ["sig"], "message": {
+                "header": {"numRequiredSignatures":1,"numReadonlySignedAccounts":0,"numReadonlyUnsignedAccounts":0},
+                "accountKeys":["payer"], "recentBlockhash":"block", "instructions":[], "addressTableLookups":[]
+            }},
+            "meta": {"err":null, "status":{"Ok":null}, "fee":0,
+                "preBalances":[100,0], "postBalances":[90,10],
+                "loadedAddresses":{"writable":["loaded"], "readonly":[]},
+                "preTokenBalances":[{"accountIndex":1,"mint":"mint","owner":"owner",
+                    "uiTokenAmount":{"amount":"100","decimals":6,"uiAmount":0.0001,"uiAmountString":"0.0001"}}],
+                "postTokenBalances":[]
+            }
+        });
+        let _: EncodedConfirmedTransactionWithStatusMeta =
+            serde_json::from_value(raw.clone()).unwrap();
+        let deltas = extract_solana_native_balance_deltas(None, "solana-mainnet", &raw);
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[1].account_address, "loaded");
+        assert_eq!(deltas[1].delta, lamports_to_sol(10));
+        let closed = extract_solana_token_transfers(None, "solana-mainnet", &raw);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].from_address, "owner");
+        raw["meta"]["postTokenBalances"] = raw["meta"]["preTokenBalances"].clone();
+        raw["meta"]["postTokenBalances"][0]["owner"] = serde_json::json!("new-owner");
+        let changed = extract_solana_token_transfers(None, "solana-mainnet", &raw);
+        assert_eq!(changed.len(), 2);
+        assert!(changed.iter().any(|t| t.to_address == "new-owner"));
+        assert!(changed.iter().any(|t| t.from_address == "owner"));
     }
 
     #[test]

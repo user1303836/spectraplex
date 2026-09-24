@@ -50,6 +50,7 @@ async fn pg_is_available() -> bool {
 macro_rules! require_pg {
     () => {
         if !pg_is_available().await {
+            assert!(std::env::var_os("TEST_DATABASE_URL").is_none(), "Configured test PostgreSQL is unavailable; refusing to skip integration coverage");
             eprintln!(
                 "SKIPPED: PostgreSQL not available at {} — set TEST_DATABASE_URL or start PostgreSQL",
                 base_url()
@@ -492,7 +493,13 @@ async fn network_seed_data_13_networks() {
     let (pool, db_name) = create_test_db("nets").await;
     run_all_migrations(&pool).await;
 
-    assert_eq!(row_count(&pool, "networks").await, 13);
+    assert_eq!(row_count(&pool, "networks").await, 16);
+    let demo_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM networks WHERE id LIKE '%-demo' AND is_testnet")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(demo_count, 3);
 
     // Verify specific networks
     let expected = [

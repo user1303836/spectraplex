@@ -1,6 +1,9 @@
 .git
 target/
-node_modules/
+**/node_modules/
+**/__pycache__/
+web-tests/artifacts/
+*.log
 .smithers/
 .claude/
 .entire/
@@ -12,3 +15,6 @@ bun.lock
 
 *.md
 .env
+spectraplex.toml
+exports/
+.local/

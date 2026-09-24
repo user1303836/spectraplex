@@ -1,0 +1,151 @@
+import { chromium } from 'playwright';
+import assert from 'node:assert/strict';
+import { readFile, mkdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+const require = createRequire(import.meta.url);
+const base = process.env.SPECTRAPLEX_TEST_URL;
+const key = process.env.SPECTRAPLEX_TEST_KEY;
+assert(base && key, 'Set SPECTRAPLEX_TEST_URL and SPECTRAPLEX_TEST_KEY (or run smoke-test.sh --browser)');
+const chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const browser = await chromium.launch({ headless: true, ...(existsSync(chrome) ? { executablePath: chrome } : {}) });
+const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, acceptDownloads: true });
+// Headless Chromium does not consistently grant clipboard access from a click.
+// Scope explicit test permissions to this disposable local deployment.
+await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: new URL(base).origin });
+const errors = [];
+page.on('pageerror', error => errors.push(error.message));
+const artifacts = fileURLToPath(new URL('./artifacts/', import.meta.url));
+await mkdir(artifacts, { recursive: true });
+async function accessible() {
+  await page.evaluate(await readFile(require.resolve('axe-core/axe.min.js'), 'utf8'));
+  const violations = await page.evaluate(async () => (await window.axe.run(document, { runOnly: { type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21aa'] } })).violations);
+  assert.deepEqual(violations.map(v => `${v.id}: ${v.nodes.map(n => n.target).join(', ')}`), [], 'Accessibility violations');
+}
+try {
+  await page.goto(base);
+  await page.getByLabel('API key', { exact: true }).fill('incorrect-key');
+  await page.getByRole('button', { name: 'Connect', exact: true }).click();
+  await page.getByRole('alert').waitFor();
+  assert.match(await page.getByRole('alert').innerText(), /API key/);
+  await page.getByLabel('API key', { exact: true }).fill(key);
+  await page.getByRole('button', { name: 'Connect', exact: true }).click();
+  await page.locator('#workspace').waitFor({ state: 'visible' });
+  await page.getByRole('button', { name: 'Solana', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('#selected-target-name').textContent === 'Sample · Solana wallet');
+  await page.waitForFunction(() => document.querySelectorAll('#records-table tbody tr').length >= 3, { timeout: 30000 });
+  assert(await page.locator('#ingest').isDisabled(), 'Synthetic data must not be fetched from live providers');
+  assert(await page.locator('#next').isDisabled(), 'Pagination must stop at end of records');
+  await accessible();
+  await page.screenshot({ path: `${artifacts}/desktop.png`, fullPage: true });
+
+  await page.getByLabel('Dataset', { exact: true }).selectOption('raw_transactions');
+  await page.waitForFunction(() => document.querySelectorAll('#records-table tbody tr').length === 2);
+  await page.getByText('View JSON', { exact: true }).first().click();
+  assert.match(await page.locator('#records-table').innerText(), /raw_metadata/);
+  await page.getByLabel('From', { exact: false }).fill('2099-01-01T00:00');
+  await page.getByRole('button', { name: 'Apply', exact: true }).click();
+  await page.locator('#empty-records').waitFor({ state: 'visible' });
+  await page.getByRole('button', { name: 'Reset', exact: true }).click();
+  await page.waitForFunction(() => document.querySelectorAll('#records-table tbody tr').length === 2);
+  await page.getByRole('button', { name: 'Export CSV', exact: true }).click();
+  await page.locator('#panel-activity').waitFor({ state: 'visible' });
+  await page.waitForFunction(() => document.querySelector('#jobs-table tbody tr')?.textContent.includes('Download'), { timeout: 30000 });
+  const downloadEvent = page.waitForEvent('download');
+  await page.locator('#jobs-table tbody tr').first().getByRole('button', { name: 'Download', exact: true }).click();
+  const download = await downloadEvent;
+  const csv = await readFile(await download.path(), 'utf8');
+  assert.match(csv, /raw_metadata/); assert.match(csv, /sample-solana/);
+  const provenanceEvent = page.waitForEvent('download');
+  await page.locator('#jobs-table tbody tr').first().getByRole('button', { name: 'Provenance', exact: true }).click();
+  const provenance = JSON.parse(await readFile(await (await provenanceEvent).path(), 'utf8'));
+  assert.equal(provenance.record_count, 2);
+
+  // Retry an actual failed provider job without changing its requested mode.
+  const failed = page.locator('#jobs-table tbody tr').filter({ hasText: 'chain ID mismatch' });
+  const retried = page.waitForRequest(r => r.method() === 'POST' && /\/targets\/[^/]+\/ingest$/.test(r.url()));
+  await failed.getByRole('button', { name: 'Retry', exact: true }).click();
+  assert.equal((await retried).postDataJSON().mode, 'backfill');
+
+  // Exercise target creation, browser file validation, JSONL import and real paging.
+  await page.getByRole('button', { name: 'Explore data', exact: true }).click();
+  await page.getByText('Add a target', { exact: true }).click();
+  await page.getByLabel('Network', { exact: true }).selectOption('ethereum-mainnet');
+  const wallet = '0x' + '3'.repeat(40);
+  await page.getByLabel('Address / market symbol', { exact: true }).fill(wallet);
+  await page.locator('#target-label').fill('Browser import');
+  await page.locator('#target-start-block').fill('10');
+  const created = page.waitForResponse(r => r.url().endsWith('/v1/targets') && r.request().method() === 'POST');
+  await page.getByRole('button', { name: 'Create target', exact: true }).click();
+  assert.equal((await (await created).json()).filter_spec.from_block, 10);
+  await page.waitForFunction(() => document.querySelector('#selected-target-name').textContent === 'Browser import');
+  await page.getByLabel('Dataset', { exact: true }).selectOption('raw_transactions');
+  await page.locator('#import-section summary').click();
+  await page.locator('#import-file').setInputFiles({ name: 'invalid.json', mimeType: 'application/json', buffer: Buffer.from('not json') });
+  await page.getByRole('button', { name: 'Import & materialize', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('#notice').textContent.includes('Invalid JSON/JSONL'));
+  const sample = JSON.parse(await readFile(new URL('../api/static/samples.json', import.meta.url), 'utf8')).ethereum.records[0];
+  const records = Array.from({ length: 60 }, (_, i) => {
+    const record = structuredClone(sample);
+    record.tx_hash = '0x' + (50000 + i).toString(16).padStart(64, '0');
+    record.timestamp = 1735689600 + i;
+    record.raw_metadata.topics[2] = '0x' + wallet.slice(2).padStart(64, '0');
+    return record;
+  });
+  await page.locator('#import-file').setInputFiles({ name: 'history.jsonl', mimeType: 'application/json', buffer: Buffer.from(records.map(r => JSON.stringify(r)).join('\n')) });
+  await page.getByRole('button', { name: 'Import & materialize', exact: true }).click();
+  await page.waitForFunction(() => document.querySelectorAll('#records-table tbody tr').length === 50);
+  const firstPage = await page.locator('#records-table tbody tr').allTextContents();
+  await page.locator('#next').click();
+  await page.waitForFunction(() => document.querySelectorAll('#records-table tbody tr').length === 10);
+  const secondPage = await page.locator('#records-table tbody tr').allTextContents();
+  assert.equal(new Set([...firstPage, ...secondPage]).size, 60, 'Pages overlap or lost imported rows');
+  assert(await page.locator('#next').isDisabled());
+  await page.locator('#previous').click();
+  await page.waitForFunction(() => document.querySelectorAll('#records-table tbody tr').length === 50);
+  assert.deepEqual(await page.locator('#records-table tbody tr').allTextContents(), firstPage);
+
+  await page.getByRole('button', { name: 'API keys', exact: true }).click();
+  await page.getByLabel('Key name', { exact: true }).fill('Browser test');
+  await page.getByRole('button', { name: 'Create key', exact: true }).click();
+  await page.locator('#new-key-box').waitFor({ state: 'visible' });
+  const tenantKey = await page.locator('#new-key').inputValue();
+  assert.match(tenantKey, /^spx_/);
+  await page.bringToFront();
+  await page.getByRole('button', { name: 'Copy key', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('#notice').textContent.includes('Key copied'));
+  assert.equal(await page.evaluate(() => navigator.clipboard.readText()), tenantKey);
+  await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
+  assert.equal(await page.locator('#new-key').inputValue(), '');
+  assert.equal(await page.evaluate(() => localStorage.length + sessionStorage.length), 0, 'Keys must not persist in browser storage');
+  await page.getByLabel('API key', { exact: true }).fill(tenantKey);
+  await page.getByRole('button', { name: 'Connect', exact: true }).click();
+  await page.locator('#workspace').waitFor({ state: 'visible' });
+  await page.locator('#empty-target').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#target-list option').count(), 0, 'New tenant inherited targets');
+  await page.getByRole('button', { name: 'Ethereum', exact: true }).click();
+  await page.waitForFunction(() => document.querySelectorAll('#records-table tbody tr').length === 2, { timeout: 30000 });
+  assert(await page.locator('#import-section').isHidden(), 'Tenant offered arbitrary imports');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await accessible();
+  assert(await page.locator('#records-table tbody tr').evaluateAll(rows => rows.every(row => row.clientHeight < 120)), 'Closed records should not wrap hashes into excessively tall rows');
+  await page.screenshot({ path: `${artifacts}/mobile.png`, fullPage: true });
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'Mobile page overflows horizontally');
+  await page.setViewportSize({ width: 320, height: 800 });
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), '320px reflow overflows horizontally');
+  await accessible();
+  await page.getByRole('button', { name: 'API keys', exact: true }).click();
+  page.once('dialog', dialog => dialog.accept());
+  await page.locator('#keys-table tbody tr').filter({ hasText: 'Browser test' }).getByRole('button', { name: 'Revoke', exact: true }).click();
+  await page.locator('#login').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#api-key').inputValue(), '', 'Revocation must clear credentials');
+  assert.deepEqual(errors, [], 'Browser runtime errors');
+  console.log('PASS browser: authentication, samples, filters, JSONL import, real pagination, retries, downloads, keys, tenant isolation, mobile layout and WCAG AA checks');
+} catch (error) {
+  console.error('Browser notice:', await page.locator('#notice').innerText().catch(() => '(unavailable)'));
+  await page.screenshot({ path: `${artifacts}/failure.png`, fullPage: true, mask: [page.locator('#api-key'), page.locator('#new-key')] }).catch(() => {});
+  throw error;
+} finally {
+  await browser.close();
+}

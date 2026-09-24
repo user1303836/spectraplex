@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Your self-hosted blockchain data workbench. Explore, normalize and export on-chain activity.">
+  <title>Spectraplex · Data workbench</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%230e1729'/%3E%3Cpath d='M8 26L20 7l12 19-12 7z' fill='%2355d9b0'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/style.css"><script src="/assets/app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar"><a class="brand" href="/"><span class="mark" aria-hidden="true">◈</span> spectraplex <span class="version">1.0</span></a><div class="connection"><span id="connection-state">Self-hosted data workbench</span><button id="disconnect" class="ghost" hidden>Disconnect</button></div></header>
+<main id="main">
+  <section id="login" class="welcome">
+    <div><p class="eyebrow">YOUR DATA. YOUR INFRASTRUCTURE.</p><h1>Make on-chain activity<br>work for you.</h1><p class="lead">From raw transactions to useful datasets. Track wallets across Solana, Ethereum and Hyperliquid, then take your data anywhere.</p><div class="feature-line"><span>Wallet research</span><span>Portfolio activity</span><span>CSV &amp; JSONL exports</span></div></div>
+    <form id="login-form" class="card connect-card"><span class="eyebrow">CONNECT TO THIS INSTANCE</span><h2>Open your workspace</h2><label for="api-key">API key</label><input id="api-key" type="password" required autocomplete="off" placeholder="Paste your API key" spellcheck="false"><p class="hint">Use the key in your <code>.env</code> file, or a tenant key shared by your administrator. Your key stays in memory—not browser storage.</p><button class="primary" type="submit">Connect</button><p class="hint">New here? Run <code>./scripts/setup.sh</code>, then <code>docker compose up --build -d</code>.</p></form>
+  </section>
+  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+  <div id="workspace" hidden>
+    <nav class="tabs" aria-label="Workspace"><button data-panel="explore" aria-current="page">Explore data</button><button data-panel="activity">Activity <span id="pending-count" class="count"></span></button><button data-panel="access">API keys</button><span class="local-note">Private by default · No telemetry</span></nav>
+    <section id="panel-explore" class="layout">
+      <aside class="sidebar">
+        <div class="section-title"><h2>Your targets</h2><button id="refresh-targets" class="text-button">Refresh</button></div>
+        <label class="sr-only" for="target-search">Filter targets</label><input id="target-search" type="search" placeholder="Find a target…">
+        <label class="sr-only" for="target-list">Select target</label><select id="target-list" size="7"></select>
+        <details id="add-target"><summary>Add a target</summary><form id="target-form"><label for="target-kind">Type</label><select id="target-kind"><option value="wallet">Wallet</option><option value="market">Hyperliquid market (raw data)</option></select><label for="target-network">Network</label><select id="target-network" required></select><label for="target-address">Address / market symbol</label><input id="target-address" required spellcheck="false" placeholder="Wallet address or ETH"><div id="start-block-field" hidden><label for="target-start-block">Start at block <span class="hint">(optional)</span></label><input id="target-start-block" type="number" min="0" max="9007199254740991" step="1" placeholder="Recent blocks by default"><p class="hint">EVM scans forward in bounded batches. Choose an older block to start historical research.</p></div><label for="target-label">Label <span class="hint">(optional)</span></label><input id="target-label" maxlength="120" placeholder="Research wallet"><button type="submit" class="primary">Create target</button></form></details>
+        <div class="samples"><p class="eyebrow">START WITH SAMPLE DATA</p><p class="hint">Synthetic examples. No provider or funds needed.</p><div class="sample-buttons"><button data-demo="solana">Solana</button><button data-demo="ethereum">Ethereum</button><button data-demo="hyperliquid">Hyperliquid</button></div><a class="hint" href="/assets/samples.json" download="spectraplex-samples.json">Download example payloads</a></div>
+      </aside>
+      <div class="explorer">
+        <div id="empty-target" class="empty-state card"><span class="empty-mark" aria-hidden="true">◈</span><h2>Your next insight starts here.</h2><p>Add a wallet to ingest activity, or load a sample<br>to explore the complete pipeline in seconds.</p><p class="hint">Raw → normalized → derived datasets → export</p></div>
+        <div id="target-view" hidden>
+          <div class="target-heading"><div><p class="eyebrow" id="target-network-label"></p><h1 id="selected-target-name"></h1><p class="mono muted" id="selected-target-address"></p></div><div class="actions"><button id="backfill" hidden>Fetch older</button><button id="ingest" class="primary">Fetch activity</button></div></div>
+          <p id="target-caveat" class="hint"></p>
+          <div class="card data-card">
+            <form id="query-form" class="filters"><div class="dataset-field"><label for="dataset">Dataset</label><select id="dataset"></select></div><div><label for="from">From <span class="hint">(local time)</span></label><input id="from" type="datetime-local"></div><div><label for="to">To <span class="hint">(local time)</span></label><input id="to" type="datetime-local"></div><button type="submit">Apply</button><button id="clear-filters" type="button" class="text-button">Reset</button></form>
+            <div class="data-toolbar"><div><strong id="record-count">No records loaded</strong><span id="coverage" class="badge">Coverage unknown</span></div><div class="actions"><button data-export="csv">Export CSV</button><button data-export="jsonl">Export JSONL</button></div></div>
+            <div class="table-scroll" tabindex="0" aria-label="Dataset records"><table id="records-table"><thead></thead><tbody></tbody></table></div>
+            <div id="empty-records" class="empty-state" hidden><h3>No matching records yet</h3><p>Fetch activity or import a file, wait for materialization in Activity, or try another dataset/time range.</p></div>
+            <div class="pagination"><button id="previous">← Previous</button><span id="page-label">Page 1</span><button id="next">Next →</button></div>
+          </div>
+          <details id="import-section" class="card import-card"><summary>Import raw transactions <span class="hint">· admin only</span></summary><p class="hint">Import trusted RPC payloads as a JSON array, <code>{"records": […]}</code>, or JSONL. Each record needs <code>tx_hash</code>, <code>timestamp</code> (Unix seconds), and <code>raw_metadata</code>. Maximum 500 records / 1 MiB. Imported data is not verified against a chain.</p><form id="import-form"><label for="import-file">JSON or JSONL file</label><input type="file" id="import-file" accept=".json,.jsonl,application/json" required><button class="primary" type="submit">Import &amp; materialize</button></form></details>
+          <p class="footnote">Balances show changes in indexed history, not verified account balances. Unknown ERC20 decimals (−1) mean raw units, excluded from balance totals. PnL and protocol analytics are beta/experimental; exports are not tax returns.</p>
+        </div>
+      </div>
+    </section>
+    <section id="panel-activity" hidden><div class="page-heading"><div><p class="eyebrow">DURABLE PIPELINE</p><h1>Activity &amp; exports</h1><p class="muted">Jobs and downloads survive API restarts. This view refreshes automatically.</p></div><button id="refresh-jobs">Refresh</button></div><div class="card table-scroll"><table id="jobs-table"><thead><tr><th>Operation</th><th>Dataset / network</th><th>Status</th><th>Created</th><th>Result</th></tr></thead><tbody></tbody></table><p id="empty-jobs" class="empty-state">No jobs yet. Load sample data or fetch a target to get started.</p></div><div class="pagination"><button id="jobs-previous">← Previous</button><span id="jobs-page">Page 1</span><button id="jobs-next">Next →</button></div></section>
+    <section id="panel-access" hidden><div class="page-heading"><div><p class="eyebrow">SCOPED ACCESS</p><h1>API keys</h1><p id="key-explanation" class="muted"></p></div></div><form id="key-form" class="card key-form"><div><label for="key-name">Key name</label><input id="key-name" required maxlength="120" placeholder="Research workspace"></div><button class="primary" type="submit">Create key</button></form><div id="new-key-box" class="card" hidden><label for="new-key">Copy now—this key is only shown once</label><input id="new-key" readonly><button id="copy-key">Copy key</button><p class="hint">Treat this as a password. Use it in the workbench or with <code>Authorization: Bearer &lt;key&gt;</code>.</p></div><div class="card table-scroll"><table id="keys-table"><thead><tr><th>Name</th><th>Key ID</th><th>Created</th><th>Action</th></tr></thead><tbody></tbody></table></div></section>
+  </div>
+</main>
+<footer>spectraplex <span>Open-source blockchain data workbench</span><a href="https://github.com/user1303836/spectraplex" target="_blank" rel="noreferrer">Source ↗</a></footer>
+<noscript>This workbench needs JavaScript. The REST API remains available at /v1.</noscript>
+</body>
+</html>
