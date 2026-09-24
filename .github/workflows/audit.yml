@@ -8,15 +8,18 @@ on:
       - "Cargo.lock"
       - "**/Cargo.toml"
       - ".cargo/audit.toml"
+      - ".github/workflows/audit.yml"
   push:
     branches: [main]
     paths:
       - "Cargo.lock"
       - "**/Cargo.toml"
       - ".cargo/audit.toml"
+      - ".github/workflows/audit.yml"
 
 permissions:
   contents: read
+  checks: write
   issues: write
 
 jobs:
