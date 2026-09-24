@@ -210,6 +210,7 @@ pub(crate) async fn fetch_export_metadata(
 /// `None` if the dataset is unknown.
 fn csv_header_for(dataset: &str) -> Option<&'static str> {
     Some(match dataset {
+        "raw_transactions" => "id,network,tx_hash,timestamp,block_number,source,raw_metadata\n",
         "token_transfers" => token_transfers_csv_header(),
         "native_balance_deltas" => native_balance_deltas_csv_header(),
         "decoded_events" => decoded_events_csv_header(),
@@ -244,6 +245,25 @@ fn encode_batch(
     buf: &mut Vec<u8>,
 ) -> anyhow::Result<()> {
     match (format, batch) {
+        (ExportFormat::Jsonl, ExportRecordBatch::RawTransactions(v)) => encode_jsonl_page(v, buf),
+        (ExportFormat::Csv, ExportRecordBatch::RawTransactions(v)) => {
+            use crate::export_csv::csv_escape;
+            use std::io::Write;
+            for row in v {
+                writeln!(
+                    buf,
+                    "{},{},{},{},{},{},{}",
+                    row.id,
+                    csv_escape(&row.network),
+                    csv_escape(&row.tx_hash),
+                    row.timestamp,
+                    row.block_number.map(|v| v.to_string()).unwrap_or_default(),
+                    csv_escape(&row.source),
+                    csv_escape(&row.raw_metadata.to_string())
+                )?;
+            }
+            Ok(())
+        }
         (ExportFormat::Jsonl, ExportRecordBatch::TokenTransfers(v)) => encode_jsonl_page(v, buf),
         (ExportFormat::Jsonl, ExportRecordBatch::NativeBalanceDeltas(v)) => {
             encode_jsonl_page(v, buf)

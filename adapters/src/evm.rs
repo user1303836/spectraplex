@@ -18,8 +18,8 @@ use spectraplex_core::connector::{
 use spectraplex_core::models::{Chain, ChainIngestor, IndexerCheckpoint, Transaction};
 use spectraplex_core::provider::{NetworkContext, ProviderCapability};
 use spectraplex_core::v2::{
-    ChainFamily, EvmTraceType, IndexTarget, IngestionBatch, RawEvmTrace, RawTransaction,
-    TargetKind, TargetMode,
+    ChainFamily, Checkpoint, EvmTraceType, IndexTarget, IngestionBatch, RawEvmTrace,
+    RawTransaction, TargetKind, TargetMode,
 };
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -68,8 +68,8 @@ fn next_block_after_i64(last_block: i64) -> Option<u64> {
         .map(|block| block.saturating_add(1))
 }
 
-fn default_from_block(latest_block: u64, limit: usize, block_chunk: u64) -> u64 {
-    latest_block.saturating_sub(usize_to_u64_or_max(limit).saturating_mul(block_chunk))
+fn default_from_block(latest_block: u64, limit: usize, _block_chunk: u64) -> u64 {
+    latest_block.saturating_sub(usize_to_u64_or_max(limit).saturating_sub(1))
 }
 
 /// EVM chain adapter that fetches logs and transactions via JSON-RPC.
@@ -135,7 +135,7 @@ impl EvmAdapter {
 
     /// Set a custom block chunk size for `eth_getLogs` range queries.
     pub fn with_block_chunk(mut self, chunk: u64) -> Self {
-        self.block_chunk = chunk;
+        self.block_chunk = chunk.max(1);
         self
     }
 
@@ -190,6 +190,56 @@ impl EvmAdapter {
         }
 
         Ok(adapter)
+    }
+
+    // A bounded confirmed window, not a claim of irreversible finality.
+    async fn confirmed_head(&self) -> anyhow::Result<u64> {
+        let expected = match self.network.as_str() {
+            "ethereum-mainnet" => 1,
+            "ethereum-sepolia" => 11155111,
+            "base-mainnet" => 8453,
+            "base-sepolia" => 84532,
+            "arbitrum-mainnet" => 42161,
+            "arbitrum-sepolia" => 421614,
+            "hyperevm-mainnet" => 999,
+            "hyperevm-testnet" => 998,
+            other => anyhow::bail!("No verified EVM chain ID for network {other}"),
+        };
+        self.rate_limiter.until_ready().await;
+        let actual = self.provider.get_chain_id().await?;
+        anyhow::ensure!(
+            actual == expected,
+            "RPC chain ID mismatch: expected {expected} for {}, got {actual}",
+            self.network
+        );
+        self.rate_limiter.until_ready().await;
+        Ok(self.provider.get_block_number().await?.saturating_sub(12))
+    }
+
+    async fn scan_window(
+        &self,
+        cursor: Option<&serde_json::Value>,
+        limit: usize,
+    ) -> anyhow::Result<(u64, u64)> {
+        anyhow::ensure!(
+            (1..=100_000).contains(&limit),
+            "EVM block limit must be 1–100000"
+        );
+        let head = self.confirmed_head().await?;
+        let from = cursor_to_from_block(cursor, head, limit, self.block_chunk);
+        let end = head.min(from.saturating_add(limit as u64 - 1));
+        Ok((from, end))
+    }
+
+    fn scan_checkpoint(&self, target: &IndexTarget, end: u64) -> Checkpoint {
+        Checkpoint {
+            id: Uuid::new_v4(),
+            target_id: target.id,
+            network: self.network.clone(),
+            source: "rpc".into(),
+            cursor: json!({"last_block": end, "confirmations": 12}),
+            updated_at: Utc::now(),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -395,28 +445,14 @@ impl EvmAdapter {
             self.rate_limiter.until_ready().await;
 
             // Fetch full block with transactions
-            let block_opt = self
+            let block = self
                 .provider
                 .get_block_by_number(block_num.into())
                 .full()
-                .await;
-
-            let block = match block_opt {
-                Ok(Some(b)) => b,
-                Ok(None) => {
-                    block_num += 1;
-                    continue;
-                }
-                Err(e) => {
-                    warn!(
-                        block_number = block_num,
-                        error = %e,
-                        "Failed to fetch block for native tx scan, skipping"
-                    );
-                    block_num += 1;
-                    continue;
-                }
-            };
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Block {block_num} unavailable; checkpoint not advanced")
+                })?;
 
             let block_timestamp = block.header().timestamp();
             let block_hash = block.header().hash();
@@ -433,18 +469,19 @@ impl EvmAdapter {
                         let tx_hash = format!("{:#x}", tx.tx_hash());
                         let value = TransactionTrait::value(tx);
 
-                        // Fetch receipt for gas data (only for outbound txs)
-                        let mut gas_used: Option<u128> = None;
-                        let mut effective_gas_price: Option<u128> = None;
-                        if from_match {
-                            self.rate_limiter.until_ready().await;
-                            if let Ok(Some(receipt)) =
-                                self.provider.get_transaction_receipt(tx.tx_hash()).await
-                            {
-                                gas_used = Some(u64_to_u128(receipt.gas_used));
-                                effective_gas_price = Some(receipt.effective_gas_price);
-                            }
-                        }
+                        self.rate_limiter.until_ready().await;
+                        let receipt = self
+                            .provider
+                            .get_transaction_receipt(tx.tx_hash())
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Receipt {tx_hash} unavailable; checkpoint not advanced"
+                                )
+                            })?;
+                        let receipt_json = serde_json::to_value(&receipt)?;
+                        let gas_used = Some(u64_to_u128(receipt.gas_used));
+                        let effective_gas_price = Some(receipt.effective_gas_price);
 
                         records.push(NativeTxRecord {
                             tx_hash,
@@ -456,6 +493,7 @@ impl EvmAdapter {
                             block_timestamp,
                             gas_used,
                             effective_gas_price,
+                            receipt: receipt_json,
                         });
                     }
                 }
@@ -528,9 +566,10 @@ impl EvmAdapter {
     async fn enrich_tx_data(
         &self,
         logs: &[Log],
-    ) -> HashMap<String, (serde_json::Value, serde_json::Value)> {
-        let mut seen_tx_hashes: HashMap<String, (serde_json::Value, serde_json::Value)> =
-            HashMap::new();
+    ) -> anyhow::Result<HashMap<String, (serde_json::Value, serde_json::Value)>> {
+        let mut seen_tx_hashes = HashMap::new();
+        let mut block_times = HashMap::new();
+        let mut decimal_cache = HashMap::new();
 
         for log in logs {
             let tx_hash_b256 = match log.transaction_hash {
@@ -543,45 +582,98 @@ impl EvmAdapter {
                 continue;
             }
 
-            let mut tx_fields = json!({});
-            let mut receipt_fields = json!({});
-
+            anyhow::ensure!(
+                !log.removed,
+                "Provider returned a removed log; retry after reorg"
+            );
+            let block_number = log
+                .block_number
+                .ok_or_else(|| anyhow::anyhow!("Log missing block number"))?;
+            let timestamp = if let Some(time) = block_times.get(&block_number) {
+                *time
+            } else {
+                self.rate_limiter.until_ready().await;
+                let block = self
+                    .provider
+                    .get_block_by_number(block_number.into())
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Block {block_number} unavailable"))?;
+                anyhow::ensure!(
+                    Some(block.header().hash()) == log.block_hash,
+                    "Block changed during ingestion; retry"
+                );
+                let time = block.header().timestamp();
+                block_times.insert(block_number, time);
+                time
+            };
             self.rate_limiter.until_ready().await;
-            match self.provider.get_transaction_by_hash(tx_hash_b256).await {
-                Ok(Some(full_tx)) => {
-                    let value = full_tx.inner.value();
-                    let from = full_tx.inner.signer();
-                    let to = full_tx.inner.to().map(|a| format!("{a:#x}"));
-                    tx_fields = json!({
-                        "value": format!("{value:#x}"),
-                        "from": format!("{from:#x}"),
-                        "to": to,
-                    });
+            let full_tx = self
+                .provider
+                .get_transaction_by_hash(tx_hash_b256)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Transaction {tx_hash} unavailable"))?;
+            let value = full_tx.inner.value();
+            let from = full_tx.inner.signer();
+            let to = full_tx.inner.to().map(|a| format!("{a:#x}"));
+            let tx_fields = json!({"value": format!("{value:#x}"), "from": format!("{from:#x}"), "to": to, "timestamp": timestamp});
+            self.rate_limiter.until_ready().await;
+            let receipt = self
+                .provider
+                .get_transaction_receipt(tx_hash_b256)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Receipt {tx_hash} unavailable"))?;
+            let receipt_json = serde_json::to_value(&receipt)?;
+            let mut decimal_hints = serde_json::Map::new();
+            for entry in receipt_json["logs"].as_array().into_iter().flatten() {
+                if entry["topics"].as_array().map(Vec::len) != Some(3)
+                    || entry["topics"][0] != ERC20_TRANSFER_TOPIC
+                {
+                    continue;
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(tx_hash = %tx_hash, error = %e, "Failed to fetch transaction");
+                let Some(address) = entry["address"].as_str() else {
+                    continue;
+                };
+                let decimals = if let Some(known) = crate::evm_parser::known_token_decimals(address)
+                {
+                    Some(known)
+                } else if let Some(cached) = decimal_cache.get(address) {
+                    *cached
+                } else {
+                    self.rate_limiter.until_ready().await;
+                    let request = json!({"jsonrpc":"2.0", "id":1, "method":"eth_call", "params":[{"to":address,"data":"0x313ce567"}, format!("{block_number:#x}")]});
+                    let response = match self
+                        .trace_http_client
+                        .post(self.rpc_url.clone())
+                        .json(&request)
+                        .send()
+                        .await
+                    {
+                        Ok(response) => response.json::<serde_json::Value>().await.ok(),
+                        Err(_) => None,
+                    };
+                    let value = response
+                        .as_ref()
+                        .and_then(|r| r["result"].as_str())
+                        .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                        .filter(|d| *d <= 255);
+                    decimal_cache.insert(address.to_string(), value);
+                    value
+                };
+                if let Some(decimals) = decimals {
+                    decimal_hints.insert(address.to_lowercase(), json!(decimals));
                 }
             }
-
-            self.rate_limiter.until_ready().await;
-            match self.provider.get_transaction_receipt(tx_hash_b256).await {
-                Ok(Some(receipt)) => {
-                    receipt_fields = json!({
-                        "gas_used": format!("{:#x}", receipt.gas_used),
-                        "effective_gas_price": format!("{:#x}", receipt.effective_gas_price),
-                    });
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(tx_hash = %tx_hash, error = %e, "Failed to fetch receipt");
-                }
-            }
+            let receipt_fields = json!({
+                "token_decimals": decimal_hints,
+                "gas_used": format!("{:#x}", receipt.gas_used),
+                "effective_gas_price": format!("{:#x}", receipt.effective_gas_price),
+                "logs": receipt_json["logs"], "status": receipt_json["status"],
+            });
 
             seen_tx_hashes.insert(tx_hash, (tx_fields, receipt_fields));
         }
 
-        seen_tx_hashes
+        Ok(seen_tx_hashes)
     }
 
     // -----------------------------------------------------------------------
@@ -590,9 +682,8 @@ impl EvmAdapter {
 
     /// Convert enriched logs into V2 `RawTransaction` records.
     ///
-    /// Attaches tx-level fields (value, from, to, gas) only to the first log
-    /// per transaction hash to avoid duplicate gas fee / value entries in the
-    /// downstream parser.
+    /// One canonical row per transaction, containing every receipt log.
+    /// Otherwise the Bronze unique key silently discards all but one transfer.
     fn logs_to_raw_transactions(
         &self,
         logs: &[Log],
@@ -607,8 +698,14 @@ impl EvmAdapter {
                 Some(h) => format!("{h:#x}"),
                 None => continue,
             };
-
-            let block_timestamp = log.block_timestamp.unwrap_or(0);
+            if !emitted_tx_hashes.insert(tx_hash.clone()) {
+                continue;
+            }
+            let block_timestamp = enrichment
+                .get(&tx_hash)
+                .and_then(|(fields, _)| fields["timestamp"].as_u64())
+                .or(log.block_timestamp)
+                .unwrap_or(0);
 
             let mut raw_metadata = json!({
                 "log_index": log.log_index,
@@ -620,8 +717,7 @@ impl EvmAdapter {
                 "data": format!("0x{}", alloy::hex::encode(log.data().data.as_ref())),
             });
 
-            let is_first_log = emitted_tx_hashes.insert(tx_hash.clone());
-            if is_first_log {
+            {
                 if let Some((tx_fields, receipt_fields)) = enrichment.get(&tx_hash) {
                     if let Some(obj) = raw_metadata.as_object_mut() {
                         if let Some(tx_obj) = tx_fields.as_object() {
@@ -677,17 +773,13 @@ impl EvmAdapter {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("wallet target must have an address"))?;
         let wallet_addr: Address = wallet_str.parse()?;
-
-        self.rate_limiter.until_ready().await;
-        let latest_block = self.provider.get_block_number().await?;
-
-        let from_block = cursor_to_from_block(cursor, latest_block, limit, self.block_chunk);
+        let (from_block, latest_block) = self.scan_window(cursor, limit).await?;
 
         let (logs, native_txs) = self
             .fetch_wallet_combined(wallet_addr, from_block, latest_block)
             .await?;
 
-        let enrichment = self.enrich_tx_data(&logs).await;
+        let enrichment = self.enrich_tx_data(&logs).await?;
         let mut records =
             self.logs_to_raw_transactions(&logs, &enrichment, "evm-rpc-wallet-backfill");
 
@@ -715,7 +807,8 @@ impl EvmAdapter {
 
         Ok(IngestionBatch {
             records,
-            checkpoint: None,
+            checkpoint: (from_block <= latest_block)
+                .then(|| self.scan_checkpoint(target, latest_block)),
             run_metadata: None,
         })
     }
@@ -736,23 +829,20 @@ impl EvmAdapter {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("contract target must have an address"))?;
         let contract_addr: Address = contract_str.parse()?;
-
-        self.rate_limiter.until_ready().await;
-        let latest_block = self.provider.get_block_number().await?;
-
-        let from_block = cursor_to_from_block(cursor, latest_block, limit, self.block_chunk);
+        let (from_block, latest_block) = self.scan_window(cursor, limit).await?;
 
         let logs = self
             .fetch_logs(contract_addr, from_block, latest_block)
             .await?;
 
-        let enrichment = self.enrich_tx_data(&logs).await;
+        let enrichment = self.enrich_tx_data(&logs).await?;
         let records =
             self.logs_to_raw_transactions(&logs, &enrichment, "evm-rpc-contract-backfill");
 
         Ok(IngestionBatch {
             records,
-            checkpoint: None,
+            checkpoint: (from_block <= latest_block)
+                .then(|| self.scan_checkpoint(target, latest_block)),
             run_metadata: None,
         })
     }
@@ -764,15 +854,12 @@ impl EvmAdapter {
     /// via the spec's `address_filter` field.
     async fn topic_filter_backfill(
         &self,
-        _target: &IndexTarget,
+        target: &IndexTarget,
         spec: &TopicFilterSpec,
         cursor: Option<&serde_json::Value>,
         limit: usize,
     ) -> anyhow::Result<IngestionBatch> {
-        self.rate_limiter.until_ready().await;
-        let latest_block = self.provider.get_block_number().await?;
-
-        let from_block = cursor_to_from_block(cursor, latest_block, limit, self.block_chunk);
+        let (from_block, latest_block) = self.scan_window(cursor, limit).await?;
 
         // Parse topic positions from the spec
         let topic0 = parse_topic_value(spec.topics.first())?;
@@ -799,13 +886,14 @@ impl EvmAdapter {
             )
             .await?;
 
-        let enrichment = self.enrich_tx_data(&logs).await;
+        let enrichment = self.enrich_tx_data(&logs).await?;
         let records =
             self.logs_to_raw_transactions(&logs, &enrichment, "evm-rpc-topic-filter-backfill");
 
         Ok(IngestionBatch {
             records,
-            checkpoint: None,
+            checkpoint: (from_block <= latest_block)
+                .then(|| self.scan_checkpoint(target, latest_block)),
             run_metadata: None,
         })
     }
@@ -1065,6 +1153,15 @@ impl Connector for EvmAdapter {
             );
         }
 
+        // The target's start block seeds only its first scan. Durable progress
+        // always wins on subsequent fetches, including empty windows.
+        let initial_cursor = target
+            .filter_spec
+            .as_ref()
+            .and_then(|s| s.get("from_block"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|block| serde_json::json!({"from_block": block}));
+        let cursor = cursor.or(initial_cursor.as_ref());
         match target.kind {
             TargetKind::Wallet => self.wallet_backfill(target, cursor, limit).await,
             TargetKind::Contract => self.contract_backfill(target, cursor, limit).await,
@@ -1117,7 +1214,7 @@ impl ChainIngestor for EvmAdapter {
             .fetch_wallet_combined(address, from_block, latest_block)
             .await?;
 
-        let seen_tx_hashes = self.enrich_tx_data(&logs).await;
+        let seen_tx_hashes = self.enrich_tx_data(&logs).await?;
 
         let mut transactions = Vec::new();
         let mut emitted_tx_hashes = HashSet::new();
@@ -1213,6 +1310,7 @@ struct NativeTxRecord {
     block_timestamp: u64,
     gas_used: Option<u128>,
     effective_gas_price: Option<u128>,
+    receipt: serde_json::Value,
 }
 
 impl NativeTxRecord {
@@ -1233,6 +1331,8 @@ impl NativeTxRecord {
             "to": &self.to,
             "value": format!("{:#x}", self.value),
             "source_type": "native_transfer",
+            "status": self.receipt["status"],
+            "logs": self.receipt["logs"].as_array().cloned().unwrap_or_default(),
         });
 
         if let (Some(gas), Some(price)) = (self.gas_used, self.effective_gas_price) {
@@ -1294,6 +1394,9 @@ fn cursor_to_from_block(
         if let Some(last_block) = c.get("last_block").and_then(|v| v.as_u64()) {
             return last_block.saturating_add(1);
         }
+        if let Some(from_block) = c.get("from_block").and_then(serde_json::Value::as_u64) {
+            return from_block;
+        }
         // V1 compat cursor
         if let Some(last_block) = c.get("last_block").and_then(|v| v.as_i64()) {
             if let Some(next_block) = next_block_after_i64(last_block) {
@@ -1312,6 +1415,33 @@ fn cursor_to_from_block(
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn requested_start_block_is_used_until_a_checkpoint_exists() {
+        assert_eq!(
+            cursor_to_from_block(
+                Some(&serde_json::json!({"from_block": 500})),
+                1000,
+                50,
+                2000
+            ),
+            500
+        );
+        assert_eq!(
+            cursor_to_from_block(Some(&serde_json::json!({"from_block": 0})), 1000, 50, 2000),
+            0
+        );
+        assert_eq!(
+            cursor_to_from_block(
+                Some(&serde_json::json!({"from_block": 500, "last_block": 549})),
+                1000,
+                50,
+                2000
+            ),
+            550
+        );
+        assert_eq!(cursor_to_from_block(None, 1000, 50, 2000), 951);
+    }
 
     #[test]
     fn test_adapter_defaults() {
@@ -1419,8 +1549,8 @@ mod tests {
     #[test]
     fn test_cursor_to_from_block_no_cursor() {
         let from = cursor_to_from_block(None, 20_000_000, 10, 2000);
-        // 20_000_000 - 10 * 2000 = 19_980_000
-        assert_eq!(from, 19_980_000);
+        // Exactly ten blocks, inclusive of the confirmed head.
+        assert_eq!(from, 19_999_991);
     }
 
     #[test]
@@ -1441,7 +1571,7 @@ mod tests {
     fn test_cursor_to_from_block_v1_negative_uses_default() {
         let cursor = json!({"v1_compat": true, "last_block": -1i64});
         let from = cursor_to_from_block(Some(&cursor), 20_000_000, 10, 2000);
-        assert_eq!(from, 19_980_000);
+        assert_eq!(from, 19_999_991);
     }
 
     // -- Connector capabilities --
@@ -1724,6 +1854,7 @@ mod tests {
             block_timestamp: 1700000000,
             gas_used: Some(21000),
             effective_gas_price: Some(1_000_000_000), // 1 gwei
+            receipt: json!({"status":"0x1", "logs": []}),
         };
 
         let metadata = record.to_raw_metadata();
@@ -1755,6 +1886,7 @@ mod tests {
             block_timestamp: 1700000000,
             gas_used: None,
             effective_gas_price: None,
+            receipt: json!({"status":"0x1", "logs": []}),
         };
 
         let metadata = record.to_raw_metadata();

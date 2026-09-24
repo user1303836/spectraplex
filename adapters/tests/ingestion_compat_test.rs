@@ -65,6 +65,7 @@ async fn pg_is_available() -> bool {
 macro_rules! require_pg {
     () => {
         if !pg_is_available().await {
+            assert!(std::env::var_os("TEST_DATABASE_URL").is_none(), "Configured test PostgreSQL is unavailable; refusing to skip integration coverage");
             eprintln!(
                 "SKIPPED: PostgreSQL not available at {} — set TEST_DATABASE_URL or start PostgreSQL",
                 base_url()

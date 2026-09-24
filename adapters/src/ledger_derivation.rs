@@ -220,7 +220,7 @@ pub fn derive_ledger_from_hl_fills(
                     user_id,
                     wallet_address: wallet.to_string(),
                     asset_symbol: fee_token.to_string(),
-                    amount: -fee.abs(),
+                    amount: -fee.clone(),
                     entry_type: EntryType::Fee,
                     fiat_value: None,
                 });
@@ -250,8 +250,7 @@ pub fn derive_ledger_from_hl_fills(
 
 /// Derive ledger entries from Silver `HlFundingPayment` records.
 ///
-/// Converts each funding payment into a `Fee` entry, consistent with
-/// V1 `parse_funding` behavior.
+/// Funding received is income; funding paid is an expense.
 pub fn derive_ledger_from_hl_funding(
     wallet: &str,
     user_id: Uuid,
@@ -269,7 +268,11 @@ pub fn derive_ledger_from_hl_funding(
             wallet_address: wallet.to_string(),
             asset_symbol: "USDC".to_string(),
             amount: payment.amount.clone(),
-            entry_type: EntryType::Fee,
+            entry_type: if payment.amount > BigDecimal::from(0) {
+                EntryType::Income
+            } else {
+                EntryType::Fee
+            },
             fiat_value: None,
         });
         *entry_offset += 1;
@@ -673,9 +676,9 @@ pub fn derive_wallet_ledger_from_hl_fills(
                     timestamp,
                     entry_type: "fee".to_string(),
                     asset_symbol: fee_token.to_string(),
-                    amount: -fee.abs(),
+                    amount: -fee.clone(),
                     counterparty_address: None,
-                    fee_amount: Some(fee.abs()),
+                    fee_amount: Some(fee.clone()),
                     fee_asset: Some(fee_token.to_string()),
                     cost_basis: None,
                     proceeds: None,
@@ -1381,7 +1384,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].asset_symbol, "USDC");
         assert_eq!(entries[0].amount, BigDecimal::from_str("5.0").unwrap());
-        assert!(matches!(entries[0].entry_type, EntryType::Fee));
+        assert!(matches!(entries[0].entry_type, EntryType::Income));
     }
 
     #[test]

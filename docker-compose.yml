@@ -1,33 +1,44 @@
 services:
   postgres:
     image: postgres:17
+    restart: unless-stopped
     environment:
       POSTGRES_USER: spectraplex
       POSTGRES_PASSWORD: spectraplex
       POSTGRES_DB: spectraplex
     ports:
-      - "5432:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U spectraplex"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   api:
     build: .
+    user: "${CONTAINER_UID:-1000}:1000"
+    restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:${SPECTRAPLEX_PORT:-3000}:3000"
     environment:
       DATABASE_URL: postgres://spectraplex:spectraplex@postgres:5432/spectraplex
+      SPECTRAPLEX_API_KEY: "${SPECTRAPLEX_API_KEY:?Run ./scripts/setup.sh first}"
       SPECTRAPLEX_PORT: "3000"
       SPECTRAPLEX_HOST: "0.0.0.0"
       SPECTRAPLEX_LOG_LEVEL: info
+      # Optional environment overrides; otherwise honor spectraplex.toml.
+      SOLANA_RPC_URL:
+      EVM_RPC_URL:
+    volumes:
+      - exports:/app/exports
+      - ./spectraplex.toml:/app/spectraplex.toml:ro
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["spectraplex-api"]
+    stop_grace_period: 30s
 
 volumes:
   pgdata:
+  exports:

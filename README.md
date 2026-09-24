@@ -3,416 +3,131 @@
 [![CI](https://github.com/user1303836/spectraplex/actions/workflows/ci.yml/badge.svg)](https://github.com/user1303836/spectraplex/actions/workflows/ci.yml)
 [![Security Audit](https://github.com/user1303836/spectraplex/actions/workflows/audit.yml/badge.svg)](https://github.com/user1303836/spectraplex/actions/workflows/audit.yml)
 
-Multi-chain blockchain indexer and ETL pipeline. Ingest raw data from Solana, EVM chains, and Hyperliquid, normalize it into queryable datasets, and export it as CSV or JSONL.
+**Your self-hosted blockchain data workbench.** Explore wallet activity across Solana, Ethereum-family networks and Hyperliquid. Import trusted data, inspect transactions, and download CSV or JSONL—with provenance. Browser UI, REST API and CLI; no telemetry or frontend build required.
 
-## Quick Start
+## Start here
+
+Requires Docker with Compose v2 (Windows: use WSL). Allow roughly 4 GB RAM and 10 GB free disk for the first build, which takes several minutes.
 
 ```bash
-# Clone and build
 git clone https://github.com/user1303836/spectraplex.git
 cd spectraplex
-cargo build --workspace
-
-# Start PostgreSQL
-./scripts/local-dev.sh
-
-# Start the API server (auto-runs migrations on first start)
-cargo run --bin spectraplex-api
-# → http://127.0.0.1:3000/health
-
-# Run the smoke test (in another terminal)
-./scripts/smoke-test.sh
-
-# Or skip provider-dependent ingestion if you don't have live RPC access:
-# ./scripts/smoke-test.sh --skip-ingest
+./scripts/setup.sh
+docker compose up --build -d --wait
 ```
 
-Requires Rust (stable) and PostgreSQL 15+. Docker handles Postgres if you don't have one running.
+Open **http://localhost:3000**. Connect using the value of `SPECTRAPLEX_API_KEY` in `.env`.
 
-## Features
+1. Click **Solana**, **Ethereum** or **Hyperliquid** under sample data. No RPC account or funds needed.
+2. Choose a dataset, filter dates, or open **View JSON**. Normalized results appear when the background job finishes.
+3. Click **Export CSV** or **Export JSONL**. Download the file and its provenance from **Activity**.
 
-**Ingest from supported wallet and target paths through the API.** Wallet ingest is the stable MVP path; selected non-wallet targets are available only where the support matrix below labels them supported.
+Samples are synthetic and isolated from real networks. Reloading them is safe. Keys stay in browser memory; reloading disconnects you.
 
-**Bronze-native Silver materialization.** Raw data is extracted directly into canonical Silver datasets — token transfers, balance deltas, decoded events, fills, funding, and positions — without V1 compatibility overhead.
+**Real data:** set your RPC URLs in `spectraplex.toml`, run `docker compose restart api`, then **Add a target → Fetch activity**. Public RPCs may throttle requests. Solana's **Fetch older** walks backwards through history. EVM targets accept an optional starting block and scan forwards in bounded batches; the default is recent blocks. `ingest_limit` controls each batch (EVM: blocks; Solana: transactions).
 
-**Durable control plane.** Ingestion jobs, stream subscriptions, export jobs, and materialization runs are all Postgres-backed with worker loops, heartbeats, lease-based ownership, and restart recovery.
+**Sharing:** create tenant keys in **API keys**, not copies of your admin key. Admin-created keys start isolated workspaces; tenant-created keys share that tenant's workspace. Administrators can access all data.
 
-**Real-time streaming with full lineage.** Solana gRPC and Hyperliquid WebSocket streams create ingestion runs, persist V2 checkpoints, and auto-trigger downstream materialization — the same lineage model as backfill.
+**Operations:** `/ready` checks the database. `docker compose logs --tail 100 api` shows diagnostics. PostgreSQL and exports persist in named volumes; back up both. `docker compose down -v` deletes them. If ports are occupied, set `SPECTRAPLEX_PORT` or `POSTGRES_PORT` in `.env`. Keep the local credentials private; use TLS and hardened database credentials before exposing the service remotely.
 
-**Query and export structured datasets.** Silver and Gold datasets are available through a REST API with filtering, pagination, and async export to CSV, JSONL, local files, or webhooks.
+## What you can work with
 
-**V2-backed wallet reads.** Legacy wallet endpoints (`/v1/transactions/:wallet`, `/v1/ledger/:wallet`, etc.) are served from V2 tables behind unchanged response shapes.
+| Input | Useful datasets |
+|---|---|
+| Solana wallets, including v0 transactions | Raw transactions, token transfers, native balance deltas, wallet ledger, indexed balance history |
+| EVM wallets | Raw transactions, ERC20 transfers, top-level native value and execution gas, wallet ledger, indexed balance history |
+| Hyperliquid wallets | Fills, funding, deposits/withdrawals, wallet ledger; beta PnL and trade history |
+| Hyperliquid markets; EVM contracts/topic filters via API | Raw transaction query/export |
+| Trusted JSON/JSONL imports (admin only) | The same durable ingestion → normalization → export pipeline |
 
-**Built-in analytics endpoints.** Trader PnL, market stats, protocol activity, and TVL queries ship out of the box.
+The dataset selector and `GET /v1/datasets` list available datasets. Configure additional networks/providers using `spectraplex.toml.example`.
 
-## Architecture
+**Know the limits:**
+- This is bounded indexing, not a complete-chain index or verified account balance service. EVM scans stop 12 blocks behind the head; that is not a reorg/finality guarantee. Hyperliquid providers may retain only limited history.
+- A “complete” dataset status means its indexed batch was processed, not that all historical activity was found. Inspect coverage and export provenance.
+- EVM wallet accounting excludes internal transfers, NFTs, and fees beyond execution gas. Unknown ERC20 decimals are `-1`: amounts remain raw units and are excluded from financial totals.
+- Balances are cumulative changes in indexed events. PnL/trade grouping is beta; protocol/TVL analytics and live streaming are experimental. Exports are not tax returns.
+- Imports are trusted, not independently chain-verified. Existing Bronze payloads are immutable. Older arrivals can rebuild known balance deltas; legacy snapshots without deltas fail closed rather than invent history.
 
-Data flows through three tiers:
+## API: sample → query → download
 
-```
-Ingestion → Bronze (raw_transactions) → Silver (token_transfers, etc.) → Gold (wallet_ledger, etc.)
-                ↓                              ↓
-         target_matches              dataset_completeness
-         ingestion_runs              dataset_versions
-         V2 checkpoints              dataset_watermarks
-```
-
-- **Bronze** is canonical and target-agnostic. Raw chain data lives in `raw_transactions` and is linked to `ingestion_runs` and `target_matches`.
-- **Silver** datasets are extracted directly from Bronze using chain-specific parsers. Every Silver row carries `raw_transaction_id` for provenance.
-- **Gold** datasets are derived from Silver for wallet, tax, forensics, and analytics use cases.
-
-All operational state — jobs, streams, exports, materialization runs — is durable in PostgreSQL. No runtime truth lives in in-memory maps.
-
-## Supported Chains
-
-| Chain | Data Source | Networks |
-|-------|------------|----------|
-| **Solana** | RPC + Yellowstone gRPC | `solana-mainnet` |
-| **Ethereum** | `eth_getLogs` via alloy | `ethereum-mainnet` |
-| **Base** | `eth_getLogs` via alloy | `base-mainnet` |
-| **Arbitrum** | `eth_getLogs` via alloy | `arbitrum-mainnet` |
-| **HyperEVM** | `eth_getLogs` via alloy | `hyperevm-mainnet` |
-| **Hyperliquid** | REST + WebSocket | `hypercore-mainnet` |
-
-## Datasets
-
-| Dataset | Tier | Description |
-|---------|------|-------------|
-| `token_transfers` | Silver | Token transfer records across all chains |
-| `native_balance_deltas` | Silver | Native currency balance changes per account |
-| `decoded_events` | Silver | ABI-decoded EVM events and Solana logs |
-| `hl_fills` | Silver | Hyperliquid trade fills |
-| `hl_funding` | Silver | Hyperliquid funding payments |
-| `positions` | Silver | Position state changes from fills and liquidations |
-| `wallet_ledger` | Gold | Ledger entries with counterparty tracking |
-| `balance_history` | Gold | Per-asset balance snapshots over time |
-| `hl_pnl_summary` | Gold | Hyperliquid PnL per coin per period |
-| `hl_trade_history` | Gold | Hyperliquid trades with entry/exit grouping |
-| `protocol_events` | Gold | Protocol events derived from decoded logs |
-| `pool_snapshots` | Gold | Pool state snapshots from events and transfers |
-
-## MVP Support Matrix
-
-Support levels:
-
-- **Stable** — intended for the documented MVP path and covered by local checks or deterministic tests.
-- **Beta** — usable but still needs broader correctness fixtures or provider hardening before production-grade claims.
-- **Experimental** — implemented building blocks exist, but operators should expect sharp edges.
-- **Unsupported** — intentionally not advertised as working yet.
-
-### Target and Ingestion Support
-
-| Target / path | Support | Notes |
-|---------------|---------|-------|
-| Solana wallet via `POST /v1/ingest` or `POST /v1/targets/:id/ingest` | Stable | V2-backed wallet ingest remains the primary stable path for wallet ledger, balance, and export workflows. |
-| EVM wallet via `POST /v1/ingest` or `POST /v1/targets/:id/ingest` | Beta | Wallet ingest exists, but chain-id/finality/reorg hardening must land before production-grade support claims. |
-| Hyperliquid wallet via `POST /v1/ingest` or streams | Beta | REST/WebSocket flows exist, but provider-rate-limit/backoff and gap-detection hardening are still tracked separately. |
-| Hyperliquid market target via `POST /v1/targets/:id/ingest` | Beta | First non-wallet target-centric connector path. This path currently writes Bronze market data; Silver/Gold auto-materialization is not yet part of the market-target contract. |
-| EVM contract/topic target via target-centric ingest | Unsupported | Connector/runtime hardening is intentionally deferred. Do not treat EVM contract/topic targets as a supported runtime path yet. |
-| CLI `normalize` | Legacy compatibility | Available for offline/file-based workflows, but the API ingestion + auto-materialization path is the recommended V2 flow. |
-
-### Dataset and Export Support
-
-| Dataset flow | Support | Notes |
-|--------------|---------|-------|
-| Silver dataset query/export with `target_id` for materialized wallet paths | Stable | Silver tables carry raw lineage and target matching. Tenant requests must include an owned `target_id`. Non-wallet targets are only query/export-supported where their row above says materialization is part of the contract. |
-| `wallet_ledger` Gold query/export | Stable | Target-scoped wallet ledger reads use Gold-specific filtering and include export provenance. |
-| `balance_history` Gold query/export | Beta | Materialized with DB-seeded running balances; keep representative correctness fixtures current before production-grade use. |
-| Hyperliquid Gold datasets (`hl_pnl_summary`, `hl_trade_history`) | Beta | Durable Gold tables exist; correctness depends on fill/funding semantics and provider completeness. |
-| Protocol/TVL Gold datasets (`protocol_events`, `pool_snapshots`) | Experimental | Query/export paths exist, but protocol semantics and TVL calculations need representative fixtures before stable claims. |
-| Dataset completeness/status | Stable for owned targets | Tenant-scoped API keys see owner-filtered target completeness/status; dataset version metadata remains global. |
-| Export provenance sidecars | Stable | Dataset exports include version and completeness metadata when available. |
-
-Known high/critical provider and operational hardening issues are tracked in GitHub issues #248-#267. The support levels above are intentionally conservative until those risks are either fixed or scoped out of a stable path.
-
-## Supported Path vs Legacy Compatibility
-
-Spectraplex has two operational paths:
-
-**Supported MVP path (recommended):**
-1. Register a target via API (`POST /v1/targets`) or use the wallet ingest shortcut
-2. Trigger ingestion via API (`POST /v1/targets/:id/ingest` or `POST /v1/ingest` for wallet shortcuts)
-3. Workers write V2 Bronze (`raw_transactions`); stable wallet paths auto-materialize Silver/Gold
-4. Query or export from durable V2 tables with an owned `target_id`
-
-This path is fully tenant-scoped, survives restarts, and produces completeness/provenance metadata for every export.
-
-**Legacy compatibility path (CLI `normalize`):**
-- `spectraplex-cli normalize` parses V1 transactions and writes `ledger_entries` directly
-- API workers optionally write V1 tables (`transactions`, `indexer_checkpoints`) for backward compatibility
-- Controlled by `enable_v1_compat_writes` config (default: `true`)
-
-Operators who no longer need V1 tables can set `enable_v1_compat_writes = false` in `spectraplex.toml`. The CLI `normalize` command remains available for offline/file-based workflows but is not the recommended pipeline.
-
-## API
-
-All `/v1/*` routes require `Authorization: Bearer <API_KEY>`.
-
-Tenant-scoped API keys (created via `POST /v1/api-keys`) are required for tenant isolation on dataset queries, dataset status/completeness, and exports. The legacy config key (`SPECTRAPLEX_API_KEY`) can also call these endpoints (without tenant isolation) and is used to bootstrap the first tenant key.
-
-### Ingestion and Jobs
+Requires `curl` and `jq`. Run from the repository after starting the service:
 
 ```bash
-# Trigger wallet ingestion (wallet + network; API auto-creates the target)
-curl -X POST http://127.0.0.1:3000/v1/ingest \
-  -H Authorization:\ Bearer\ *** \
-  -H Content-Type:\ application/json \
-  -d '{"wallet": "<ADDRESS>", "network": "solana-mainnet"}'
+source .env
+BASE="http://127.0.0.1:${SPECTRAPLEX_PORT:-3000}"
+api() { curl -fsS -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
+  -H 'Content-Type: application/json' "$@"; }
 
-# Trigger target-centric ingestion for an existing target
-curl -X POST http://127.0.0.1:3000/v1/targets/<TARGET_ID>/ingest \
-  -H Authorization:\ Bearer\ *** \
-  -H Content-Type:\ application/json \
-  -d '{"mode": "backfill"}'
+# Raw records are available immediately; normalization runs in the background.
+SAMPLE=$(api -X POST "$BASE/v1/demo/ethereum" -d '{}')
+TARGET=$(printf '%s' "$SAMPLE" | jq -r .target_id)
+api "$BASE/v1/datasets/raw_transactions/records?target_id=$TARGET&limit=50" | jq
 
-# Check job status
-curl -H Authorization:\ Bearer\ *** \
-  http://127.0.0.1:3000/v1/jobs/<JOB_ID>
+EXPORT=$(api -X POST "$BASE/v1/export/dataset" \
+  -d "{\"dataset\":\"raw_transactions\",\"target_id\":\"$TARGET\",\"format\":\"jsonl\"}" | jq -r .id)
+for attempt in $(seq 1 60); do
+  STATE=$(api "$BASE/v1/export/jobs/$EXPORT" | jq -r .state)
+  [[ "$STATE" == completed || "$STATE" == failed ]] && break
+  sleep 1
+done
+api "$BASE/v1/export/jobs/$EXPORT" | jq
+if [[ "$STATE" == completed ]]; then
+  api "$BASE/v1/export/jobs/$EXPORT/download" -o history.jsonl
+  api "$BASE/v1/export/jobs/$EXPORT/download?provenance=true" -o history.provenance.json
+fi
 ```
 
-Ingestion jobs are durable — they persist across restarts and are claimed by background workers with heartbeat-based lease management.
+Use `wallet_ledger`, `token_transfers` or another dataset name for normalized results after materialization completes. Record queries support `target_id`, `network`, `time_start`/`time_end` (Unix seconds), `limit` and `offset`.
 
-### Real-Time Streaming
+| Action | Route |
+|---|---|
+| Create/list targets | `POST` / `GET /v1/targets` |
+| Fetch a target | `POST /v1/targets/{id}/ingest` with `{"mode":"incremental"}` or `{"mode":"backfill"}` |
+| Inspect jobs | `GET /v1/jobs`, `GET /v1/jobs/{id}` |
+| Create a tenant key | `POST /v1/api-keys` with `{"name":"Research"}` |
+| Revoke a key | `DELETE /v1/api-keys/{id}` |
+
+### Import your own records
+
+Create a real-network target, then open **Import raw transactions**. Accepts JSON arrays, `{"records":[…]}`, or JSONL; at most 500 records / 1 MiB per upload. Each record needs `tx_hash`, `timestamp` (Unix seconds), and a chain-specific `raw_metadata` RPC payload. Optional: `block_number`. Download sample payloads from the sidebar to see the shapes; don't present synthetic records as real activity.
+
+For an existing real target and a trusted `records.jsonl` file, the equivalent API request is:
 
 ```bash
-# Start a Solana gRPC stream (requires SOLANA_GRPC_URL and legacy/admin key)
-curl -X POST http://127.0.0.1:3000/v1/stream/start \
-  -H "Authorization: Bearer $LEGACY_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"chain": "solana"}'
-
-# Start a Hyperliquid WebSocket stream for a wallet
-curl -X POST http://127.0.0.1:3000/v1/stream/start \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"chain": "hyperliquid", "wallet": "0x..."}'
-
-# List active streams
-curl -H "Authorization: Bearer $API_KEY" \
-  http://127.0.0.1:3000/v1/streams
-
-# Stop a stream
-curl -X POST http://127.0.0.1:3000/v1/stream/<STREAM_ID>/stop \
-  -H "Authorization: Bearer $API_KEY"
+read -r -p 'Real target ID: ' REAL_TARGET
+jq -s '{records: .}' records.jsonl | \
+  api -X POST "$BASE/v1/targets/$REAL_TARGET/import" --data-binary @-
 ```
 
-Stream subscriptions are durable and create `ingestion_runs` per flush batch with full Bronze lineage. Hyperliquid streams subscribe to user fills, funding, and ledger updates via WebSocket with automatic reconnection.
-
-### Targets and Networks
+## CLI and development
 
 ```bash
-# Register an indexing target
-curl -X POST http://127.0.0.1:3000/v1/targets \
-  -H "Authorization: Bearer $SPECT...KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"kind": "wallet", "network": "solana-mainnet", "address": "<ADDRESS>", "mode": "both"}'
-
-# List networks
-curl -H "Authorization: Bearer $SPECT...KEY" http://127.0.0.1:3000/v1/networks
+docker compose exec api spectraplex-cli --help
+docker compose exec api spectraplex-cli list-networks
 ```
 
-### API Keys
+Prefer the workbench/API for the canonical pipeline. CLI `normalize` is a legacy compatibility path, not the workbench materializer.
 
-Spectraplex supports two authentication modes:
-- **Legacy config key** — set via `SPECTRAPLEX_API_KEY` or `api_key` in config. Full admin access, no tenant isolation.
-- **Tenant-scoped keys** — created via the API, stored in Postgres, isolated by owner.
+To run natively on macOS/Linux: install **Rust 1.94+** and **PostgreSQL 16+** (or start just `docker compose up -d postgres`), run `./scripts/setup.sh`, set `DATABASE_URL` in `.env`, then:
 
 ```bash
-# Create a tenant-scoped API key (use legacy key for auth)
-curl -X POST http://127.0.0.1:3000/v1/api-keys \
-  -H "Authorization: Bearer $SPECT...CONFIG_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "production"}'
-# → returns {"id":"...","key":"spx_...","owner_id":"..."}
-
-# List your active keys
-curl -H "Authorization: Bearer $SPX...TENANT_KEY" \
-  http://127.0.0.1:3000/v1/api-keys
-
-# Revoke a key
-curl -X DELETE http://127.0.0.1:3000/v1/api-keys/<KEY_ID> \
-  -H "Authorization: Bearer $SPX...TENANT_KEY"
+cargo run --locked --bin spectraplex-api
 ```
 
-### Query Datasets
-
-Tenant-scoped dataset queries require `target_id`:
+Config loads from `spectraplex.toml` (or `SPECTRAPLEX_CONFIG`), then environment overrides. The API applies migrations automatically. Use a **local test database account with CREATEDB permission** for integration tests; PostgreSQL's `psql` and Python 3 must be on PATH:
 
 ```bash
-# Query a dataset (tenant-scoped)
-curl -H "Authorization: Bearer ***" \
-  "http://127.0.0.1:3000/v1/datasets/token_transfers/records?target_id=<TARGET_ID>&network=solana-mainnet&limit=50"
-
-# Check dataset completeness for your tenant's targets
-curl -H "Authorization: Bearer ***" \
-  http://127.0.0.1:3000/v1/datasets/token_transfers/completeness
-
-# Check dataset status for your tenant's targets
-curl -H "Authorization: Bearer ***" \
-  http://127.0.0.1:3000/v1/datasets/token_transfers/status
+source .env
+export TEST_DATABASE_URL="$DATABASE_URL"
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+npm ci --prefix web-tests
+(cd web-tests && npx playwright install chromium)
+./scripts/smoke-test.sh --browser
 ```
 
-Dataset completeness is tracked per target and network. After each materialization run, the system upserts a completeness record with coverage bounds (timestamp or block range), record count, and status (`complete`, `partial`, `backfilling`, or `gap`).
+Node 22+ is only needed for browser tests. The smoke suite uses isolated databases and local provider fixtures, covering three-chain ingestion, financial fixtures, replay, tenant isolation, imports, exports, restart recovery, mobile layout and automated WCAG AA checks. CI also boots containers and checks volume persistence. Reviewed upstream security exceptions live in `.cargo/audit.toml`.
 
-### Export
-
-Tenant-scoped exports require `target_id`:
-
-```bash
-# Create an export job (CSV or JSONL)
-curl -X POST http://127.0.0.1:3000/v1/export/dataset \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"dataset": "wallet_ledger", "format": "csv", "target_id": "<TARGET_ID>", "network": "solana-mainnet"}'
-
-# Download when ready
-curl -H "Authorization: Bearer $API_KEY" \
-  http://127.0.0.1:3000/v1/export/jobs/<JOB_ID>/download
-```
-
-Export jobs write two files to the configured export directory:
-- `{job_id}.csv` or `{job_id}.jsonl` — the data artifact
-- `{job_id}.provenance.json` — sidecar with dataset version, completeness status, coverage bounds, and record count
-
-The provenance file is useful for downstream pipelines that need to know whether the export is complete or partial before processing.
-
-Export jobs are durable with heartbeat-based worker execution. Supported sinks: `local_file` and `webhook`.
-
-### Callback HMAC Verification
-
-When `callback_hmac_secret` is configured, callback payloads include an `X-Spectraplex-Signature` header:
-
-```bash
-curl -X POST http://127.0.0.1:3000/v1/ingest \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"wallet": "<ADDRESS>", "network": "solana-mainnet", "callback_url": "https://your-app.example.com/webhook"}'
-```
-
-The webhook receiver can verify the signature:
-
-```python
-import hmac
-import hashlib
-
-def verify_signature(payload: bytes, signature_header: str, secret: str) -> bool:
-    expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(f"sha256={expected}", signature_header)
-```
-
-Signature format: `X-Spectraplex-Signature: sha256=<hex>`.
-
-### Analytics
-
-```bash
-# Hyperliquid trader analytics
-curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
-  "http://127.0.0.1:3000/v1/analytics/hl/trader?wallet=<ADDRESS>"
-
-# Protocol activity
-curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
-  "http://127.0.0.1:3000/v1/analytics/protocol/activity?network=ethereum-mainnet"
-
-# TVL
-curl -H "Authorization: Bearer $SPECTRAPLEX_API_KEY" \
-  http://127.0.0.1:3000/v1/analytics/protocol/tvl
-```
-
-<details>
-<summary>Full endpoint reference</summary>
-
-**Ingestion and job control:**
-`POST /v1/ingest` | `POST /v1/ingest/batch` | `POST /v1/normalize` | `GET /v1/jobs/:job_id` | `POST /v1/stream/start` | `POST /v1/stream/:stream_id/stop` | `GET /v1/streams`
-
-**Wallet endpoints (V2-backed):**
-`GET /v1/transactions/:wallet` | `GET /v1/transactions/:wallet/:tx_hash` | `GET /v1/ledger/:wallet` | `GET /v1/export/:wallet` | `GET /v1/balances/:wallet` | `GET /v1/stats/:wallet`
-
-**Targets and networks:**
-`POST /v1/targets` | `GET /v1/targets` | `GET /v1/targets/:target_id` | `POST /v1/targets/:target_id/ingest` | `GET /v1/networks` | `GET /v1/networks/:network_id`
-
-**API keys:**
-`POST /v1/api-keys` | `GET /v1/api-keys` | `DELETE /v1/api-keys/:key_id`
-
-**Datasets:**
-`GET /v1/datasets` | `GET /v1/datasets/:name/versions` | `GET /v1/datasets/:name/records` | `GET /v1/datasets/:name/completeness` | `GET /v1/datasets/:name/status`
-
-**Export:**
-`POST /v1/export/dataset` | `GET /v1/export/jobs/:job_id` | `GET /v1/export/jobs/:job_id/download` | `GET /v1/export/tax`
-
-**Analytics:**
-`GET /v1/forensics/activity` | `GET /v1/analytics/hl/trader` | `GET /v1/analytics/hl/market` | `GET /v1/analytics/protocol/activity` | `GET /v1/analytics/protocol/tvl`
-
-</details>
-
-## CLI
-
-```bash
-cargo run --bin spectraplex-cli -- --help
-```
-
-| Command | Description |
-|---------|-------------|
-| `init-db` | Create tables, indexes, and seed network data |
-| `ingest` | Pull raw transactions from a chain into Bronze storage |
-| `normalize` | Materialize Silver datasets from ingested Bronze data |
-| `register-target` | Register a wallet, contract, program, or event filter for indexing |
-| `list-targets` | List registered targets with optional network/kind filters |
-| `list-networks` | Show all seeded networks |
-
-```bash
-# Ingest from any chain
-spectraplex-cli --db-url "$DATABASE_URL" ingest --chain ethereum --wallet <ADDRESS> --rpc "$EVM_RPC_URL" --limit 10
-spectraplex-cli --db-url "$DATABASE_URL" ingest --chain hyperliquid --wallet <ADDRESS> --limit 10
-
-# Register a target for ERC-20 Transfer events
-spectraplex-cli --db-url "$DATABASE_URL" register-target \
-  --kind topic_filter --network ethereum-mainnet \
-  --filter-spec '{"topics":["0xddf252ad00000000000000000000000000000000000000000000000000000000"]}' \
-  --mode backfill --label "ERC20 transfers"
-```
-
-## Configuration
-
-Spectraplex loads config from (in order of precedence):
-
-1. Defaults
-2. `spectraplex.toml` (copy from `spectraplex.toml.example`)
-3. `SPECTRAPLEX_*` environment variables
-4. Direct env vars (`DATABASE_URL`, `SOLANA_RPC_URL`, etc.)
-
-Key environment variables:
-
-```bash
-DATABASE_URL=postgresql://localhost/spectraplex
-SPECTRAPLEX_API_KEY=***
-SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
-EVM_RPC_URL=https://eth.llamarpc.com
-# Optional
-SOLANA_GRPC_URL=https://your-yellowstone-endpoint
-SOLANA_GRPC_TOKEN=***
-# Optional: disable V1 compatibility writes
-# SPECTRAPLEX_ENABLE_V1_COMPAT_WRITES=false
-```
-
-## Project Layout
-
-```
-spectraplex/
-├── core/         Shared models, config, dataset registry, traits
-├── adapters/     Chain adapters, parsers, dual-write layer, repository
-├── cli/          CLI entry points
-├── api/          Axum HTTP API server + background workers
-└── migrations/   PostgreSQL schema and seed data
-```
-
-## Development
-
-```bash
-cargo fmt --all --check                                    # format check
-cargo clippy --workspace --all-targets -- -D warnings      # lint
-cargo test --workspace                                     # tests
-```
-
-## License
-
-MIT
+MIT licensed. Rust workspace: `core/` models, `adapters/` ingestion/storage, `api/` workbench/workers, `cli/` administration, `migrations/` schema.

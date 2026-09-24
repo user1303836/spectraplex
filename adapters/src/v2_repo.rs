@@ -1241,6 +1241,7 @@ pub fn build_dataset_completeness_upsert(
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum ExportRecordBatch {
+    RawTransactions(Vec<RawTransaction>),
     TokenTransfers(Vec<TokenTransfer>),
     NativeBalanceDeltas(Vec<NativeBalanceDelta>),
     DecodedEvents(Vec<DecodedEvent>),
@@ -1261,6 +1262,7 @@ impl ExportRecordBatch {
     /// exhausted.
     pub fn len(&self) -> usize {
         match self {
+            ExportRecordBatch::RawTransactions(v) => v.len(),
             ExportRecordBatch::TokenTransfers(v) => v.len(),
             ExportRecordBatch::NativeBalanceDeltas(v) => v.len(),
             ExportRecordBatch::DecodedEvents(v) => v.len(),
@@ -1479,12 +1481,18 @@ pub fn build_dataset_filter_query(
     let mut n: usize = 0;
     let mut wheres: Vec<String> = Vec::new();
 
+    let is_bronze = table_name == "raw_transactions";
     if target_id.is_some() {
-        sql.push_str(" JOIN target_matches tm ON tm.raw_transaction_id = dt.raw_transaction_id");
+        sql.push_str(if is_bronze {
+            " JOIN target_matches tm ON tm.raw_transaction_id = dt.id"
+        } else {
+            " JOIN target_matches tm ON tm.raw_transaction_id = dt.raw_transaction_id"
+        });
     }
-    if time_start.is_some() || time_end.is_some() {
+    if !is_bronze && (time_start.is_some() || time_end.is_some()) {
         sql.push_str(" JOIN raw_transactions rt ON rt.id = dt.raw_transaction_id");
     }
+    let time_alias = if is_bronze { "dt" } else { "rt" };
 
     if let Some(tid) = target_id {
         n += 1;
@@ -1501,13 +1509,13 @@ pub fn build_dataset_filter_query(
     }
     if let Some(start) = time_start {
         n += 1;
-        wheres.push(format!("rt.timestamp >= ${n}"));
+        wheres.push(format!("{time_alias}.timestamp >= ${n}"));
         use sqlx::Arguments;
         args.add(start).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     if let Some(end) = time_end {
         n += 1;
-        wheres.push(format!("rt.timestamp <= ${n}"));
+        wheres.push(format!("{time_alias}.timestamp <= ${n}"));
         use sqlx::Arguments;
         args.add(end).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
@@ -2292,10 +2300,13 @@ impl Repository {
     // -----------------------------------------------------------------------
 
     pub async fn save_raw_transactions(&self, txs: &[RawTransaction]) -> anyhow::Result<()> {
+        let mut tx = self.pool().begin().await?;
         for chunk in txs.chunks(Self::V2_BATCH_SIZE) {
             let (query, args) = build_raw_transaction_insert(chunk)?;
-            sqlx::query_with(&query, args).execute(self.pool()).await?;
+            sqlx::query_with(&query, args).execute(&mut *tx).await?;
+            Self::link_run_inputs(&mut tx, chunk).await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2312,18 +2323,37 @@ impl Repository {
         &self,
         txs: &[RawTransaction],
     ) -> anyhow::Result<Vec<Uuid>> {
+        let mut tx = self.pool().begin().await?;
         let mut all_ids = Vec::with_capacity(txs.len());
         for chunk in txs.chunks(Self::V2_BATCH_SIZE) {
-            let (query, args) = build_raw_transaction_upsert_returning(chunk)?;
-            let rows = sqlx::query_with(&query, args)
-                .fetch_all(self.pool())
-                .await?;
-            for row in &rows {
-                let id: Uuid = row.try_get("id")?;
-                all_ids.push(id);
-            }
+            all_ids.extend(Self::upsert_raw_batch_in_tx(&mut tx, chunk).await?);
         }
+        tx.commit().await?;
         Ok(all_ids)
+    }
+
+    pub async fn query_raw_transactions(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+        time_start: Option<i64>,
+        time_end: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<RawTransaction>> {
+        let (sql, args) = build_dataset_filter_query(
+            "dt.*",
+            "raw_transactions",
+            "dt.timestamp",
+            target_id,
+            network,
+            time_start,
+            time_end,
+            limit,
+            offset,
+        )?;
+        let rows = sqlx::query_with(&sql, args).fetch_all(self.pool()).await?;
+        rows.iter().map(row_to_raw_transaction).collect()
     }
 
     pub async fn get_raw_transaction_by_hash(
@@ -2350,7 +2380,9 @@ impl Repository {
         let rows = sqlx::query(
             "SELECT id, network, tx_hash, timestamp, block_number, raw_metadata, \
              source, ingestion_run_id, ingested_at \
-             FROM raw_transactions WHERE ingestion_run_id = $1 ORDER BY timestamp",
+             FROM raw_transactions rt WHERE ingestion_run_id = $1 OR EXISTS (\
+                 SELECT 1 FROM ingestion_run_transactions i WHERE i.ingestion_run_id = $1 \
+                 AND i.raw_transaction_id = rt.id) ORDER BY timestamp, id",
         )
         .bind(run_id)
         .fetch_all(self.pool())
@@ -3252,6 +3284,44 @@ impl Repository {
         rows.iter().map(row_to_decoded_event).collect()
     }
 
+    /// Complete indexed input set for one public wallet, independent of batch/run boundaries.
+    pub async fn hl_wallet_inputs(
+        &self,
+        wallet: &str,
+        network: &str,
+    ) -> anyhow::Result<(Vec<HlFillRecord>, Vec<HlFundingPayment>)> {
+        let predicate = "dt.network = $1 AND EXISTS (SELECT 1 FROM target_matches tm JOIN index_targets t ON t.id = tm.target_id WHERE tm.raw_transaction_id = dt.raw_transaction_id AND t.network = $1 AND lower(t.address) = lower($2))";
+        let fills = sqlx::query(&format!("SELECT dt.* FROM hl_fill_records dt WHERE {predicate} ORDER BY dt.fill_time, dt.id LIMIT 100001"))
+            .bind(network).bind(wallet).fetch_all(self.pool()).await?;
+        let funding = sqlx::query(&format!("SELECT dt.* FROM hl_funding_payments dt WHERE {predicate} ORDER BY dt.payment_time, dt.id LIMIT 100001"))
+            .bind(network).bind(wallet).fetch_all(self.pool()).await?;
+        anyhow::ensure!(
+            fills.len() <= 100000 && funding.len() <= 100000,
+            "HL analytics exceeds 100000 indexed events; refusing truncated calculation"
+        );
+        Ok((
+            fills
+                .iter()
+                .map(row_to_hl_fill_record)
+                .collect::<anyhow::Result<_>>()?,
+            funding
+                .iter()
+                .map(row_to_hl_funding_payment)
+                .collect::<anyhow::Result<_>>()?,
+        ))
+    }
+
+    pub async fn canonical_decoded_events(
+        &self,
+        raw_ids: &[Uuid],
+    ) -> anyhow::Result<Vec<DecodedEvent>> {
+        let rows = sqlx::query("SELECT * FROM decoded_events WHERE raw_transaction_id = ANY($1)")
+            .bind(raw_ids)
+            .fetch_all(self.pool())
+            .await?;
+        rows.iter().map(row_to_decoded_event).collect()
+    }
+
     /// Query Hyperliquid fill records with optional target, network, and time-window filters.
     #[allow(clippy::too_many_arguments)]
     pub async fn query_hl_fill_records(
@@ -3530,12 +3600,33 @@ impl Repository {
     // Gold-tier: wallet_ledger and balance_history (P5-W1)
     // -----------------------------------------------------------------------
 
-    /// Upsert wallet_ledger records. Uses ON CONFLICT DO NOTHING on the primary key
-    /// to maintain idempotency.
     pub async fn save_wallet_ledger_records(
         &self,
         records: &[WalletLedgerRecord],
     ) -> anyhow::Result<()> {
+        self.write_wallet_ledger_records(records, None).await
+    }
+
+    pub async fn replace_wallet_ledger_records(
+        &self,
+        wallet: &str,
+        inputs: &[Uuid],
+        records: &[WalletLedgerRecord],
+    ) -> anyhow::Result<()> {
+        self.write_wallet_ledger_records(records, Some((wallet, inputs)))
+            .await
+    }
+
+    async fn write_wallet_ledger_records(
+        &self,
+        records: &[WalletLedgerRecord],
+        replace: Option<(&str, &[Uuid])>,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool().begin().await?;
+        if let Some((wallet, inputs)) = replace {
+            sqlx::query("DELETE FROM wallet_ledger WHERE wallet_address = $1 AND raw_transaction_id = ANY($2)")
+                .bind(wallet).bind(inputs).execute(&mut *tx).await?;
+        }
         for chunk in records.chunks(500) {
             let mut query_builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
                 "INSERT INTO wallet_ledger (id, raw_transaction_id, wallet_address, network, tx_hash, \
@@ -3570,17 +3661,28 @@ impl Repository {
                  proceeds = EXCLUDED.proceeds, \
                  dataset_version_id = EXCLUDED.dataset_version_id",
             );
-            query_builder.build().execute(self.pool()).await?;
+            query_builder.build().execute(&mut *tx).await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
     /// Upsert balance_history records.
     pub async fn save_balance_snapshots(&self, records: &[BalanceSnapshot]) -> anyhow::Result<()> {
+        self.save_balance_snapshots_with_deltas(records, &Default::default())
+            .await
+    }
+
+    pub async fn save_balance_snapshots_with_deltas(
+        &self,
+        records: &[BalanceSnapshot],
+        deltas: &std::collections::HashMap<Uuid, bigdecimal::BigDecimal>,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool().begin().await?;
         for chunk in records.chunks(500) {
             let mut query_builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
                 "INSERT INTO balance_history (id, wallet_address, asset_symbol, network, \
-                 timestamp, balance, tx_hash, dataset_version_id, created_at) ",
+                 timestamp, balance, tx_hash, dataset_version_id, created_at, delta) ",
             );
             query_builder.push_values(chunk, |mut b, r| {
                 b.push_bind(r.id)
@@ -3591,15 +3693,18 @@ impl Repository {
                     .push_bind(&r.balance)
                     .push_bind(&r.tx_hash)
                     .push_bind(r.dataset_version_id)
-                    .push_bind(r.created_at);
+                    .push_bind(r.created_at)
+                    .push_bind(deltas.get(&r.id));
             });
             query_builder.push(
                 " ON CONFLICT (id) DO UPDATE SET \
                  balance = EXCLUDED.balance, \
+                 delta = COALESCE(EXCLUDED.delta, balance_history.delta), \
                  dataset_version_id = EXCLUDED.dataset_version_id",
             );
-            query_builder.build().execute(self.pool()).await?;
+            query_builder.build().execute(&mut *tx).await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3745,6 +3850,27 @@ impl Repository {
         .await
     }
 
+    async fn direct_wallet_scope(
+        &self,
+        target_id: Option<Uuid>,
+        network: Option<&str>,
+    ) -> anyhow::Result<Option<(Option<String>, Option<String>)>> {
+        if let Some(id) = target_id {
+            let Some(target) = self.get_index_target(id).await? else {
+                return Ok(None);
+            };
+            if target.kind != TargetKind::Wallet || network.is_some_and(|n| n != target.network) {
+                return Ok(None);
+            }
+            let Some(address) = target.address.filter(|a| !a.is_empty()) else {
+                return Ok(None);
+            };
+            Ok(Some((Some(address), Some(target.network))))
+        } else {
+            Ok(Some((None, network.map(str::to_owned))))
+        }
+    }
+
     // -- P5-W2: Hyperliquid Gold analytics query/export methods --
 
     pub async fn query_hl_pnl_summary(
@@ -3756,17 +3882,12 @@ impl Repository {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<HlPnlSummary>> {
-        let target_address = if let Some(tid) = target_id {
-            match self.get_index_target(tid).await? {
-                Some(t) => match t.address {
-                    Some(addr) if !addr.is_empty() => Some(addr),
-                    _ => return Ok(Vec::new()),
-                },
-                None => return Ok(Vec::new()),
-            }
-        } else {
-            None
+        let Some((target_address, scoped_network)) =
+            self.direct_wallet_scope(target_id, network).await?
+        else {
+            return Ok(Vec::new());
         };
+        let network = scoped_network.as_deref();
         let cols = "dt.id, dt.wallet_address, dt.coin, dt.network, dt.period_start, \
                     dt.period_end, dt.total_closed_pnl, dt.total_funding, dt.total_fees, \
                     dt.net_pnl, dt.trade_count, dt.fill_count, dt.avg_trade_size, \
@@ -3815,17 +3936,12 @@ impl Repository {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<HlTradeHistory>> {
-        let target_address = if let Some(tid) = target_id {
-            match self.get_index_target(tid).await? {
-                Some(t) => match t.address {
-                    Some(addr) if !addr.is_empty() => Some(addr),
-                    _ => return Ok(Vec::new()),
-                },
-                None => return Ok(Vec::new()),
-            }
-        } else {
-            None
+        let Some((target_address, scoped_network)) =
+            self.direct_wallet_scope(target_id, network).await?
+        else {
+            return Ok(Vec::new());
         };
+        let network = scoped_network.as_deref();
         let cols = "dt.id, dt.wallet_address, dt.coin, dt.network, dt.side, dt.entry_price, \
                     dt.exit_price, dt.size, dt.opened_at, dt.closed_at, dt.realized_pnl, \
                     dt.fees, dt.num_fills, dt.dataset_version_id, dt.created_at";
@@ -3995,6 +4111,32 @@ impl Repository {
 
     /// Bulk insert HL PnL summary records.
     pub async fn save_hl_pnl_summary(&self, records: &[HlPnlSummary]) -> anyhow::Result<()> {
+        self.write_hl_pnl_summary(records, None).await
+    }
+
+    pub async fn replace_hl_pnl_summary(
+        &self,
+        wallet: &str,
+        network: &str,
+        records: &[HlPnlSummary],
+    ) -> anyhow::Result<()> {
+        self.write_hl_pnl_summary(records, Some((wallet, network)))
+            .await
+    }
+
+    async fn write_hl_pnl_summary(
+        &self,
+        records: &[HlPnlSummary],
+        replace: Option<(&str, &str)>,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool().begin().await?;
+        if let Some((wallet, network)) = replace {
+            sqlx::query("DELETE FROM hl_pnl_summary WHERE wallet_address = $1 AND network = $2")
+                .bind(wallet)
+                .bind(network)
+                .execute(&mut *tx)
+                .await?;
+        }
         for chunk in records.chunks(500) {
             let mut query_builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
                 "INSERT INTO hl_pnl_summary (id, wallet_address, coin, network, period_start, \
@@ -4021,13 +4163,40 @@ impl Repository {
                     .push_bind(r.created_at);
             });
             query_builder.push(HL_PNL_SUMMARY_CONFLICT_SQL);
-            query_builder.build().execute(self.pool()).await?;
+            query_builder.build().execute(&mut *tx).await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
     /// Bulk insert HL trade history records.
     pub async fn save_hl_trade_history(&self, records: &[HlTradeHistory]) -> anyhow::Result<()> {
+        self.write_hl_trade_history(records, None).await
+    }
+
+    pub async fn replace_hl_trade_history(
+        &self,
+        wallet: &str,
+        network: &str,
+        records: &[HlTradeHistory],
+    ) -> anyhow::Result<()> {
+        self.write_hl_trade_history(records, Some((wallet, network)))
+            .await
+    }
+
+    async fn write_hl_trade_history(
+        &self,
+        records: &[HlTradeHistory],
+        replace: Option<(&str, &str)>,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool().begin().await?;
+        if let Some((wallet, network)) = replace {
+            sqlx::query("DELETE FROM hl_trade_history WHERE wallet_address = $1 AND network = $2")
+                .bind(wallet)
+                .bind(network)
+                .execute(&mut *tx)
+                .await?;
+        }
         for chunk in records.chunks(500) {
             let mut query_builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
                 "INSERT INTO hl_trade_history (id, wallet_address, coin, network, side, \
@@ -4052,8 +4221,9 @@ impl Repository {
                     .push_bind(r.created_at);
             });
             query_builder.push(HL_TRADE_HISTORY_CONFLICT_SQL);
-            query_builder.build().execute(self.pool()).await?;
+            query_builder.build().execute(&mut *tx).await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -4196,6 +4366,21 @@ impl Repository {
         rows.iter().map(row_to_balance_snapshot).collect()
     }
 
+    pub async fn balance_snapshot_deltas(
+        &self,
+        ids: &[Uuid],
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, bigdecimal::BigDecimal>> {
+        let rows = sqlx::query(
+            "SELECT id, delta FROM balance_history WHERE id = ANY($1) AND delta IS NOT NULL",
+        )
+        .bind(ids)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("id")?, row.try_get("delta")?)))
+            .collect()
+    }
+
     // -----------------------------------------------------------------------
     // Snapshotted streaming export (fixes PR #238 [P1] correctness)
     // -----------------------------------------------------------------------
@@ -4264,6 +4449,25 @@ impl Repository {
             .await?;
 
         let total = match dataset {
+            "raw_transactions" => {
+                stream_paged_in_tx(
+                    &mut tx,
+                    "dt.*",
+                    "raw_transactions",
+                    "dt.timestamp",
+                    target_id,
+                    network,
+                    time_start,
+                    time_end,
+                    page_size,
+                    hard_cap,
+                    &cancel,
+                    &tx_out,
+                    row_to_raw_transaction,
+                    ExportRecordBatch::RawTransactions,
+                )
+                .await?
+            }
             "token_transfers" => {
                 let cols = "dt.id, dt.raw_transaction_id, dt.network, dt.token_address, \
                             dt.token_symbol, dt.from_address, dt.to_address, dt.amount, \

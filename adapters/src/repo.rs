@@ -116,6 +116,11 @@ impl Repository {
         &self.pool
     }
 
+    pub async fn check_connection(&self) -> anyhow::Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
     /// Batch size for chunked inserts.
     const BATCH_SIZE: usize = 500;
 

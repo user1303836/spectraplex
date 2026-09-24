@@ -82,7 +82,7 @@ fn parse_fill(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<Vec<
                 user_id: tx.user_id,
                 wallet_address: tx.wallet_address.clone(),
                 asset_symbol: fee_token.to_string(),
-                amount: -fee.abs(), // Fees are always outgoing
+                amount: -fee, // Negative fees are maker rebates.
                 entry_type: EntryType::Fee,
                 fiat_value: None,
             });
@@ -135,8 +135,12 @@ fn parse_funding(tx: &Transaction, data: &serde_json::Value) -> anyhow::Result<V
         user_id: tx.user_id,
         wallet_address: tx.wallet_address.clone(),
         asset_symbol: "USDC".to_string(),
+        entry_type: if amount > BigDecimal::from(0) {
+            EntryType::Income
+        } else {
+            EntryType::Fee
+        },
         amount,
-        entry_type: EntryType::Fee,
         fiat_value: None,
     }])
 }
@@ -366,7 +370,7 @@ pub fn extract_hyperliquid_native_balance_deltas(
             };
 
             // Total USDC delta from this fill = -fee + closed_pnl
-            let delta = &pnl - &fee.abs();
+            let delta = &pnl - &fee;
 
             if delta == BigDecimal::from(0) {
                 return vec![];

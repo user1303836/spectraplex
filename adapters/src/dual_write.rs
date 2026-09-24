@@ -1364,6 +1364,17 @@ impl Repository {
             coverage_end: raw_txs.iter().map(|r| r.timestamp).max(),
             ..Default::default()
         };
+        for raw in raw_txs {
+            let family =
+                DatasetRegistry::chain_family_for_network(&raw.network).unwrap_or(ChainFamily::Evm);
+            if let Err(error) = crate::validate_import_payload(family, &raw.raw_metadata) {
+                result.total_failed += 1;
+                warn!(%error, tx_hash = %raw.tx_hash, "Invalid raw payload; materialization aborted before writes");
+            }
+        }
+        if result.total_failed != 0 {
+            return result;
+        }
 
         let dataset_versions = self.resolve_silver_dataset_versions().await;
 
@@ -1478,17 +1489,8 @@ impl Repository {
             }
         }
 
-        let total = all_token_transfers.len()
-            + all_native_balance_deltas.len()
-            + all_decoded_events.len()
-            + all_hl_fills.len()
-            + all_hl_funding.len()
-            + all_hl_positions.len();
-
-        if total == 0 {
-            return result;
-        }
-
+        // Native EVM value/gas flows have no fabricated Silver pre/post balances;
+        // they still require Gold materialization even when no log was emitted.
         // Write Silver records to the database.
         if !all_token_transfers.is_empty() {
             let n = all_token_transfers.len();
@@ -1590,6 +1592,20 @@ impl Repository {
             "Bronze-native Silver dataset materialization complete"
         );
 
+        // Gold foreign keys must use persisted Silver IDs, not fresh parser UUIDs
+        // that an idempotent Silver upsert may have discarded.
+        if !all_decoded_events.is_empty() {
+            let raw_ids: Vec<_> = raw_txs.iter().map(|r| r.id).collect();
+            match self.canonical_decoded_events(&raw_ids).await {
+                Ok(events) => all_decoded_events = events,
+                Err(error) => {
+                    result.total_failed += all_decoded_events.len();
+                    warn!(%error, "Could not resolve canonical decoded events");
+                    return result;
+                }
+            }
+        }
+
         // --- Gold materialization from Silver ---
         if let Some(wallet) = wallet_address {
             if !wallet.is_empty() {
@@ -1605,6 +1621,12 @@ impl Repository {
                         wallet_target_id,
                     )
                     .await;
+                result.total_failed += gold_result.wallet_ledger_failed
+                    + gold_result.balance_history_failed
+                    + gold_result.hl_pnl_summary_failed
+                    + gold_result.hl_trade_history_failed
+                    + gold_result.protocol_events_failed
+                    + gold_result.pool_snapshots_failed;
                 result.gold_wallet_ledger_written = gold_result.wallet_ledger_written;
                 result.gold_balance_history_written = gold_result.balance_history_written;
                 result.gold_hl_pnl_summary_written = gold_result.hl_pnl_summary_written;
@@ -1853,11 +1875,14 @@ impl Repository {
 
         // --- Token transfers ---
         for transfer in token_transfers {
+            if transfer.decimals < 0 {
+                continue;
+            } // unknown units remain available in Silver/Raw
             let from_match =
                 normalize_address_for_comparison(&transfer.from_address) == wallet_norm;
             let to_match = normalize_address_for_comparison(&transfer.to_address) == wallet_norm;
 
-            if !from_match && !to_match {
+            if from_match == to_match {
                 continue;
             }
 
@@ -1873,7 +1898,7 @@ impl Repository {
 
             if from_match {
                 let key = format!(
-                    "wl:{}:{}:{}:out",
+                    "wl:{wallet_norm}:{}:{}:{}:out",
                     raw_tx_id.map(|u| u.to_string()).unwrap_or_default(),
                     transfer.token_address,
                     transfer.transfer_index
@@ -1900,7 +1925,7 @@ impl Repository {
 
             if to_match {
                 let key = format!(
-                    "wl:{}:{}:{}:in",
+                    "wl:{wallet_norm}:{}:{}:{}:in",
                     raw_tx_id.map(|u| u.to_string()).unwrap_or_default(),
                     transfer.token_address,
                     transfer.transfer_index
@@ -1926,63 +1951,56 @@ impl Repository {
             }
         }
 
-        // --- Native balance deltas ---
+        // Separate Solana fees from value movement. HL settlement is represented
+        // below by fills and funding, not again by its aggregate native deltas.
         for delta in native_deltas {
-            if normalize_address_for_comparison(&delta.account_address) != wallet_norm {
+            if normalize_address_for_comparison(&delta.account_address) != wallet_norm
+                || delta.network.starts_with("hypercore")
+                || delta.network.starts_with("hyperliquid")
+            {
                 continue;
             }
-
             let raw_tx_id = delta.raw_transaction_id;
             let raw_tx = raw_tx_id.and_then(|id| raw_tx_map.get(&id));
             let tx_hash = raw_tx.map(|r| r.tx_hash.clone()).unwrap_or_default();
             let timestamp = raw_tx.map(|r| r.timestamp).unwrap_or(0);
-
-            let key = format!(
-                "wl:{}:native:{}",
-                raw_tx_id.map(|u| u.to_string()).unwrap_or_default(),
-                delta.account_address
-            );
-
-            let entry_type = if delta.is_fee_payer {
-                "fee"
+            let fee = if delta.is_fee_payer && delta.network.starts_with("solana") {
+                BigDecimal::from(
+                    raw_tx
+                        .and_then(|r| r.raw_metadata["meta"]["fee"].as_u64())
+                        .unwrap_or(0),
+                ) / BigDecimal::from(1_000_000_000u64)
             } else {
-                "transfer"
+                BigDecimal::from(0)
             };
-
-            let fee_amount = if delta.is_fee_payer {
-                // Fee is the absolute value of the delta for fee payers
-                Some(if delta.delta < BigDecimal::from(0) {
-                    -delta.delta.clone()
-                } else {
-                    delta.delta.clone()
-                })
-            } else {
-                None
-            };
-            let fee_asset = if delta.is_fee_payer {
-                Some(delta.native_token.clone())
-            } else {
-                None
-            };
-
-            ledger_records.push(WalletLedgerRecord {
-                id: Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()),
-                raw_transaction_id: raw_tx_id,
-                wallet_address: wallet_address.to_string(),
-                network: delta.network.clone(),
-                tx_hash,
-                timestamp,
-                entry_type: entry_type.to_string(),
-                asset_symbol: delta.native_token.clone(),
-                amount: delta.delta.clone(),
-                counterparty_address: None,
-                fee_amount,
-                fee_asset,
-                cost_basis: None,
-                proceeds: None,
-                dataset_version_id: wl_version_id,
-                created_at: now,
-            });
+            for (kind, amount) in [("transfer", &delta.delta + &fee), ("fee", -fee.clone())] {
+                if amount == BigDecimal::from(0) {
+                    continue;
+                }
+                let key = format!(
+                    "wl:{wallet_norm}:{}:native:{}:{kind}",
+                    raw_tx_id.unwrap_or_default(),
+                    delta.account_address
+                );
+                ledger_records.push(WalletLedgerRecord {
+                    id: Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()),
+                    raw_transaction_id: raw_tx_id,
+                    wallet_address: wallet_address.to_string(),
+                    network: delta.network.clone(),
+                    tx_hash: tx_hash.clone(),
+                    timestamp,
+                    entry_type: kind.into(),
+                    asset_symbol: delta.native_token.clone(),
+                    amount,
+                    counterparty_address: None,
+                    fee_amount: (kind == "fee").then(|| fee.clone()),
+                    fee_asset: (kind == "fee").then(|| delta.native_token.clone()),
+                    cost_basis: None,
+                    proceeds: None,
+                    dataset_version_id: wl_version_id,
+                    created_at: now,
+                });
+            }
         }
 
         // --- HL fills ---
@@ -1993,7 +2011,7 @@ impl Repository {
 
             let trade_id = fill.trade_id.unwrap_or(0);
             let key = format!(
-                "wl:{}:fill:{}:{}",
+                "wl:{wallet_norm}:{}:fill:{}:{}",
                 raw_tx_id.map(|u| u.to_string()).unwrap_or_default(),
                 fill.coin,
                 trade_id
@@ -2011,18 +2029,63 @@ impl Repository {
                 wallet_address: wallet_address.to_string(),
                 network: fill.network.clone(),
                 tx_hash,
-                timestamp: fill.fill_time,
+                timestamp: raw_tx.map(|r| r.timestamp).unwrap_or(fill.fill_time / 1000),
                 entry_type: "trade".to_string(),
                 asset_symbol: fill.coin.clone(),
                 amount,
                 counterparty_address: None,
-                fee_amount: fill.fee.clone(),
-                fee_asset: fill.fee_token.clone(),
+                fee_amount: None,
+                fee_asset: None,
                 cost_basis: None,
                 proceeds: None,
                 dataset_version_id: wl_version_id,
                 created_at: now,
             });
+        }
+
+        // Settlement cash flows are separate from perpetual position quantities.
+        for fill in hl_fills {
+            let raw_tx = fill.raw_transaction_id.and_then(|id| raw_tx_map.get(&id));
+            for (kind, value, asset) in [
+                (
+                    "fee",
+                    fill.fee.as_ref().map(|v| -v.clone()),
+                    fill.fee_token.as_deref().unwrap_or("USDC"),
+                ),
+                ("income", fill.closed_pnl.clone(), "USDC"),
+            ] {
+                let Some(amount) = value.filter(|v| *v != BigDecimal::from(0)) else {
+                    continue;
+                };
+                let key = format!(
+                    "wl:{wallet_norm}:{}:fill:{}:{}:{kind}",
+                    fill.raw_transaction_id.unwrap_or_default(),
+                    fill.coin,
+                    fill.trade_id.unwrap_or(0)
+                );
+                ledger_records.push(WalletLedgerRecord {
+                    id: Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()),
+                    raw_transaction_id: fill.raw_transaction_id,
+                    wallet_address: wallet_address.into(),
+                    network: fill.network.clone(),
+                    tx_hash: raw_tx.map(|r| r.tx_hash.clone()).unwrap_or_default(),
+                    timestamp: raw_tx.map(|r| r.timestamp).unwrap_or(fill.fill_time / 1000),
+                    entry_type: kind.into(),
+                    asset_symbol: asset.into(),
+                    amount,
+                    counterparty_address: None,
+                    fee_amount: if kind == "fee" {
+                        fill.fee.clone()
+                    } else {
+                        None
+                    },
+                    fee_asset: (kind == "fee").then(|| asset.into()),
+                    cost_basis: None,
+                    proceeds: None,
+                    dataset_version_id: wl_version_id,
+                    created_at: now,
+                });
+            }
         }
 
         // --- HL funding payments ---
@@ -2032,7 +2095,7 @@ impl Repository {
             let tx_hash = raw_tx.map(|r| r.tx_hash.clone()).unwrap_or_default();
 
             let key = format!(
-                "wl:{}:funding:{}:{}",
+                "wl:{wallet_norm}:{}:funding:{}:{}",
                 raw_tx_id.map(|u| u.to_string()).unwrap_or_default(),
                 funding.coin,
                 funding.payment_time
@@ -2044,8 +2107,10 @@ impl Repository {
                 wallet_address: wallet_address.to_string(),
                 network: funding.network.clone(),
                 tx_hash,
-                timestamp: funding.payment_time,
-                entry_type: format!("funding:{}", funding.coin),
+                timestamp: raw_tx
+                    .map(|r| r.timestamp)
+                    .unwrap_or(funding.payment_time / 1000),
+                entry_type: "funding".to_string(),
                 asset_symbol: "USDC".to_string(),
                 amount: funding.amount.clone(),
                 counterparty_address: None,
@@ -2058,10 +2123,59 @@ impl Repository {
             });
         }
 
-        // Write wallet_ledger records
-        if !ledger_records.is_empty() {
+        let mut evm_balance_flows = Vec::new();
+        for raw in raw_txs
+            .iter()
+            .filter(|r| r.raw_metadata["from"].is_string())
+        {
+            match crate::evm_parser::native_flows(&raw.raw_metadata, wallet_address) {
+                Ok(flows) => {
+                    let asset = if raw.network.starts_with("hyperevm") {
+                        "HYPE"
+                    } else {
+                        "ETH"
+                    };
+                    let net: BigDecimal = flows.iter().map(|(_, amount)| amount.clone()).sum();
+                    if net != BigDecimal::from(0) {
+                        evm_balance_flows.push((raw, asset, net));
+                    }
+                    for (kind, amount) in flows {
+                        let key = format!("wl:{wallet_norm}:{}:evm:{kind}", raw.id);
+                        ledger_records.push(WalletLedgerRecord {
+                            id: Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()),
+                            raw_transaction_id: Some(raw.id),
+                            wallet_address: wallet_address.into(),
+                            network: raw.network.clone(),
+                            tx_hash: raw.tx_hash.clone(),
+                            timestamp: raw.timestamp,
+                            entry_type: kind.into(),
+                            asset_symbol: asset.into(),
+                            fee_amount: (kind == "fee").then(|| -amount.clone()),
+                            fee_asset: (kind == "fee").then(|| asset.into()),
+                            amount,
+                            counterparty_address: None,
+                            cost_basis: None,
+                            proceeds: None,
+                            dataset_version_id: wl_version_id,
+                            created_at: now,
+                        });
+                    }
+                }
+                Err(error) => {
+                    result.wallet_ledger_failed += 1;
+                    warn!(%error, tx_hash = %raw.tx_hash, "Malformed EVM value/gas data");
+                }
+            }
+        }
+
+        // Replace this wallet's input slice atomically, also repairing prior parser output.
+        if !raw_txs.is_empty() {
             let n = ledger_records.len();
-            match self.save_wallet_ledger_records(&ledger_records).await {
+            let inputs: Vec<_> = raw_txs.iter().map(|raw| raw.id).collect();
+            match self
+                .replace_wallet_ledger_records(wallet_address, &inputs, &ledger_records)
+                .await
+            {
                 Ok(()) => {
                     result.wallet_ledger_written = n;
                     for record in &ledger_records {
@@ -2117,6 +2231,9 @@ impl Repository {
             let mut balance_events: Vec<BalanceEvent> = Vec::new();
 
             for transfer in token_transfers {
+                if transfer.decimals < 0 {
+                    continue;
+                }
                 let from_match =
                     normalize_address_for_comparison(&transfer.from_address) == wallet_norm;
                 let to_match =
@@ -2140,7 +2257,19 @@ impl Repository {
                 } else {
                     transfer.amount.clone()
                 };
-                let snapshot_id = balance_snapshot_id(&asset, timestamp, &tx_hash, transfer.id);
+                let source_id = Uuid::new_v5(
+                    &Uuid::NAMESPACE_URL,
+                    format!(
+                        "transfer:{}:{}:{}:{}:{}",
+                        raw_tx_id.unwrap_or_default(),
+                        transfer.token_address,
+                        transfer.from_address,
+                        transfer.to_address,
+                        transfer.transfer_index
+                    )
+                    .as_bytes(),
+                );
+                let snapshot_id = balance_snapshot_id(&asset, timestamp, &tx_hash, source_id);
                 balance_events.push(BalanceEvent {
                     network: transfer.network.clone(),
                     asset,
@@ -2159,8 +2288,18 @@ impl Repository {
                 let raw_tx = raw_tx_id.and_then(|id| raw_tx_map.get(&id));
                 let tx_hash = raw_tx.map(|r| r.tx_hash.clone()).unwrap_or_default();
                 let timestamp = raw_tx.map(|r| r.timestamp).unwrap_or(0);
+                let source_id = Uuid::new_v5(
+                    &Uuid::NAMESPACE_URL,
+                    format!(
+                        "native:{}:{}:{}",
+                        raw_tx_id.unwrap_or_default(),
+                        delta.account_address,
+                        delta.native_token
+                    )
+                    .as_bytes(),
+                );
                 let snapshot_id =
-                    balance_snapshot_id(&delta.native_token, timestamp, &tx_hash, delta.id);
+                    balance_snapshot_id(&delta.native_token, timestamp, &tx_hash, source_id);
                 balance_events.push(BalanceEvent {
                     network: delta.network.clone(),
                     asset: delta.native_token.clone(),
@@ -2168,6 +2307,17 @@ impl Repository {
                     tx_hash,
                     delta: delta.delta.clone(),
                     snapshot_id,
+                });
+            }
+
+            for (raw, asset, delta) in evm_balance_flows {
+                balance_events.push(BalanceEvent {
+                    network: raw.network.clone(),
+                    asset: asset.into(),
+                    timestamp: raw.timestamp,
+                    tx_hash: raw.tx_hash.clone(),
+                    delta,
+                    snapshot_id: balance_snapshot_id(asset, raw.timestamp, &raw.tx_hash, raw.id),
                 });
             }
 
@@ -2211,6 +2361,7 @@ impl Repository {
                 }
 
                 let mut snapshots: Vec<BalanceSnapshot> = Vec::new();
+                let mut snapshot_deltas = HashMap::new();
                 for ((network, asset), incoming_events) in incoming_by_key {
                     let Some((first_ts, first_id)) = first_event_by_key
                         .get(&(network.clone(), asset.clone()))
@@ -2295,8 +2446,29 @@ impl Repository {
                         }
                     };
 
-                    let has_existing_suffix =
-                        suffix.iter().any(|snap| !incoming_ids.contains(&snap.id));
+                    let suffix_ids: Vec<_> = suffix.iter().map(|snap| snap.id).collect();
+                    let suffix_deltas = match self.balance_snapshot_deltas(&suffix_ids).await {
+                        Ok(deltas) => deltas,
+                        Err(e) => {
+                            let count = incoming_events.len();
+                            result.balance_history_failed += count;
+                            increment_gold_dataset_network_failures(
+                                &mut result.per_dataset_network_failed,
+                                "balance_history",
+                                &network,
+                                count,
+                            );
+                            *result
+                                .per_dataset_network_written
+                                .entry(("balance_history".into(), network.clone()))
+                                .or_default() += count;
+                            warn!(error = %e, "Failed to read stored balance deltas");
+                            continue;
+                        }
+                    };
+                    let has_existing_suffix = suffix.iter().any(|snap| {
+                        !incoming_ids.contains(&snap.id) && !suffix_deltas.contains_key(&snap.id)
+                    });
                     if has_existing_suffix {
                         let skipped = incoming_events.len();
                         result.balance_history_failed += skipped;
@@ -2335,10 +2507,20 @@ impl Repository {
                         })
                         .collect();
 
-                    // Only incoming deterministic rows are safe to replay here. Any
-                    // existing suffix rows were fail-closed above because the current
-                    // schema does not store per-row deltas/source order for lossless
-                    // downstream recomputation.
+                    for snapshot in suffix
+                        .into_iter()
+                        .filter(|snap| !incoming_ids.contains(&snap.id))
+                    {
+                        recompute_events.push(BalanceRecomputeEvent {
+                            id: snapshot.id,
+                            network: snapshot.network,
+                            asset: snapshot.asset_symbol,
+                            timestamp: snapshot.timestamp,
+                            tx_hash: snapshot.tx_hash,
+                            delta: suffix_deltas[&snapshot.id].clone(),
+                            created_at: snapshot.created_at,
+                        });
+                    }
 
                     recompute_events.sort_by(|a, b| {
                         a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id))
@@ -2349,6 +2531,7 @@ impl Repository {
                         .unwrap_or_else(|| BigDecimal::from(0));
                     for event in recompute_events {
                         balance += &event.delta;
+                        snapshot_deltas.insert(event.id, event.delta.clone());
                         snapshots.push(BalanceSnapshot {
                             id: event.id,
                             wallet_address: wallet_address.to_string(),
@@ -2365,7 +2548,10 @@ impl Repository {
 
                 if !snapshots.is_empty() {
                     let n = snapshots.len();
-                    match self.save_balance_snapshots(&snapshots).await {
+                    match self
+                        .save_balance_snapshots_with_deltas(&snapshots, &snapshot_deltas)
+                        .await
+                    {
                         Ok(()) => {
                             result.balance_history_written += n;
                             for snapshot in &snapshots {
@@ -2399,6 +2585,28 @@ impl Repository {
             }
         }
 
+        // Rebuild analytics from all indexed Silver inputs, never a single batch.
+        // Read persisted IDs as well, so replay cannot fork trade identities.
+        let hl_network = hl_fills
+            .first()
+            .map(|f| f.network.as_str())
+            .or_else(|| hl_funding.first().map(|f| f.network.as_str()));
+        let (indexed_fills, indexed_funding) = if let Some(network) = hl_network {
+            match self.hl_wallet_inputs(wallet_address, network).await {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    result.hl_pnl_summary_failed += 1;
+                    result.hl_trade_history_failed += 1;
+                    warn!(%error, "Cannot load complete indexed HL analytics inputs");
+                    return result;
+                }
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let hl_fills = indexed_fills.as_slice();
+        let hl_funding = indexed_funding.as_slice();
+
         // --- HL PnL summary ---
         if !hl_fills.is_empty() || !hl_funding.is_empty() {
             let network = hl_fills
@@ -2406,8 +2614,13 @@ impl Repository {
                 .map(|f| f.network.as_str())
                 .or_else(|| hl_funding.first().map(|f| f.network.as_str()))
                 .unwrap_or("hyperliquid");
-            let period_start = raw_txs.iter().map(|r| r.timestamp).min().unwrap_or(0);
-            let period_end = raw_txs.iter().map(|r| r.timestamp).max().unwrap_or(0);
+            let times: Vec<_> = hl_fills
+                .iter()
+                .map(|f| f.fill_time / 1000)
+                .chain(hl_funding.iter().map(|f| f.payment_time / 1000))
+                .collect();
+            let period_start = times.iter().copied().min().unwrap_or(0);
+            let period_end = times.iter().copied().max().unwrap_or(0);
             let mut summaries = crate::hl_analytics::compute_pnl_summary(
                 wallet_address,
                 network,
@@ -2421,7 +2634,10 @@ impl Repository {
             }
             if !summaries.is_empty() {
                 let n = summaries.len();
-                match self.save_hl_pnl_summary(&summaries).await {
+                match self
+                    .replace_hl_pnl_summary(wallet_address, network, &summaries)
+                    .await
+                {
                     Ok(()) => {
                         result.hl_pnl_summary_written = n;
                         for summary in &summaries {
@@ -2464,10 +2680,15 @@ impl Repository {
                 crate::hl_analytics::build_trade_history(wallet_address, network, hl_fills);
             for t in &mut trades {
                 t.dataset_version_id = hl_trade_version_id;
+                t.opened_at /= 1000;
+                t.closed_at /= 1000;
             }
-            if !trades.is_empty() {
+            {
                 let n = trades.len();
-                match self.save_hl_trade_history(&trades).await {
+                match self
+                    .replace_hl_trade_history(wallet_address, network, &trades)
+                    .await
+                {
                     Ok(()) => {
                         result.hl_trade_history_written = n;
                         for trade in &trades {
@@ -2504,8 +2725,20 @@ impl Repository {
         if !decoded_events.is_empty() {
             let mut events =
                 crate::protocol_analytics::compute_protocol_events(decoded_events, None);
+            let event_times: HashMap<_, _> = decoded_events
+                .iter()
+                .filter_map(|event| {
+                    event
+                        .raw_transaction_id
+                        .and_then(|id| raw_tx_map.get(&id))
+                        .map(|raw| (event.id, raw.timestamp))
+                })
+                .collect();
             for e in &mut events {
                 e.dataset_version_id = protocol_events_version_id;
+                if let Some(time) = e.raw_event_id.and_then(|id| event_times.get(&id)) {
+                    e.timestamp = *time;
+                }
             }
             if !events.is_empty() {
                 let n = events.len();
@@ -2739,7 +2972,7 @@ impl Repository {
                 last_ingestion_run_id: run_id,
                 records_count: total_records_count,
                 gap_ranges: None,
-                notes: None,
+                notes: Some("Processing status covers indexed inputs only, not complete chain history. Unknown-decimal ERC20 amounts are excluded from Gold totals.".into()),
                 created_at: now,
                 updated_at: now,
             };

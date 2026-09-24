@@ -348,6 +348,18 @@ pub fn validate_target(target: &IndexTarget) -> Result<(), Vec<String>> {
         ));
     }
 
+    if let Some(block) = target
+        .filter_spec
+        .as_ref()
+        .and_then(|s| s.get("from_block"))
+    {
+        if target.chain_family != ChainFamily::Evm
+            || block.as_u64().is_none_or(|n| n > i64::MAX as u64)
+        {
+            errors.push("from_block must be a nonnegative integer up to 9223372036854775807 on an EVM target".into());
+        }
+    }
+
     // Rule 3: filter_spec required for complex target kinds
     let filter_required = matches!(target.kind, TargetKind::TopicFilter | TargetKind::Protocol);
     if filter_required && target.filter_spec.is_none() {
@@ -396,6 +408,33 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn evm_start_block_is_validated() {
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("1"),
+            serde_json::json!(u64::MAX),
+        ] {
+            let target = make_target(
+                TargetKind::Wallet,
+                ChainFamily::Evm,
+                Some("0x123"),
+                Some(serde_json::json!({"from_block": value})),
+                TargetMode::Backfill,
+            );
+            assert!(validate_target(&target).is_err());
+        }
+        let target = make_target(
+            TargetKind::Wallet,
+            ChainFamily::Evm,
+            Some("0x123"),
+            Some(serde_json::json!({"from_block": 0})),
+            TargetMode::Backfill,
+        );
+        assert!(validate_target(&target).is_ok());
     }
 
     // -- ConnectorCapabilities --

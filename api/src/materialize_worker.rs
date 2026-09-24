@@ -502,8 +502,9 @@ pub(crate) async fn execute_normalize(
                 run_id = %run_id,
                 written = silver_result.total_written,
                 failed = silver_result.total_failed,
-                "Bronze-native Silver materialization had partial failures"
+                "Bronze-native Silver/Gold materialization had partial failures"
             );
+            anyhow::bail!("Materialization failed for {} records; retry normalization using this ingestion run", silver_result.total_failed);
         }
 
         return Ok(silver_result);
@@ -546,7 +547,7 @@ fn dataset_completeness_for_ingestion_run(
                 last_ingestion_run_id: Some(irun.id),
                 records_count: usize_to_i64_or_max(*ds_count),
                 gap_ranges: None,
-                notes: None,
+                notes: Some("Processing status covers this run's indexed inputs, not complete chain history or complete protocol decoding.".into()),
                 created_at: now,
                 updated_at: now,
             })

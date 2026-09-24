@@ -66,7 +66,20 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - run: cargo test --locked --workspace
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web-tests/package-lock.json
+      - run: npm ci --prefix web-tests
+      - run: cd web-tests && npx playwright install --with-deps chromium
+      - run: ./scripts/smoke-test.sh --browser
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-failure-artifacts
+          path: web-tests/artifacts
 
   build:
     name: Build (release)
@@ -75,4 +88,32 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --workspace
+      - run: cargo build --locked --release --workspace
+
+  docker:
+    name: Docker first run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and boot
+        run: |
+          ./scripts/setup.sh
+          docker compose up --build -d --wait --wait-timeout 120
+          curl -fsS http://127.0.0.1:3000/ready
+          test "$(docker compose exec -T api id -u)" != 0
+      - name: Check pipeline and persistence
+        run: |
+          set -a; source .env; set +a
+          export SPECTRAPLEX_TEST_URL=http://127.0.0.1:3000
+          export SPECTRAPLEX_TEST_KEY="$SPECTRAPLEX_API_KEY"
+          python3 scripts/container_test.py prepare .local/container-check.json
+          docker compose down
+          docker compose up -d --wait --wait-timeout 120
+          python3 scripts/container_test.py verify .local/container-check.json
+      - name: Container logs
+        if: failure()
+        run: docker compose logs --tail 100
+      - name: Stop
+        if: always()
+        run: docker compose down -v

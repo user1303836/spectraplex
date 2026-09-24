@@ -6,3 +6,16 @@ members = [
     "api",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.94"
+repository = "https://github.com/user1303836/spectraplex"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
