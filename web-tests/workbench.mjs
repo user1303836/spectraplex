@@ -11,6 +11,9 @@ assert(base && key, 'Set SPECTRAPLEX_TEST_URL and SPECTRAPLEX_TEST_KEY (or run s
 const chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const browser = await chromium.launch({ headless: true, ...(existsSync(chrome) ? { executablePath: chrome } : {}) });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, acceptDownloads: true });
+// Headless Chromium does not consistently grant clipboard access from a click.
+// Scope explicit test permissions to this disposable local deployment.
+await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: new URL(base).origin });
 const errors = [];
 page.on('pageerror', error => errors.push(error.message));
 const artifacts = fileURLToPath(new URL('./artifacts/', import.meta.url));
@@ -109,8 +112,10 @@ try {
   await page.locator('#new-key-box').waitFor({ state: 'visible' });
   const tenantKey = await page.locator('#new-key').inputValue();
   assert.match(tenantKey, /^spx_/);
+  await page.bringToFront();
   await page.getByRole('button', { name: 'Copy key', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('#notice').textContent.includes('Key copied'));
+  assert.equal(await page.evaluate(() => navigator.clipboard.readText()), tenantKey);
   await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
   assert.equal(await page.locator('#new-key').inputValue(), '');
   assert.equal(await page.evaluate(() => localStorage.length + sessionStorage.length), 0, 'Keys must not persist in browser storage');
@@ -137,6 +142,10 @@ try {
   assert.equal(await page.locator('#api-key').inputValue(), '', 'Revocation must clear credentials');
   assert.deepEqual(errors, [], 'Browser runtime errors');
   console.log('PASS browser: authentication, samples, filters, JSONL import, real pagination, retries, downloads, keys, tenant isolation, mobile layout and WCAG AA checks');
+} catch (error) {
+  console.error('Browser notice:', await page.locator('#notice').innerText().catch(() => '(unavailable)'));
+  await page.screenshot({ path: `${artifacts}/failure.png`, fullPage: true, mask: [page.locator('#api-key'), page.locator('#new-key')] }).catch(() => {});
+  throw error;
 } finally {
   await browser.close();
 }
